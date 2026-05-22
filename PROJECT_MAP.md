@@ -8,7 +8,7 @@ Legend: ✅ done · 🚧 in progress · ⬜ planned
 ## Milestones
 - ✅ **M0** — repo skeleton + Bolt submodule + build (builds + tests pass on MSVC; CI workflow added)
 - 🚧 **M1** — HTTP/1.1 + TLS + Bolt-native router + chained middleware + Bolt primitives (App facade + Request/Response + middleware onion + dispatch bridge DONE, 24/24 ctest green; remaining: Bolt primitives wired Arena/SPSC/swiss/topology)
-- ⬜ **M2** — HTTP/2(ALPN) + compression + CORS + coroutine SSE + WebSocket
+- 🚧 **M2** — HTTP/2(ALPN) + compression + CORS + coroutine SSE + WebSocket (WebSocket echo + coroutine SSE verified end-to-end through App with tests + examples; gzip compression seam landed [zlib stopgap, identity locally]; 45/45 ctest green. Remaining: HTTP/2 ALPN surface)
 - ⬜ **M3** — HTTP/3 + WebRTC seams (scaffolded)
 - 🚧 **M4** — hardening, benchmarks, docs (benchmarks + zero-alloc/bounded-resource hardening tests + ASan/UBSan option + asan/assertions CI legs landed; 36/36 ctest green on MSVC)
 - ⬜ later — Gestalt migration
@@ -48,8 +48,8 @@ tools/fuzz_check/          # throwaway standalone validation of the fuzz util (n
 | TLS/ALPN | ✅ | OpenSSL 3.6.1 linked (OpenSSL::SSL/Crypto); BOLTAPI_ENABLE_TLS default ON |
 | HTTP/2 (frames/hpack/streams) | ✅ | forked custom impl (no nghttp2); frame/hpack/huffman/stream/connection compiled |
 | Windows portability shim | ✅ | include/boltapi/net/sys_compat.h: winsock close/recv/send/set_nonblocking, WSAStartup, ssize_t, time/byteorder shims, windows.h macro undefs |
-| Compression / CORS | ⬜ | gzip + optional br/zstd |
-| Coroutine SSE / WebSocket | ⬜ | forked |
+| Compression / CORS | 🚧 | M2 — gzip codec seam `include/boltapi/compression.h` + `src/compression.cpp` (Accept-Encoding parser + `gzip_encode`); zlib STOPGAP gated by `BOLTAPI_HAVE_GZIP` (option `BOLTAPI_WITH_GZIP` ON; identity when zlib absent — current state on this box). App appends compression middleware LAST (innermost) when `Config.enable_compression`: gzip iff Accept-Encoding gzip + body>256B + no existing Content-Encoding; sets Content-Encoding/Content-Length/Vary. Dual-mode test `tests/compression_test.cpp`. Docs: `docs/COMPRESSION.md` (Bolt-native-codec TODO). CORS done (M1). br/zstd options off/unwired. |
+| Coroutine SSE / WebSocket | ✅ | M2 — verified end-to-end through App. WebSocket: `app.websocket("/ws",...)` echo; engine handles RFC6455 upgrade (101 + Sec-WebSocket-Accept) by path, on_text_message→send_text echoes unmasked frames. SSE: `app.sse_coro("/events",...)` streams via SSEWriter; engine sends text/event-stream headers before handler. Tests: `tests/ws_echo_test.cpp` (handshake+accept-key, masked echo, multi-message, close) + `tests/sse_test.cpp` (content-type + ordered events, bounded reads). Examples: `examples/ws_echo.cpp`, `examples/sse_stream.cpp`. |
 | HTTP/3 + WebRTC seams | ⬜ | protocol.h/transport.h registry, stubs |
 | Bolt primitives wired (Arena/SPSC/swiss/topology) | ⬜ | from the start in M1 |
 

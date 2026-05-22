@@ -23,6 +23,7 @@ option(BOLTAPI_WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
 # Feature toggles (wired up in later milestones; declared now so the build
 # surface is stable). Defaults keep M0 dependency-light.
 option(BOLTAPI_ENABLE_TLS   "Enable TLS/HTTPS (needs OpenSSL)" ON)   # M1: forked engine needs OpenSSL
+option(BOLTAPI_WITH_GZIP    "gzip response compression (zlib stopgap)" ON)
 option(BOLTAPI_WITH_BROTLI  "Enable Brotli compression"        OFF)
 option(BOLTAPI_WITH_ZSTD    "Enable zstd compression"          OFF)
 option(BOLTAPI_WITH_JSON    "Enable simdjson JSON parsing"      OFF)
@@ -58,6 +59,27 @@ add_subdirectory(extern/bolt EXCLUDE_FROM_ALL)
 # unconditionally because http2/websocket use libcrypto even on cleartext.
 # ---------------------------------------------------------------------------
 find_package(OpenSSL REQUIRED)
+
+# ---------------------------------------------------------------------------
+# gzip response compression (M2). STOPGAP per repo deps policy: Bolt has no
+# compression codec yet, so we use zlib when present, gated behind
+# BOLTAPI_HAVE_GZIP. When BOLTAPI_WITH_GZIP=ON AND ZLIB is found we link it and
+# define BOLTAPI_HAVE_GZIP=1; otherwise the codec degrades to graceful identity
+# (BOLTAPI_HAVE_GZIP=0). See include/boltapi/compression.h for the Bolt-native
+# TODO. The define is applied below on the boltapi target.
+# ---------------------------------------------------------------------------
+set(BOLTAPI_HAVE_GZIP 0)
+if(BOLTAPI_WITH_GZIP)
+    find_package(ZLIB QUIET)
+    if(ZLIB_FOUND)
+        set(BOLTAPI_HAVE_GZIP 1)
+        message(STATUS "Bolt API gzip: ENABLED (zlib ${ZLIB_VERSION_STRING} — stopgap; Bolt-native codec TODO)")
+    else()
+        message(STATUS "Bolt API gzip: DISABLED (zlib not found; identity passthrough)")
+    endif()
+else()
+    message(STATUS "Bolt API gzip: DISABLED (BOLTAPI_WITH_GZIP=OFF; identity passthrough)")
+endif()
 
 # ---------------------------------------------------------------------------
 # Forked engine source list (hard fork of FasterAPI's CoroUnifiedServer).
@@ -124,6 +146,7 @@ add_library(boltapi STATIC
     src/version.cpp
     src/router.cpp          # Bolt-native dictionary/SwissTable router
     src/app.cpp             # M1: App facade + dispatch bridge + middleware fold
+    src/compression.cpp     # M2: gzip codec seam (zlib stopgap, BOLTAPI_HAVE_GZIP)
     ${BOLTAPI_ENGINE_SOURCES}
 )
 add_library(boltapi::boltapi ALIAS boltapi)
@@ -135,6 +158,13 @@ target_compile_features(boltapi PUBLIC cxx_std_20)
 target_link_libraries(boltapi PUBLIC bolt::bolt OpenSSL::SSL OpenSSL::Crypto)
 if(WIN32)
     target_link_libraries(boltapi PUBLIC ws2_32 mswsock)
+endif()
+
+# gzip seam: PUBLIC so app.h/compression.h consumers and tests compile against
+# the same BOLTAPI_HAVE_GZIP value the library was built with.
+target_compile_definitions(boltapi PUBLIC BOLTAPI_HAVE_GZIP=${BOLTAPI_HAVE_GZIP})
+if(BOLTAPI_HAVE_GZIP)
+    target_link_libraries(boltapi PUBLIC ZLIB::ZLIB)
 endif()
 boltapi_apply_hardening(boltapi)
 boltapi_apply_sanitizers(boltapi)   # no-op unless BOLTAPI_SANITIZE=ON
@@ -155,6 +185,22 @@ if(BOLTAPI_BUILD_EXAMPLES)
     add_executable(boltapi_hello examples/hello.cpp)
     target_link_libraries(boltapi_hello PRIVATE boltapi::boltapi)
     boltapi_apply_hardening(boltapi_hello)
+
+    # M2: WebSocket echo server through the App facade.
+    add_executable(boltapi_ws_echo examples/ws_echo.cpp)
+    target_link_libraries(boltapi_ws_echo PRIVATE boltapi::boltapi)
+    if(WIN32)
+        target_link_libraries(boltapi_ws_echo PRIVATE ws2_32 mswsock)
+    endif()
+    boltapi_apply_hardening(boltapi_ws_echo)
+
+    # M2: coroutine SSE stream through the App facade.
+    add_executable(boltapi_sse_stream examples/sse_stream.cpp)
+    target_link_libraries(boltapi_sse_stream PRIVATE boltapi::boltapi)
+    if(WIN32)
+        target_link_libraries(boltapi_sse_stream PRIVATE ws2_32 mswsock)
+    endif()
+    boltapi_apply_hardening(boltapi_sse_stream)
 endif()
 
 if(BOLTAPI_BUILD_TESTS)

@@ -6,6 +6,8 @@
 
 #include "boltapi/app.h"
 
+#include "boltapi/compression.h"
+
 #include <cassert>
 #include <utility>
 
@@ -35,6 +37,62 @@ AsyncMiddleware make_cors_middleware(std::string origin) {
             co_return;  // short-circuit: do not call next()
         }
         co_await next();
+        co_return;
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Built-in gzip compression middleware (M2). Inserted as the LAST link in the
+// chain so it runs INNERMOST — closest to the handler — and therefore sees the
+// final response body after the handler (and any user middleware) has produced
+// it. Awaits next() (the handler), then conditionally replaces the body.
+//
+// Compresses only when ALL hold:
+//   * Config.enable_compression                       (caller opted in)
+//   * a real gzip backend is compiled in              (BOLTAPI_HAVE_GZIP)
+//   * the request's Accept-Encoding lists gzip
+//   * the response body exceeds kMinCompressBytes     (tiny bodies aren't worth it)
+//   * no Content-Encoding is already set              (don't double-encode)
+// Otherwise the body passes through untouched. On success it sets
+// Content-Encoding: gzip, fixes Content-Length, and adds Vary: Accept-Encoding.
+// ---------------------------------------------------------------------------
+constexpr std::size_t kMinCompressBytes = 256;
+
+AsyncMiddleware make_compression_middleware() {
+    return [](Request& req, Response& res, Next next) -> core::coro_task<void> {
+        co_await next();
+
+        if (!compression::gzip_available()) {
+            co_return;  // identity mode: nothing to do
+        }
+
+        http::CoroHttpResponse& raw = res.raw();
+
+        // Already encoded? Leave it.
+        if (raw.headers.find("Content-Encoding") != raw.headers.end()) {
+            co_return;
+        }
+        // Body below the threshold? Not worth the gzip framing overhead.
+        if (raw.body.size() <= kMinCompressBytes) {
+            co_return;
+        }
+        // Client must accept gzip.
+        const std::string ae = req.header("Accept-Encoding");
+        if (!compression::accepts_gzip(ae)) {
+            co_return;
+        }
+
+        bool ok = false;
+        std::string encoded = compression::gzip_encode(raw.body, ok);
+        if (!ok) {
+            co_return;  // backend hiccup: serve identity
+        }
+
+        raw.body.swap(encoded);
+        raw.headers["Content-Encoding"] = "gzip";
+        raw.headers["Content-Length"] = std::to_string(raw.body.size());
+        // Caches must key on Accept-Encoding now that the body varies by it.
+        raw.headers["Vary"] = "Accept-Encoding";
         co_return;
     };
 }
@@ -101,6 +159,13 @@ void App::build_dispatch() {
     if (config_.enable_cors) {
         middleware_.insert(middleware_.begin(),
                            make_cors_middleware(config_.cors_origin));
+    }
+
+    // Append the compression middleware LAST so it runs innermost (closest to
+    // the handler) and observes the final response body. Added after the CORS
+    // prepend so ordering is fixed before the router is built.
+    if (config_.enable_compression) {
+        middleware_.push_back(make_compression_middleware());
     }
 
     router_ = std::make_unique<Router>();

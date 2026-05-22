@@ -45,3 +45,25 @@ boltapi_add_test(boltapi_bounded_resource_test bounded_resource_test.cpp)
 if(WIN32)
     target_link_libraries(boltapi_bounded_resource_test PRIVATE ws2_32 mswsock)
 endif()
+
+# M2: WebSocket echo end-to-end through App — RFC6455 handshake (101 +
+# Sec-WebSocket-Accept), masked client text frames echoed back unmasked,
+# multiple messages on one connection, and a close frame.
+boltapi_add_test(boltapi_ws_echo_test ws_echo_test.cpp)
+if(WIN32)
+    target_link_libraries(boltapi_ws_echo_test PRIVATE ws2_32 mswsock)
+endif()
+
+# M2: coroutine SSE end-to-end through App — text/event-stream content type and
+# ordered data:/event: frames parsed off the wire, bounded with a read timeout.
+boltapi_add_test(boltapi_sse_test sse_test.cpp)
+if(WIN32)
+    target_link_libraries(boltapi_sse_test PRIVATE ws2_32 mswsock)
+endif()
+
+# M2: response compression — gzip middleware. Passes in BOTH modes: with zlib
+# (asserts Content-Encoding: gzip + roundtrip) and without (asserts identity).
+boltapi_add_test(boltapi_compression_test compression_test.cpp)
+if(WIN32)
+    target_link_libraries(boltapi_compression_test PRIVATE ws2_32 mswsock)
+endif()
