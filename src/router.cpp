@@ -80,7 +80,8 @@ constexpr uint32_t kSegWildcard = 2;  // '*' — captures the remaining path
 
 constexpr uint32_t kNoNode      = 0xFFFFFFFFu;  // trie child sentinel
 constexpr uint32_t kMaxNodes    = kMaxRoutes * (kMaxSegments + 1);  // upper bound
-constexpr uint32_t kMaxChildren = 16;  // distinct literal children probed per node
+// Literal trie edges are stored in a shared bolt::SwissTable keyed by
+// (parent_node, segment_id). No per-node fan-out limit, nodes stay tiny.
 
 // FNV-1a over a byte range — stable, matches DictionaryPool's hash family.
 uint64_t fnv1a(const char* data, uint32_t len) noexcept {
@@ -119,12 +120,10 @@ struct Route {
     uint32_t param_count;
 };
 
-// A trie node. Children are stored as parallel (key,id) arrays for branch-free
-// integer probing; param/wildcard successors are single indices.
+// A trie node. Literal children are looked up via RouterImpl::child_tbl, keyed
+// by (this_node, segment_id); param/wildcard successors are single indices.
+// 16 bytes regardless of fan-out.
 struct TrieNode {
-    uint32_t lit_keys[kMaxChildren];   // interned segment ids
-    uint32_t lit_kids[kMaxChildren];   // child node indices
-    uint32_t lit_count;
     uint32_t param_kid;                // node index for a '{...}' child or kNoNode
     uint32_t wild_kid;                 // node index for a '*' child or kNoNode
     uint32_t route_id;                 // route terminating here, or kInvalidRoute
@@ -140,6 +139,7 @@ struct RouterImpl {
     bolt::Arena          arena;
     bolt::DictionaryPool dict;       // interns literal segments + param names
     bolt::SwissTable     static_tbl; // static_key -> route_id
+    bolt::SwissTable     child_tbl;  // (parent_node<<32 | seg_id) -> child node idx
 
     Route    routes[kMaxRoutes];
     uint32_t route_count;
@@ -292,7 +292,6 @@ uint32_t alloc_node(RouterImpl& s) noexcept {
     assert(s.node_count < kMaxNodes);
     const uint32_t id = s.node_count++;
     TrieNode& n = s.node_pool[id];
-    n.lit_count      = 0;
     n.param_kid      = kNoNode;
     n.wild_kid       = kNoNode;
     n.route_id       = kInvalidRoute;
@@ -300,21 +299,24 @@ uint32_t alloc_node(RouterImpl& s) noexcept {
     return id;
 }
 
-// Find-or-create the literal child of `node` keyed by `lit`. Returns kNoNode
-// when the per-node child fan-out is exceeded.
+// Pack a literal trie edge into a collision-free 64-bit key. Both parent node
+// id and interned segment id are < 2^32, so the pair is exact (SwissTable
+// stores and compares the raw key).
+inline uint64_t edge_key(uint32_t node, uint32_t lit) noexcept {
+    return (static_cast<uint64_t>(node) << 32) | static_cast<uint64_t>(lit);
+}
+
+// Find-or-create the literal child of `node` keyed by interned segment `lit`,
+// via the shared edge table. Returns kNoNode only if the edge table is full
+// (it is sized to the node-pool upper bound, so that should not happen).
 uint32_t literal_child(RouterImpl& s, uint32_t node, uint32_t lit) noexcept {
-    assert(node < s.node_count);
     assert(s.node_pool != nullptr);
-    TrieNode& n = s.node_pool[node];
-    for (uint32_t i = 0; i < n.lit_count; ++i) {
-        if (n.lit_keys[i] == lit) return n.lit_kids[i];
-    }
-    if (n.lit_count >= kMaxChildren) return kNoNode;
+    assert(node < s.node_count);
+    const uint64_t key = edge_key(node, lit);
+    const int32_t hit = s.child_tbl.find(key);
+    if (hit >= 0) return static_cast<uint32_t>(hit);
     const uint32_t child = alloc_node(s);
-    TrieNode& nn = s.node_pool[node];  // reload (alloc may have grown count)
-    nn.lit_keys[nn.lit_count] = lit;
-    nn.lit_kids[nn.lit_count] = child;
-    ++nn.lit_count;
+    if (!s.child_tbl.insert(key, child)) return kNoNode;
     return child;
 }
 
@@ -330,6 +332,11 @@ void Router::build() noexcept {
     s.node_pool = s.arena.allocate_array<TrieNode>(cap);
     assert(s.node_pool != nullptr);
     s.node_count = 0;
+    // Edge table sized to the node-pool upper bound (each node has <=1 incoming
+    // literal edge), so literal_child() never overflows in practice.
+    const bool cok = bolt::SwissTable::create(&s.child_tbl, cap, &s.arena);
+    assert(cok);
+    (void)cok;
     const uint32_t root = alloc_node(s);
     assert(root == 0);
     (void)root;
@@ -349,12 +356,13 @@ void Router::build() noexcept {
         uint32_t cur = 0;  // root
         const uint32_t method_tag = 0xF0000000u | static_cast<uint32_t>(rt.method);
         cur = literal_child(s, cur, method_tag);
-        assert(cur != kNoNode);
+        if (cur == kNoNode) continue;  // edge table exhausted (should not happen)
+        bool route_ok = true;
         for (uint32_t i = 0; i < rt.seg_count; ++i) {
             const Segment& sg = s.segs[rt.first_seg + i];
             if (sg.kind == kSegLiteral) {
                 cur = literal_child(s, cur, sg.lit_id);
-                assert(cur != kNoNode);
+                if (cur == kNoNode) { route_ok = false; break; }
             } else if (sg.kind == kSegParam) {
                 TrieNode& n = s.node_pool[cur];
                 if (n.param_kid == kNoNode) {
@@ -368,6 +376,7 @@ void Router::build() noexcept {
                 cur = s.node_pool[cur].wild_kid;
             }
         }
+        if (!route_ok) continue;
         // Last writer wins on duplicate param paths; keeps registration order
         // priority deterministic (earlier static handled separately).
         if (s.node_pool[cur].route_id == kInvalidRoute) {
@@ -500,14 +509,9 @@ MatchResult Router::match(Method m, std::string_view path) const noexcept {
 
     // Enter the method-tagged root edge.
     const uint32_t method_tag = 0xF0000000u | static_cast<uint32_t>(m);
-    uint32_t mroot = kNoNode;
-    {
-        const TrieNode& root = s.node_pool[0];
-        for (uint32_t i = 0; i < root.lit_count; ++i) {
-            if (root.lit_keys[i] == method_tag) { mroot = root.lit_kids[i]; break; }
-        }
-    }
-    if (mroot == kNoNode) return res;
+    const int32_t mhit = s.child_tbl.find(edge_key(0, method_tag));
+    if (mhit < 0) return res;
+    const uint32_t mroot = static_cast<uint32_t>(mhit);
 
     stack[0] = Frame{mroot, 0, 0, 0};
     sp = 0;
@@ -538,15 +542,13 @@ MatchResult Router::match(Method m, std::string_view path) const noexcept {
             uint32_t lit = s.dict.find(seg.data(),
                                        static_cast<uint32_t>(seg.size()));
             if (lit != bolt::kDictPoolInvalidCode) {
-                for (uint32_t i = 0; i < node.lit_count; ++i) {
-                    if (node.lit_keys[i] == lit) {
-                        assert(sp + 1 <= static_cast<int32_t>(kMaxSegments));
-                        stack[sp + 1] =
-                            Frame{node.lit_kids[i], f.depth + 1, f.pcount, 0};
-                        ++sp;
-                        advanced = true;
-                        break;
-                    }
+                const int32_t c = s.child_tbl.find(edge_key(f.node, lit));
+                if (c >= 0) {
+                    assert(sp + 1 <= static_cast<int32_t>(kMaxSegments));
+                    stack[sp + 1] =
+                        Frame{static_cast<uint32_t>(c), f.depth + 1, f.pcount, 0};
+                    ++sp;
+                    advanced = true;
                 }
             }
             if (advanced) continue;

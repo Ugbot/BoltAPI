@@ -17,6 +17,10 @@ add_test(NAME boltapi_router COMMAND boltapi_router_test)
 # gtest-based units (http_fuzz generator). Uses boltapi_add_test() from BoltApiGTest.
 boltapi_add_test(boltapi_util_fuzz_test util_fuzz_test.cpp)
 
+# Router fan-out regression: >16 distinct sibling literal/param routes (would
+# have OOB'd the old fixed [16] per-node child array).
+boltapi_add_test(boltapi_router_fanout_test router_fanout_test.cpp)
+
 # M1: App facade integration test — spins a real App on an ephemeral cleartext
 # HTTP/1.1 port and drives it with a raw client socket + http_fuzz inputs.
 boltapi_add_test(boltapi_app_integration_test app_integration_test.cpp)
