@@ -122,6 +122,7 @@ endif()
 add_library(boltapi STATIC
     src/version.cpp
     src/router.cpp          # Bolt-native dictionary/SwissTable router
+    src/app.cpp             # M1: App facade + dispatch bridge + middleware fold
     ${BOLTAPI_ENGINE_SOURCES}
 )
 add_library(boltapi::boltapi ALIAS boltapi)

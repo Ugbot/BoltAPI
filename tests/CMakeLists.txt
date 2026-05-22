@@ -14,3 +14,16 @@ add_test(NAME boltapi_router COMMAND boltapi_router_test)
 
 # gtest-based units (http_fuzz generator). Uses boltapi_add_test() from BoltApiGTest.
 boltapi_add_test(boltapi_util_fuzz_test util_fuzz_test.cpp)
+
+# M1: App facade integration test — spins a real App on an ephemeral cleartext
+# HTTP/1.1 port and drives it with a raw client socket + http_fuzz inputs.
+boltapi_add_test(boltapi_app_integration_test app_integration_test.cpp)
+if(WIN32)
+    target_link_libraries(boltapi_app_integration_test PRIVATE ws2_32 mswsock)
+endif()
+
+# M1: middleware onion — chain order, short-circuit (401), sync+async mix.
+boltapi_add_test(boltapi_middleware_test middleware_test.cpp)
+if(WIN32)
+    target_link_libraries(boltapi_middleware_test PRIVATE ws2_32 mswsock)
+endif()
