@@ -1,0 +1,49 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "msvc",
+      "displayName": "MSVC (Visual Studio 2022, x64)",
+      "description": "Windows build with MSVC. Never MinGW.",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build/msvc",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    },
+    {
+      "name": "ninja-msvc",
+      "displayName": "Ninja + MSVC (run from a vcvars64 shell)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/ninja-msvc",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" },
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+    },
+    {
+      "name": "release",
+      "displayName": "Ninja Release (Linux/macOS)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/release",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" },
+      "condition": { "type": "notEquals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+    },
+    {
+      "name": "debug",
+      "displayName": "Ninja Debug (Linux/macOS)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/debug",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" },
+      "condition": { "type": "notEquals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "msvc",       "configurePreset": "msvc",       "configuration": "Release" },
+    { "name": "ninja-msvc", "configurePreset": "ninja-msvc" },
+    { "name": "release",    "configurePreset": "release" },
+    { "name": "debug",      "configurePreset": "debug" }
+  ],
+  "testPresets": [
+    { "name": "msvc",    "configurePreset": "msvc",    "configuration": "Release", "output": { "outputOnFailure": true } },
+    { "name": "release", "configurePreset": "release", "output": { "outputOnFailure": true } }
+  ]
+}

@@ -1,0 +1,42 @@
+name: ci
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  build-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: "linux-gcc",   os: ubuntu-24.04, preset: release, cc: gcc-13,   cxx: g++-13 }
+          - { name: "linux-clang", os: ubuntu-24.04, preset: release, cc: clang-18, cxx: clang++-18 }
+          - { name: "macos-clang", os: macos-14,     preset: release, cc: clang,    cxx: clang++ }
+          - { name: "windows-msvc", os: windows-2022, preset: msvc }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Ninja (non-Windows)
+        if: runner.os != 'Windows'
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update && sudo apt-get install -y ninja-build; fi
+          if [ "$RUNNER_OS" = "macOS" ]; then brew install ninja; fi
+        shell: bash
+
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }}
+        env:
+          CC:  ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }} ${{ runner.os == 'Windows' && '--config Release' || '' }}
+
+      - name: Test
+        run: ctest --preset ${{ matrix.preset }}

@@ -1,0 +1,3 @@
+[submodule "extern/bolt"]
+	path = extern/bolt
+	url = https://github.com/Ugbot/bolt
