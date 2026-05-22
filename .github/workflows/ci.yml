@@ -40,3 +40,65 @@ jobs:
 
       - name: Test
         run: ctest --preset ${{ matrix.preset }}
+
+  # ---------------------------------------------------------------------------
+  # ASan + UBSan (Linux/clang). Exercises the full suite instrumented; this is
+  # where MSVC's local ASan-runtime gap is covered.
+  # ---------------------------------------------------------------------------
+  asan:
+    name: asan (ubuntu-clang-18)
+    runs-on: ubuntu-24.04
+    env:
+      CC:  clang-18
+      CXX: clang++-18
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Ninja
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Configure (ASan/UBSan)
+        run: >
+          cmake -S . -B build/asan -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DBOLTAPI_SANITIZE=ON
+
+      - name: Build
+        run: cmake --build build/asan
+
+      - name: Test
+        env:
+          # Halt on first error; print full reports; symbolize frames.
+          ASAN_OPTIONS: abort_on_error=1:halt_on_error=1:print_stacktrace=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ctest --test-dir build/asan --output-on-failure
+
+  # ---------------------------------------------------------------------------
+  # Debug build with assertions enabled — TigerStyle invariants must hold under
+  # the full suite (asserts are compiled out of Release).
+  # ---------------------------------------------------------------------------
+  assertions:
+    name: assertions (ubuntu-debug)
+    runs-on: ubuntu-24.04
+    env:
+      CC:  clang-18
+      CXX: clang++-18
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Ninja
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Configure (Debug, asserts on)
+        run: cmake --preset debug
+
+      - name: Build
+        run: cmake --build --preset debug
+
+      - name: Test
+        # No testPreset for debug; drive ctest against the debug binary dir.
+        run: ctest --test-dir build/debug --output-on-failure

@@ -635,6 +635,28 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
         // Request completed - no longer first request
         is_first_request = false;
 
+        // Enforce the header-size limit on the COMPLETED parse as well, not just
+        // mid-read. The in-loop check (above) only fires when more data is still
+        // needed; a request whose oversized headers arrive in a single recv (and
+        // fit under the stack buffer) parses on the first attempt and would
+        // otherwise bypass the limit. The header block is everything consumed
+        // minus the body bytes. Mirrors the post-parse 413 body check below.
+        if (config_.max_header_size != 0) {
+            const size_t header_bytes =
+                consumed > parsed_req.body.size()
+                    ? consumed - parsed_req.body.size()
+                    : consumed;
+            if (header_bytes > config_.max_header_size) {
+                const char* too_large =
+                    "HTTP/1.1 431 Request Header Fields Too Large\r\n"
+                    "Content-Length: 0\r\n"
+                    "Connection: close\r\n"
+                    "\r\n";
+                co_await io.async_write(fd, too_large, strlen(too_large));
+                break;
+            }
+        }
+
         // Parse successful - convert to CoroHttpRequest
         CoroHttpRequest req;
         req.method = std::string(parsed_req.method_str);

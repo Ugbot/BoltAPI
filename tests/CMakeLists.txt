@@ -4,12 +4,14 @@
 add_executable(boltapi_smoke_test smoke_test.cpp)
 target_link_libraries(boltapi_smoke_test PRIVATE boltapi::boltapi)
 boltapi_apply_hardening(boltapi_smoke_test)
+boltapi_apply_sanitizers(boltapi_smoke_test)
 add_test(NAME boltapi_smoke COMMAND boltapi_smoke_test)
 
 # Bolt-native router unit test (plain main(), no gtest).
 add_executable(boltapi_router_test router_test.cpp)
 target_link_libraries(boltapi_router_test PRIVATE boltapi::boltapi)
 boltapi_apply_hardening(boltapi_router_test)
+boltapi_apply_sanitizers(boltapi_router_test)
 add_test(NAME boltapi_router COMMAND boltapi_router_test)
 
 # gtest-based units (http_fuzz generator). Uses boltapi_add_test() from BoltApiGTest.
@@ -26,4 +28,16 @@ endif()
 boltapi_add_test(boltapi_middleware_test middleware_test.cpp)
 if(WIN32)
     target_link_libraries(boltapi_middleware_test PRIVATE ws2_32 mswsock)
+endif()
+
+# M4 hardening: zero heap allocation across Router::match() and the http1
+# parser hot paths (global operator new/delete counter).
+boltapi_add_test(boltapi_no_alloc_test no_alloc_test.cpp)
+
+# M4 hardening: bounded resources — App rejects oversized body (413) /
+# headers (431), stays responsive after rejects, and Router handles
+# over-deep / over-param paths gracefully (no UB).
+boltapi_add_test(boltapi_bounded_resource_test bounded_resource_test.cpp)
+if(WIN32)
+    target_link_libraries(boltapi_bounded_resource_test PRIVATE ws2_32 mswsock)
 endif()

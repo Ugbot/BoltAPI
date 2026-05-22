@@ -10,7 +10,7 @@ Legend: ✅ done · 🚧 in progress · ⬜ planned
 - 🚧 **M1** — HTTP/1.1 + TLS + Bolt-native router + chained middleware + Bolt primitives (App facade + Request/Response + middleware onion + dispatch bridge DONE, 24/24 ctest green; remaining: Bolt primitives wired Arena/SPSC/swiss/topology)
 - ⬜ **M2** — HTTP/2(ALPN) + compression + CORS + coroutine SSE + WebSocket
 - ⬜ **M3** — HTTP/3 + WebRTC seams (scaffolded)
-- ⬜ **M4** — hardening, benchmarks, docs
+- 🚧 **M4** — hardening, benchmarks, docs (benchmarks + zero-alloc/bounded-resource hardening tests + ASan/UBSan option + asan/assertions CI legs landed; 36/36 ctest green on MSVC)
 - ⬜ later — Gestalt migration
 
 ## Layout (current)
@@ -19,6 +19,9 @@ CMakeLists.txt              # root build: links bolt::bolt, builds boltapi stati
 CMakePresets.json          # msvc (VS2022) / ninja-msvc / release / debug
 cmake/BoltApiCompileOptions.cmake   # boltapi_apply_hardening (TigerStyle flags)
 cmake/BoltApiGTest.cmake            # GTest find/FetchContent + boltapi_add_test() helper
+cmake/BoltApiSanitizers.cmake       # option(BOLTAPI_SANITIZE) + boltapi_apply_sanitizers()
+benchmarks/                # router_bench + throughput_bench (BOLTAPI_BUILD_BENCHMARKS; not ctest)
+docs/BENCHMARKS.md         # measured router ns/op + speedup, throughput req/s
 extern/bolt/               # git submodule -> github.com/Ugbot/bolt
 include/boltapi/
   boltapi.h                # umbrella

@@ -36,6 +36,7 @@ set(CMAKE_CXX_EXTENSIONS        OFF)
 
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 include(BoltApiCompileOptions)
+include(BoltApiSanitizers)   # option(BOLTAPI_SANITIZE) + boltapi_apply_sanitizers()
 
 # ---------------------------------------------------------------------------
 # Bolt submodule (zero-dependency compute core). Build only what we link.
@@ -136,6 +137,7 @@ if(WIN32)
     target_link_libraries(boltapi PUBLIC ws2_32 mswsock)
 endif()
 boltapi_apply_hardening(boltapi)
+boltapi_apply_sanitizers(boltapi)   # no-op unless BOLTAPI_SANITIZE=ON
 
 # Header-only consumption alias (for pieces that are header-only).
 add_library(boltapi_headers INTERFACE)
@@ -167,9 +169,17 @@ if(BOLTAPI_BUILD_TESTS)
         target_link_libraries(boltapi_engine_e2e PRIVATE ws2_32 mswsock)
     endif()
     boltapi_apply_hardening(boltapi_engine_e2e)
+    boltapi_apply_sanitizers(boltapi_engine_e2e)
     add_test(NAME boltapi_engine_e2e COMMAND boltapi_engine_e2e)
 
     add_subdirectory(tests)
 endif()
 
-message(STATUS "Bolt API ${PROJECT_VERSION}: tests=${BOLTAPI_BUILD_TESTS} examples=${BOLTAPI_BUILD_EXAMPLES} tls=${BOLTAPI_ENABLE_TLS}")
+# ---------------------------------------------------------------------------
+# Benchmarks (hand-rolled std::chrono harness; NOT registered with ctest).
+# ---------------------------------------------------------------------------
+if(BOLTAPI_BUILD_BENCHMARKS)
+    add_subdirectory(benchmarks)
+endif()
+
+message(STATUS "Bolt API ${PROJECT_VERSION}: tests=${BOLTAPI_BUILD_TESTS} examples=${BOLTAPI_BUILD_EXAMPLES} benchmarks=${BOLTAPI_BUILD_BENCHMARKS} sanitize=${BOLTAPI_SANITIZE} tls=${BOLTAPI_ENABLE_TLS}")

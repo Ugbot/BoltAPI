@@ -52,6 +52,9 @@ function(boltapi_add_test name)
         ${PROJECT_SOURCE_DIR}/include
     )
     boltapi_apply_hardening(${name})
+    if(COMMAND boltapi_apply_sanitizers)
+        boltapi_apply_sanitizers(${name})   # no-op unless BOLTAPI_SANITIZE=ON
+    endif()
 
     if(COMMAND gtest_discover_tests)
         gtest_discover_tests(${name})
