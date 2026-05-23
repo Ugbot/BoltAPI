@@ -37,8 +37,8 @@ Every WebRTC test/interop MUST be non-hanging:
 - [ ] Harden the aiortc interop test (hard timeout, no hang) + **browser** data-channel gate (Chrome + Firefox, documented + scripted).
 
 ## WM1 — DTLS-SRTP keying  (media foundation)
-- [ ] DtlsContext `use_srtp` ext (profiles `SRTP_AEAD_AES_128_GCM`, `SRTP_AES128_CM_SHA1_80`); `SSL_export_keying_material` (label `EXTRACTOR-dtls_srtp`) → client/server master key+salt.
-- [ ] RFC 3711 KDF → SRTP + SRTCP session keys. Bolt Arena; OpenSSL EVP.
+- [x] DtlsContext `use_srtp` ext (profiles `SRTP_AEAD_AES_128_GCM`, `SRTP_AES128_CM_SHA1_80`); `SSL_export_keying_material` (label `EXTRACTOR-dtls_srtp`) → client/server master key+salt (`DtlsSession::export_srtp_keying`, `SrtpKeying`).
+- [x] RFC 3711 KDF → SRTP + SRTCP session keys via `SrtpKeying::build_sessions` (role-mapped inbound/outbound `srtp::SrtpSession`). Live gate `tests/dtls_srtp_test.cpp`: real OpenSSL DTLS client (use_srtp) ↔ our server, both export, profile matches, cross-stack RTP protect↔unprotect byte-exact both ways.
 
 ## WM2 — SRTP / SRTCP  (`webrtc/srtp`)
 - [ ] SRTP protect/unprotect: AES-CM-128-HMAC-SHA1-80 **and** AES-128-GCM; ROC + replay window. REBUILD (FasterAPI SRTP was fake).
@@ -51,8 +51,8 @@ Every WebRTC test/interop MUST be non-hanging:
 - [ ] RTCP SR/RR/SDES/BYE + compound parse/build; per-SSRC stats (jitter, loss, RTT).
 
 ## WM4 — Media SDP negotiation  (`webrtc/sdp`)
-- [ ] Parse/generate `m=audio`/`m=video` (UDP/TLS/RTP/SAVPF), a=rtpmap/fmtp/rtcp-fb/ssrc/extmap/direction; **BUNDLE** + **rtcp-mux**; a=mid/group/msid.
-- [ ] Codec intersection with offer → answer: audio **Opus/PCMU/PCMA**, video **VP8/VP9/H264** (relay PTs; no transcode).
+- [x] Parse/generate `m=audio`/`m=video` (UDP/TLS/RTP/SAVPF), a=rtpmap/fmtp/rtcp-fb/ssrc/extmap/direction; **BUNDLE** + **rtcp-mux**; a=mid/group/msid (`SdpMedia::{direction,rtpmap_for,fmtp_for,payload_types,rtcp_mux,ssrc}`).
+- [x] Codec intersection with offer → answer (`negotiate_media` + `build_media_answer`): audio **Opus/PCMU/PCMA**, video **VP8/VP9/H264** (relay PTs; no transcode), BUNDLE+rtcp-mux on one transport. Gate `tests/media_sdp_test.cpp` (real Chrome A/V offer, both m-lines, malformed→error).
 
 ## WM5 — Interceptor pipeline + Track API  (Pion-style)
 - [ ] `webrtc/interceptor`: ordered RTP/RTCP middleware chain (mirrors our HTTP onion). Built-ins (each tickable): **NACK responder + generator (RTX)**, **RTCP SR/RR reporter**, **PLI/FIR** keyframe request, **TWCC** feedback + receiver bandwidth estimate.

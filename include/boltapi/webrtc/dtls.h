@@ -48,10 +48,12 @@
 #pragma once
 
 #include "boltapi/net/sys_compat.h"
+#include "boltapi/webrtc/srtp.h"
 
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -61,6 +63,69 @@
 namespace bolt::api {
 namespace net { class UdpTransport; }
 namespace webrtc {
+
+// ----------------------------------------------------------------------------
+// DTLS-SRTP keying (RFC 5764). After the DTLS handshake completes, the peers
+// agree on an SRTP protection profile (via the use_srtp extension) and derive
+// SRTP master key+salt material with SSL_export_keying_material. The 60-byte
+// (CM) / 56-byte (GCM) keying block carries, in order:
+//   client_write_master_key | server_write_master_key |
+//   client_write_master_salt | server_write_master_salt
+// As the DTLS SERVER (answerer), our OUTBOUND SRTP uses the server-write keys
+// and our INBOUND SRTP uses the client-write keys (reversed for a client role).
+// ----------------------------------------------------------------------------
+
+// The two profiles Bolt advertises (RFC 5764 §4.1.2 profile IDs). Mirrors the
+// SRTP crypto Profile so a SrtpKeying can build a srtp::SrtpSession directly.
+enum class SrtpProfileId : std::uint8_t {
+    kNone                = 0,
+    kAesCm128HmacSha1_80 = 1,  // SRTP_AES128_CM_SHA1_80  (0x0001)
+    kAeadAes128Gcm       = 2,  // SRTP_AEAD_AES_128_GCM   (0x0007)
+};
+
+// Per-profile master key + salt lengths (RFC 3711 / RFC 7714). CM uses a 16-byte
+// key + 14-byte salt; GCM uses a 16-byte key + 12-byte salt.
+inline constexpr std::size_t kSrtpMasterKeyLen = 16;     // both profiles
+inline constexpr std::size_t kSrtpSaltLenCm    = 14;     // RFC 3711
+inline constexpr std::size_t kSrtpSaltLenGcm   = 12;     // RFC 7714 §8.1
+// Bound on the exported keying block = 2 keys + 2 (CM) salts (the larger case).
+inline constexpr std::size_t kSrtpKeyingMax =
+    2 * kSrtpMasterKeyLen + 2 * kSrtpSaltLenCm;  // 60 bytes
+
+inline constexpr std::size_t srtp_salt_len(SrtpProfileId p) noexcept {
+    return p == SrtpProfileId::kAeadAes128Gcm ? kSrtpSaltLenGcm : kSrtpSaltLenCm;
+}
+
+// SrtpKeying — the negotiated profile + the two master key/salt pairs split out
+// of the exported keying block. Fixed-size buffers (no heap). build_sessions()
+// turns it into a ready inbound + outbound srtp::SrtpSession with the correct
+// role mapping for the DTLS server.
+struct SrtpKeying {
+    SrtpProfileId profile   = SrtpProfileId::kNone;
+    bool          is_server = true;  // our DTLS role (server = answerer)
+
+    std::uint8_t client_key[kSrtpMasterKeyLen]{};
+    std::uint8_t server_key[kSrtpMasterKeyLen]{};
+    std::uint8_t client_salt[kSrtpSaltLenCm]{};  // up to 14 bytes used
+    std::uint8_t server_salt[kSrtpSaltLenCm]{};
+
+    bool valid() const noexcept { return profile != SrtpProfileId::kNone; }
+
+    // Map the DTLS-SRTP profile to the SRTP crypto Profile.
+    srtp::Profile crypto_profile() const noexcept {
+        assert(profile != SrtpProfileId::kNone && "crypto_profile: no profile");
+        assert(static_cast<int>(profile) <= 2 && "crypto_profile: bad id");
+        return profile == SrtpProfileId::kAeadAes128Gcm
+                   ? srtp::Profile::kAeadAes128Gcm
+                   : srtp::Profile::kAesCm128HmacSha1_80;
+    }
+
+    // Build the inbound + outbound SRTP sessions with role-correct key mapping.
+    // server (our role): outbound = server-write keys; inbound = client-write.
+    // client role: reversed. Returns false if not valid or a session init fails.
+    bool build_sessions(srtp::SrtpSession& inbound,
+                        srtp::SrtpSession& outbound) const noexcept;
+};
 
 // ----------------------------------------------------------------------------
 // Bounds (TigerStyle). A DTLS record is bounded by the UDP MTU; the wbio drain
@@ -169,6 +234,18 @@ public:
 
     // The peer's cert SHA-256 fingerprint, valid once Established (empty before).
     const std::string& peer_fingerprint() const noexcept { return peer_fingerprint_; }
+
+    // ---- DTLS-SRTP keying (RFC 5764) -------------------------------------
+    // After Established: read the negotiated SRTP profile and export the keying
+    // material (SSL_export_keying_material, label "EXTRACTOR-dtls_srtp", empty
+    // context), splitting it into client/server master key+salt for `out`.
+    // Returns false if not Established, no profile was negotiated, or the export
+    // failed. `out` is fully overwritten on success. noexcept, bounded scratch.
+    bool export_srtp_keying(SrtpKeying& out) const noexcept;
+
+    // Convenience: export + build_sessions in one step. False on any failure.
+    bool make_srtp_sessions(srtp::SrtpSession& inbound,
+                            srtp::SrtpSession& outbound) const noexcept;
 
     // Counters (observability).
     std::uint64_t records_in()  const noexcept { return records_in_; }

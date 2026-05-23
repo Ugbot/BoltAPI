@@ -19,12 +19,14 @@
   Out (later): multiple tracks, simulcast, TURN.
 
 ## Phase M1 — DTLS-SRTP keying
-- [ ] Enable `use_srtp` DTLS extension on the DtlsContext (SRTP profiles
+- [x] Enable `use_srtp` DTLS extension on the DtlsContext (SRTP profiles
       `SRTP_AEAD_AES_128_GCM` + `SRTP_AES128_CM_SHA1_80`); after handshake export
       keying material (`SSL_export_keying_material`, label "EXTRACTOR-dtls_srtp")
-      → client/server SRTP master keys+salts. **REBUILD** (FasterAPI had none).
-- [ ] Derive SRTP/SRTCP session keys (RFC 3711 KDF). Bolt: bolt::Arena; OpenSSL
-      EVP for AES-CTR/GCM + HMAC-SHA1.
+      → client/server SRTP master keys+salts (`DtlsSession::export_srtp_keying`
+      + `SrtpKeying`).
+- [x] Derive SRTP/SRTCP session keys (RFC 3711 KDF) via `SrtpKeying::build_sessions`
+      → role-mapped inbound/outbound `srtp::SrtpSession` (server: out=server-write,
+      in=client-write; client reversed). Live gate `tests/dtls_srtp_test.cpp`.
 
 ## Phase M2 — SRTP / SRTCP
 - [ ] SRTP protect/unprotect: AES-CM-128 + HMAC-SHA1-80 AND AES-128-GCM; ROC
@@ -42,11 +44,13 @@
       Bolt: SwissTable for SSRC→stream, Arena/ring for packets.
 
 ## Phase M4 — Media SDP negotiation
-- [ ] Parse/generate `m=audio`/`m=video` (UDP/TLS/RTP/SAVPF), a=rtpmap, a=fmtp,
+- [x] Parse/generate `m=audio`/`m=video` (UDP/TLS/RTP/SAVPF), a=rtpmap, a=fmtp,
       a=rtcp-fb, a=ssrc, a=mid, a=group:BUNDLE, a=setup, a=ice-*, a=extmap,
-      direction (sendrecv/recvonly/sendonly). Extend our SDP codec.
-- [ ] Codec intersection with the offer (pick common PT); answer with the agreed
-      codecs; rtcp-mux + BUNDLE everything onto the one ICE/DTLS transport.
+      direction (sendrecv/recvonly/sendonly). Extended our SDP codec
+      (`SdpMedia::{direction,rtpmap_for,fmtp_for,payload_types,rtcp_mux,ssrc}`).
+- [x] Codec intersection with the offer (pick common PT) via `negotiate_media`;
+      `build_media_answer` answers with the agreed codecs; rtcp-mux + BUNDLE all
+      m-lines onto the one ICE/DTLS transport. Gate `tests/media_sdp_test.cpp`.
 
 ## Phase M5 — Track API + relay/echo
 - [ ] `MediaTrack` (kind audio/video, SSRC, codec) + `App::on_track(handler)` and

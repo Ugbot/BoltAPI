@@ -56,9 +56,18 @@ namespace webrtc {
 // caps are generous for a single m=application section plus typical attributes.
 // ----------------------------------------------------------------------------
 inline constexpr std::size_t kSdpMaxMediaSections   = 4;    // BUNDLE of a few m-lines
-inline constexpr std::size_t kSdpMaxAttrsPerSection = 32;   // a= lines per scope
-inline constexpr std::size_t kSdpMaxFormatsPerMedia = 16;   // m= format tokens
+// A real Chrome audio+video offer carries ~10 codecs * (rtpmap+fmtp+rtcp-fb*4)
+// plus extmap/ssrc per m-line, so the per-section attribute cap must be generous
+// (still fixed/bounded — TigerStyle, no growth). 128 covers Chrome/Firefox.
+inline constexpr std::size_t kSdpMaxAttrsPerSection = 128;  // a= lines per scope
+inline constexpr std::size_t kSdpMaxFormatsPerMedia = 32;   // m= PT tokens (audio lists many)
 inline constexpr std::size_t kSdpMaxCandidates      = 16;   // a=candidate lines / media
+
+// Media (audio/video) negotiation bounds (WM4). kMaxMediaSections = audio +
+// video + (optional) application; kMaxCodecsPerSection bounds the negotiated
+// codec set we emit per m-line. Both fixed — no unbounded vectors.
+inline constexpr std::size_t kMaxMediaSections    = kSdpMaxMediaSections;
+inline constexpr std::size_t kMaxCodecsPerSection = 16;
 
 // ----------------------------------------------------------------------------
 // Result codes — no exceptions.
@@ -110,6 +119,27 @@ struct SdpMedia {
     // sctp-port as a parsed integer; false (out unchanged) if absent/malformed.
     bool sctp_port(std::uint16_t* out) const noexcept;
     bool max_message_size(std::uint32_t* out) const noexcept;
+
+    // ---- Media (audio/video) accessors (WM4) ------------------------------
+    // Media direction (RFC 4566 §6): one of sendrecv/recvonly/sendonly/inactive.
+    // Defaults to "sendrecv" when no direction attribute is present.
+    std::string_view direction() const noexcept;
+
+    // a=rtpmap:<pt> <encoding>/<clock>[/<chans>] for a given payload type. The
+    // returned view is the encoding part ("opus/48000/2", "VP8/90000"), empty if
+    // no rtpmap line names `pt`. There can be one rtpmap per PT, so we scan all.
+    std::string_view rtpmap_for(std::uint8_t pt) const noexcept;
+    // a=fmtp:<pt> <params> for `pt` (the params view), empty if absent.
+    std::string_view fmtp_for(std::uint8_t pt) const noexcept;
+
+    // The payload types from the m= format list, parsed as integers, into `out`
+    // (capacity `cap`). Returns the count written (bounded by cap & format_count).
+    std::size_t payload_types(std::uint8_t* out, std::size_t cap) const noexcept;
+
+    // True if a=rtcp-mux is present (RTP+RTCP on one port — always for WebRTC).
+    bool rtcp_mux() const noexcept { return has_attr("rtcp-mux"); }
+    // First a=ssrc:<id> ... value (the "<id> cname:.." string), empty if absent.
+    std::string_view ssrc() const noexcept { return attr("ssrc"); }
 };
 
 // ----------------------------------------------------------------------------
@@ -179,6 +209,67 @@ struct AnswerParams {
 // first). Requires ufrag/pwd/fingerprint to be non-empty (asserted). Returns
 // SdpError::Ok, or SdpError::MalformedLine if a required field is empty.
 SdpError build_answer(const AnswerParams& p, std::string& out);
+
+// ===========================================================================
+// WM4 — media (audio + video) SDP negotiation.
+// ===========================================================================
+
+// Media kinds we negotiate (relay/echo, no transcode — WEBRTC_MEDIA_PLAN §M4).
+enum class MediaKind : std::uint8_t { kAudio = 0, kVideo = 1 };
+
+// One negotiated codec kept in the answer: the offer's payload type plus the
+// rtpmap encoding string and (optional) fmtp params, all zero-copy views into
+// the offer buffer (which must outlive the answer build).
+struct NegotiatedCodec {
+    std::uint8_t     pt = 0;        // payload type (echoed from the offer)
+    std::string_view rtpmap;        // "opus/48000/2", "VP8/90000", ...
+    std::string_view fmtp;          // fmtp params (may be empty)
+};
+
+// One negotiated media section (audio or video): the common codecs kept, the
+// mid (echoed from the offer), and the direction we answer with.
+struct NegotiatedMedia {
+    MediaKind        kind = MediaKind::kAudio;
+    std::string_view mid;                       // echoed from the offer m-line
+    std::string_view direction = "recvonly";    // our answer direction
+    NegotiatedCodec  codecs[kMaxCodecsPerSection]{};
+    std::size_t      codec_count = 0;
+};
+
+// The result of intersecting an offer against Bolt's supported codec set: the
+// per-m-line negotiated codecs (BUNDLE all onto one transport). Fixed capacity.
+struct MediaNegotiation {
+    NegotiatedMedia media[kMaxMediaSections]{};
+    std::size_t     media_count = 0;
+};
+
+// negotiate_media — intersect the parsed `offer`'s audio/video m-lines against
+// Bolt's supported codecs (audio: Opus/PCMU/PCMA; video: VP8/VP9/H264), keeping
+// only the common ones (offer's PTs, in offer order). Non-audio/video sections
+// (e.g. m=application) are ignored here. Returns SdpError::Ok (or Overflow if a
+// bound is exceeded). noexcept, no allocation, fully bounded.
+SdpError negotiate_media(const SdpSession& offer, MediaNegotiation& out) noexcept;
+
+// MediaAnswerParams — inputs to build a media (audio+video) SDP answer. Bolt is
+// the answerer (DTLS server, setup:passive, ice-lite). All m-lines BUNDLE onto
+// one ICE/DTLS transport with rtcp-mux. The negotiated codecs come from
+// negotiate_media(); ufrag/pwd/fingerprint identify the transport.
+struct MediaAnswerParams {
+    std::string_view origin_session_id = "4611731400430051336";
+    std::string_view ice_ufrag;            // required
+    std::string_view ice_pwd;              // required
+    std::string_view fingerprint_sha256;   // hex "AB:CD:.." (no algo prefix)
+    std::string_view setup = "passive";    // we are the DTLS server
+    bool             ice_lite = true;      // emit a=ice-lite (session level)
+    const MediaNegotiation* negotiation = nullptr;  // required, non-empty
+};
+
+// build_media_answer — emit a complete audio+video answer SDP into `out`
+// (cleared first), BUNDLE + rtcp-mux, one m-line per negotiated section with the
+// agreed PTs only, a=rtpmap/a=fmtp echoed, setup:passive, ice-lite. Requires
+// ufrag/pwd/fingerprint + a non-empty negotiation. Returns SdpError::Ok, or
+// SdpError::MalformedLine if a required field is empty / no media negotiated.
+SdpError build_media_answer(const MediaAnswerParams& p, std::string& out);
 
 }  // namespace webrtc
 }  // namespace bolt::api

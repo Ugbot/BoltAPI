@@ -111,6 +111,80 @@ bool SdpMedia::max_message_size(std::uint32_t* out) const noexcept {
     return parse_uint(v, out);
 }
 
+namespace {
+
+// Split "<pt> <rest>" -> pt + rest. Returns false if the leading token isn't a
+// payload type in [0,127] or there is no following text.
+bool split_pt_rest(std::string_view v, std::uint8_t* pt,
+                   std::string_view* rest) noexcept {
+    assert(pt != nullptr && "split_pt_rest: null pt");
+    assert(rest != nullptr && "split_pt_rest: null rest");
+    const std::size_t sp = v.find(' ');
+    if (sp == std::string_view::npos) return false;
+    std::uint16_t n = 0;
+    const std::string_view head = v.substr(0, sp);
+    const char* first = head.data();
+    const char* last  = head.data() + head.size();
+    const std::from_chars_result r = std::from_chars(first, last, n);
+    if (r.ec != std::errc{} || r.ptr != last || n > 127) return false;
+    *pt = static_cast<std::uint8_t>(n);
+    std::string_view tail = v.substr(sp + 1);
+    while (!tail.empty() && (tail.front() == ' ' || tail.front() == '\t'))
+        tail.remove_prefix(1);
+    *rest = tail;
+    return true;
+}
+
+}  // namespace
+
+std::string_view SdpMedia::direction() const noexcept {
+    assert(attr_count <= kSdpMaxAttrsPerSection && "direction: attr overflow");
+    assert(format_count <= kSdpMaxFormatsPerMedia && "direction: fmt overflow");
+    for (std::size_t i = 0; i < attr_count; ++i) {
+        const std::string_view k = attrs[i].key;
+        if (k == "sendrecv" || k == "recvonly" || k == "sendonly" ||
+            k == "inactive")
+            return k;
+    }
+    return std::string_view{"sendrecv"};  // RFC 4566 default
+}
+
+std::string_view SdpMedia::rtpmap_for(std::uint8_t pt) const noexcept {
+    assert(attr_count <= kSdpMaxAttrsPerSection && "rtpmap_for: attr overflow");
+    assert(pt <= 127 && "rtpmap_for: pt range");
+    for (std::size_t i = 0; i < attr_count; ++i) {
+        if (attrs[i].key != "rtpmap") continue;
+        std::uint8_t p = 0;
+        std::string_view rest;
+        if (split_pt_rest(attrs[i].value, &p, &rest) && p == pt) return rest;
+    }
+    return std::string_view{};
+}
+
+std::string_view SdpMedia::fmtp_for(std::uint8_t pt) const noexcept {
+    assert(attr_count <= kSdpMaxAttrsPerSection && "fmtp_for: attr overflow");
+    assert(pt <= 127 && "fmtp_for: pt range");
+    for (std::size_t i = 0; i < attr_count; ++i) {
+        if (attrs[i].key != "fmtp") continue;
+        std::uint8_t p = 0;
+        std::string_view rest;
+        if (split_pt_rest(attrs[i].value, &p, &rest) && p == pt) return rest;
+    }
+    return std::string_view{};
+}
+
+std::size_t SdpMedia::payload_types(std::uint8_t* out,
+                                    std::size_t cap) const noexcept {
+    assert(out != nullptr || cap == 0);
+    assert(format_count <= kSdpMaxFormatsPerMedia && "payload_types: fmt overflow");
+    std::size_t n = 0;
+    for (std::size_t i = 0; i < format_count && n < cap; ++i) {
+        std::uint8_t pt = 0;
+        if (parse_uint(formats[i], &pt)) out[n++] = pt;
+    }
+    return n;
+}
+
 // ---------------------------------------------------------------------------
 // SdpSession lookups
 // ---------------------------------------------------------------------------
@@ -342,6 +416,189 @@ SdpError build_answer(const AnswerParams& p, std::string& out) {
         append_attr(out, "end-of-candidates", std::string_view{});
     }
 
+    return SdpError::Ok;
+}
+
+// ===========================================================================
+// WM4 — media negotiation + answer.
+// ===========================================================================
+namespace {
+
+// Case-insensitive equality of two ASCII spans.
+bool ieq(std::string_view a, std::string_view b) noexcept {
+    assert(a.size() <= 256 && "ieq: a span bound");
+    assert(b.size() <= 256 && "ieq: b span bound");
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        char ca = a[i], cb = b[i];
+        if (ca >= 'a' && ca <= 'z') ca = static_cast<char>(ca - 32);
+        if (cb >= 'a' && cb <= 'z') cb = static_cast<char>(cb - 32);
+        if (ca != cb) return false;
+    }
+    return true;
+}
+
+// The encoding name from an rtpmap value: "opus/48000/2" -> "opus".
+std::string_view encoding_name(std::string_view rtpmap) noexcept {
+    assert(rtpmap.size() <= 256 && "encoding_name: span bound");
+    const std::size_t slash = rtpmap.find('/');
+    const std::string_view name =
+        slash == std::string_view::npos ? rtpmap : rtpmap.substr(0, slash);
+    assert(name.size() <= rtpmap.size() && "encoding_name: overran");
+    return name;
+}
+
+// Is `name` a codec Bolt supports for `kind` (relay/echo, no transcode)?
+bool is_supported_codec(MediaKind kind, std::string_view name) noexcept {
+    assert(name.size() <= 64 && "is_supported_codec: name bound");
+    assert((kind == MediaKind::kAudio || kind == MediaKind::kVideo) &&
+           "is_supported_codec: bad kind");
+    if (kind == MediaKind::kAudio) {
+        return ieq(name, "opus") || ieq(name, "PCMU") || ieq(name, "PCMA");
+    }
+    return ieq(name, "VP8") || ieq(name, "VP9") || ieq(name, "H264");
+}
+
+// Map a media_type token to a MediaKind; false for non-audio/video sections.
+bool media_kind_of(std::string_view t, MediaKind* k) noexcept {
+    assert(k != nullptr && "media_kind_of: null");
+    assert(t.size() <= 64 && "media_kind_of: type bound");
+    if (t == "audio") { *k = MediaKind::kAudio; return true; }
+    if (t == "video") { *k = MediaKind::kVideo; return true; }
+    return false;
+}
+
+// Pick our answer direction given the offer's direction. We are a relay/echo
+// answerer (recvonly default); we only promise sendrecv if the offerer does.
+std::string_view answer_direction(std::string_view offer_dir) noexcept {
+    assert(offer_dir.size() <= 16 && "answer_direction: dir bound");
+    assert(!offer_dir.empty() && "answer_direction: empty dir");
+    if (offer_dir == "sendonly") return std::string_view{"recvonly"};
+    if (offer_dir == "recvonly") return std::string_view{"sendonly"};
+    if (offer_dir == "inactive") return std::string_view{"inactive"};
+    return std::string_view{"sendrecv"};
+}
+
+}  // namespace
+
+SdpError negotiate_media(const SdpSession& offer,
+                         MediaNegotiation& out) noexcept {
+    assert(offer.media_count <= kSdpMaxMediaSections && "negotiate: media overflow");
+    assert(kMaxCodecsPerSection <= kSdpMaxFormatsPerMedia &&
+           "negotiate: codec cap > fmt cap");
+    out = MediaNegotiation{};
+
+    for (std::size_t mi = 0; mi < offer.media_count; ++mi) {
+        const SdpMedia& m = offer.media[mi];
+        MediaKind kind{};
+        if (!media_kind_of(m.media_type, &kind)) continue;  // skip application
+        if (out.media_count >= kMaxMediaSections) return SdpError::Overflow;
+
+        NegotiatedMedia& nm = out.media[out.media_count];
+        nm = NegotiatedMedia{};
+        nm.kind = kind;
+        nm.mid = m.mid();
+        nm.direction = answer_direction(m.direction());
+
+        std::uint8_t pts[kSdpMaxFormatsPerMedia];
+        const std::size_t npt = m.payload_types(pts, kSdpMaxFormatsPerMedia);
+        for (std::size_t i = 0; i < npt; ++i) {
+            const std::string_view rm = m.rtpmap_for(pts[i]);
+            if (rm.empty()) continue;  // need an rtpmap to relay
+            if (!is_supported_codec(kind, encoding_name(rm))) continue;
+            if (nm.codec_count >= kMaxCodecsPerSection) return SdpError::Overflow;
+            NegotiatedCodec& c = nm.codecs[nm.codec_count++];
+            c.pt = pts[i];
+            c.rtpmap = rm;
+            c.fmtp = m.fmtp_for(pts[i]);
+        }
+        // Keep the section even if empty so the answer can mark it inactive; but
+        // only count sections that had at least one common codec.
+        if (nm.codec_count > 0) ++out.media_count;
+    }
+    return SdpError::Ok;
+}
+
+// Emit one m= media section into `out` for a negotiated audio/video line.
+static void append_media_section(std::string& out, const NegotiatedMedia& nm) {
+    assert(nm.codec_count > 0 && "append_media_section: empty");
+    assert(nm.codec_count <= kMaxCodecsPerSection && "append_media_section: overflow");
+
+    // m=<kind> 9 UDP/TLS/RTP/SAVPF <pt>...
+    out.append("m=", 2);
+    out.append(nm.kind == MediaKind::kAudio ? "audio" : "video");
+    out.append(" 9 UDP/TLS/RTP/SAVPF", 20);
+    for (std::size_t i = 0; i < nm.codec_count; ++i) {
+        out.push_back(' ');
+        append_uint(out, nm.codecs[i].pt);
+    }
+    out.append("\r\n", 2);
+    append_line(out, 'c', "IN IP4 0.0.0.0");
+    append_attr(out, "rtcp-mux", std::string_view{});
+    if (!nm.mid.empty()) append_attr(out, "mid", nm.mid);
+    append_attr(out, nm.direction, std::string_view{});
+
+    for (std::size_t i = 0; i < nm.codec_count; ++i) {
+        const NegotiatedCodec& c = nm.codecs[i];
+        {  // a=rtpmap:<pt> <encoding>
+            std::string v;
+            append_uint(v, c.pt);
+            v.push_back(' ');
+            v.append(c.rtpmap.data(), c.rtpmap.size());
+            append_attr(out, "rtpmap", v);
+        }
+        if (!c.fmtp.empty()) {  // a=fmtp:<pt> <params>
+            std::string v;
+            append_uint(v, c.pt);
+            v.push_back(' ');
+            v.append(c.fmtp.data(), c.fmtp.size());
+            append_attr(out, "fmtp", v);
+        }
+    }
+}
+
+SdpError build_media_answer(const MediaAnswerParams& p, std::string& out) {
+    if (p.ice_ufrag.empty() || p.ice_pwd.empty() ||
+        p.fingerprint_sha256.empty() || p.negotiation == nullptr) {
+        return SdpError::MalformedLine;
+    }
+    if (p.negotiation->media_count == 0) return SdpError::MalformedLine;
+    assert(p.negotiation->media_count <= kMaxMediaSections && "answer: overflow");
+    assert(!p.setup.empty() && "answer: empty setup");
+
+    out.clear();
+    append_line(out, 'v', "0");
+    out.append("o=- ", 4);
+    out.append(p.origin_session_id.data(), p.origin_session_id.size());
+    out.append(" 2 IN IP4 127.0.0.1\r\n");
+    append_line(out, 's', "-");
+    append_line(out, 't', "0 0");
+
+    // a=group:BUNDLE <mid> <mid> ... — all m-lines on one transport.
+    out.append("a=group:BUNDLE", 14);
+    for (std::size_t i = 0; i < p.negotiation->media_count; ++i) {
+        const std::string_view mid = p.negotiation->media[i].mid;
+        out.push_back(' ');
+        out.append(mid.data(), mid.size());
+    }
+    out.append("\r\n", 2);
+    append_attr(out, "msid-semantic", " WMS");
+    if (p.ice_lite) append_attr(out, "ice-lite", std::string_view{});
+
+    // Build the fingerprint value once (shared by every m-line via BUNDLE).
+    std::string fp;
+    fp.reserve(8 + p.fingerprint_sha256.size());
+    fp.append("sha-256 ");
+    fp.append(p.fingerprint_sha256.data(), p.fingerprint_sha256.size());
+
+    for (std::size_t i = 0; i < p.negotiation->media_count; ++i) {
+        append_media_section(out, p.negotiation->media[i]);
+        // Transport attrs repeat per m-line (BUNDLE-able, identical creds).
+        append_attr(out, "ice-ufrag", p.ice_ufrag);
+        append_attr(out, "ice-pwd", p.ice_pwd);
+        append_attr(out, "fingerprint", fp);
+        append_attr(out, "setup", p.setup);
+    }
     return SdpError::Ok;
 }
 

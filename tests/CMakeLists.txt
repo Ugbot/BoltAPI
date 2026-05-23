@@ -270,6 +270,30 @@ boltapi_add_test(boltapi_rtp_test rtp_test.cpp)
 boltapi_add_test(boltapi_srtp_test srtp_test.cpp)
 target_link_libraries(boltapi_srtp_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 
+# WM1: DTLS-SRTP KEYING — THE LIVE KEYING GATE (RFC 5764). Stands up our
+# UdpTransport + DtlsContext (server, use_srtp) + DtlsSessionManager on an
+# ephemeral loopback UDP port, then runs a REAL OpenSSL DTLS CLIENT (also
+# use_srtp) against it. Asserts BOTH reach handshake-complete; the negotiated
+# SRTP profile MATCHES on both sides; BOTH export keying material and build
+# inbound/outbound SrtpSessions; then the client SRTP-protects an RTP packet
+# (built via rtp.h) which the server unprotects byte-exact (and the reverse),
+# proving the role-mapped keys agree end-to-end. Bounded by a wall-clock
+# deadline so it can't hang. Links OpenSSL + ws2_32/mswsock/iphlpapi (Windows).
+boltapi_add_test(boltapi_dtls_srtp_test dtls_srtp_test.cpp)
+target_link_libraries(boltapi_dtls_srtp_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+if(WIN32)
+    target_link_libraries(boltapi_dtls_srtp_test PRIVATE ws2_32 mswsock iphlpapi)
+endif()
+
+# WM4: MEDIA SDP NEGOTIATION — parse a REAL Chrome audio+video offer (m=audio
+# Opus + m=video VP8/H264, BUNDLE, rtcp-mux, extmap, ssrc, ice-ufrag/pwd,
+# fingerprint:sha-256); assert mids/codecs/fingerprint/ice for BOTH m-lines;
+# intersect against Bolt's supported codecs (audio Opus/PCMU/PCMA, video
+# VP8/VP9/H264) keeping only common PTs; build an answer (BUNDLE, rtcp-mux,
+# setup:passive, ice-lite, negotiated PTs only) that round-trips through our own
+# parser. Malformed input -> error (no throw/crash). Pure codec, no engine deps.
+boltapi_add_test(boltapi_media_sdp_test media_sdp_test.cpp)
+
 # M3: HTTP/3 + WebRTC seam — ProtocolRegistry mechanism (register/has/create),
 # a dummy IProtocol returning NotImplemented, and (when the compile flags are
 # ON) the real H3/WebRTC stub factories registering. Flag-AWARE: passes in the
