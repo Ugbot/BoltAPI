@@ -56,9 +56,15 @@ function(boltapi_add_test name)
         boltapi_apply_sanitizers(${name})   # no-op unless BOLTAPI_SANITIZE=ON
     endif()
 
+    # Hard wall-clock ceiling on EVERY discovered test (TigerStyle: bounded
+    # everything). Our gates run in <25s; this 180s ceiling exists so a
+    # misbehaving test (e.g. an external-client interop leg whose subprocess
+    # wedges) can NEVER hang the suite — ctest kills it and reports a failure
+    # instead of stalling. Per-test overrides may set a tighter TIMEOUT.
     if(COMMAND gtest_discover_tests)
-        gtest_discover_tests(${name})
+        gtest_discover_tests(${name} PROPERTIES TIMEOUT 180)
     else()
         add_test(NAME ${name} COMMAND ${name})
+        set_tests_properties(${name} PROPERTIES TIMEOUT 180)
     endif()
 endfunction()
