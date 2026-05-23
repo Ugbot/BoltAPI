@@ -385,6 +385,106 @@ int DtlsSession::read_app(std::uint8_t* out, std::size_t cap) noexcept {
 }
 
 // ===========================================================================
+// DTLS-SRTP keying (RFC 5764)
+// ===========================================================================
+namespace {
+
+// Map an OpenSSL SRTP protection-profile id (RFC 5764 §4.1.2) to ours.
+SrtpProfileId map_srtp_profile(unsigned long id) noexcept {
+    assert(id != 0 && "map_srtp_profile: zero id (no profile)");
+    assert(id <= 0xFFFF && "map_srtp_profile: id out of 16-bit range");
+    // SRTP_AES128_CM_SHA1_80 = 0x0001, SRTP_AEAD_AES_128_GCM = 0x0007.
+    if (id == 0x0007) return SrtpProfileId::kAeadAes128Gcm;
+    if (id == 0x0001) return SrtpProfileId::kAesCm128HmacSha1_80;
+    return SrtpProfileId::kNone;
+}
+
+}  // namespace
+
+bool SrtpKeying::build_sessions(srtp::SrtpSession& inbound,
+                                srtp::SrtpSession& outbound) const noexcept {
+    assert(profile != SrtpProfileId::kNone && "build_sessions: no profile");
+    assert(static_cast<int>(profile) <= 2 && "build_sessions: bad profile");
+    if (!valid()) return false;
+
+    const srtp::Profile cp = crypto_profile();
+    const std::size_t slen = srtp_salt_len(profile);
+    assert(slen <= srtp::kMasterSaltLen && "build_sessions: salt over KDF master");
+
+    // Role mapping: as the DTLS SERVER, OUTBOUND uses the server-write keys and
+    // INBOUND uses the client-write keys. A client role is the mirror image.
+    const std::uint8_t* out_key  = is_server ? server_key  : client_key;
+    const std::uint8_t* out_salt = is_server ? server_salt : client_salt;
+    const std::uint8_t* in_key   = is_server ? client_key  : server_key;
+    const std::uint8_t* in_salt  = is_server ? client_salt : server_salt;
+
+    // RFC 3711 §4.3 KDF takes a 14-byte master salt left-justified in the IV
+    // block. GCM's exported master salt is only 12 bytes (RFC 5764 §4.1.2), so
+    // zero-extend it to 14 bytes; both peers do the same -> keys still agree.
+    std::uint8_t out_ms[srtp::kMasterSaltLen]{};
+    std::uint8_t in_ms[srtp::kMasterSaltLen]{};
+    std::memcpy(out_ms, out_salt, slen);
+    std::memcpy(in_ms, in_salt, slen);
+
+    if (outbound.init(cp, out_key, kSrtpMasterKeyLen, out_ms,
+                      srtp::kMasterSaltLen) != srtp::Error::kOk) {
+        return false;
+    }
+    if (inbound.init(cp, in_key, kSrtpMasterKeyLen, in_ms,
+                     srtp::kMasterSaltLen) != srtp::Error::kOk) {
+        return false;
+    }
+    return true;
+}
+
+bool DtlsSession::export_srtp_keying(SrtpKeying& out) const noexcept {
+    assert(out.client_key != nullptr && "export_srtp_keying: out invalid");
+    assert(kSrtpKeyingMax == 60 && "export_srtp_keying: keying bound drift");
+    out = SrtpKeying{};
+    if (!ssl_ || state_ != State::Established) return false;
+
+    SRTP_PROTECTION_PROFILE* prof = SSL_get_selected_srtp_profile(ssl_);
+    if (prof == nullptr) return false;
+    const SrtpProfileId id = map_srtp_profile(prof->id);
+    if (id == SrtpProfileId::kNone) return false;
+
+    const std::size_t klen = kSrtpMasterKeyLen;
+    const std::size_t slen = srtp_salt_len(id);
+    const std::size_t total = 2 * klen + 2 * slen;
+    assert(total <= kSrtpKeyingMax && "export_srtp_keying: block overflow");
+
+    // RFC 5764 §4.2: label "EXTRACTOR-dtls_srtp", empty context.
+    static const char kLabel[] = "EXTRACTOR-dtls_srtp";
+    std::uint8_t block[kSrtpKeyingMax]{};
+    if (SSL_export_keying_material(ssl_, block, total, kLabel,
+                                   sizeof(kLabel) - 1, nullptr, 0, 0) != 1) {
+        return false;
+    }
+
+    // Block layout: c_key | s_key | c_salt | s_salt.
+    std::size_t off = 0;
+    std::memcpy(out.client_key, block + off, klen); off += klen;
+    std::memcpy(out.server_key, block + off, klen); off += klen;
+    std::memcpy(out.client_salt, block + off, slen); off += slen;
+    std::memcpy(out.server_salt, block + off, slen); off += slen;
+    assert(off == total && "export_srtp_keying: split mismatch");
+
+    out.profile = id;
+    out.is_server = true;  // DtlsSession is always the DTLS server (answerer).
+    return true;
+}
+
+bool DtlsSession::make_srtp_sessions(srtp::SrtpSession& inbound,
+                                     srtp::SrtpSession& outbound) const noexcept {
+    assert((state_ != State::Established || ssl_ != nullptr) &&
+           "make_srtp_sessions: established w/o ssl");
+    assert(static_cast<int>(state_) <= 3 && "make_srtp_sessions: bad state");
+    SrtpKeying keying;
+    if (!export_srtp_keying(keying)) return false;
+    return keying.build_sessions(inbound, outbound);
+}
+
+// ===========================================================================
 // DtlsSessionManager
 // ===========================================================================
 DtlsSessionManager::Entry*
