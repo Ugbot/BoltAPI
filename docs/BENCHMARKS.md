@@ -77,14 +77,35 @@ and best-effort: it prints results and exits 0 even on partial completion, so it
 is safe to wire into a CI bench leg but is deliberately **not** registered with
 `ctest`.
 
+## Body-path throughput — slot-pool vs `bolt::Arena` (`body_throughput_bench`)
+
+The request-body buffer can use either the default fixed-tier **slot-pool** or
+**`bolt::Arena`** (opt-in `-DBOLTAPI_USE_BOLT_ARENA=ON`). This bench POSTs a
+32 KiB body to `/echo` (large enough to bypass the connection stack buffer and
+force a `RequestBodyBuffer::acquire()` every request), 4 client threads ×
+5,000 keep-alive requests.
+
+| Body buffer | req/s | body bandwidth (in+out) | mean latency |
+|---|---:|---:|---:|
+| slot-pool (default) | ~32.4–32.9 k | ~2.0 GiB/s | ~119 µs |
+| `bolt::Arena` (opt-in) | ~32.3–32.5 k | ~2.0 GiB/s | ~120 µs |
+
+**Conclusion: perf-neutral (within noise).** The body buffer is one allocation
+per request and is not the bottleneck — the time goes to loopback syscalls, the
+`std::string` body/response copies, and coroutine/worker scheduling. Bolt's
+~3 ns bump-allocation is real in isolation but invisible here, and the Arena
+path needs an atomic `live_views_` self-guard (coroutines migrate worker threads
+across `co_await`), which offsets the tiny win. The Arena path is kept as a
+**validated, default-OFF opt-in**; the real lever for the body path is a
+zero-copy `req.body()` view + zero-copy response (eliminating the string copies)
+— a separate, larger change.
+
 ## Notes / TODOs
 
-- The router's per-node literal fan-out is bounded by an internal
-  `kMaxChildren = 16`. The benchmark's param routes share a small set of
-  top-level resource segments so the trie stays within that bound (also the
-  realistic shape of an API). Registering >16 distinct literal children at a
-  single trie node currently relies on a debug `assert` that is compiled out in
-  Release — see "Findings" in the hardening report. Not exercised here.
+- The router's literal trie edges live in a shared `bolt::SwissTable` keyed by
+  `(parent_node, segment_id)` — fan-out is unbounded and nodes are 16 bytes
+  regardless (see `router_fanout_test`). (This replaced an earlier fixed
+  `[16]` per-node array that could OOB in Release.)
 - The App middleware chain (`std::function`) and the per-request coroutine frame
   allocate per request today; the throughput number includes that cost. The
   zero-alloc guarantee (and `no_alloc_test`) is scoped to `Router::match()` and

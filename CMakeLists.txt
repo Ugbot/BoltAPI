@@ -166,6 +166,21 @@ target_compile_definitions(boltapi PUBLIC BOLTAPI_HAVE_GZIP=${BOLTAPI_HAVE_GZIP}
 if(BOLTAPI_HAVE_GZIP)
     target_link_libraries(boltapi PUBLIC ZLIB::ZLIB)
 endif()
+
+# ---------------------------------------------------------------------------
+# Bolt-native request body arena (risk-gated, opt-in). When ON, the request
+# body buffer is backed by a thread-local bolt::Arena (bump allocator, reset
+# per request) instead of the default slot-pool. PUBLIC so headers compiled in
+# tests/examples see the same flag value the library was built with.
+# See include/boltapi/http/body_buffer_arena.h.
+# ---------------------------------------------------------------------------
+if(BOLTAPI_USE_BOLT_ARENA)
+    target_compile_definitions(boltapi PUBLIC BOLTAPI_USE_BOLT_ARENA=1)
+    message(STATUS "Bolt API body arena: bolt::Arena (BOLTAPI_USE_BOLT_ARENA=ON, opt-in)")
+else()
+    target_compile_definitions(boltapi PUBLIC BOLTAPI_USE_BOLT_ARENA=0)
+    message(STATUS "Bolt API body arena: slot-pool (default; set -DBOLTAPI_USE_BOLT_ARENA=ON for bolt::Arena)")
+endif()
 boltapi_apply_hardening(boltapi)
 boltapi_apply_sanitizers(boltapi)   # no-op unless BOLTAPI_SANITIZE=ON
 

@@ -762,6 +762,13 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
                 }
                 body_detected = false;
 
+                // Reclaim the per-request bolt::Arena (no-op when the arena flag
+                // is OFF). Safe here: the response is fully written, req.body was
+                // copied out, and any pipelined leftover is already in stack_buf
+                // (copied above before body_buf.reset()), so no live view points
+                // into the arena.
+                thread_body_arena_reset();
+
                 // Reset parser for next request
                 parser.reset();
                 continue;  // Skip normal handler processing
@@ -985,6 +992,13 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
         }
         body_detected = false;
 
+        // Reclaim the per-request bolt::Arena (no-op when the arena flag is
+        // OFF). Safe here: the response is fully written, req.body / response
+        // already hold their own std::string copies, and any pipelined leftover
+        // is already in stack_buf (copied above before body_buf.reset()), so no
+        // live view points into the arena.
+        thread_body_arena_reset();
+
         // Reset parser for next request
         parser.reset();
     }
@@ -1113,6 +1127,15 @@ core::coro_task<void> CoroUnifiedServer::handle_http2_connection(
             h2_conn.commit_output(static_cast<size_t>(written));
         }
     }
+
+    // Reclaim the per-request bolt::Arena (no-op when the arena flag is OFF).
+    // Done at connection teardown rather than per-stream: HTTP/2 multiplexes
+    // many streams whose bodies may still be mid-accumulation across reads, so a
+    // per-stream reset would risk wiping another stream's live body view. By
+    // teardown every stream body has either been copied out to a std::string
+    // (stream->request_body() in the request callback) or abandoned, and the
+    // self-guarding reset only reclaims once no arena view is outstanding.
+    thread_body_arena_reset();
 
     io.async_close(fd);
 }

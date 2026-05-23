@@ -60,10 +60,14 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ninja-build
 
       - name: Configure (ASan/UBSan)
+        # Exercise the opt-in bolt::Arena request-body path under ASan/UBSan: the
+        # whole-arena per-request reset is the high-risk swap, so we want
+        # use-after-reset / lifetime bugs caught here on Linux clang.
         run: >
           cmake -S . -B build/asan -G Ninja
           -DCMAKE_BUILD_TYPE=RelWithDebInfo
           -DBOLTAPI_SANITIZE=ON
+          -DBOLTAPI_USE_BOLT_ARENA=ON
 
       - name: Build
         run: cmake --build build/asan

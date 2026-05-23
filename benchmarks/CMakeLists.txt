@@ -19,3 +19,14 @@ if(WIN32)
 endif()
 boltapi_apply_hardening(boltapi_throughput_bench)
 boltapi_apply_sanitizers(boltapi_throughput_bench)
+
+# Body-path throughput: POSTs a >stack-buffer body to exercise the request-body
+# buffer (slot-pool vs bolt::Arena). This is the bench that reveals the
+# BOLTAPI_USE_BOLT_ARENA swap's effect.
+add_executable(boltapi_body_throughput_bench body_throughput_bench.cpp)
+target_link_libraries(boltapi_body_throughput_bench PRIVATE boltapi::boltapi)
+if(WIN32)
+    target_link_libraries(boltapi_body_throughput_bench PRIVATE ws2_32 mswsock)
+endif()
+boltapi_apply_hardening(boltapi_body_throughput_bench)
+boltapi_apply_sanitizers(boltapi_body_throughput_bench)
