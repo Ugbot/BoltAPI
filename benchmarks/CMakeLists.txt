@@ -41,3 +41,16 @@ if(WIN32)
 endif()
 boltapi_apply_hardening(boltapi_udp_echo_bench)
 boltapi_apply_sanitizers(boltapi_udp_echo_bench)
+
+# QUIC loopback throughput: full 1-RTT handshakes/s + bulk stream MB/s + CPU/byte
+# over two QuicConnections on real UDP loopback, driven through the SAME inline
+# I/O-thread datagram path the App uses for HTTP/3. An A/B harness for the W5f
+# hot-path work. Needs OpenSSL (QUIC TLS) like the QUIC ctest targets.
+add_executable(boltapi_quic_throughput_bench quic_throughput_bench.cpp)
+target_link_libraries(boltapi_quic_throughput_bench PRIVATE boltapi::boltapi
+    OpenSSL::SSL OpenSSL::Crypto)
+if(WIN32)
+    target_link_libraries(boltapi_quic_throughput_bench PRIVATE ws2_32 mswsock iphlpapi)
+endif()
+boltapi_apply_hardening(boltapi_quic_throughput_bench)
+boltapi_apply_sanitizers(boltapi_quic_throughput_bench)

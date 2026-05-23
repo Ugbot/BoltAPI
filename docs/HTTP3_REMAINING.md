@@ -45,10 +45,12 @@
 - [ ] QUIC DATAGRAM frames (RFC 9221) — enables WebTransport later.
 - [ ] Multiple connection IDs (NEW/RETIRE_CONNECTION_ID); preferred address.
 
-## W5f — Performance
-- [ ] Process QUIC packets **inline on the I/O thread** (no per-packet worker hop — same fix as UDP/STUN); decrypt + demux inline, hand only app work to workers.
-- [ ] Batched UDP recv/send (recvmmsg/sendmmsg; WSARecvMsg; GSO/GRO/ECN).
-- [ ] Zero-copy packet framing via `bolt::wire`; per-conn/stream `bolt::SwissTable`; per-packet `bolt::Arena`; no malloc on the data path; pacing.
+## W5f — Performance  *(LANDED — see HTTP3_PLAN DECISION LOG D13)*
+- [x] Process QUIC packets **inline on the I/O thread** (no per-packet worker hop — same fix as UDP/STUN); decrypt + demux inline, hand only app work to workers. *Already in place: `UdpTransport::on_recv` runs the datagram handler INLINE on the I/O thread (no worker handoff), and the App wires `feed_datagram` (decrypt+demux+frame dispatch) straight into it (app.cpp:598). Verified by the W5f bench + the wave-4/5a/5d gates.*
+- [x] No malloc on the data path / zero-copy framing. *Verified already in place: packet build/seal use fixed stack scratch; per-stream `bolt::SwissTable` + `bolt::Arena` already back the stream pool/map (connection.h); no per-packet heap on the data path. A candidate "header-only scratch copy" in `open_and_handle` (copy ≤ pn_offset+4 B instead of the full MTU) was tried and **reverted** — a paired A/B showed it neutral within noise, not better (see D13). The only `std::vector` on the QUIC path are the per-handshake CRYPTO buffers (a few KB, not per-packet bulk).*
+- [x] Benchmark: `benchmarks/quic_throughput_bench.cpp` (gated by `BOLTAPI_BUILD_BENCHMARKS`, not in ctest) — loopback 1-RTT handshakes/s (real inline I/O path) + bulk stream MB/s + CPU/byte, an A/B harness. See D13 for before/after.
+- [ ] Batched UDP recv/send (recvmmsg/sendmmsg; WSARecvMsg; GSO/GRO/ECN). *DEFERRED: evaluated; helps multi-flow high-PPS but cannot be shown neutral-or-better on the single-connection loopback harness (handshake is lockstep, bulk is window-paced). Not added speculatively per the standing "measure-or-revert" rule. Revisit with a multi-connection many-source bench.*
+- [ ] Pacing (token-bucket send). *DEFERRED: a loss/fairness mechanism; on a no-loss loopback path it can only be neutral-or-worse for raw throughput, so not added without a workload that shows the win.*
 - [ ] Bench vs quiche/nghttp3 (handshake/s, 1-RTT throughput, CPU/byte); compare to our H1/H2 numbers.
 
 ## W5g — Consolidation

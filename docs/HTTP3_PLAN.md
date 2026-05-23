@@ -1100,4 +1100,76 @@ without WebRTC), the 11 new `QuicRobustness*` tests included; the wave-4 handsha
 gate + wave-5a stream gates stay green. Warning-clean on connection.h /
 robustness.h / the new test (MSVC VS2022, build/msvc).
 
-### D13. Next wave (wave 5f — performance; or 5c interop)
+### D13. Wave 5f — QUIC/HTTP3 hot-path PERFORMANCE — LANDED
+
+**Scope:** the W5f hot-path items, applied under the standing "measure, keep only
+neutral-or-better, else revert" rule. Default `ctest` stayed **220/220** green
+(1 expected aiortc skip) at every step.
+
+**Bench (NEW, the A/B harness):** `benchmarks/quic_throughput_bench.cpp`, gated by
+`BOLTAPI_BUILD_BENCHMARKS`, NOT in ctest. Two parts:
+  * **handshakes/s** — full 1-RTT handshakes to ESTABLISHED over REAL UDP
+    loopback through the production inline-on-the-I/O-thread datagram path
+    (`UdpTransport` recv callback → `feed_datagram`). Exercises the actual hot
+    path under load.
+  * **bulk MB/s + CPU/byte** — sustained one-way STREAM transfer
+    (kBulkStreams × 256 KiB; a Stream's send buffer is a fixed 256 KiB with no
+    in-place reclaim, so total is spread across streams). Driven on a
+    deterministic in-process FIFO relay so the number isolates QUIC
+    build/seal/parse/open + framing CPU from loopback scheduling jitter.
+    CPU/byte = process (user+kernel) CPU over the bulk phase ÷ bytes.
+
+**Numbers on this box (MSVC VS2022 Release, x64). Stable metrics:**
+
+| metric            | value          |
+|-------------------|----------------|
+| handshakes/sec    | ~62 (59–64)    |
+| bulk MB/s         | ~1.7 (1.5–1.8) |
+| CPU ns/byte       | ~5.4–6.0 µs/B (noisy; see below) |
+
+The CPU/byte figure is dominated by AEAD crypto + the idle IODispatcher/worker
+threads' process CPU; on this single-connection harness it carries ±15% run-to-
+run noise, so only a **paired back-to-back** A/B (rebuild-revert-rebuild on the
+same box) is trustworthy for it.
+
+**REVERTED — receive open path "header-only scratch copy" (candidate).** Tried
+copying only `[0, pn_offset+4)` into mutable scratch in `open_and_handle`
+instead of the whole ≤1500 B packet (the AEAD reads ciphertext straight from
+the original, never-mutated recv buffer, so the full copy is redundant). A
+careless first read looked like −25% CPU/byte, but a PAIRED measurement
+(stash-revert build = mean **5669** ns/B over 6 runs; restored build = mean
+**5984** ns/B over 6 runs) showed it is **NOT better — neutral within noise**.
+The per-packet ~1500 B memcpy is negligible next to AEAD on this path. Per the
+standing "keep only if measured neutral-or-better, no speculative changes"
+rule, the change was **reverted**; `connection.h` is unchanged. (Worth
+revisiting only with a profiler that isolates the open path, or a real
+high-PPS multi-connection load where the copy could matter.)
+
+**ALREADY IN PLACE (verified, no change needed):**
+  * *Inline I/O-thread QUIC processing.* `UdpTransport::on_recv` runs the
+    registered datagram handler INLINE on the I/O thread (no per-packet
+    worker-pool hop — the W5/WebRTC STUN fix), and the App feeds
+    `feed_datagram` (decrypt + demux + frame dispatch) straight into it. Only
+    the routed app handler is the worker-eligible "heavy" work. The
+    PROJECT_MAP "per-packet worker-pool handoff" gap was the general UDP path,
+    already closed.
+  * *No malloc on the data path.* Packet build/seal use fixed stack scratch;
+    the per-stream pool + stream-id→index map are `bolt::Arena` +
+    `bolt::SwissTable` (connection.h). The only `std::vector` are the
+    per-handshake CRYPTO transmit buffers (a few KB, a handful of times per
+    connection — NOT the per-packet bulk path).
+
+**DEFERRED (NOT added — would be speculative / non-neutral on this harness):**
+  * *Batched UDP recv/send (recvmmsg/sendmmsg/WSARecvMsg, GSO/GRO/ECN).*
+    Requires new `async_io` virtuals across all 4 backends + IOCP impl; it
+    helps many-source high-PPS, but on a single-connection loopback bench the
+    handshake is lockstep and the bulk is window-paced, so no win is
+    demonstrable here. Per the measure-or-revert rule, not added without a
+    multi-connection many-source bench that shows it.
+  * *Pacing (token-bucket send).* A loss/fairness mechanism; on a no-loss
+    loopback path it can only be neutral-or-worse for raw throughput, so not
+    added without a workload that proves the benefit.
+
+**Public API:** none changed. `net/async_io`, `net/udp_transport`,
+`net/io_dispatcher`, and `quic/*` public signatures are unchanged; the kept
+change is internal to `open_and_handle`.
