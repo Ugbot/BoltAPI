@@ -5,13 +5,20 @@
 
 Legend: ✅ done · 🚧 in progress · ⬜ planned
 
+> **Direction (set 2026-05-23):** goal = the **fastest COMPLETE implementation of all web protocols**. The engine is **not sacred** — refactor `coro_unified_server`/`IODispatcher`/`async_io` when it makes the whole faster/cleaner (correctness-gated, green increments). Near-term consequence: the WebRTC/HTTP3 `UdpTransport` runs on its own rx thread for now (correctness-first); the perf phase should integrate UDP into the unified event loop and unify dispatch via `ProtocolRegistry`.
+
 ## Milestones
-- ✅ **M0** — repo skeleton + Bolt submodule + build (builds + tests pass on MSVC; CI workflow added)
-- 🚧 **M1** — HTTP/1.1 + TLS + Bolt-native router + chained middleware + Bolt primitives (App facade + Request/Response + middleware onion + dispatch bridge DONE, 24/24 ctest green; remaining: Bolt primitives wired Arena/SPSC/swiss/topology)
-- 🚧 **M2** — HTTP/2(ALPN) + compression + CORS + coroutine SSE + WebSocket (WebSocket echo + coroutine SSE verified end-to-end through App with tests + examples; gzip compression seam landed [zlib stopgap, identity locally]; 45/45 ctest green. Remaining: HTTP/2 ALPN surface)
-- ✅ **M3** — HTTP/3 + WebRTC seams (scaffolded): ITransport/IProtocol/ProtocolRegistry contract + UdpTransport/Http3/WebRtc stubs (NotImplemented), gated by BOLTAPI_WITH_HTTP3/BOLTAPI_WITH_WEBRTC (default OFF). App seam hook (enable_http3/http3_port/enable_webrtc) logs+continues when enabled-but-unimplemented. Live H1/H2 core UNTOUCHED. Default 52/52 ctest green (45 base + 7 flag-aware seam cases); flags-ON 54/54. docs/SEAMS.md + CI seams-on leg added.
-- 🚧 **M4** — hardening, benchmarks, docs (benchmarks + zero-alloc/bounded-resource hardening tests + ASan/UBSan option + asan/assertions CI legs landed; 36/36 ctest green on MSVC)
+- ✅ **M0** — repo skeleton + Bolt submodule + build
+- ✅ **M1** — HTTP/1.1 + TLS + Bolt-native router + chained middleware + Bolt primitives (App facade, Request/Response, middleware onion, dispatch bridge; router fan-out OOB fixed via SwissTable edges; body Arena gated `BOLTAPI_USE_BOLT_ARENA`; dead ring_buffer/coro_resumer removed)
+- ✅ **M2** — HTTP/2(ALPN) + compression seam (gzip/zlib-stopgap) + CORS + coroutine SSE + WebSocket (all verified e2e through App)
+- ✅ **M3** — HTTP/3 + WebRTC seams scaffolded (ITransport/IProtocol/ProtocolRegistry; stubs gated; H1/H2 untouched; docs/SEAMS.md)
+- 🚧 **M4** — hardening, benchmarks, docs (hardening tests + sanitizers + benches + CI legs landed; remote push pending)
+- ✅ **JSON** — Bolt **fionn** (`bolt::parse`) wired as the canonical parser; `Request::json()`; no simdjson. docs/JSON.md
+- 🚧 **HTTP/3 (full)** — plan in docs/HTTP3_PLAN.md; not started (mostly port: FasterAPI QUIC TLS/packet-protection/QPACK are real)
+- 🚧 **WebRTC (full)** — plan in docs/WEBRTC_PLAN.md. Wave 1: SDP + STUN codecs (RFC 5769 gated). Wave 2: UdpTransport + ICE-lite (live STUN binding over the wire ✅). Next: DTLS, then SCTP/DCEP data channels.
 - ⬜ later — Gestalt migration
+
+Current suite: **103/103 ctest green on MSVC** (default build).
 
 ## Layout (current)
 ```
