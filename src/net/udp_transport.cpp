@@ -34,11 +34,20 @@ namespace net {
 namespace {
 
 // RFC 7983 first-byte classification.
+//
+// The datagram handler also receives QUIC packets: a QUIC long-header packet has
+// the high bit set (first byte >= 0x80) and a QUIC short (1-RTT) header has the
+// fixed bit set with the form bit clear (0x40..0x7F). Both ranges sit ABOVE the
+// RFC 7983 DTLS range (20..63), so routing them to the same datagram handler is
+// additive and never overlaps STUN (0..3) or DTLS (20..63) — WebRTC demux is
+// unchanged. The handler (DtlsSessionManager or QuicConnection) discriminates by
+// the first byte itself.
 enum class PacketKind : std::uint8_t { Stun, Dtls, Drop };
 
 inline PacketKind classify(std::uint8_t first_byte) noexcept {
     if (first_byte <= 3) return PacketKind::Stun;                      // 0..3   => STUN
     if (first_byte >= 20 && first_byte <= 63) return PacketKind::Dtls; // 20..63 => DTLS
+    if (first_byte >= 64) return PacketKind::Dtls;  // 64..255 => QUIC (long/short header) -> datagram handler
     return PacketKind::Drop;                                           // else   => drop
 }
 

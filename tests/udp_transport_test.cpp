@@ -182,8 +182,12 @@ TEST(UdpTransport, RoundTripWithSourceAddressAndDemux) {
                        reinterpret_cast<sockaddr*>(&dst), sizeof(dst)),
               static_cast<ssize_t>(sizeof(dtls_dgram)));
 
-    // --- "Other" datagram (first byte 128) -> dropped ---
-    const std::uint8_t other_dgram[] = {0x80, 0x00};
+    // --- "Other" datagram (first byte 16) -> dropped ---
+    // First bytes 4..19 are unassigned by RFC 7983 (between STUN 0..3 and DTLS
+    // 20..63) and below the QUIC range (>=64), so they are dropped by the demux.
+    // (0x80 used to be "other" but is now a QUIC long-header byte routed to the
+    // datagram handler — see classify() in src/net/udp_transport.cpp.)
+    const std::uint8_t other_dgram[] = {0x10, 0x00};
     ASSERT_EQ(::sendto(c.fd, reinterpret_cast<const char*>(other_dgram),
                        sizeof(other_dgram), 0,
                        reinterpret_cast<sockaddr*>(&dst), sizeof(dst)),

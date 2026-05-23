@@ -208,10 +208,13 @@ This is the gap the FasterAPI audit identified: the crypto layer is **real and
 production-grade**, but the *base* `quic_connection.cpp` never invoked it
 (`AUDIT_NOTES.md:137-140`). We port the **secure** path and drive it.
 
-- [ ] **3.1 Crypto buffer (per-level CRYPTO stream reassembly).** *What:* ordered
-      reassembly of handshake bytes per encryption level. *PORT*
-      `C:\code\FasterAPI\src\cpp\http\quic\quic_crypto_buffer.h`. *Bolt primitive:*
-      `bolt::Arena` for the reassembly scratch; ring buffer for ordered bytes.
+- [x] **3.1 Crypto buffer (per-level CRYPTO stream reassembly).** *DONE (wave 4)*
+      (`CryptoReassembly` in `include/boltapi/quic/connection.h`). ADAPTED from
+      `quic_crypto_buffer.h` (CryptoBuffer): bounded to a single fixed
+      `kMaxCryptoBuffer` (64 KiB) array with a contiguous-receive cursor + a
+      single buffered out-of-order region (no std::vector segment list);
+      duplicate-prefix skip; `peek()`/`consume()` hand contiguous bytes to
+      `QuicTls.feed_crypto`. Sufficient for the loopback handshake.
 - [x] **3.2 Packet protection: AEAD + header protection + HKDF.** *DONE (wave 2)*
       (`include/boltapi/quic/packet_protection.h`). Real AES-128/256-GCM +
       ChaCha20-Poly1305 via OpenSSL EVP, HKDF-Extract/Expand/Expand-Label,
@@ -236,18 +239,26 @@ production-grade**, but the *base* `quic_connection.cpp` never invoked it
       cert (reusing the WebRTC DTLS pattern). Transport-params codec (RFC 9000
       §18) uses our `quic/varint.h`. Each yielded secret drives a wave-2
       `PacketProtection` via `derive_packet_keys`. See DECISION LOG D4.
-- [ ] **3.4 Handshake manager (level transitions, key install).** *What:* drives
-      handshake state across Initial/Handshake/1-RTT, installs read/write keys per
-      level as secrets arrive, derives Initial keys from the DCID. *PORT*
-      `C:\code\FasterAPI\src\cpp\http\quic\quic_handshake.h`. *Bolt primitive:*
-      fixed per-level key arrays (no map).
-- [ ] **3.5 Secure connection = the real encrypt/decrypt connection.** *What:*
-      the connection class that actually applies 3.2–3.4 (encrypt outgoing /
-      decrypt incoming packets in a live connection). *PORT*
-      `C:\code\FasterAPI\src\cpp\http\quic\quic_secure_connection.h` (34KB, real
-      encrypt/decrypt per audit). **This replaces the stubbed base
-      `quic_connection.cpp` path** — see salvage map. *Bolt primitive:*
-      `bolt::Arena` per-packet; `bolt::SwissTable` for streams (Phase 5).
+- [x] **3.4 Handshake manager (level transitions, key install).** *DONE (wave 4)*
+      folded into `QuicConnection` (`include/boltapi/quic/connection.h`). The
+      per-level key install is driven by wave-3 `QuicTls` (each yielded secret
+      installs a `PacketProtection` for that level+direction); the connection
+      derives the Initial keys from the DCID (`derive_initial_keys`) and selects
+      the right `PacketProtection` per level (`read_protection`/`write_protection`:
+      Initial from DCID, Handshake/1-RTT from QuicTls). Fixed per-level arrays, no
+      map. (FasterAPI's separate `quic_handshake.h` HandshakeManager was not
+      ported — its role is split between wave-3 `tls.h` and this connection.)
+- [x] **3.5 Secure connection = the real encrypt/decrypt connection.** *DONE
+      (wave 4)* (`QuicConnection`, `include/boltapi/quic/connection.h`). ADAPTED
+      from `quic_secure_connection.h`'s SECURE flow: inbound
+      `feed_datagram`->parse header (wave-1 `packet.h`)->select level->
+      header-unprotect + AEAD-open (wave-2 `packet_protection.h`)->parse frames
+      (wave-1 `frames.h`)->CRYPTO reassembly->`QuicTls.feed_crypto`->install
+      Handshake/1-RTT keys; outbound pull TLS CRYPTO->frame->build header->
+      AEAD-seal->header-protect->`UdpTransport::send`. This is the path the base
+      `quic_connection.cpp` never invoked (audit:140). Streams/flow-control are
+      wave 5. *Bolt primitive:* fixed stack scratch per packet (no per-packet
+      heap); `bolt::SwissTable` for streams is wave 5.
 - [x] **3.6 Self-test the AEAD/HP against RFC 9001 Appendix A test vectors.**
       *DONE (wave 2)* (`tests/quic_protection_test.cpp`, target
       `boltapi_quic_protection_test`, default suite). BYTE-EXACT against RFC 9001
@@ -268,14 +279,13 @@ end-to-end encrypted handshake the FasterAPI tests never exercised — audit:140
 
 ## Phase 4 — Connection state machine, loss, congestion, flow control, ACK
 
-- [ ] **4.1 Connection state machine.** *What:* IDLE -> HANDSHAKE -> ESTABLISHED
-      -> CLOSING/DRAINING -> CLOSED; idle timeout; CONNECTION_CLOSE handling.
-      *PORT the state-machine shape from*
-      `C:\code\FasterAPI\src\cpp\http\quic\quic_connection.{h,cpp}` **but drive the
-      secure path from 3.5** (do **not** port the plaintext decrypt TODOs at
-      `quic_connection.cpp:138/170` — those are the stub the audit flagged).
-      *Bolt primitive:* `bolt::SwissTable` for stream map (replace
-      `std::unordered_map<uint64_t, unique_ptr<QUICStream>>`).
+- [~] **4.1 Connection state machine.** *PARTIAL — handshake path DONE (wave 4)*
+      (`ConnState` New->Handshaking->Established->Closing/Draining/Closed in
+      `include/boltapi/quic/connection.h`). Server sends HANDSHAKE_DONE at 1-RTT;
+      client confirms on receiving it; CONNECTION_CLOSE -> Draining. Drives the
+      SECURE path from 3.5 (NOT the plaintext stub). Remaining: idle timeout,
+      full CONNECTION_CLOSE emission/Closing drain, and the stream map
+      (`bolt::SwissTable`) land with streams in wave 5.
 - [ ] **4.2 ACK tracking + ACK frame generation.** *What:* received-PN ranges,
       ACK ranges, ACK delay, ECN counts. *PORT*
       `C:\code\FasterAPI\src\cpp\http\quic\quic_ack_tracker.{h,cpp}`. *Bolt
@@ -775,14 +785,84 @@ truncated, reject over-long CID).
 156; +5: 4 transport-params + 1 handshake gate), zero warnings on the new TUs,
 H1/H2/WebRTC/QUIC-primitives/protection suites unchanged.
 
-### D5. Next wave (wave 4 — QUIC connection)
-1. Process Initial packets end-to-end: parse (wave-1 `packet.h`) -> unprotect
-   (wave-2 `PacketProtection` from DCID) -> reassemble CRYPTO (per-level buffer)
-   -> drive `QuicTls` (wave 3) -> install Handshake/1-RTT keys from the yielded
-   secrets -> seal/open subsequent packets.
-2. Connection state machine (IDLE -> HANDSHAKE -> ESTABLISHED -> CLOSING/
-   DRAINING -> CLOSED) + RFC 9002 loss recovery (PTO, time-threshold, RTT)
-   extracted as a clean unit; ACK tracking already in `ack.h`.
-3. Streams + flow control -> QPACK (static/dynamic, encoder/decoder) -> HTTP/3
-   frames -> bridge QUIC streams to `CoroHttpRequest` -> the existing `App`
-   router.
+### D5. Wave 4 — QUIC connection — LANDED in D6.
+
+### D6. QUIC CONNECTION LANDED (wave 4) — real handshake to ESTABLISHED over UDP
+
+`include/boltapi/quic/connection.h` (header-only; OpenSSL always linked, so it
+compiles UNCONDITIONALLY into the default suite — no `BOLTAPI_WITH_HTTP3` gate)
++ `tests/quic_connection_test.cpp` (the wave-4 GATE), namespace
+`bolt::api::quic`, Tiger Style (>=2 asserts/fn, bounded fixed buffers, no
+recursion on the packet hot path, <70-line fns, noexcept, no exceptions, bool
+returns). ADAPTED from FasterAPI's `quic_secure_connection.h` SECURE flow (the
+path the base `quic_connection.cpp` never invoked, audit:140), retargeted onto
+boltapi/quic/* (waves 1-3) + `net::UdpTransport`.
+
+**`QuicConnection` (client + server roles).** Owns: a wave-3 `QuicTls`; Initial
+`PacketProtection` derived from the DCID (RFC 9001 §5.2) for read+write;
+Handshake/1-RTT `PacketProtection` borrowed from `QuicTls` (installed from the
+yielded secrets); the three wave-1 packet-number spaces + per-space wave-1
+`AckRangeTracker`; a per-level `CryptoReassembly` (adapted from
+`quic_crypto_buffer.h`); per-level outbound CRYPTO send buffers + offsets. CIDs:
+our SCID (`local_cid_`, 8 random bytes), the peer's SCID (`peer_cid_`, our DCID
+for sends), and `initial_dcid_` (the DCID that keys Initial). Client picks a
+random initial DCID; the server adopts the client's DCID to key Initial + the
+client's SCID to reply on the first Initial.
+
+**Inbound `feed_datagram`:** loop over coalesced packets (bounded
+`kMaxCoalescedPackets`; trailing 0x00 PADDING ends the run) — `parse_form` ->
+parse long/short header (wave 1) -> if keys present, `unprotect_header` +
+`decrypt` (wave 2) over a stack scratch copy -> decode the truncated PN (wave-1
+`pn_decode`) -> record the PN for ACK -> walk frames: CRYPTO (reassemble in-order
+-> `feed_crypto`), ACK (mark space largest-acked + clear our CRYPTO-pending),
+PADDING/PING, CONNECTION_CLOSE (-> Draining), HANDSHAKE_DONE (client ->
+confirmed), STREAM (framing skipped — wave 5). Then `tls_.advance()` and flush.
+
+**Outbound:** after advance, pull `QuicTls` CRYPTO per level -> stash + frame
+into CRYPTO frames across as many packets as the flight needs (the ClientHello
+flight is ~1.4 KB > one packet) + an ACK on the first packet -> build the right
+header (Initial: token + 4-byte PN + Length varint, padded to 1200 per §14.1;
+Handshake long header; 1-RTT short header) -> AEAD-seal -> header-protect (4-byte
+PN so the HP sample sits right after the PN) -> `UdpTransport::send`. Server, on
+its first client Initial, derives Initial keys from the client's DCID, then
+emits Initial(ServerHello) + Handshake(EE/Cert/Finished); at 1-RTT it sends
+HANDSHAKE_DONE to finish. A minimal `tick()` retransmits still-unacked CRYPTO
+(rewind the send offset) + a due ACK — enough to make a clean loopback handshake
+reliable; full RFC 9002 loss recovery is wave 5.
+
+**One demux change** (additive, WebRTC-safe): `src/net/udp_transport.cpp`
+`classify()` now routes first byte >= 64 (QUIC long/short headers) to the
+datagram handler. QUIC's range (>=0x40) sits ABOVE the RFC 7983 DTLS range
+(20..63) and never overlaps STUN (0..3) or DTLS, so WebRTC demux is unchanged;
+the handler discriminates by first byte. `udp_transport_test.cpp`'s "dropped"
+case was moved from first byte 0x80 (now QUIC) to 0x10 (4..19, genuinely
+unassigned) — still asserts unclassified bytes drop.
+
+**GATE RESULT** (`tests/quic_connection_test.cpp`, default suite, REAL UDP):
+two `QuicConnection`s (client + server) on two `net::UdpTransport`s bound to
+ephemeral loopback ports, each transport's datagram handler feeding the owning
+connection and each connection's send fn pushing built datagrams to the peer;
+the client `start()`s, a bounded 10s driver loop ticks both. **BOTH reach
+`ConnState::kEstablished`** (Initial -> Handshake -> 1-RTT); **1-RTT read+write
+keys installed on both sides**; **ALPN == h3** both; **transport parameters
+exchanged** (each side decoded the other's `initial_max_data` etc.); and a
+**1-RTT seal/open round-trip over the wire BOTH ways** — server seals a 1-RTT
+PING+ACK the client opens (its Application-space `largest_received` advances) and
+vice-versa (the server's HANDSHAKE_DONE was itself a 1-RTT packet the client
+opened during the handshake). Bounded by a wall-clock deadline; no hang; passes
+8/8 repeats. Real curl/quiche/aiortc-h3 interop is a later wave.
+
+**Status:** default `cmake --preset msvc` + `ctest -C Release` = **162/162**
+(was 161; +1 connection gate; 1 aiortc-interop SKIPPED under WebRTC=OFF as
+before), zero warnings on the new TU, H1/H2/WebRTC suites
+(dtls/datachannel/ice/sctp) + QUIC primitives/protection/tls unchanged.
+
+### D7. Next wave (wave 5 — loss recovery + streams -> QPACK -> H3)
+1. RFC 9002 loss recovery (sent-packet bookkeeping, PTO, time-threshold loss,
+   smoothed/min RTT + rttvar) extracted as a clean `quic_loss_recovery` unit to
+   replace the wave-4 "rewind unacked CRYPTO on tick" stand-in; NewReno
+   congestion + flow control (port `quic_congestion`/`quic_flow_control`).
+2. Streams (bidi/uni lifecycle, ordered reassembly) on a `bolt::SwissTable`
+   stream map; CONNECTION_CLOSE emission + idle timeout; Initial-key discard.
+3. QPACK (static/dynamic tables, encoder/decoder) -> HTTP/3 frames -> bridge
+   QUIC streams to `CoroHttpRequest` -> the existing `App` router.

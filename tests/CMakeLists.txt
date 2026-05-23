@@ -208,6 +208,21 @@ target_link_libraries(boltapi_quic_protection_test PRIVATE OpenSSL::SSL OpenSSL:
 boltapi_add_test(boltapi_quic_tls_test quic_tls_test.cpp)
 target_link_libraries(boltapi_quic_tls_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 
+# Wave 4: QUIC CONNECTION — THE LIVE HANDSHAKE GATE. Two QuicConnections (client
+# + server, boltapi/quic/connection.h) on two net::UdpTransports over ephemeral
+# loopback UDP ports run a REAL TLS 1.3 QUIC handshake end-to-end (Initial ->
+# Handshake -> 1-RTT). Each transport's datagram handler feeds the owning
+# connection; each connection's send fn pushes built datagrams to the peer.
+# Asserts: BOTH reach Established; 1-RTT keys installed both sides; ALPN h3;
+# transport params exchanged; a 1-RTT packet sealed by one opens on the other
+# (PING+ACK round-trip over real UDP). Bounded by a wall-clock deadline (no
+# hang). OpenSSL + ws2_32/mswsock on Windows. Runs in the default suite.
+boltapi_add_test(boltapi_quic_connection_test quic_connection_test.cpp)
+target_link_libraries(boltapi_quic_connection_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+if(WIN32)
+    target_link_libraries(boltapi_quic_connection_test PRIVATE ws2_32 mswsock iphlpapi)
+endif()
+
 # M3: HTTP/3 + WebRTC seam — ProtocolRegistry mechanism (register/has/create),
 # a dummy IProtocol returning NotImplemented, and (when the compile flags are
 # ON) the real H3/WebRTC stub factories registering. Flag-AWARE: passes in the
