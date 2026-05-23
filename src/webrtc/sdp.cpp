@@ -602,5 +602,98 @@ SdpError build_media_answer(const MediaAnswerParams& p, std::string& out) {
     return SdpError::Ok;
 }
 
+// ===========================================================================
+// WM6 — combined media + data-channel answer (the aiortc `server` shape).
+// ===========================================================================
+namespace {
+
+// Emit the shared per-m-line transport attrs (BUNDLE: identical on every line).
+void append_transport_attrs(std::string& out, std::string_view ufrag,
+                            std::string_view pwd, std::string_view fp,
+                            std::string_view setup) {
+    assert(!ufrag.empty() && "transport attrs: ufrag");
+    assert(!setup.empty() && "transport attrs: setup");
+    append_attr(out, "ice-ufrag", ufrag);
+    append_attr(out, "ice-pwd", pwd);
+    append_attr(out, "fingerprint", fp);
+    append_attr(out, "setup", setup);
+}
+
+// Emit a=candidate:... lines (verbatim, with the leading "a=") + end-of-cands.
+void append_candidates(std::string& out, const std::string_view* cands,
+                       std::size_t n) {
+    assert(cands != nullptr || n == 0);
+    assert(n <= 64 && "append_candidates: bound");
+    if (cands == nullptr || n == 0) return;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (cands[i].empty()) continue;
+        out.append("a=", 2);
+        out.append(cands[i].data(), cands[i].size());
+        out.append("\r\n", 2);
+    }
+    append_attr(out, "end-of-candidates", std::string_view{});
+}
+
+}  // namespace
+
+SdpError build_echo_answer(const EchoAnswerParams& p, std::string& out) {
+    if (p.ice_ufrag.empty() || p.ice_pwd.empty() ||
+        p.fingerprint_sha256.empty() || p.negotiation == nullptr ||
+        p.negotiation->media_count == 0) {
+        return SdpError::MalformedLine;
+    }
+    assert(p.negotiation->media_count <= kMaxMediaSections && "echo: overflow");
+    assert(!p.setup.empty() && "echo: empty setup");
+
+    out.clear();
+    append_line(out, 'v', "0");
+    out.append("o=- ", 4);
+    out.append(p.origin_session_id.data(), p.origin_session_id.size());
+    out.append(" 2 IN IP4 127.0.0.1\r\n");
+    append_line(out, 's', "-");
+    append_line(out, 't', "0 0");
+
+    // a=group:BUNDLE <media mids...> [<data mid>] — all on one transport.
+    out.append("a=group:BUNDLE", 14);
+    for (std::size_t i = 0; i < p.negotiation->media_count; ++i) {
+        out.push_back(' ');
+        const std::string_view mid = p.negotiation->media[i].mid;
+        out.append(mid.data(), mid.size());
+    }
+    if (!p.data_mid.empty()) {
+        out.push_back(' ');
+        out.append(p.data_mid.data(), p.data_mid.size());
+    }
+    out.append("\r\n", 2);
+    append_attr(out, "msid-semantic", " WMS");
+    if (p.ice_lite) append_attr(out, "ice-lite", std::string_view{});
+
+    std::string fp;
+    fp.reserve(8 + p.fingerprint_sha256.size());
+    fp.append("sha-256 ");
+    fp.append(p.fingerprint_sha256.data(), p.fingerprint_sha256.size());
+
+    // Media m-lines first; candidates on the FIRST m-line only.
+    for (std::size_t i = 0; i < p.negotiation->media_count; ++i) {
+        append_media_section(out, p.negotiation->media[i]);
+        append_transport_attrs(out, p.ice_ufrag, p.ice_pwd, fp, p.setup);
+        if (i == 0) append_candidates(out, p.candidates, p.candidate_count);
+    }
+
+    // Data m-line (when the offer had m=application), under the same BUNDLE.
+    if (!p.data_mid.empty()) {
+        out.append("m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n");
+        append_line(out, 'c', "IN IP4 0.0.0.0");
+        append_attr(out, "mid", p.data_mid);
+        append_transport_attrs(out, p.ice_ufrag, p.ice_pwd, fp, p.setup);
+        append_attr(out, "sctp-port",
+                    [&] { std::string s; append_uint(s, p.sctp_port); return s; }());
+        append_attr(out, "max-message-size",
+                    [&] { std::string s; append_uint(s, p.max_message_size);
+                          return s; }());
+    }
+    return SdpError::Ok;
+}
+
 }  // namespace webrtc
 }  // namespace bolt::api

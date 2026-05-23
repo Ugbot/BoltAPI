@@ -1,15 +1,23 @@
-// demo_server.cpp — Bolt API WebRTC interop demo server.
+// demo_server.cpp — Bolt API WebRTC interop demo server (data + media echo).
 //
-// Brings up an App on :8080 that:
-//   * enables WebRTC (ICE-lite + DTLS server + SCTP/DCEP data channels) and the
-//     POST /webrtc/offer signaling route (offer SDP -> our answer SDP),
+// One server tying HTTP + WS + SSE + data-channel echo + MEDIA echo together
+// behind the POST /webrtc/offer signaling route. Brings up an App on :8080 that:
+//   * enables WebRTC (ICE-lite + DTLS server + SCTP/DCEP data channels + SRTP
+//     media) and the POST /webrtc/offer signaling route (offer -> answer),
+//   * MEDIA ECHO (WM6, aiortc `server` shape): received audio + video RTP is
+//     looped straight back out (re-SRTP, relay, no transcode) via
+//     enable_media_echo(),
 //   * echoes every data-channel message on the "chat" label (text + binary),
+//   * a GET /health route + a WebSocket /ws echo + an SSE /events stream, to show
+//     the media/data surfaces coexisting with H1/H2/WS/SSE on one App,
 //   * serves the testing/web/ directory at "/" so http://localhost:8080/
-//     webrtc.html loads the browser RTCPeerConnection test page.
+//     webrtc.html (data) and /media.html (audio+video) load the browser pages.
 //
 // This is the server the interop harness points at:
-//   * browser:  open http://localhost:8080/webrtc.html, click "Connect & echo"
-//   * headless: uv run --with aiortc python testing/aiortc_datachannel.py 8080
+//   * browser (data):  open http://localhost:8080/webrtc.html
+//   * browser (media): open http://localhost:8080/media.html  (getUserMedia)
+//   * headless (data): uv run --with aiortc python tests/interop/aiortc_datachannel.py 8080
+//   * headless (media):uv run --with aiortc python tests/interop/aiortc_media.py 8080
 //
 // Built only under BOLTAPI_WITH_WEBRTC (the CMake target is guarded), so the
 // default build is unaffected. Run from the repo root so the relative
@@ -34,6 +42,12 @@ int main(int argc, char** argv) {
     wcfg.max_message_size = 262144;
     app.enable_webrtc(wcfg);
 
+    // WM6: MEDIA ECHO (aiortc `server` shape). Loop received audio + video RTP
+    // straight back out (re-SRTP, relay, no transcode). The signaling answer
+    // negotiates the offered audio/video m-lines sendrecv so the peer's media
+    // returns to it. H1/H2 + data channels are untouched.
+    app.enable_media_echo();
+
 #if defined(BOLTAPI_WITH_WEBRTC)
     // "chat" data channel: echo each message straight back, preserving type.
     app.on_data_channel("chat",
@@ -50,15 +64,27 @@ int main(int argc, char** argv) {
         });
 #endif
 
+    // Plain HTTP/WS/SSE surfaces alongside the WebRTC ones — one App, all wired.
+    app.get("/health", [](bolt::api::Request&, bolt::api::Response& res) {
+        res.status(200).content_type("text/plain; charset=utf-8").send("ok");
+    });
+    app.websocket("/ws", [](bolt::api::http::WebSocketConnection& ws) {
+        ws.on_text_message = [&ws](const std::string& msg) {
+            ws.send_text(msg);  // echo
+        };
+    });
+
     // Serve the browser test harness (and anything else under testing/web/).
     app.static_files("/", web_root);
 
     std::fprintf(stderr,
         "Bolt API demo server on http://127.0.0.1:%u\n"
-        "  open  http://127.0.0.1:%u/webrtc.html  (browser WebRTC test)\n"
-        "  POST  /webrtc/offer                    (signaling)\n"
+        "  open  http://127.0.0.1:%u/webrtc.html  (browser data-channel test)\n"
+        "  open  http://127.0.0.1:%u/media.html   (browser audio+video echo)\n"
+        "  GET   /health   WS /ws                 (HTTP/WS surfaces)\n"
+        "  POST  /webrtc/offer                    (signaling: data + media)\n"
         "  static root: %s\n",
-        port, port, web_root.c_str());
+        port, port, port, web_root.c_str());
 
     return app.run("127.0.0.1", port);
 }

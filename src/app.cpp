@@ -675,6 +675,33 @@ void App::serve_http3_request(http3::H3Connection& h3,
 // V1: a SINGLE active peer. A second offer re-pins the stack to the new peer.
 // Multi-peer keyed by ufrag is a documented follow-up (WEBRTC_PLAN §13).
 // ---------------------------------------------------------------------------
+
+namespace {
+// Unwrap the offer SDP from the POST body: a JSON {"sdp":"..."} envelope OR a
+// raw SDP body (detected by a leading '{' after optional whitespace). On JSON,
+// the extracted SDP is copied into `owned` (which must outlive the returned
+// view). Returns false on a malformed JSON envelope. Bounded, no throw.
+bool unwrap_offer_sdp(std::string_view body, std::string& owned,
+                      std::string_view& out_sdp) noexcept {
+    assert(owned.empty() && "unwrap_offer_sdp: owned must start empty");
+    assert(out_sdp.empty() || out_sdp.data() != nullptr);
+    out_sdp = body;
+    std::size_t i = 0;
+    while (i < body.size() && (body[i] == ' ' || body[i] == '\t' ||
+                               body[i] == '\r' || body[i] == '\n')) {
+        ++i;
+    }
+    if (i >= body.size() || body[i] != '{') return true;  // raw SDP
+    json::Document doc = json::parse(body);
+    if (!doc.ok()) return false;
+    const std::string_view s = doc["sdp"].as_string();
+    if (s.empty()) return false;
+    owned.assign(s.data(), s.size());
+    out_sdp = owned;
+    return true;
+}
+}  // namespace
+
 bool App::handle_webrtc_offer(std::string_view body, std::string& out_answer) {
     out_answer.clear();
     // The transport must be up (init_protocol_seams ran and bound the socket).
@@ -682,43 +709,32 @@ bool App::handle_webrtc_offer(std::string_view body, std::string& out_answer) {
         return false;
     }
 
-    // Accept a JSON {"sdp":"..."} envelope OR a raw SDP body. Detect JSON by a
-    // leading '{' (after optional whitespace). The extracted SDP must outlive
-    // the parse below, so copy it into an owned buffer when it comes from JSON.
+    // Accept a JSON {"sdp":"..."} envelope OR a raw SDP body.
     std::string sdp_owned;
-    std::string_view sdp_text = body;
-    {
-        std::size_t i = 0;
-        while (i < body.size() && (body[i] == ' ' || body[i] == '\t' ||
-                                   body[i] == '\r' || body[i] == '\n')) {
-            ++i;
-        }
-        if (i < body.size() && body[i] == '{') {
-            json::Document doc = json::parse(body);
-            if (!doc.ok()) return false;
-            const std::string_view s = doc["sdp"].as_string();
-            if (s.empty()) return false;
-            sdp_owned.assign(s.data(), s.size());
-            sdp_text = sdp_owned;
-        }
-    }
+    std::string_view sdp_text;
+    if (!unwrap_offer_sdp(body, sdp_owned, sdp_text)) return false;
 
     webrtc::SdpSession offer;
     if (webrtc::parse(sdp_text, offer) != webrtc::SdpError::Ok) return false;
     const webrtc::SdpMedia* app_m = offer.application_media();
-    if (app_m == nullptr) return false;
+    // Pick a transport-carrying section to read BUNDLEd ICE creds + fingerprint:
+    // the data m-line if present, else the first m= section (audio/video). WM6
+    // offers (aiortc `server`) may carry only audio+video with no data channel.
+    const webrtc::SdpMedia* xport = app_m;
+    if (xport == nullptr && offer.media_count > 0) xport = &offer.media[0];
+    if (xport == nullptr) return false;
 
     // Peer ICE credentials: m-line first, then session-level (Firefox places
     // some attrs at session scope). Both ufrag and pwd are required for STUN.
-    std::string_view peer_ufrag = app_m->ice_ufrag();
-    std::string_view peer_pwd   = app_m->ice_pwd();
+    std::string_view peer_ufrag = xport->ice_ufrag();
+    std::string_view peer_pwd   = xport->ice_pwd();
     if (peer_ufrag.empty()) peer_ufrag = offer.session_attr("ice-ufrag");
     if (peer_pwd.empty())   peer_pwd   = offer.session_attr("ice-pwd");
     if (peer_ufrag.empty() || peer_pwd.empty()) return false;
 
     // Offer DTLS fingerprint: m-line first, then session-level. Used to bind the
     // peer cert at DTLS-handshake completion (the WebRTC identity check).
-    std::string_view offer_fp = app_m->fingerprint();
+    std::string_view offer_fp = xport->fingerprint();
     if (offer_fp.empty()) offer_fp = offer.session_attr("fingerprint");
     if (offer_fp.empty()) return false;
 
@@ -730,9 +746,75 @@ bool App::handle_webrtc_offer(std::string_view body, std::string& out_answer) {
         webrtc_dtls_mgr_->set_offer_fingerprint(offer_fp);
     }
 
-    // ----- Build OUR answer. -----
+    // Our host ICE candidate lines (IceCandidate::to_string form). Stored owned
+    // so the string_views handed to the answer builder outlive the call.
+    std::vector<std::string>      cand_strings;
+    std::vector<std::string_view> cand_views;
+    gather_candidate_views(cand_strings, cand_views);
+    const std::string_view* cv =
+        cand_views.empty() ? nullptr : cand_views.data();
+    const std::size_t cvn = cand_views.size();
+
+    // WM6: when media echo is enabled AND the offer carries audio/video,
+    // negotiate the media (+ data) m-lines into ONE BUNDLEd echo answer. Else
+    // fall back to the data-channel-only answer (the original behavior).
+    if (media_echo_ && build_echo_answer_for(offer, cv, cvn, out_answer)) {
+        return true;
+    }
+    return build_data_answer_for(app_m, cv, cvn, out_answer);
+}
+
+// Gather our host ICE candidate lines (IceCandidate::to_string form) into
+// `owned` + `views`. `views` references `owned`, so they share a lifetime.
+void App::gather_candidate_views(std::vector<std::string>& owned,
+                                 std::vector<std::string_view>& views) {
+    assert(webrtc_agent_ != nullptr && "gather_candidates: no agent");
+    assert(owned.empty() && views.empty() && "gather_candidates: not empty");
+    const std::size_t ncand = webrtc_agent_->candidate_count();
+    owned.reserve(ncand);
+    views.reserve(ncand);
+    for (std::size_t i = 0; i < ncand; ++i) {
+        owned.emplace_back(webrtc_agent_->candidate(i).to_string());
+    }
+    for (const std::string& s : owned) views.emplace_back(s);
+}
+
+// WM6: COMBINED media+data echo answer (audio/video sendrecv so the peer's media
+// is echoed back, + the data m-line when present), all BUNDLEd. Returns false if
+// no audio/video could be negotiated (the caller then tries the data-only path).
+bool App::build_echo_answer_for(const webrtc::SdpSession& offer,
+                                const std::string_view* cands,
+                                std::size_t ncand, std::string& out_answer) {
+    assert(webrtc_agent_ != nullptr && "echo answer: no agent");
+    assert(webrtc_dtls_ctx_ != nullptr && "echo answer: no dtls ctx");
+    webrtc::MediaNegotiation neg;
+    if (webrtc::negotiate_media(offer, neg) != webrtc::SdpError::Ok) return false;
+    if (neg.media_count == 0) return false;
+    webrtc::EchoAnswerParams ep;
+    ep.ice_ufrag          = webrtc_agent_->ufrag();
+    ep.ice_pwd            = webrtc_agent_->pwd();
+    ep.fingerprint_sha256 = webrtc_dtls_ctx_->fingerprint();
+    ep.setup              = "passive";
+    ep.ice_lite           = true;
+    ep.negotiation        = &neg;
+    const webrtc::SdpMedia* app_m = offer.application_media();
+    if (app_m != nullptr) ep.data_mid = app_m->mid();
+    ep.sctp_port        = webrtc_config_.sctp_port;
+    ep.max_message_size = webrtc_config_.max_message_size;
+    ep.candidates       = cands;
+    ep.candidate_count  = ncand;
+    return webrtc::build_echo_answer(ep, out_answer) == webrtc::SdpError::Ok;
+}
+
+// WM6: data-channel-only answer (the original behavior) for an offer with an
+// m=application section. Returns false when there is nothing to answer.
+bool App::build_data_answer_for(const webrtc::SdpMedia* app_m,
+                                const std::string_view* cands,
+                                std::size_t ncand, std::string& out_answer) {
+    assert(webrtc_agent_ != nullptr && "data answer: no agent");
+    assert(webrtc_dtls_ctx_ != nullptr && "data answer: no dtls ctx");
+    if (app_m == nullptr) return false;  // nothing we can answer
     webrtc::AnswerParams p;
-    // Echo the offer's mid so a=group:BUNDLE references the right section.
     const std::string_view offer_mid = app_m->mid();
     if (!offer_mid.empty()) p.mid = offer_mid;
     p.ice_ufrag          = webrtc_agent_->ufrag();
@@ -742,23 +824,8 @@ bool App::handle_webrtc_offer(std::string_view body, std::string& out_answer) {
     p.ice_lite           = true;         // Bolt is the ICE-lite controlled peer
     p.sctp_port          = webrtc_config_.sctp_port;
     p.max_message_size   = webrtc_config_.max_message_size;
-
-    // Our host ICE candidate lines (IceCandidate::to_string form). Stored owned
-    // so the string_views handed to build_answer outlive the call.
-    const std::size_t ncand = webrtc_agent_->candidate_count();
-    std::vector<std::string>      cand_strings;
-    std::vector<std::string_view> cand_views;
-    cand_strings.reserve(ncand);
-    cand_views.reserve(ncand);
-    for (std::size_t i = 0; i < ncand; ++i) {
-        cand_strings.emplace_back(webrtc_agent_->candidate(i).to_string());
-    }
-    for (const std::string& s : cand_strings) cand_views.emplace_back(s);
-    if (!cand_views.empty()) {
-        p.candidates      = cand_views.data();
-        p.candidate_count = cand_views.size();
-    }
-
+    p.candidates         = cands;
+    p.candidate_count    = ncand;
     return webrtc::build_answer(p, out_answer) == webrtc::SdpError::Ok;
 }
 
@@ -776,6 +843,28 @@ void App::media_deliver_trampoline(void* ctx, webrtc::MediaTrack& track,
     if (*handler != nullptr) (*handler)(track, data, len);
 }
 #endif  // BOLTAPI_WITH_WEBRTC
+
+// WM6 echo: loop one inbound RTP packet straight back out on its OWN track
+// (re-SRTP, relay, NO transcode — the aiortc `server` shape). Defined
+// UNCONDITIONALLY because enable_media_echo()'s handler lambda references it in
+// both build modes; the MediaTrack write is only reachable under
+// BOLTAPI_WITH_WEBRTC (where the SRTP transport is up). noexcept (the
+// exception-free build requires it).
+void App::echo_track(webrtc::MediaTrack& track, const std::uint8_t* rtp_data,
+                     std::size_t rtp_len) noexcept {
+    assert(rtp_data != nullptr && "echo_track: null rtp");
+    assert(rtp_len >= 12u && "echo_track: short rtp (need >= RTP header)");
+#if defined(BOLTAPI_WITH_WEBRTC)
+    // track.write -> outbound interceptors -> SRTP-protect -> UdpTransport.
+    track.write(rtp_data, rtp_len);
+#else
+    // No media transport in the default build; void all params (asserts compile
+    // out under NDEBUG, so without this they would be unreferenced — C4100).
+    (void)track;
+    (void)rtp_data;
+    (void)rtp_len;
+#endif
+}
 
 // ---------------------------------------------------------------------------
 // Lifecycle.

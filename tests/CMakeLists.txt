@@ -333,6 +333,24 @@ if(WIN32)
     target_link_libraries(boltapi_media_track_test PRIVATE ws2_32 mswsock iphlpapi)
 endif()
 
+# WM6: MEDIA ECHO — THE "AUDIO+VIDEO WORKS" PRIMARY GATE (default suite, NO
+# external deps, deadline-bounded). Our OWN stack on BOTH ends drives the REAL
+# server media-echo path end to end: a SERVER side (UdpTransport + DTLS server
+# + WebRtcPeerHub with an on_track ECHO handler — exactly App::enable_media_echo)
+# and a CLIENT side that is a REAL OpenSSL DTLS-SRTP peer (the same client as the
+# live keying gate). After a genuine DTLS-SRTP handshake the client SRTP-protects
+# audio + video RTP and sends it over real loopback UDP; the server hub
+# unprotects -> RFC5761 demux -> per-SSRC MediaTrack -> echo -> track.write ->
+# outbound interceptors -> SRTP-protect -> UDP; the client unprotects the echo
+# and asserts it is BYTE-EXACT for BOTH tracks over 40 seeded randomized rounds.
+# Proves "audio+video echo works" without aiortc. Bounded by an iteration cap +
+# a wall-clock deadline (no hang). Links OpenSSL + ws2_32/mswsock/iphlpapi (Win).
+boltapi_add_test(boltapi_media_echo_test media_echo_test.cpp)
+target_link_libraries(boltapi_media_echo_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+if(WIN32)
+    target_link_libraries(boltapi_media_echo_test PRIVATE ws2_32 mswsock iphlpapi)
+endif()
+
 # M3: HTTP/3 + WebRTC seam — ProtocolRegistry mechanism (register/has/create),
 # a dummy IProtocol returning NotImplemented, and (when the compile flags are
 # ON) the real H3/WebRTC stub factories registering. Flag-AWARE: passes in the

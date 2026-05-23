@@ -67,14 +67,24 @@
       (two tracks audio+video distinct SSRCs, 64 seeded randomized rounds
       byte-exact; sequence-gap → parseable Generic NACK; reporter tick →
       parseable SR/RR compound). Deadline-bounded, default suite.
-- [ ] Echo example: receive a track, loop its RTP back out (re-SRTP) — the aiortc
-      `server` shape. Wire into the demo server. (WM6 — the pipeline is ready;
-      `on_track` handlers can already echo via `track.write`.)
+- [x] Echo example: receive a track, loop its RTP back out (re-SRTP) — the aiortc
+      `server` shape. `App::enable_media_echo()` installs an on_track handler that
+      `track.write`s every inbound RTP straight back out (relay, NO transcode);
+      signaling answers the offered audio/video m-lines sendrecv (+ data m-line
+      when present) via `webrtc::build_echo_answer`. Wired into the demo server
+      (`examples/demo_server.cpp`). PRIMARY GATE `tests/media_echo_test.cpp`
+      (default suite, no aiortc): a REAL DTLS-SRTP client sends audio+video RTP
+      through the production `WebRtcPeerHub` echo path; echoed RTP BYTE-EXACT for
+      BOTH tracks over 40 seeded randomized rounds, deadline-bounded.
 
 ## Phase M6 — Interop + perf
-- [ ] aiortc interop (via `uv run --with aiortc`): the `server`/`videostream`/
-      `webcam` shapes — send audio+video to Bolt, get the echo. Browser
-      `getUserMedia` test page in `testing/web/`.
+- [x] aiortc interop (via `uv run --with aiortc --with numpy --with av`): the
+      `server` shape — aiortc sends a synthetic audio+video track to Bolt and
+      gets the echo (`tests/interop/aiortc_media.py` + bounded `AiortcMediaInterop`
+      gtest, WEBRTC=ON, PASSES vs aiortc 1.14). Browser `getUserMedia` page
+      `testing/web/media.html`. All interop legs run through the no-stall runner
+      `tests/interop/bounded_proc.h` (hard timeout + WHOLE-tree kill; can never
+      hang/leak — proven). (`videostream`/`webcam` shapes: later.)
 - [ ] Perf: SRTP on the I/O thread (inline), batched recv, zero-copy RTP via
       bolt::wire, per-SSRC SwissTable; no per-packet malloc.
 
