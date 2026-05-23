@@ -30,3 +30,6 @@ demo_server.log
 demo_server.out
 ctest_*.txt
 testing/**/__pycache__/
+
+# Agent worktrees
+/.worktrees/

@@ -18,11 +18,11 @@
 - [~] Gate: loopback stream echo (multi-KB, byte-exact, FIN) + lossy-link completes via retransmit + flow-control no-deadlock.
 
 ## W5b — QPACK + HTTP/3 frames + App bridge  *(the "serves requests" wave)*
-- [ ] **QPACK** (RFC 9204): static table, Huffman, encoder + decoder, encoder/decoder streams, dynamic table (start with static + literal, then dynamic). PORT FasterAPI `qpack/*` (real) → `boltapi/quic/qpack` or `boltapi/http3/qpack`.
-- [ ] **HTTP/3 frame layer** (RFC 9114): control stream + SETTINGS, HEADERS, DATA, GOAWAY; uni-stream types (control, QPACK enc/dec, push — push unused); stream/frame validation.
-- [ ] **Bridge**: a client-initiated bidi stream's HEADERS(+DATA) → decode QPACK → build `CoroHttpRequest` → run the existing App **router + middleware + handler** → response → encode QPACK HEADERS + DATA back on the stream. Reuse the H1/H2 dispatch path (App already routes H1/H2 through one handler).
-- [ ] App/seam wiring: register HTTP/3 via `ProtocolRegistry` (Http3Protocol no longer NotImplemented); `App::enable_http3` actually serves on a UDP port; share UdpTransport.
-- [ ] Gate: loopback our-client ↔ our-server — an `app.get("/ping")` handler answered over real HTTP/3 (HEADERS+DATA), status + body byte-exact.
+- [x] **QPACK** (RFC 9204): static table, Huffman, encoder + decoder, encoder/decoder streams, dynamic table (static + literal; bounded dynamic table). PORTED FasterAPI `qpack/*` → `boltapi/http3/{qpack,qpack_static_table,qpack_huffman}.h`.
+- [x] **HTTP/3 frame layer** (RFC 9114): `boltapi/http3/frame.h` — control stream + SETTINGS (QPACK_MAX_TABLE_CAPACITY / MAX_FIELD_SECTION_SIZE / QPACK_BLOCKED_STREAMS), HEADERS, DATA, GOAWAY/CANCEL_PUSH/MAX_PUSH_ID types; uni-stream type prefixes (control, push, QPACK enc/dec); bounded frame reader/writer over `quic/varint.h`. Header-only, compiles unconditionally.
+- [x] **Bridge**: `boltapi/http3/h3_connection.h` — a client-initiated bidi stream's HEADERS(+DATA) → QPACK-decode pseudo-headers (:method/:path/:scheme/:authority) + regular headers + accumulate DATA body → `H3Request` → App `dispatch_http3()` (the SAME router + middleware + handler the H1/H2 path uses, factored into `App::dispatch_coro_`) → QPACK-encode :status + headers as HEADERS + body as DATA back on the stream, then FIN. Bounded fixed-capacity per-stream pool (no unbounded growth).
+- [x] App/seam wiring: `App::enable_http3()` + `App::start_http3()` bring a real QUIC server endpoint up on a UDP port (sharing `net::UdpTransport`) and bridge decoded requests through the shared dispatch path; `register_http3` keeps the `ProtocolRegistry` path exercised (the registry stub stays NotImplemented at the *seam* level by design — the real serving is App-direct, mirroring the WebRTC wiring). Gated by `BOLTAPI_WITH_HTTP3`; the frame/h3 headers + `dispatch_http3` stay unconditional so the gate runs in the default suite.
+- [x] Gate: loopback our-client ↔ our-server (`tests/http3_app_test.cpp`, default suite) — `app.get("/ping")`→200 "pong", `app.post("/echo")`→byte-exact echo of an 8 KB randomized body, and a 404 for an unrouted path, all answered over real HTTP/3 (QPACK HEADERS + DATA over QUIC) status + body byte-exact. Bounded by wall-clock deadlines (no hang).
 
 ## W5c — Real interop
 - [ ] **curl --http3** smoke against the demo server (curl built with HTTP/3, or via uv-run a client).

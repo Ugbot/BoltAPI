@@ -233,59 +233,96 @@ void App::build_dispatch() {
     }
 
     // The single dispatch handler. Captures `this`; App outlives the server
-    // (server_ is owned by App and stopped in stop()/dtor).
+    // (server_ is owned by App and stopped in stop()/dtor). The body lives in
+    // dispatch_coro_ so the HTTP/3 path (dispatch_http3) reuses it verbatim.
     App* self = this;
     server_->set_handler(
         [self](const http::CoroHttpRequest& creq)
             -> core::coro_task<http::CoroHttpResponse> {
             assert(self != nullptr);
             assert(self->router_ != nullptr);
-
-            http::CoroHttpResponse cresp;
-            cresp.status = 200;
-            cresp.status_message = "OK";
-
-            // Path component only (router matches on path; query stripped).
-            std::string_view target(creq.path);
-            const std::size_t qm = target.find('?');
-            const std::string_view match_path =
-                (qm == std::string_view::npos) ? target : target.substr(0, qm);
-
-            const Method method = method_from(creq.method);
-            MatchResult mr;
-            if (method != Method::Unknown) {
-                mr = self->router_->match(method, match_path);
-            }
-
-            if (!mr.matched()) {
-                // No route. 404. (405 is a documented optional for v1.)
-                cresp.status = 404;
-                cresp.status_message = "Not Found";
-                cresp.headers.set("Content-Type", "text/plain; charset=utf-8");
-                cresp.body = "Not Found";
-                co_return cresp;
-            }
-
-            const std::size_t idx =
-                (mr.route_id < self->route_id_to_index_.size())
-                    ? self->route_id_to_index_[mr.route_id]
-                    : self->routes_.size();
-            if (idx >= self->routes_.size()) {
-                cresp.status = 500;
-                cresp.status_message = "Internal Server Error";
-                cresp.body = "route table desync";
-                co_return cresp;
-            }
-
-            Request  req(creq, mr.params, mr.param_count);
-            Response res(cresp);
-
-            co_await self->run_chain(idx, req, res);
-
-            // Ensure the reason phrase tracks any status set via raw mutation.
-            cresp.status_message = Response::reason_phrase(cresp.status);
-            co_return cresp;
+            co_return co_await self->dispatch_coro_(creq);
         });
+}
+
+// ---------------------------------------------------------------------------
+// dispatch_coro_ — the shared match -> chain -> response coroutine. Reused by
+// both the engine handler (H1/H2) and the synchronous HTTP/3 entry so all three
+// protocols traverse the SAME router + middleware + handler path.
+// ---------------------------------------------------------------------------
+core::coro_task<http::CoroHttpResponse> App::dispatch_coro_(
+    const http::CoroHttpRequest& creq) const {
+    assert(router_ != nullptr);
+    assert(route_id_to_index_.size() >= routes_.size() ||
+           route_id_to_index_.empty());
+
+    http::CoroHttpResponse cresp;
+    cresp.status = 200;
+    cresp.status_message = "OK";
+
+    // Path component only (router matches on path; query stripped).
+    std::string_view target(creq.path);
+    const std::size_t qm = target.find('?');
+    const std::string_view match_path =
+        (qm == std::string_view::npos) ? target : target.substr(0, qm);
+
+    const Method method = method_from(creq.method);
+    MatchResult mr;
+    if (method != Method::Unknown) {
+        mr = router_->match(method, match_path);
+    }
+
+    if (!mr.matched()) {
+        cresp.status = 404;
+        cresp.status_message = "Not Found";
+        cresp.headers.set("Content-Type", "text/plain; charset=utf-8");
+        cresp.body = "Not Found";
+        co_return cresp;
+    }
+
+    const std::size_t idx = (mr.route_id < route_id_to_index_.size())
+                                ? route_id_to_index_[mr.route_id]
+                                : routes_.size();
+    if (idx >= routes_.size()) {
+        cresp.status = 500;
+        cresp.status_message = "Internal Server Error";
+        cresp.body = "route table desync";
+        co_return cresp;
+    }
+
+    Request  req(creq, mr.params, mr.param_count);
+    Response res(cresp);
+
+    co_await run_chain(idx, req, res);
+
+    cresp.status_message = Response::reason_phrase(cresp.status);
+    co_return cresp;
+}
+
+// ---------------------------------------------------------------------------
+// dispatch_http3 — synchronous bridge entry. Drives the (lazy) dispatch
+// coroutine to completion inline and returns the response. The App's sync
+// handlers run inline (initial_suspend is suspend_always; the first resume runs
+// the fully-synchronous chain through co_return), so one resume completes it.
+// TigerStyle: asserts the router is built + the coroutine completes; no throw.
+// ---------------------------------------------------------------------------
+http::CoroHttpResponse App::dispatch_http3(const http::CoroHttpRequest& req) {
+    assert(router_ != nullptr && "dispatch_http3 before build_dispatch");
+    assert(started_ && "dispatch_http3 before start");
+
+    core::coro_task<http::CoroHttpResponse> task = dispatch_coro_(req);
+    // Take ownership of the typed handle so we can read the promise value and
+    // destroy the frame deterministically (the task no longer owns it).
+    auto handle = task.release();
+    assert(handle && "dispatch coroutine has no handle");
+    if (!handle.done()) {
+        handle.resume();  // sync chain runs to co_return in one resume
+    }
+    assert(handle.done() && "HTTP/3 dispatch did not complete synchronously");
+
+    http::CoroHttpResponse resp = std::move(handle.promise().value());
+    handle.destroy();
+    return resp;
 }
 
 // ---------------------------------------------------------------------------
@@ -317,25 +354,10 @@ void App::init_protocol_seams() {
 
     if (config_.enable_http3) {
 #if defined(BOLTAPI_WITH_HTTP3)
+        // Keep the protocol-registry path exercised (the seam stays honest).
         const proto::Status reg = proto::register_http3(registry);
-        if (reg.is_ok() && registry.has(proto::ProtocolId::Http3)) {
-            std::unique_ptr<proto::IProtocol> h3 =
-                registry.create(proto::ProtocolId::Http3);
-            assert(h3 != nullptr);
-            const uint16_t udp_port =
-                config_.http3_port != 0 ? config_.http3_port
-                                        : config_.server.http1_port;
-            transport::UdpTransport udp(
-                transport::Endpoint{config_.server.host, udp_port});
-            // Stub serve() returns NotImplemented; log it and move on.
-            const proto::Status served = h3->serve(udp);
-            if (proto::is_not_implemented(served)) {
-                std::fprintf(stderr,
-                    "[boltapi] HTTP/3 enabled but not yet implemented "
-                    "(seam stub on UDP :%u); continuing with HTTP/1.1+HTTP/2.\n",
-                    static_cast<unsigned>(udp_port));
-            }
-        }
+        (void)reg;
+        start_http3();  // W5b: a REAL QUIC/HTTP3 server endpoint over UDP.
 #else
         std::fprintf(stderr,
             "[boltapi] Config.enable_http3=true ignored: built without "
@@ -496,6 +518,122 @@ void App::init_protocol_seams() {
     }
 }
 
+#if defined(BOLTAPI_WITH_HTTP3)
+// ---------------------------------------------------------------------------
+// start_http3 — W5b: stand up a real QUIC server endpoint on the HTTP/3 UDP
+// port and bridge decoded HTTP/3 requests to the SAME dispatch path H1/H2 use.
+//
+// A net::UdpTransport binds the port (sharing the engine's IODispatcher). Its
+// datagram handler feeds the owning QuicConnection (server role) under a mutex;
+// the QuicConnection's send fn pushes datagrams back to the last seen peer. An
+// H3Connection bridges: once 1-RTT keys are up it opens its control/QPACK uni
+// streams + SETTINGS; per inbound request it builds a CoroHttpRequest, runs
+// dispatch_http3(), and sends the CoroHttpResponse back over the stream. Single
+// active peer (v1). Never touches the H1/H2 server.
+// ---------------------------------------------------------------------------
+void App::start_http3() {
+    assert(config_.enable_http3 && "start_http3 without enable_http3");
+    assert(http3_conn_ == nullptr && "start_http3 called twice");
+
+    const uint16_t udp_port = config_.http3_port != 0 ? config_.http3_port
+                                                      : config_.server.http1_port;
+    http3_transport_ = std::make_unique<net::UdpTransport>();
+    if (!http3_transport_->bind(config_.server.host.c_str(), udp_port)) {
+        std::fprintf(stderr,
+            "[boltapi] HTTP/3: failed to bind UDP :%u; H3 not started. "
+            "H1/H2 unaffected.\n", static_cast<unsigned>(udp_port));
+        http3_transport_.reset();
+        return;
+    }
+
+    http3_quic_ = std::make_unique<quic::QuicConnection>();
+    http3_conn_ = std::make_unique<http3::H3Connection>();
+
+    // The server's outbound send fn targets the last peer that reached us. The
+    // peer address is captured by the datagram handler before feed_datagram.
+    auto peer = std::make_shared<sockaddr_storage>();
+    auto peer_len = std::make_shared<int>(0);
+    net::UdpTransport* tp = http3_transport_.get();
+    auto send_fn = [tp, peer, peer_len](const std::uint8_t* d, std::size_t n) {
+        if (*peer_len <= 0) return;
+        tp->send(reinterpret_cast<const sockaddr*>(peer.get()), *peer_len, d, n);
+    };
+    if (!http3_quic_->init(/*is_server=*/true, send_fn)) {
+        std::fprintf(stderr, "[boltapi] HTTP/3: QUIC init failed; H3 not started.\n");
+        http3_conn_.reset(); http3_quic_.reset(); http3_transport_.reset();
+        return;
+    }
+
+    http3_conn_->attach(*http3_quic_, /*is_server=*/true);
+    App* self = this;
+    http3::H3Connection* h3 = http3_conn_.get();
+    http3_conn_->set_request_handler([self, h3](const http3::H3Request& r) {
+        self->serve_http3_request(*h3, r);
+    });
+
+    quic::QuicConnection* qc = http3_quic_.get();
+    http3::H3Connection* hc = http3_conn_.get();
+    std::mutex* mtx = &http3_mtx_;
+    http3_transport_->set_datagram_handler(
+        [qc, hc, peer, peer_len, mtx](const sockaddr* p, int plen,
+                                      const std::uint8_t* d, std::size_t n) {
+            std::lock_guard<std::mutex> lk(*mtx);
+            if (p != nullptr && plen > 0 &&
+                plen <= static_cast<int>(sizeof(sockaddr_storage))) {
+                std::memcpy(peer.get(), p, static_cast<std::size_t>(plen));
+                *peer_len = plen;
+            }
+            qc->feed_datagram(d, n);
+            if (qc->one_rtt_keys_ready()) hc->send_settings();
+        });
+    http3_transport_->start();
+
+    std::fprintf(stderr,
+        "[boltapi] HTTP/3: QUIC server up on UDP :%u (ALPN h3); requests bridge "
+        "to the shared App dispatch path. H1/H2 unaffected.\n",
+        static_cast<unsigned>(http3_transport_->bound_port()));
+}
+
+// ---------------------------------------------------------------------------
+// serve_http3_request — build a CoroHttpRequest from a decoded H3Request, route
+// it through dispatch_http3(), and send the response back over the H3 stream.
+// Bounded: header views are copied into a stable per-call store (the H3 request
+// views borrow QPACK/stream storage; CoroHttpRequest holds views, so the bytes
+// must outlive the dispatch call). TigerStyle: asserts, no exceptions.
+// ---------------------------------------------------------------------------
+void App::serve_http3_request(http3::H3Connection& h3,
+                              const http3::H3Request& r) {
+    assert(started_ && "serve_http3_request before start");
+    assert(r.method.size() <= 16 && "implausible HTTP method");
+
+    http::CoroHttpRequest creq;
+    creq.method = r.method;
+    creq.path   = r.path;
+    creq.body   = std::string_view(reinterpret_cast<const char*>(r.body),
+                                   r.body_len);
+    for (std::size_t i = 0; i < r.header_count &&
+                            i < http::CoroHttpRequest::MAX_HEADERS; ++i) {
+        creq.add_header(r.headers[i].name, r.headers[i].value);
+    }
+
+    http::CoroHttpResponse resp = dispatch_http3(creq);
+
+    // Marshal response headers into the H3 send shape (views into resp storage).
+    http3::H3ResponseHeader hdrs[http::CoroResponseHeaders::MAX_RESPONSE_HEADERS];
+    std::size_t hc = 0;
+    for (const auto& e : resp.headers) {
+        if (hc >= http::CoroResponseHeaders::MAX_RESPONSE_HEADERS) break;
+        hdrs[hc].name  = e.name;
+        hdrs[hc].value = e.value;
+        ++hc;
+    }
+    const std::uint8_t* body =
+        reinterpret_cast<const std::uint8_t*>(resp.body.data());
+    (void)h3.send_response(r.stream_id, resp.status, hdrs, hc, body,
+                           resp.body.size());
+}
+#endif  // BOLTAPI_WITH_HTTP3
+
 #if defined(BOLTAPI_WITH_WEBRTC)
 // ---------------------------------------------------------------------------
 // handle_webrtc_offer — the signaling exchange (offer parse -> stack config ->
@@ -639,6 +777,16 @@ void App::stop() {
     if (server_ && started_) {
         server_->stop();
     }
+#if defined(BOLTAPI_WITH_HTTP3)
+    // Stop the HTTP/3 receive loop + close the UDP socket BEFORE freeing the
+    // QUIC/H3 state (the connection's send fn uses the transport). Idempotent.
+    if (http3_transport_) {
+        http3_transport_->stop();
+    }
+    http3_conn_.reset();   // bridge (borrows the QuicConnection)
+    http3_quic_.reset();   // QUIC endpoint (TLS/keys)
+    http3_transport_.reset();
+#endif
 #if defined(BOLTAPI_WITH_WEBRTC)
     // Clean WebRTC teardown: stop the receive loop + close the UDP socket BEFORE
     // freeing the DTLS sessions (the manager's sessions send through the

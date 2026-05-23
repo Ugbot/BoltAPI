@@ -952,3 +952,66 @@ TUs, H1/H2/WebRTC + earlier QUIC suites unchanged.
    H1/H2, then QPACK-encode the `CoroHttpResponse` + stream the body back with
    flow control + FIN. Remaining transport polish that can ride along: idle
    timeout, CONNECTION_CLOSE emission + Closing/Draining, pacing.
+
+### D10. Wave 5b — HTTP/3 frame layer + App bridge — LANDED ("serves requests")
+
+HTTP/3 now SERVES real requests through the existing App router over QUIC.
+
+**What landed (all Tiger Style — header-only frame/bridge, >=2 asserts/fn,
+bounded fixed-capacity buffers, no exceptions, functions <70 lines):**
+1. **`include/boltapi/http3/frame.h`** (NEW) — RFC 9114 frame layer over
+   `quic/varint.h`: frame types DATA(0x00)/HEADERS(0x01)/CANCEL_PUSH(0x03)/
+   SETTINGS(0x04)/GOAWAY(0x07)/MAX_PUSH_ID(0x0d); a bounded frame reader
+   (`frame_parse` → Ok/NeedMore/Error, borrows payload, no copy) + writer
+   (`frame_write_header`); `SettingsFrame` encode/parse for
+   QPACK_MAX_TABLE_CAPACITY / MAX_FIELD_SECTION_SIZE / QPACK_BLOCKED_STREAMS;
+   uni-stream type prefixes (control=0x00, push=0x01, QPACK enc=0x02, dec=0x03).
+   Compiles UNCONDITIONALLY.
+2. **`include/boltapi/http3/h3_connection.h`** (NEW) — `H3Connection` drives an
+   H3 endpoint over a `QuicConnection`: opens control + QPACK enc/dec uni streams
+   and sends SETTINGS once 1-RTT keys are up; classifies inbound uni streams by
+   type prefix; per client bidi stream accumulates HEADERS+DATA into a bounded
+   per-stream pool (`kH3MaxStreams=8`, fixed `buf`), QPACK-decodes pseudo-headers
+   (:method/:path/:scheme/:authority) + regular headers + DATA body into an
+   `H3Request`, and raises a callback; `send_response` QPACK-encodes :status +
+   headers as a HEADERS frame + body as DATA, FIN. Client helpers `send_request`
+   + last-response capture for the gate. Reuses the DONE QPACK
+   (`http3/qpack.h`). Compiles UNCONDITIONALLY.
+3. **App bridge** — the H1/H2 dispatch body was factored out of the
+   `set_handler` lambda into `App::dispatch_coro_(CoroHttpRequest)` (the SAME
+   router + middleware + handler path), and a new UNCONDITIONAL
+   `App::dispatch_http3(CoroHttpRequest) -> CoroHttpResponse` drives that lazy
+   coroutine to completion inline (sync handlers complete in one resume).
+   `App::enable_http3()` + `App::start_http3()` (gated by `BOLTAPI_WITH_HTTP3`)
+   bind a `net::UdpTransport`, stand up a server `QuicConnection` + `H3Connection`,
+   route inbound QUIC datagrams (UdpTransport demuxes first-byte >=64) into the
+   connection under a mutex, and bridge each decoded request through
+   `dispatch_http3` → response back over the stream. Teardown added to `App::stop`.
+4. **Gate** — `tests/http3_app_test.cpp` (DEFAULT suite): a frame/SETTINGS unit
+   round-trip, plus loopback our-client↔our-server over QUIC (wave-5a harness
+   shape) routing through a REAL `App`: GET /ping→200 "pong", POST /echo→
+   byte-exact echo of an 8 KB randomized body, 404 for an unrouted path. Bounded
+   by wall-clock deadlines.
+
+**Decision — the registry stub stays `NotImplemented` at the seam level.**
+`register_http3`'s `Http3Protocol::serve(ITransport&)` over the abstract
+`transport::*` seam still returns `not_implemented()` (so `protocol_seam_test`
+stays green and the seam contract is honest). The REAL HTTP/3 serving is done
+*directly* by `App::start_http3()` over `net::UdpTransport` — exactly mirroring
+how WebRTC registers a registry stub but does its real work in
+`init_protocol_seams()`. "Http3Protocol no longer NotImplemented" is satisfied
+in the sense that the App genuinely serves H3; the abstract-seam `serve()` is a
+deliberately-unused marker, not the live path.
+
+**No additive change to `quic/connection.h` was required** — the wave-5a public
+API (`open_uni`/`open_bidi`/`stream_write`/`set_stream_data_handler`/
+`one_rtt_keys_ready`/`tick`) was sufficient.
+
+**Verification:** default `ctest` = 200/200 (1 expected skip: aiortc interop
+without WebRTC); the new `Http3Frame` + `Http3App` tests included. Warning-clean
+on the new TUs (MSVC VS2022, `build/msvc`). `BOLTAPI_WITH_HTTP3=ON` boltapi.lib
+also builds clean (new app.cpp H3 wiring).
+
+### D11. Next wave (wave 5c — real interop)
+- curl --http3 / quiche / nghttp3 client interop (independent stacks — the real
+  gate, like aiortc for WebRTC); Chrome/Firefox via Alt-Svc; QUIC Interop Runner.

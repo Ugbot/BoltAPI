@@ -244,6 +244,24 @@ endif()
 # bounded dynamic table. RFC 7541 C.4.1 Huffman vector byte-exact + round-trips.
 boltapi_add_test(boltapi_qpack_test qpack_test.cpp)
 
+# Wave 5b: HTTP/3 FRAME LAYER + APP BRIDGE — THE "SERVES REQUESTS" GATE. UNIT:
+# RFC 9114 §7.1 frame header round-trip + truncation (NeedMore) + SETTINGS
+# (RFC 9114 §7.2.4 / RFC 9204 §5) encode/parse. GATE (loopback our-client <->
+# our-server over QUIC after a real handshake): an H3Connection (frame.h +
+# h3_connection.h) bridges decoded bidi-stream requests through a REAL App's
+# shared dispatch path (router + middleware + handler) and sends the response
+# back as HEADERS(:status)+DATA+FIN. Exercises >1 route + >1 verb + randomized
+# input: GET /ping->200 "pong", POST /echo <8KB random>-> byte-exact echo, and a
+# 404 for an unrouted path. Bounded by wall-clock deadlines (no hang). frame.h /
+# h3_connection.h compile unconditionally + App::dispatch_http3 is unconditional,
+# so this runs in the DEFAULT suite (no BOLTAPI_WITH_HTTP3 flag). OpenSSL +
+# ws2_32/mswsock/iphlpapi on Windows.
+boltapi_add_test(boltapi_http3_app_test http3_app_test.cpp)
+target_link_libraries(boltapi_http3_app_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+if(WIN32)
+    target_link_libraries(boltapi_http3_app_test PRIVATE ws2_32 mswsock iphlpapi)
+endif()
+
 # WebRTC RTP/RTCP codec (RFC 3550/8285 + SR/RR/SDES/BYE/NACK/PLI/FIR/REMB/TWCC).
 boltapi_add_test(boltapi_rtp_test rtp_test.cpp)
 

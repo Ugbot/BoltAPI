@@ -43,6 +43,13 @@
 #include "boltapi/webrtc/peer_hub.h"
 #endif
 
+#if defined(BOLTAPI_WITH_HTTP3)
+#include "boltapi/net/udp_transport.h"
+#include "boltapi/quic/connection.h"
+#include "boltapi/http3/h3_connection.h"
+#include <mutex>
+#endif
+
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -254,6 +261,30 @@ public:
         return *this;
     }
 
+    // -----------------------------------------------------------------------
+    // HTTP/3 (W5b). enable_http3() turns on the HTTP/3 surface; when the build
+    // has BOLTAPI_WITH_HTTP3, init_protocol_seams() brings a real QUIC endpoint
+    // up on a UDP port (sharing net::UdpTransport) and serves decoded HTTP/3
+    // requests through the SAME dispatch path as H1/H2. Purely additive: it never
+    // touches the H1/H2 serving path. Returns *this for chaining.
+    // -----------------------------------------------------------------------
+    App& enable_http3(uint16_t udp_port = 0) {
+        assert(!started_);
+        config_.enable_http3 = true;
+        if (udp_port != 0) config_.http3_port = udp_port;
+        return *this;
+    }
+
+    // Synchronous dispatch entry: route a CoroHttpRequest through the SAME
+    // router + middleware + handler the H1/H2 path uses and return the filled
+    // CoroHttpResponse. Drives the (lazy) dispatch coroutine to completion inline
+    // — the App's sync handlers run inline, so one resume completes the chain.
+    // Unconditional (no BOLTAPI_WITH_HTTP3 gate) so the W5b gate test can route
+    // HTTP/3 requests through the App in the default suite. Must be called after
+    // build_dispatch() (i.e. after run/start_background). TigerStyle: bounded,
+    // asserts the router is built, no exceptions.
+    http::CoroHttpResponse dispatch_http3(const http::CoroHttpRequest& req);
+
     // Register a data-channel message handler for a given label, mirroring the
     // websocket(...) registration shape. The handler is recorded now and will
     // be invoked by the data-channel layer once the transport is implemented.
@@ -414,6 +445,17 @@ private:
     // from run/start_background after build_dispatch().
     void init_protocol_seams();
 
+#if defined(BOLTAPI_WITH_HTTP3)
+    // W5b: bring a real QUIC server endpoint up on the HTTP/3 UDP port, bridge
+    // decoded HTTP/3 requests to dispatch_http3(). Called from init_protocol_
+    // seams() under BOLTAPI_WITH_HTTP3. Never touches the H1/H2 server.
+    void start_http3();
+
+    // Build a CoroHttpRequest from a decoded H3Request, route it through
+    // dispatch_http3(), and send the response back over the H3 stream.
+    void serve_http3_request(http3::H3Connection& h3, const http3::H3Request& r);
+#endif
+
 #if defined(BOLTAPI_WITH_WEBRTC)
     // WebRTC signaling: parse the peer OFFER SDP (raw body or JSON {"sdp":...}),
     // configure the live ICE/DTLS stack for that peer (expected remote ufrag/pwd,
@@ -427,6 +469,13 @@ private:
     // Run the middleware chain for one matched route, terminal = handler.
     core::coro_task<void> run_chain(std::size_t route_index,
                                     Request& req, Response& res) const;
+
+    // The shared dispatch coroutine: match -> Request/Response -> middleware
+    // chain -> handler -> CoroHttpResponse. Used by BOTH the engine handler
+    // (set_handler in build_dispatch) and the synchronous HTTP/3 entry
+    // (dispatch_http3). Defined in app.cpp.
+    core::coro_task<http::CoroHttpResponse> dispatch_coro_(
+        const http::CoroHttpRequest& creq) const;
 
     Config config_;
 
@@ -463,6 +512,18 @@ private:
     // Created in init_protocol_seams() after the DTLS manager; torn down before
     // the DTLS manager in stop().
     std::unique_ptr<webrtc::WebRtcPeerHub>      webrtc_hub_;
+#endif
+
+#if defined(BOLTAPI_WITH_HTTP3)
+    // HTTP/3 (W5b): a real QUIC server endpoint over a shared net::UdpTransport.
+    // init_protocol_seams() binds the UDP socket, routes inbound QUIC datagrams
+    // (first byte >= 64, demuxed by UdpTransport) into the QuicConnection, and an
+    // H3Connection bridges decoded requests to dispatch_http3(). Single-peer (v1),
+    // serialized by h3_mtx_. Torn down before the transport in stop().
+    std::unique_ptr<net::UdpTransport>     http3_transport_;
+    std::unique_ptr<quic::QuicConnection>  http3_quic_;
+    std::unique_ptr<http3::H3Connection>   http3_conn_;
+    std::mutex                             http3_mtx_;
 #endif
 
     std::unique_ptr<Router>                   router_;
