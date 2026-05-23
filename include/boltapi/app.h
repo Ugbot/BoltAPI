@@ -88,6 +88,19 @@ struct WebRtcConfig {
     // Advertise a=ice-lite in the answer (server-side answerer optimisation).
     bool        ice_lite     = false;
 
+    // WI — Full ICE (RFC 8445). When set, the App also stands up a FullIceAgent
+    // (controlled role by default: the browser/offerer is controlling) alongside
+    // the ice-lite responder, enabling bidirectional connectivity checks, trickle
+    // candidate intake, and ICE restart. The ice-lite responder stays wired so
+    // the existing live-STUN path and ice-lite peers keep working.
+    bool        full_ice     = false;
+
+    // WI — Trickle ICE (RFC 8838). HTTP signaling route for INCREMENTAL remote
+    // candidates POSTed after the offer/answer. Accepts the RTCIceCandidateInit
+    // JSON envelope {"candidate":"candidate:...","sdpMid":"0","sdpMLineIndex":0}
+    // (or a bare candidate line / "end-of-candidates"). Empty disables the route.
+    std::string trickle_path = "/webrtc/candidate";
+
     // SCTP association parameters surfaced into the SDP answer.
     uint16_t    sctp_port        = 5000;
     uint32_t    max_message_size = 262144;
@@ -525,6 +538,14 @@ private:
     // the WebRTC transport isn't up. Defined in app.cpp. Single active peer (v1).
     bool handle_webrtc_offer(std::string_view body, std::string& out_answer);
 
+    // WI — Trickle ICE (RFC 8838): ingest ONE incremental remote candidate (or
+    // an end-of-candidates signal) POSTed after the offer/answer. Parses the
+    // RTCIceCandidateInit JSON envelope / bare candidate line, feeds the
+    // candidate to the FullIceAgent (when full_ice) so a new pair is formed +
+    // checked. Returns false (no transport / malformed) without crashing.
+    // Defined in app.cpp.
+    bool handle_webrtc_trickle(std::string_view body) noexcept;
+
     // WM6: build the COMBINED media+data echo answer for a parsed offer (when
     // enable_media_echo() is set and the offer carries audio/video). `cands` are
     // our host ICE candidate lines. Returns false if no media negotiated (caller
@@ -544,6 +565,11 @@ private:
     // lives. Keeps handle_webrtc_offer small. Defined in app.cpp.
     void gather_candidate_views(std::vector<std::string>& owned,
                                 std::vector<std::string_view>& views);
+
+    // WI — register OUR gathered host candidates as the FullIceAgent's LOCAL
+    // candidates (idempotent: only runs once, when full_ice + the agent exist).
+    // The send-base is the WebRTC UDP socket. Defined in app.cpp. noexcept.
+    void register_local_ice_candidates() noexcept;
 
     // WM5: the C-style deliver trampoline bound as each MediaTrack's deliver
     // sink. `ctx` is &track_handler_ (a stable MediaTrackHandler*); it forwards
@@ -604,6 +630,11 @@ private:
     // None of this touches the H1/H2 server.
     std::unique_ptr<net::UdpTransport>   webrtc_transport_;
     std::unique_ptr<webrtc::IceAgent>    webrtc_agent_;
+    // WI — Full ICE (RFC 8445). Created in init_protocol_seams() when
+    // WebRtcConfig::full_ice is set: a FullIceAgent (controlled role) running
+    // bidirectional connectivity checks + trickle candidate intake alongside the
+    // ice-lite responder. The STUN handler routes inbound checks to BOTH agents.
+    std::unique_ptr<webrtc::FullIceAgent> webrtc_full_ice_;
     // DTLS server (answerer, setup:passive): a shared context (self-signed cert
     // + SHA-256 fingerprint for the SDP a=fingerprint) and a per-peer session
     // manager wired as the transport's datagram handler (first byte 20..63).

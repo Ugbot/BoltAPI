@@ -200,5 +200,215 @@ private:
     std::uint64_t tx_errors_    = 0;
 };
 
+// ============================================================================
+// FULL ICE (RFC 8445) — controlling + controlled, connectivity checks in BOTH
+// directions, candidate pairs + checklist with pair states, role-conflict
+// resolution (tie-breaker), nomination, trickle, and ICE restart.
+//
+// This is an OPTION alongside IceAgent (ice-lite). Where IceAgent only RESPONDS
+// to inbound Binding Requests, FullIceAgent ALSO generates Binding Requests
+// (connectivity checks) toward remote candidates and tracks the per-pair state
+// machine until a pair is nominated + valid.
+//
+// TigerStyle: fixed-capacity candidate/pair tables (kMaxCandidates/kMaxPairs),
+// bounded check pacing, no recursion, no exceptions, allocation-light (the only
+// std::string is the credentials + candidate addresses, built at gather time).
+// ============================================================================
+
+inline constexpr std::size_t kMaxCandidates = 16;  // remote candidates we track
+inline constexpr std::size_t kMaxPairs      = 64;  // checklist capacity (bounded)
+
+// RFC 8445 §6.1.2.6 candidate-pair state.
+enum class PairState : std::uint8_t {
+    Frozen     = 0,
+    Waiting    = 1,
+    InProgress = 2,
+    Succeeded  = 3,
+    Failed     = 4,
+};
+
+// RFC 8445 §5.2 agent role.
+enum class IceRole : std::uint8_t { Controlling = 0, Controlled = 1 };
+
+// A remote candidate (parsed from SDP / trickle), with a resolved sockaddr so
+// connectivity checks can sendto it without re-parsing on the hot path.
+struct RemoteCandidate {
+    IceCandidate     cand{};
+    sockaddr_storage addr{};
+    int              addr_len = 0;
+    bool             used     = false;
+};
+
+// A local candidate paired against remotes (host/srflx/relay; addr resolved).
+struct LocalCandidate {
+    IceCandidate     cand{};
+    sockaddr_storage base{};      // the base transport address we send FROM
+    int              base_len = 0;
+    bool             used     = false;
+};
+
+// One candidate pair (RFC 8445 §6.1.2): local x remote + state + priority.
+struct CandidatePair {
+    std::size_t  local_idx  = 0;
+    std::size_t  remote_idx = 0;
+    std::uint64_t priority   = 0;   // RFC 8445 §6.1.2.3 pair priority
+    PairState    state      = PairState::Frozen;
+    bool         nominated  = false;
+    bool         use_candidate_sent = false;
+    std::uint8_t txn[stun::kTransactionIdLen]{};  // pending check txn id
+    bool         have_txn   = false;
+    std::uint32_t check_sent_ms = 0;  // last check send time (pacing/retransmit)
+    std::uint8_t  retries    = 0;
+    bool         used       = false;
+};
+
+// RFC 8445 §6.1.2.3 candidate-pair priority from the two component priorities.
+std::uint64_t pair_priority(std::uint32_t controlling_pri,
+                            std::uint32_t controlled_pri) noexcept;
+
+// srflx priority (RFC 8445 §5.1.2.1): type-pref 100.
+std::uint32_t srflx_priority(std::uint8_t component) noexcept;
+// relay priority (RFC 8445 §5.1.2.1): type-pref 0.
+std::uint32_t relay_priority(std::uint8_t component) noexcept;
+
+class FullIceAgent {
+public:
+    FullIceAgent() noexcept = default;
+    ~FullIceAgent() = default;
+    FullIceAgent(const FullIceAgent&) = delete;
+    FullIceAgent& operator=(const FullIceAgent&) = delete;
+
+    // Result of processing one inbound STUN datagram in full-ICE mode.
+    enum class HandleResult : std::uint8_t {
+        Ignored,         // not a STUN message we handle
+        Request,         // valid Binding Request -> success response sent
+        Response,        // Binding Success Response to one of our checks
+        ErrorResponse,   // we sent (or received) an error
+        RoleConflict,    // 487 role conflict observed/handled
+        Nominated,       // a valid pair got nominated as a result
+    };
+
+    void set_role(IceRole role) noexcept;
+    IceRole role() const noexcept { return role_; }
+    std::uint64_t tiebreaker() const noexcept { return tiebreaker_; }
+
+    void set_credentials(std::string_view ufrag, std::string_view pwd) noexcept;
+    void set_remote_credentials(std::string_view ufrag,
+                                std::string_view pwd) noexcept;
+    void generate_credentials(std::uint64_t seed) noexcept;
+    void set_tiebreaker(std::uint64_t tb) noexcept;
+
+    std::string_view ufrag()        const noexcept { return ufrag_; }
+    std::string_view pwd()          const noexcept { return pwd_; }
+    std::string_view remote_ufrag() const noexcept { return remote_ufrag_; }
+    std::string_view remote_pwd()   const noexcept { return remote_pwd_; }
+
+    // Add a LOCAL candidate (host/srflx/relay) we will check FROM. Returns the
+    // index, or kMaxCandidates on overflow. `base` is the address we send from.
+    std::size_t add_local_candidate(const IceCandidate& c, const sockaddr* base,
+                                    int base_len) noexcept;
+    // Add a REMOTE candidate (trickle or in-SDP). Forms pairs with all locals,
+    // eliminates exact duplicates, and (when Waiting) unfreezes them. Returns the
+    // index, or kMaxCandidates on overflow / parse failure.
+    std::size_t add_remote_candidate(const IceCandidate& c) noexcept;
+
+    std::size_t local_count()  const noexcept { return local_count_; }
+    std::size_t remote_count() const noexcept { return remote_count_; }
+    std::size_t pair_count()   const noexcept { return pair_count_; }
+    const CandidatePair& pair(std::size_t i) const noexcept {
+        assert(i < pair_count_);
+        return pairs_[i];
+    }
+
+    // Drive ONE round of connectivity checks: pick the highest-priority Waiting
+    // pair, send a Binding Request (with PRIORITY + ICE-CONTROLLING/CONTROLLED +
+    // optional USE-CANDIDATE), mark it In-Progress. Also retransmits timed-out
+    // In-Progress checks (bounded retries) and, for the controlling agent,
+    // nominates the best succeeded pair. `now_ms` paces checks/retransmits.
+    // Returns the number of checks sent this round (0..N). noexcept, bounded.
+    std::size_t run_checks(net::UdpTransport& transport,
+                           std::uint32_t now_ms) noexcept;
+
+    // Handle an inbound STUN datagram from `peer`. Dispatches to the request
+    // responder (incoming check -> success response, triggered check, role
+    // conflict) or the response matcher (our check succeeded -> pair Succeeded,
+    // discovered srflx -> prflx). noexcept, safe on malformed input.
+    HandleResult handle_stun(net::UdpTransport& transport, const sockaddr* peer,
+                             int peer_len, const std::uint8_t* data,
+                             std::size_t len) noexcept;
+
+    // ICE restart (RFC 8445 §9): regenerate ufrag/pwd, clear remotes + pairs,
+    // keep local candidates. New credentials must then be signaled to the peer.
+    void restart(std::uint64_t seed) noexcept;
+
+    // Convergence state.
+    bool has_nominated_pair() const noexcept { return have_nominated_; }
+    const CandidatePair* nominated_pair() const noexcept {
+        return have_nominated_ ? &pairs_[nominated_idx_] : nullptr;
+    }
+    bool selected_remote(sockaddr_storage* out, int* out_len) const noexcept;
+
+    // Counters (observability).
+    std::uint64_t checks_sent()    const noexcept { return checks_sent_; }
+    std::uint64_t checks_succeeded() const noexcept { return checks_ok_; }
+    std::uint64_t requests_handled() const noexcept { return reqs_handled_; }
+    std::uint64_t role_conflicts() const noexcept { return role_conflicts_; }
+
+private:
+    // Form pairs of `remote_idx` against every local candidate (dedup + bound).
+    void form_pairs_for_remote(std::size_t remote_idx) noexcept;
+    // Send a Binding Request connectivity check for pairs_[i]. Returns true if
+    // sent. `nominate` adds USE-CANDIDATE (controlling aggressive/regular).
+    bool send_check(net::UdpTransport& transport, std::size_t i, bool nominate,
+                    std::uint32_t now_ms) noexcept;
+    // Handle an inbound Binding REQUEST (incoming connectivity check).
+    HandleResult on_request(net::UdpTransport& transport, const stun::Message& m,
+                            const sockaddr* peer, int peer_len) noexcept;
+    // Validate an inbound request's USERNAME ("ourUfrag:..") + MESSAGE-INTEGRITY.
+    bool request_authed(const stun::Message& m) const noexcept;
+    // Detect + resolve a role conflict from the inbound check (tie-breaker).
+    // Returns true if a conflict was observed (counted + role possibly switched).
+    bool resolve_role_conflict(const stun::Message& m) noexcept;
+    // Nominate the pair toward `remote_idx` (controlled side saw USE-CANDIDATE).
+    bool nominate_remote(std::size_t remote_idx) noexcept;
+    // Handle an inbound Binding SUCCESS/ERROR RESPONSE to one of our checks.
+    HandleResult on_response(const stun::Message& m, const sockaddr* peer,
+                             int peer_len) noexcept;
+    // Build + send a Binding Success Response for an inbound check.
+    bool send_request_success(net::UdpTransport& transport,
+                              const stun::Message& req, const sockaddr* peer,
+                              int peer_len) noexcept;
+    // Find the pair index matching a pending check txn id (kMaxPairs if none).
+    std::size_t pair_for_txn(const std::uint8_t* txn) const noexcept;
+    // Add a peer-reflexive remote candidate discovered from an inbound check.
+    std::size_t add_prflx_remote(const sockaddr* peer, int peer_len,
+                                 std::uint32_t priority) noexcept;
+    // Controlling agent: pick + nominate the best Succeeded pair (sets state).
+    void maybe_nominate(net::UdpTransport& transport,
+                        std::uint32_t now_ms) noexcept;
+
+    IceRole       role_ = IceRole::Controlling;
+    std::uint64_t tiebreaker_ = 0;
+    std::string   ufrag_;
+    std::string   pwd_;
+    std::string   remote_ufrag_;
+    std::string   remote_pwd_;
+
+    LocalCandidate  locals_[kMaxCandidates]{};
+    std::size_t     local_count_ = 0;
+    RemoteCandidate remotes_[kMaxCandidates]{};
+    std::size_t     remote_count_ = 0;
+    CandidatePair   pairs_[kMaxPairs]{};
+    std::size_t     pair_count_ = 0;
+
+    bool        have_nominated_ = false;
+    std::size_t nominated_idx_  = 0;
+
+    std::uint64_t checks_sent_    = 0;
+    std::uint64_t checks_ok_      = 0;
+    std::uint64_t reqs_handled_   = 0;
+    std::uint64_t role_conflicts_ = 0;
+};
+
 }  // namespace webrtc
 }  // namespace bolt::api

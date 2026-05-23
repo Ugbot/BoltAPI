@@ -88,6 +88,55 @@
 - [ ] Perf: SRTP on the I/O thread (inline), batched recv, zero-copy RTP via
       bolt::wire, per-SSRC SwissTable; no per-packet malloc.
 
+## Phase M7 — Full ICE / TURN / trickle (connectivity beyond ice-lite)
+- [x] **Full ICE agent** (`webrtc::FullIceAgent`, RFC 8445) as an OPTION alongside
+      ice-lite (`WebRtcConfig::full_ice`): controlling/controlled roles, candidate
+      pairs + checklist with pair states, connectivity checks in BOTH directions
+      (Binding req/resp w/ PRIORITY + ICE-CONTROLLING/CONTROLLED + USE-CANDIDATE),
+      role-conflict resolution (tie-breaker), nomination, bounded retransmit, and
+      ICE restart. Bounded `kMaxCandidates`/`kMaxPairs`, no exceptions. PRIMARY
+      GATE `tests/ice_full_test.cpp` (default suite, no external servers,
+      deadline-bounded): two of OUR agents converge on a nominated valid pair
+      both directions; redundant candidate deduped + dead candidate Fails without
+      deadlock; role-conflict resolves; restart clears state.
+- [x] **Trickle ICE** (RFC 8838): `webrtc/sdp` `parse_trickle`/`generate_trickle`
+      (RTCIceCandidateInit JSON / bare candidate line / `end-of-candidates`) +
+      the `App` trickle route `POST /webrtc/candidate` (mirrors `/webrtc/offer`)
+      feeding `FullIceAgent::add_remote_candidate`. The gate delivers a candidate
+      AFTER checks start and still converges.
+- [x] **TURN client + minimal TURN server** (`webrtc/turn`, RFC 5766/8656):
+      client Allocate (long-term cred, REALM/NONCE 401 retry), Refresh,
+      CreatePermission, ChannelBind, Send/Data + ChannelData, relay candidate from
+      XOR-RELAYED-ADDRESS; an in-process server (control + relay sockets) gates it
+      over loopback. GATE `tests/turn_test.cpp` (default suite, deadline-bounded):
+      Allocate → relay candidate → CreatePermission/ChannelBind → datagram relayed
+      THROUGH the server end-to-end (both directions) → Refresh(0) releases.
+- [ ] Live srflx against a public STUN server; mDNS `.local`; IPv6 / dual-stack.
+
+## Phase WA — Media advanced (Pion-level: simulcast/SVC/RTX/FEC/BWE)
+- [x] **Simulcast** (RFC 8851 a=simulcast + RFC 8852 a=rid via the rtp-stream-id
+      header extension): SDP parse+generate (`SdpMedia::{has_simulcast,simulcast,
+      rids,rid_extmap_id}`, `NegotiatedMedia::{rids,rid_ext_id}`, answers emit
+      `a=extmap`+`a=rid recv`+`a=simulcast:recv`); `rtp::rid_value` reads the RID
+      header ext; `webrtc::SimulcastTrack` demuxes inbound layers by RID into per-
+      encoding streams (bounded `kMaxEncodings`, lazy RID→SSRC bind).
+- [x] **SVC passthrough** (`webrtc::SvcRelay`): classify (spatial,temporal) from
+      the Dependency Descriptor header ext / VP8-VP9 payload temporal id and
+      keep/drop against a target — no codec decode.
+- [x] **RTX** (RFC 4588, `webrtc::RtxInterceptor`): negotiate apt/rtx PT; on
+      inbound NACK retransmit as an OSN-prefixed RTX packet on the rtx SSRC/PT;
+      `parse_rtx` recovers the original byte-exact.
+- [x] **RED/ULPFEC** (RFC 2198 / RFC 5109, `webrtc/fec.h`): `build_fec` XORs a
+      bounded media group into a ULPFEC packet; `recover` reconstructs one dropped
+      packet byte-exact from the FEC + survivors.
+- [x] **TWCC bandwidth estimation** (`webrtc/bwe.h`): transport-cc feedback
+      build/parse; a GCC delay-based rate estimate; a token-bucket `Pacer`.
+- [x] Gates (DEFAULT suite, deadline-bounded, no external deps):
+      `tests/simulcast_test.cpp`, `tests/rtx_fec_test.cpp`, `tests/bwe_test.cpp`.
+- [ ] Wire the interceptors (RTX/SVC) + pacer into the live `WebRtcPeerHub` send
+      path + negotiate RTX/FEC/TWCC in the App signaling answer (follow-up).
+- [ ] Key update / DTLS renegotiation.
+
 ## Salvage map (media)
 | FasterAPI | Verdict | Reason |
 |---|---|---|

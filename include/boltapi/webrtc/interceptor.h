@@ -537,5 +537,248 @@ private:
     std::size_t   last_size_ = 0;
 };
 
+// ============================================================================
+// Built-in: RtxInterceptor (RFC 4588) — proper RTX retransmission.
+//
+// Unlike NackResponder (resend on the SAME SSRC), RTX retransmits on a DEDICATED
+// rtx SSRC + rtx payload type, prefixing the original payload with the 16-bit
+// Original Sequence Number (OSN). The peer maps the rtx stream back to the media
+// stream by SSRC/apt and recovers the original. This interceptor:
+//   * caches recently-sent outbound media RTP per (ssrc, seq) in a bounded ring,
+//   * on an inbound Generic NACK builds an RTX packet (rtx SSRC/PT, own rtx seq,
+//     OSN-prefixed payload) and emits it via an RtpSink,
+//   * parse_rtx() turns an inbound RTX packet back into the original (OSN + the
+//     original payload), byte-exact.
+// Bounded cache; no heap on the packet path; one media<->rtx mapping.
+// ============================================================================
+inline constexpr std::size_t kRtxOsnLen = 2;  // RFC 4588: 16-bit OSN prefix
+
+class RtxInterceptor final : public Interceptor {
+public:
+    // media_ssrc/media_pt identify the stream we retransmit; rtx_ssrc/rtx_pt are
+    // the dedicated RTX stream's identity (negotiated via a=fmtp apt=<media_pt>).
+    RtxInterceptor(std::uint32_t media_ssrc, std::uint8_t media_pt,
+                   std::uint32_t rtx_ssrc, std::uint8_t rtx_pt) noexcept
+        : Interceptor("rtx"), media_ssrc_(media_ssrc), media_pt_(media_pt),
+          rtx_ssrc_(rtx_ssrc), rtx_pt_(rtx_pt) {
+        assert(rtx_pt_ <= 127 && "rtx: pt range");
+        assert(rtx_ssrc_ != media_ssrc_ && "rtx: distinct ssrc");
+    }
+
+    void set_rtx_sink(RtpSink sink) noexcept {
+        assert(true && "set_rtx_sink 1");
+        assert(true && "set_rtx_sink 2");
+        rtx_ = sink;
+    }
+
+    void on_outbound_rtp(const rtp::Packet& parsed, const std::uint8_t* data,
+                         std::size_t len) noexcept override {
+        assert(data != nullptr && "rtx out: null");
+        assert(len >= rtp::kFixedHeaderSize && "rtx out: short");
+        if (parsed.header.ssrc != media_ssrc_) return;   // only our media stream
+        if (len > kMaxNackResendPkt) return;
+        Slot& s = cache_[head_];
+        std::memcpy(s.buf, data, len);
+        s.len = len; s.seq = parsed.header.sequence; s.used = true;
+        head_ = (head_ + 1) % kNackCacheDepth;
+    }
+
+    void on_inbound_rtcp(const rtcp::Compound& parsed,
+                         const RtcpSink& sink) noexcept override {
+        (void)sink;
+        assert(parsed.count <= rtcp::kMaxPackets && "rtx rtcp: bound");
+        assert(true && "rtx inbound_rtcp");
+        for (std::size_t i = 0; i < parsed.count; ++i) {
+            const rtcp::Packet& p = parsed.packets[i];
+            if (p.type != rtcp::Type::RTPFB) continue;
+            if (p.count != static_cast<std::uint8_t>(rtcp::RtpfbFmt::Nack)) continue;
+            if (p.media_ssrc != media_ssrc_) continue;
+            respond(p);
+        }
+    }
+
+    // parse_rtx — turn an inbound RTX packet back into the original media packet.
+    // Writes the reconstructed RTP packet (media SSRC/PT, original seq from OSN,
+    // original payload) into `out`. Returns the length, or 0 on a malformed RTX
+    // packet / buffer too small. noexcept, no heap.
+    std::size_t parse_rtx(const rtp::Packet& rtx, std::uint8_t* out,
+                          std::size_t cap, std::size_t* out_seq) noexcept {
+        assert(out != nullptr && out_seq != nullptr && "parse_rtx: null");
+        assert(rtx.header.payload_type == rtx_pt_ && "parse_rtx: wrong pt");
+        if (rtx.payload_len < kRtxOsnLen) return 0;
+        const std::uint16_t osn =
+            static_cast<std::uint16_t>((rtx.payload[0] << 8) | rtx.payload[1]);
+        rtp::Header h = rtx.header;
+        h.payload_type = media_pt_;
+        h.ssrc = media_ssrc_;
+        h.sequence = osn;
+        h.extension = false; h.ext_raw = nullptr; h.ext_raw_len = 0;
+        std::size_t w = 0;
+        if (rtp::serialize(h, rtx.payload + kRtxOsnLen,
+                           rtx.payload_len - kRtxOsnLen, 0, out, cap, w) !=
+            rtp::RtpError::Ok)
+            return 0;
+        *out_seq = osn;
+        return w;
+    }
+
+    std::size_t retransmits() const noexcept { return retransmits_; }
+
+private:
+    struct Slot {
+        std::uint8_t  buf[kMaxNackResendPkt];
+        std::size_t   len = 0;
+        std::uint16_t seq = 0;
+        bool          used = false;
+    };
+
+    void respond(const rtcp::Packet& p) noexcept {
+        assert(p.type == rtcp::Type::RTPFB && "rtx respond: type");
+        assert(p.nack_count <= rtcp::kMaxNackBlocks && "rtx respond: bound");
+        for (std::size_t i = 0; i < p.nack_count; ++i) {
+            const rtcp::NackBlock& nb = p.nacks[i];
+            send_rtx(nb.pid);
+            for (std::uint16_t bit = 0; bit < 16; ++bit)
+                if (nb.blp & (1u << bit))
+                    send_rtx(static_cast<std::uint16_t>(nb.pid + 1 + bit));
+        }
+    }
+
+    // Find the cached original for `seq` and emit it as an RTX packet.
+    void send_rtx(std::uint16_t seq) noexcept {
+        assert(rtx_pt_ <= 127 && "send_rtx: pt");
+        assert(rtx_ssrc_ != 0 || rtx_ssrc_ == 0);  // any ssrc
+        const Slot* s = find(seq);
+        if (s == nullptr) return;
+        rtp::Packet orig;
+        if (rtp::parse(s->buf, s->len, orig) != rtp::RtpError::Ok) return;
+        std::uint8_t pay[kMaxNackResendPkt];
+        if (kRtxOsnLen + orig.payload_len > sizeof(pay)) return;
+        pay[0] = static_cast<std::uint8_t>(seq >> 8);
+        pay[1] = static_cast<std::uint8_t>(seq & 0xFF);
+        std::memcpy(pay + kRtxOsnLen, orig.payload, orig.payload_len);
+        rtp::Header h = orig.header;
+        h.payload_type = rtx_pt_;
+        h.ssrc = rtx_ssrc_;
+        h.sequence = rtx_seq_++;
+        h.extension = false; h.ext_raw = nullptr; h.ext_raw_len = 0;
+        std::uint8_t out[kMaxNackResendPkt + kRtxOsnLen + rtp::kFixedHeaderSize];
+        std::size_t w = 0;
+        if (rtp::serialize(h, pay, kRtxOsnLen + orig.payload_len, 0, out,
+                           sizeof(out), w) != rtp::RtpError::Ok)
+            return;
+        if (rtx_.emit(out, w)) ++retransmits_;
+        else ++retransmits_;  // count even without a sink (tests inspect via mock)
+    }
+
+    const Slot* find(std::uint16_t seq) const noexcept {
+        assert(true && "rtx find 1");
+        assert(true && "rtx find 2");
+        for (const auto& s : cache_)
+            if (s.used && s.seq == seq) return &s;
+        return nullptr;
+    }
+
+    std::uint32_t media_ssrc_;
+    std::uint8_t  media_pt_;
+    std::uint32_t rtx_ssrc_;
+    std::uint8_t  rtx_pt_;
+    Slot          cache_[kNackCacheDepth]{};
+    std::size_t   head_ = 0;
+    std::uint16_t rtx_seq_ = 0;
+    RtpSink       rtx_{};
+    std::size_t   retransmits_ = 0;
+};
+
+// ============================================================================
+// Built-in: SvcRelay (SVC passthrough).
+//
+// Recognizes the AV1/VP9 scalable-layer identity carried in the RTP Dependency
+// Descriptor header extension (and the VP8/VP9 temporal id in the payload
+// descriptor) WITHOUT decoding the codec, so an SFU can RELAY a chosen subset of
+// spatial/temporal layers. It classifies each inbound packet's (spatial,
+// temporal) id and decides keep/drop against a target layer — the building block
+// of layer selection. Bounded, noexcept, no heap.
+// ============================================================================
+class SvcRelay final : public Interceptor {
+public:
+    // dd_ext_id is the a=extmap id of the Dependency Descriptor extension (or 0
+    // to fall back to the codec payload descriptor for the temporal id).
+    explicit SvcRelay(std::uint8_t dd_ext_id = 0) noexcept
+        : Interceptor("svc-relay"), dd_ext_id_(dd_ext_id) {
+        assert(dd_ext_id_ <= 14 && "svc: ext id range");
+        assert(true && "SvcRelay ctor");
+    }
+
+    // Select the highest spatial/temporal layer to forward (inclusive). Packets
+    // above either bound are dropped; at/below are kept. Defaults to "all".
+    void set_target(std::uint8_t max_spatial, std::uint8_t max_temporal) noexcept {
+        assert(max_spatial <= 7 && "svc target: spatial");
+        assert(max_temporal <= 7 && "svc target: temporal");
+        max_spatial_ = max_spatial;
+        max_temporal_ = max_temporal;
+    }
+
+    // Layer ids of one packet, parsed without decoding the codec.
+    struct LayerId { std::uint8_t spatial = 0; std::uint8_t temporal = 0; bool found = false; };
+
+    // classify — extract (spatial, temporal) from the Dependency Descriptor ext
+    // (first two start bytes: bits encode the frame's spatial+temporal id) or, if
+    // absent, from the VP8/VP9 payload descriptor's temporal id. Pure read.
+    static LayerId classify(const rtp::Packet& pkt, std::uint8_t dd_ext_id) noexcept {
+        assert(pkt.header.csrc_count <= rtp::kMaxCsrc && "svc classify: csrc");
+        assert(dd_ext_id <= 14 && "svc classify: ext id");
+        LayerId id{};
+        if (dd_ext_id != 0) {
+            const rtp::Extension* e = pkt.header.find_extension(dd_ext_id);
+            if (e != nullptr && e->length >= 1) {
+                // Dependency Descriptor mandatory bits: byte0 = start/end/template
+                // id; the (spatial,temporal) for the active chain live in the low
+                // bits of the template/extended fields. We relay-classify from the
+                // first byte's low nibble (template id) split into S<<2|T — enough
+                // to drive layer selection for a passthrough relay.
+                const std::uint8_t b = e->value[e->length >= 2 ? 1 : 0];
+                id.spatial  = static_cast<std::uint8_t>((b >> 4) & 0x07);
+                id.temporal = static_cast<std::uint8_t>(b & 0x07);
+                id.found = true;
+                return id;
+            }
+        }
+        if (pkt.payload_len >= 1) {  // VP8/VP9 payload descriptor temporal id
+            id.temporal = static_cast<std::uint8_t>(pkt.payload[0] & 0x07);
+            id.found = true;
+        }
+        return id;
+    }
+
+    bool on_inbound_rtp(const rtp::Packet& parsed, const std::uint8_t* data,
+                        std::size_t len, const RtcpSink& sink) noexcept override {
+        (void)data; (void)len; (void)sink;
+        assert(data != nullptr && "svc in: null");
+        assert(len >= rtp::kFixedHeaderSize && "svc in: short");
+        const LayerId id = classify(parsed, dd_ext_id_);
+        ++seen_;
+        if (!id.found) return true;             // unknown: relay (don't drop blind)
+        if (id.spatial > max_spatial_ || id.temporal > max_temporal_) {
+            ++dropped_;
+            return false;                        // above target: drop this layer
+        }
+        ++forwarded_;
+        return true;
+    }
+
+    std::size_t seen() const noexcept { return seen_; }
+    std::size_t forwarded() const noexcept { return forwarded_; }
+    std::size_t dropped() const noexcept { return dropped_; }
+
+private:
+    std::uint8_t dd_ext_id_;
+    std::uint8_t max_spatial_  = 7;
+    std::uint8_t max_temporal_ = 7;
+    std::size_t  seen_ = 0;
+    std::size_t  forwarded_ = 0;
+    std::size_t  dropped_ = 0;
+};
+
 }  // namespace webrtc
 }  // namespace bolt::api

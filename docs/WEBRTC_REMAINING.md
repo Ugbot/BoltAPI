@@ -65,17 +65,47 @@ Every WebRTC test/interop MUST be non-hanging:
 - [ ] **broadcast** (1 publisher → N viewers) and **SFU** (per-subscriber RTP forwarding, PLI/NACK via interceptors, no transcode).
 
 ## WI — Full ICE / TURN / trickle  (Pion ICE parity, beyond ice-lite)
-- [ ] **Trickle ICE** (incremental candidate exchange over signaling + end-of-candidates).
-- [ ] **Full ICE agent** (controlling/controlled, connectivity checks both directions, role conflict, restart) as an option alongside ice-lite.
-- [ ] STUN srflx via external STUN server; **TURN client** (relay candidates, allocations, channels); optional **TURN server** (`webrtc/turn`).
-- [ ] mDNS `.local` candidates; IPv6 / dual-stack; candidate prioritization/pairing.
+- [x] **Trickle ICE** (incremental candidate exchange over signaling + end-of-candidates). `webrtc/sdp` `parse_trickle`/`generate_trickle` (RTCIceCandidateInit JSON / bare line / `end-of-candidates`); `App` trickle route `POST /webrtc/candidate` (mirrors `/webrtc/offer`) feeds `FullIceAgent::add_remote_candidate`. Gate `tests/ice_full_test.cpp` delivers a candidate AFTER checks start and still converges.
+- [x] **Full ICE agent** (`webrtc::FullIceAgent`, RFC 8445): controlling/controlled roles, candidate pairs + checklist with pair states (Frozen/Waiting/In-Progress/Succeeded/Failed), connectivity checks in BOTH directions (Binding req/resp w/ PRIORITY + ICE-CONTROLLING/CONTROLLED + USE-CANDIDATE), role-conflict resolution (tie-breaker), nomination, bounded retransmit/retries, and ICE restart — an OPTION alongside ice-lite (`WebRtcConfig::full_ice`; App wires it as the controlled agent sharing creds). Bounded `kMaxCandidates`/`kMaxPairs`. PRIMARY GATE `tests/ice_full_test.cpp` (default suite, no external servers, deadline-bounded): two of OUR agents converge on a nominated valid pair both directions; redundant candidate deduped + dead candidate Fails w/o deadlock; role-conflict (two controlling) resolves; restart clears state.
+- [x] **TURN client** (`webrtc::turn::TurnClient`, RFC 5766/8656): Allocate (long-term cred MD5(user:realm:pass) + REALM/NONCE 401 retry), Refresh, CreatePermission, ChannelBind, Send/Data + ChannelData fast path, relay candidate from XOR-RELAYED-ADDRESS. **Minimal in-process TURN server** (`webrtc::turn::TurnServer`, control + relay sockets) sufficient to gate the client over loopback. Self-contained TURN message codec (the base STUN codec doesn't enumerate TURN methods/attrs). GATE `tests/turn_test.cpp` (default suite, deadline-bounded): Allocate → relay candidate → CreatePermission/ChannelBind → a datagram relayed THROUGH the server to a real peer + a reply forwarded back (both directions) → Refresh(0) releases.
+- [ ] STUN srflx via an external STUN server (the FullIceAgent's srflx/relay priority + pairing is in; live srflx gathering against a public STUN server is a follow-up).
+- [ ] mDNS `.local` candidates; IPv6 / dual-stack (IPv4 only today; IPv6 mapped-address is a documented hook).
 
 ## WA — Media advanced (Pion-level)
-- [ ] **Simulcast** (multiple encodings per track, rid/mid extensions).
-- [ ] **SVC** (scalable video coding) passthrough.
-- [ ] **RTX** retransmission stream; **RED/ULPFEC** forward error correction.
-- [ ] Bandwidth estimation (GCC / TWCC-based) + media pacing/congestion control.
-- [ ] Key update / DTLS renegotiation; abs-send-time / transport-cc header extensions.
+- [x] **Simulcast** (multiple encodings per track, rid/mid extensions). SDP:
+      `SdpMedia::{has_simulcast,simulcast,rids,rid_extmap_id}` parse a=simulcast
+      (RFC 8851) + a=rid (RFC 8852); `negotiate_media` echoes the rids + RID
+      header-extension id; `build_media_answer`/`build_echo_answer` emit
+      `a=extmap`(RID uri) + `a=rid:<id> recv` + `a=simulcast:recv <list>`. RTP:
+      `rtp::rid_value` reads the rtp-stream-id one-byte header ext; `webrtc::
+      SimulcastTrack` (bounded `kMaxEncodings`) demuxes inbound layers by RID into
+      per-encoding streams (RID->SSRC bound lazily). Gate `tests/simulcast_test.cpp`
+      (3-rid offer→answer round-trip; RID-ext inbound RTP → 3 encodings byte-exact).
+- [x] **SVC** (scalable video coding) passthrough. `webrtc::SvcRelay` interceptor
+      classifies (spatial,temporal) from the Dependency Descriptor header ext (or
+      the VP8/VP9 payload-descriptor temporal id) WITHOUT decoding and drops
+      layers above a target — the layer-selection primitive for an SFU relay.
+      Gate `tests/simulcast_test.cpp` (induced layer pattern → keep/drop counts).
+- [x] **RTX** retransmission stream; **RED/ULPFEC** forward error correction.
+      RTX: `webrtc::RtxInterceptor` (RFC 4588) caches outbound media (bounded ring),
+      on inbound Generic NACK emits RTX packets on the dedicated rtx SSRC/PT with a
+      16-bit OSN prefix, and `parse_rtx` reconstructs the original byte-exact. FEC:
+      `webrtc/fec.h` (RFC 2198/5109) `build_fec` builds a ULPFEC XOR packet over a
+      bounded group (`kMaxFecGroup`) and `recover` reconstructs ONE dropped member
+      byte-exact from the FEC packet + survivors (two-missing → NotRecoverable).
+      Gate `tests/rtx_fec_test.cpp`.
+- [x] Bandwidth estimation (GCC / TWCC-based) + media pacing/congestion control.
+      `webrtc/bwe.h`: `TwccFeedbackBuilder`/`parse_twcc_feedback` (transport-cc FCI,
+      rides RTPFB FMT 15); `DelayBasedEstimator` (GCC delay controller: trend of
+      the inter-arrival/inter-departure gradient → multiplicative decrease on
+      over-use, additive increase on steady, clamped to [`kMin`,`kMax`]); `Pacer`
+      (token bucket releasing at the estimate, burst-bounded). Gate
+      `tests/bwe_test.cpp` (FCI round-trip; rate decreases under growing delay then
+      recovers; pacer emits at ~target within a bounded band).
+- [x] abs-send-time / transport-cc header extensions: `rtp::{abs_send_time,
+      transport_cc_seq}` decode the respective one-/few-byte header exts;
+      `webrtc::{kRidExtUri,kTransportCcExtUri,kAbsSendTimeExtUri}` are the agreed
+      extmap URIs. (Key update / DTLS renegotiation remains TODO.)
 
 ## WT — WebTransport (optional; shares HTTP/3)
 - [ ] WebTransport over HTTP/3 (RFC 9297): CONNECT-UDP / H3 datagrams + streams. Depends on HTTP/3 (see HTTP3_REMAINING W5e datagrams). Reuses UdpTransport.

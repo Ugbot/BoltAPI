@@ -11,6 +11,7 @@
 #include "boltapi/webrtc/sdp.h"
 
 #include <charconv>
+#include <cstring>
 
 namespace bolt::api {
 namespace webrtc {
@@ -171,6 +172,41 @@ std::string_view SdpMedia::fmtp_for(std::uint8_t pt) const noexcept {
         if (split_pt_rest(attrs[i].value, &p, &rest) && p == pt) return rest;
     }
     return std::string_view{};
+}
+
+std::size_t SdpMedia::rids(std::string_view* out, std::size_t cap) const noexcept {
+    assert(out != nullptr || cap == 0);
+    assert(attr_count <= kSdpMaxAttrsPerSection && "rids: attr overflow");
+    std::size_t n = 0;
+    for (std::size_t i = 0; i < attr_count && n < cap; ++i) {
+        if (attrs[i].key != "rid") continue;
+        // a=rid:<id> <direction> [<restrictions>] — the id is the first token.
+        const std::string_view v = attrs[i].value;
+        const std::size_t sp = v.find(' ');
+        const std::string_view id = (sp == std::string_view::npos) ? v
+                                                                   : v.substr(0, sp);
+        if (!id.empty() && id.size() <= kMaxRidLen) out[n++] = trim(id);
+    }
+    return n;
+}
+
+std::uint8_t SdpMedia::rid_extmap_id() const noexcept {
+    assert(attr_count <= kSdpMaxAttrsPerSection && "rid_extmap_id: overflow");
+    assert(kRidExtUri.size() > 0 && "rid_extmap_id: uri");
+    for (std::size_t i = 0; i < attr_count; ++i) {
+        if (attrs[i].key != "extmap") continue;
+        // a=extmap:<id>[/<dir>] <uri> ...
+        const std::string_view v = attrs[i].value;
+        const std::size_t sp = v.find(' ');
+        if (sp == std::string_view::npos) continue;
+        if (v.find(kRidExtUri) == std::string_view::npos) continue;
+        std::string_view idtok = v.substr(0, sp);
+        const std::size_t slash = idtok.find('/');
+        if (slash != std::string_view::npos) idtok = idtok.substr(0, slash);
+        std::uint8_t id = 0;
+        if (parse_uint(idtok, &id) && id >= 1 && id <= 14) return id;
+    }
+    return 0;
 }
 
 std::size_t SdpMedia::payload_types(std::uint8_t* out,
@@ -512,6 +548,16 @@ SdpError negotiate_media(const SdpSession& offer,
             c.rtpmap = rm;
             c.fmtp = m.fmtp_for(pts[i]);
         }
+        // WA — simulcast: if the offer m-line has a=simulcast + a=rid lines,
+        // echo the rids (bounded) and the RID header-extension id so the answer
+        // can mirror the simulcast (RFC 8851/8852). Bounded by kMaxRids.
+        if (m.has_simulcast()) {
+            std::string_view rid_views[kMaxRids];
+            const std::size_t nr = m.rids(rid_views, kMaxRids);
+            for (std::size_t r = 0; r < nr; ++r) nm.rids[nm.rid_count++] = rid_views[r];
+            nm.rid_ext_id = m.rid_extmap_id();
+        }
+
         // Keep the section even if empty so the answer can mark it inactive; but
         // only count sections that had at least one common codec.
         if (nm.codec_count > 0) ++out.media_count;
@@ -554,6 +600,31 @@ static void append_media_section(std::string& out, const NegotiatedMedia& nm) {
             v.append(c.fmtp.data(), c.fmtp.size());
             append_attr(out, "fmtp", v);
         }
+    }
+
+    // WA — simulcast answer (RFC 8851/8852): echo the RID header-extension map,
+    // one a=rid:<id> recv line per offered layer, then a=simulcast:recv <list>.
+    assert(nm.rid_count <= kMaxRids && "append_media_section: rid overflow");
+    if (nm.rid_count > 0) {
+        if (nm.rid_ext_id != 0) {  // a=extmap:<id> <RID uri>
+            std::string v;
+            append_uint(v, nm.rid_ext_id);
+            v.push_back(' ');
+            v.append(kRidExtUri.data(), kRidExtUri.size());
+            append_attr(out, "extmap", v);
+        }
+        for (std::size_t r = 0; r < nm.rid_count; ++r) {  // a=rid:<id> recv
+            std::string v;
+            v.append(nm.rids[r].data(), nm.rids[r].size());
+            v.append(" recv", 5);
+            append_attr(out, "rid", v);
+        }
+        std::string sc("recv ");  // a=simulcast:recv q;h;f
+        for (std::size_t r = 0; r < nm.rid_count; ++r) {
+            if (r != 0) sc.push_back(';');
+            sc.append(nm.rids[r].data(), nm.rids[r].size());
+        }
+        append_attr(out, "simulcast", sc);
     }
 }
 
@@ -692,6 +763,123 @@ SdpError build_echo_answer(const EchoAnswerParams& p, std::string& out) {
                     [&] { std::string s; append_uint(s, p.max_message_size);
                           return s; }());
     }
+    return SdpError::Ok;
+}
+
+// ===========================================================================
+// WI — Trickle ICE (RFC 8838)
+// ===========================================================================
+namespace {
+
+// Skip ASCII whitespace from `i` in `s`.
+void skip_ws(std::string_view s, std::size_t& i) noexcept {
+    while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' ||
+                            s[i] == '\n')) {
+        ++i;
+    }
+}
+
+// Extract a JSON string value for `key` from a flat object `body` (no nesting,
+// no escapes beyond the bounded keys we use). Returns the value view + found.
+// Bounded scan, noexcept, no allocation.
+bool json_string_field(std::string_view body, std::string_view key,
+                       std::string_view& out) noexcept {
+    // Look for "<key>" then ':' then a quoted string.
+    char pat[40];
+    if (key.size() + 2 >= sizeof(pat)) return false;
+    pat[0] = '"';
+    std::memcpy(pat + 1, key.data(), key.size());
+    pat[key.size() + 1] = '"';
+    const std::string_view needle(pat, key.size() + 2);
+    const std::size_t k = body.find(needle);
+    if (k == std::string_view::npos) return false;
+    std::size_t i = k + needle.size();
+    skip_ws(body, i);
+    if (i >= body.size() || body[i] != ':') return false;
+    ++i;
+    skip_ws(body, i);
+    if (i >= body.size() || body[i] != '"') return false;
+    ++i;
+    const std::size_t start = i;
+    while (i < body.size() && body[i] != '"') ++i;
+    if (i >= body.size()) return false;
+    out = body.substr(start, i - start);
+    return true;
+}
+
+// Extract an unsigned integer field (e.g. "sdpMLineIndex": 0). Best-effort.
+bool json_uint_field(std::string_view body, std::string_view key,
+                     std::uint16_t& out) noexcept {
+    char pat[40];
+    if (key.size() + 2 >= sizeof(pat)) return false;
+    pat[0] = '"';
+    std::memcpy(pat + 1, key.data(), key.size());
+    pat[key.size() + 1] = '"';
+    const std::string_view needle(pat, key.size() + 2);
+    const std::size_t k = body.find(needle);
+    if (k == std::string_view::npos) return false;
+    std::size_t i = k + needle.size();
+    skip_ws(body, i);
+    if (i >= body.size() || body[i] != ':') return false;
+    ++i;
+    skip_ws(body, i);
+    const std::size_t start = i;
+    while (i < body.size() && body[i] >= '0' && body[i] <= '9') ++i;
+    if (i == start) return false;
+    return parse_uint(body.substr(start, i - start), &out);
+}
+
+}  // namespace
+
+SdpError parse_trickle(std::string_view body, TrickleCandidate& out) noexcept {
+    out = TrickleCandidate{};
+    std::size_t i = 0;
+    skip_ws(body, i);
+    if (i >= body.size()) return SdpError::Empty;
+
+    // JSON envelope?
+    if (body[i] == '{') {
+        std::string_view cand;
+        const bool has_cand = json_string_field(body, "candidate", cand);
+        json_string_field(body, "sdpMid", out.sdp_mid);
+        json_uint_field(body, "sdpMLineIndex", out.sdp_mline_index);
+        if (!has_cand || cand.empty()) {
+            out.end_of_candidates = true;
+            return SdpError::Ok;  // {"candidate":""} == end-of-candidates
+        }
+        out.candidate = cand;
+        return SdpError::Ok;
+    }
+
+    // Bare line: "end-of-candidates" or "candidate:...".
+    std::string_view line = body.substr(i);
+    // strip a trailing CRLF
+    while (!line.empty() && (line.back() == '\r' || line.back() == '\n' ||
+                            line.back() == ' ')) {
+        line.remove_suffix(1);
+    }
+    if (line == "end-of-candidates" || line == "a=end-of-candidates") {
+        out.end_of_candidates = true;
+        return SdpError::Ok;
+    }
+    constexpr std::string_view kA = "a=";
+    if (line.substr(0, kA.size()) == kA) line.remove_prefix(kA.size());
+    constexpr std::string_view kC = "candidate:";
+    if (line.substr(0, kC.size()) != kC) return SdpError::MalformedLine;
+    out.candidate = line;
+    return SdpError::Ok;
+}
+
+SdpError generate_trickle(const TrickleCandidate& c, std::string& out) {
+    out.append("{\"candidate\":\"");
+    if (!c.end_of_candidates) out.append(c.candidate.data(), c.candidate.size());
+    out.append("\",\"sdpMid\":\"");
+    out.append(c.sdp_mid.data(), c.sdp_mid.size());
+    out.append("\",\"sdpMLineIndex\":");
+    char buf[8];
+    auto r = std::to_chars(buf, buf + sizeof(buf), c.sdp_mline_index);
+    out.append(buf, static_cast<std::size_t>(r.ptr - buf));
+    out.push_back('}');
     return SdpError::Ok;
 }
 
