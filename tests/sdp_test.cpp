@@ -174,6 +174,38 @@ TEST(Sdp, BuildAnswerIceLite) {
     EXPECT_NE(answer.find("a=ice-lite"), std::string::npos);
 }
 
+TEST(Sdp, BuildAnswerEmitsIceCandidates) {
+    sdp::AnswerParams p;
+    p.ice_ufrag = "Bolt";
+    p.ice_pwd = "abcdef0123456789abcdef0123";
+    p.fingerprint_sha256 = "AB:CD";
+    // Candidate lines exactly as IceCandidate::to_string() produces them.
+    const std::string_view cands[] = {
+        "candidate:1 1 udp 2130706431 192.168.1.50 50000 typ host",
+        "candidate:2 1 udp 2130706431 10.0.0.5 50000 typ host",
+    };
+    p.candidates = cands;
+    p.candidate_count = 2;
+
+    std::string answer;
+    ASSERT_EQ(sdp::build_answer(p, answer), sdp::SdpError::Ok);
+    EXPECT_NE(answer.find(
+        "a=candidate:1 1 udp 2130706431 192.168.1.50 50000 typ host"),
+        std::string::npos);
+    EXPECT_NE(answer.find(
+        "a=candidate:2 1 udp 2130706431 10.0.0.5 50000 typ host"),
+        std::string::npos);
+    EXPECT_NE(answer.find("a=end-of-candidates"), std::string::npos);
+
+    // The emitted candidate lines must round-trip through the parser.
+    sdp::SdpSession s;
+    ASSERT_EQ(sdp::parse(answer, s), sdp::SdpError::Ok);
+    const sdp::SdpMedia* m = s.application_media();
+    ASSERT_NE(m, nullptr);
+    EXPECT_TRUE(m->has_attr("candidate"));
+    EXPECT_TRUE(m->has_attr("end-of-candidates"));
+}
+
 TEST(Sdp, BuildAnswerRejectsMissingRequiredFields) {
     sdp::AnswerParams p;  // all credential fields empty
     std::string answer;

@@ -312,32 +312,73 @@ void App::init_protocol_seams() {
     }
 
     if (config_.enable_webrtc) {
-        // Phase 1: the SDP + STUN codecs and the App data-channel surface are
-        // present and unit-tested, but the ICE/DTLS/SCTP transport is a later
-        // wave. Whether or not the protocol seam is compiled in, enabling WebRTC
-        // is additive and NEVER disturbs H1/H2 serving — we just announce state.
         const uint16_t udp_port = webrtc_config_.udp_port != 0
                                       ? webrtc_config_.udp_port
                                       : config_.server.http1_port;
-        std::fprintf(stderr,
-            "[boltapi] WebRTC: signaling/codecs ready, transport not yet "
-            "implemented (would bind UDP :%u; %zu data-channel handler(s) "
-            "registered); continuing with HTTP/1.1+HTTP/2.\n",
-            static_cast<unsigned>(udp_port), dc_handlers_.size());
 
 #if defined(BOLTAPI_WITH_WEBRTC)
-        // When the seam is compiled in, also exercise the registry path so the
-        // ON build can't rot. The stub serve() returns NotImplemented (logged).
-        const proto::Status reg = proto::register_webrtc(registry);
-        if (reg.is_ok() && registry.has(proto::ProtocolId::WebRtc)) {
-            std::unique_ptr<proto::IProtocol> rtc =
-                registry.create(proto::ProtocolId::WebRtc);
-            assert(rtc != nullptr);
-            transport::UdpTransport udp(
-                transport::Endpoint{config_.server.host, udp_port});
-            const proto::Status served = rtc->serve(udp);
-            (void)served;  // NotImplemented expected; already announced above.
+        // WebRTC connection machinery wave: start a REAL UdpTransport + ICE-lite
+        // IceAgent. Gather host candidates, bind the UDP port, route inbound
+        // STUN to the agent's binding responder, and log candidates + creds. A
+        // signaling route (POST /webrtc/offer producing build_answer) is a TODO
+        // hook for the next wave. This is fully isolated from the H1/H2 server:
+        // it owns its own socket + receive thread and shuts down with the App.
+        webrtc_agent_ = std::make_unique<webrtc::IceAgent>();
+        if (!webrtc_config_.ice_ufrag.empty() &&
+            !webrtc_config_.ice_pwd.empty()) {
+            webrtc_agent_->set_credentials(webrtc_config_.ice_ufrag,
+                                           webrtc_config_.ice_pwd);
         }
+        webrtc_agent_->generate_credentials(0);  // fills any missing creds
+
+        webrtc_transport_ = std::make_unique<net::UdpTransport>();
+        const bool bound =
+            webrtc_transport_->bind(config_.server.host.c_str(), udp_port);
+        if (bound) {
+            const uint16_t actual = webrtc_transport_->bound_port();
+            const std::size_t ncand =
+                webrtc_agent_->gather_host_candidates(actual);
+
+            net::UdpTransport* tp = webrtc_transport_.get();
+            webrtc::IceAgent*  ag = webrtc_agent_.get();
+            webrtc_transport_->set_stun_handler(
+                [tp, ag](const sockaddr* peer, int plen,
+                         const std::uint8_t* data, std::size_t len) {
+                    ag->handle_stun(*tp, peer, plen, data, len);
+                });
+            webrtc_transport_->start();
+
+            std::fprintf(stderr,
+                "[boltapi] WebRTC: ICE-lite agent up on UDP :%u — "
+                "ufrag=%.*s pwd=%.*s, %zu host candidate(s), %zu data-channel "
+                "handler(s); signaling route is a next-wave TODO. H1/H2 "
+                "unaffected.\n",
+                static_cast<unsigned>(actual),
+                static_cast<int>(ag->ufrag().size()), ag->ufrag().data(),
+                static_cast<int>(ag->pwd().size()), ag->pwd().data(),
+                ncand, dc_handlers_.size());
+            for (std::size_t i = 0; i < ncand; ++i) {
+                const std::string line = ag->candidate(i).to_string();
+                std::fprintf(stderr, "[boltapi] WebRTC:   a=%s\n", line.c_str());
+            }
+        } else {
+            std::fprintf(stderr,
+                "[boltapi] WebRTC: failed to bind UDP :%u; ICE transport not "
+                "started. H1/H2 unaffected.\n",
+                static_cast<unsigned>(udp_port));
+            webrtc_transport_.reset();
+            webrtc_agent_.reset();
+        }
+
+        // Keep the protocol-registry path exercised so the seam can't rot.
+        const proto::Status reg = proto::register_webrtc(registry);
+        (void)reg;
+#else
+        std::fprintf(stderr,
+            "[boltapi] Config.enable_webrtc=true ignored: built without "
+            "BOLTAPI_WITH_WEBRTC. Reconfigure with -DBOLTAPI_WITH_WEBRTC=ON. "
+            "(would bind UDP :%u; %zu data-channel handler(s))\n",
+            static_cast<unsigned>(udp_port), dc_handlers_.size());
 #endif
     }
 }
@@ -377,6 +418,15 @@ void App::stop() {
     if (server_ && started_) {
         server_->stop();
     }
+#if defined(BOLTAPI_WITH_WEBRTC)
+    // Clean WebRTC teardown: stop the receive thread + close the UDP socket
+    // before the agent is destroyed. Idempotent (stop() guards on handle).
+    if (webrtc_transport_) {
+        webrtc_transport_->stop();
+        webrtc_transport_.reset();
+    }
+    webrtc_agent_.reset();
+#endif
     started_ = false;
 }
 

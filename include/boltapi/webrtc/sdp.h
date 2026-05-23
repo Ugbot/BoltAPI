@@ -166,6 +166,13 @@ struct AnswerParams {
     std::uint16_t    sctp_port         = 5000;
     std::uint32_t    max_message_size  = 262144;
     bool             ice_lite          = false;  // emit a=ice-lite at session level
+
+    // Host (and later srflx) ICE candidate lines, WITHOUT the leading "a=" but
+    // WITH the "candidate:" token — i.e. exactly IceCandidate::to_string()
+    // output. Emitted as `a=candidate:...` lines under the m=application section.
+    // Views must outlive the build_answer call. Empty => no a=candidate lines.
+    const std::string_view* candidates = nullptr;
+    std::size_t             candidate_count = 0;
 };
 
 // build_answer — emit a complete data-channel answer SDP into `out` (cleared

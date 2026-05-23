@@ -118,17 +118,25 @@ the audit's "mostly REBUILD."
 > specified in `docs/HTTP3_PLAN.md`; this section lists only what WebRTC needs
 > from it and the demux WebRTC adds. Do not duplicate the socket code.
 
-- [ ] **Depend on the real `UdpTransport`** (replaces the stub at
-      `src/proto/udp_transport.cpp:34-37`). Needs: UDP bind, batched recv into a
-      preallocated pool, batched send, 4-tuple of each datagram. **REBUILD** (in
-      H3 plan). Bolt primitive: `bolt_batch_pool.h` for recv buffers,
-      `bolt_arena_ring.h` for the receive ring.
-- [ ] **First-byte packet demultiplexer on the UDP socket** (RFC 7983). One UDP
-      port multiplexes STUN, DTLS, and (post-DTLS) SRTP/SCTP. Classify by first
-      byte: `0..3` → STUN, `20..63` → DTLS, `128..191` → RTP/RTCP (media, later).
-      Route to the per-peer state machine keyed by source 4-tuple. **REBUILD.**
-      Bolt primitive: `join/bolt_swiss.h` (`bolt::SwissTable`) mapping
-      4-tuple → `PeerConnection*`.
+- [x] **Depend on the real `UdpTransport`**. DONE (Wave 2):
+      `include/boltapi/net/udp_transport.h` + `src/net/udp_transport.cpp` — a
+      standalone, protocol-agnostic UDP transport. ARCHITECTURE DECISION
+      (correctness-first, isolation): the engine's `IODispatcher` has no UDP
+      path and `async_io` must NOT be touched, so `UdpTransport` owns its OWN
+      UDP socket + a dedicated receive thread (non-blocking socket + a 50ms
+      `select()` poll loop + atomic stop flag → clean, hang-free shutdown on
+      winsock and POSIX). `bind(host,port)` (IPv4; ephemeral via port 0, IPv6 a
+      TODO hook), `start()/stop()` lifecycle, `send(peer,len)` → `sendto`,
+      `recvfrom` into a PREALLOCATED 2KB buffer capturing the source `sockaddr`,
+      cache-line-padded atomic rx/tx/drop counters. Compiled UNCONDITIONALLY
+      into `boltapi`. Batched recv (`recvmmsg`/IOCP) is a LATER perf phase (§11).
+- [x] **First-byte packet demultiplexer on the UDP socket** (RFC 7983). DONE
+      (Wave 2): in the receive loop, classify by first byte — `0..3` → STUN
+      (routed to the registered `StunHandler`/IceAgent), `20..63` → DTLS (routed
+      to the registered datagram handler; none yet → dropped with a counter),
+      else → dropped with a counter. RTP/RTCP (`128..191`, media) is a later
+      phase. Per-peer SwissTable keyed by 4-tuple is deferred to the DTLS/SCTP
+      wave (ICE-lite handles STUN inline in the rx path — cheap + correct).
 - [ ] **I/O→worker handoff for WebRTC packets.** Inbound classified datagrams
       cross from the I/O thread to the peer's worker via a lock-free SPSC. One
       SPSC per peer connection. **REBUILD.** Bolt primitive: `bolt_channel.h`
@@ -180,8 +188,9 @@ the audit's "mostly REBUILD."
       Bolt primitive: `bolt_arena.h`.
       DONE (Wave 1): `webrtc::build_answer(AnswerParams, std::string&)` emits the
       full passive answer (BUNDLE, ice-ufrag/pwd, fingerprint:sha-256, setup,
-      mid, sctp-port, max-message-size, optional a=ice-lite). `a=candidate:`
-      lines deferred to the ICE-agent wave (no candidates gathered yet).
+      mid, sctp-port, max-message-size, optional a=ice-lite). Wave 2:
+      `AnswerParams.candidates[]` now emits the IceAgent's `a=candidate:` host
+      lines + `a=end-of-candidates`; DTLS fingerprint stays a placeholder hook.
 - [x] **Parse the offer's required fields:** remote `ice-ufrag`/`ice-pwd`, remote
       DTLS `fingerprint` + `setup` role, `mid`, `sctp-port`, and the offerer's
       `candidate:` lines (trickle or in-SDP). **REBUILD** the field extraction on
@@ -249,18 +258,19 @@ the audit's "mostly REBUILD."
 
 > Bolt is always the **controlled** answerer in v1, which simplifies nomination.
 
-- [ ] **Candidate model (ADAPT `ICECandidate`, `ice.h:58-87`).** Keep the struct
-      and `to_string` (`ice.cpp:13-39`). **REBUILD `from_string`** (currently
-      hardcoded, `ice.cpp:50-54`) into a real tokenizing parser
-      (foundation/component/proto/priority/addr/port/typ/raddr/rport).
-      **ADAPT + REBUILD.** Bolt primitive: `bolt_arena.h` for owned strings, or
-      keep `string_view` into the SDP arena.
-- [ ] **Host candidate gathering (REBUILD `gather_host_candidates`,
-      `ice.cpp:181-201`).** Enumerate real interfaces:
-      `GetAdaptersAddresses` on Windows, `getifaddrs` on POSIX (the file's own
-      TODO at `:197-198`). Filter loopback/link-local per policy; assign
-      foundation + RFC 8445 priority. **REBUILD.** Bolt primitive: fixed-capacity
-      candidate array in a `bolt::Arena` (TigerStyle bound on candidate count).
+- [x] **Candidate model (ADAPT `ICECandidate`).** DONE (Wave 2):
+      `include/boltapi/webrtc/ice.h` `IceCandidate`. PORTED `to_string`
+      (FasterAPI `ice.cpp:13-39`) to manual `std::string` append (no `<sstream>`,
+      `-fno-exceptions`). REBUILT `from_string` as a real tokenizer
+      (foundation/component/proto/priority/addr/port/typ + optional raddr/rport),
+      returns false on malformed input (no crash). Round-trip unit-tested.
+- [x] **Host candidate gathering (REBUILD `gather_host_candidates`).** DONE
+      (Wave 2): `IceAgent::gather_host_candidates(port)` enumerates real
+      interfaces — `GetAdaptersAddresses` on Windows (`#ifdef _WIN32`, links
+      iphlpapi) / `getifaddrs` on POSIX — collects usable IPv4 host candidates,
+      skips loopback unless no other usable IPv4 exists, and assigns RFC 8445
+      §5.1.2.1 host priority + foundation + type=host. Fixed-capacity candidate
+      array (`kIceMaxCandidates`), no heap per candidate beyond the owned strings.
 - [ ] **Server-reflexive gathering** — consume §4's STUN srflx output into the
       candidate list. **REBUILD.**
 - [ ] **Candidate pairing + priority ordering** (RFC 8445 §6.1.2): form
@@ -273,15 +283,21 @@ the audit's "mostly REBUILD."
       RTO backoff, mark pairs succeeded/failed, learn peer-reflexive candidates.
       **REBUILD.** Bolt primitive: SPSC for check responses; `bolt_arena.h`;
       a timer wheel for RTO (own or `bolt_scheduler.h` if it fits).
-- [ ] **Nomination + selected pair (REBUILD `get_selected_pair`,
-      `ice.cpp:166-179`).** As controlled agent, accept the controller's
-      `USE-CANDIDATE`; promote the nominated valid pair to *selected*; expose the
-      4-tuple to the UDP demux (§2) and DTLS (§6). **REBUILD.** Bolt primitive:
-      `join/bolt_swiss.h` 4-tuple → peer.
-- [ ] **ICE-lite option** (document; possibly v1): as a server-side answerer we
-      MAY advertise `a=ice-lite` to skip our own checks. Decide; if taken it
-      shrinks the connectivity-check work above to *responder-only*. **REBUILD**
-      (decision + responder path). No Bolt primitive.
+- [x] **Nomination + selected pair (REBUILD `get_selected_pair`).** DONE
+      (Wave 2): as the controlled ICE-lite agent,
+      `IceAgent::handle_stun(...)` validates the inbound Binding Request
+      (USERNAME == "ourUfrag:..." + MESSAGE-INTEGRITY with OUR pwd), sends a
+      Binding Success Response (XOR-MAPPED-ADDRESS(peer) + MESSAGE-INTEGRITY +
+      FINGERPRINT), and on `USE-CANDIDATE` records the peer 4-tuple as the
+      SELECTED pair (`selected_peer()` / `has_selected_peer()`), exposed for the
+      DTLS wave. Bad username → 401, missing/garbled USERNAME → 400, bad
+      integrity → 401; malformed input is dropped without crashing. SwissTable
+      4-tuple→peer is deferred to multi-peer (DTLS/SCTP) wave.
+- [x] **ICE-lite option.** DONE (Wave 2): decision taken — Bolt is the
+      ICE-LITE controlled answerer. We advertise `a=ice-lite` (SDP
+      `AnswerParams.ice_lite`) and implement the RESPONDER-ONLY path: we never
+      initiate connectivity checks; we only answer Binding Requests. This is the
+      `IceAgent` above.
 - [ ] **Correctness gate:** unit test pairing/priority math vs RFC 8445 examples;
       integration test completes ICE with a browser (host + srflx) end to end.
 
@@ -435,8 +451,18 @@ the audit's "mostly REBUILD."
       MESSAGE-INTEGRITY, FINGERPRINT. **REBUILD.**
       DONE (Wave 1): `tests/stun_test.cpp` (14 cases), registered as
       `boltapi_stun_test`. All RFC 5769 vectors pass byte-exact.
-- [ ] **ICE unit tests** — candidate `from_string`/`to_string` round-trip,
-      pairing + priority math vs RFC 8445 examples, role-conflict, nomination.
+- [~] **ICE unit tests** — DONE (Wave 2): `tests/ice_test.cpp` — candidate
+      `to_string`/`from_string` round-trip (host + srflx + malformed), host
+      gathering returns >= 1 candidate, deterministic credential generation, and
+      THE LIVE STUN GATE: a real Binding Request (USERNAME/PRIORITY/ICE-
+      CONTROLLING/USE-CANDIDATE/MESSAGE-INTEGRITY/FINGERPRINT) sent over the wire
+      to a `UdpTransport`+`IceAgent`, asserting a Binding Success with
+      XOR-MAPPED-ADDRESS == client addr + valid MI + FINGERPRINT + nomination;
+      wrong-integrity rejected (error, no nomination); garbage survives without
+      crash. Also `tests/udp_transport_test.cpp` covers bind/round-trip/demux/
+      shutdown. PENDING: full pairing/priority math vs RFC 8445 examples +
+      role-conflict (not needed for the ICE-lite responder; revisit if we add a
+      controlling path).
 - [ ] **DTLS handshake test** — vs `openssl s_client -dtls` and a browser; DTLS
       1.2 and 1.3; negative fingerprint-mismatch rejection.
 - [ ] **SCTP/DCEP roundtrip** — Bolt↔Bolt loopback (INIT/SACK/retransmit under

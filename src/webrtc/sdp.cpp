@@ -327,6 +327,21 @@ SdpError build_answer(const AnswerParams& p, std::string& out) {
     append_attr(out, "max-message-size",
                 [&] { std::string s; append_uint(s, p.max_message_size); return s; }());
 
+    // a=candidate:... host (and later srflx) lines from the ICE agent. Each
+    // entry already carries the "candidate:" token (IceCandidate::to_string),
+    // so we emit it verbatim after "a=". If any candidate is present, finish
+    // with a=end-of-candidates (RFC 8838) — correct for our non-trickle answer.
+    if (p.candidates != nullptr && p.candidate_count > 0) {
+        for (std::size_t i = 0; i < p.candidate_count; ++i) {
+            const std::string_view c = p.candidates[i];
+            if (c.empty()) continue;
+            out.append("a=", 2);
+            out.append(c.data(), c.size());
+            out.append("\r\n", 2);
+        }
+        append_attr(out, "end-of-candidates", std::string_view{});
+    }
+
     return SdpError::Ok;
 }
 

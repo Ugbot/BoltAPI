@@ -35,6 +35,11 @@
 #include "boltapi/router.h"
 #include "boltapi/server/coro_unified_server.h"
 
+#if defined(BOLTAPI_WITH_WEBRTC)
+#include "boltapi/net/udp_transport.h"
+#include "boltapi/webrtc/ice.h"
+#endif
+
 #include <cassert>
 #include <cstdint>
 #include <functional>
@@ -270,6 +275,17 @@ private:
     struct DcReg { std::string label; DataChannelHandler handler; };
     WebRtcConfig        webrtc_config_{};
     std::vector<DcReg>  dc_handlers_;
+
+#if defined(BOLTAPI_WITH_WEBRTC)
+    // When enable_webrtc is set AND the flag is on, App owns a real UdpTransport
+    // + ICE-lite IceAgent: it gathers host candidates, binds the WebRtcConfig
+    // UDP port, routes inbound STUN to the agent's binding responder, and logs
+    // the gathered candidates + ufrag/pwd. Started in init_protocol_seams() and
+    // torn down cleanly in stop(). A signaling route is a TODO hook (next wave).
+    // None of this touches the H1/H2 server.
+    std::unique_ptr<net::UdpTransport>   webrtc_transport_;
+    std::unique_ptr<webrtc::IceAgent>    webrtc_agent_;
+#endif
 
     std::unique_ptr<Router>                   router_;
     std::unique_ptr<http::CoroUnifiedServer>  server_;

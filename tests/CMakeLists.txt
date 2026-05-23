@@ -88,6 +88,26 @@ boltapi_add_test(boltapi_sdp_test sdp_test.cpp)
 # incl. MESSAGE-INTEGRITY (HMAC-SHA1) and FINGERPRINT (CRC-32). Correctness gate.
 boltapi_add_test(boltapi_stun_test stun_test.cpp)
 
+# WebRTC UDP transport — bind on an ephemeral port, round-trip a datagram from a
+# raw client socket asserting the source address, verify RFC 7983 demux
+# (STUN/DTLS/drop) + counters, clean start/stop with no hang. Pure transport, no
+# engine deps. Links ws2_32/mswsock/iphlpapi on Windows.
+boltapi_add_test(boltapi_udp_transport_test udp_transport_test.cpp)
+if(WIN32)
+    target_link_libraries(boltapi_udp_transport_test PRIVATE ws2_32 mswsock iphlpapi)
+endif()
+
+# WebRTC ICE-lite agent — THE LIVE STUN GATE. Real STUN Binding Request built
+# with our codec (USERNAME/PRIORITY/ICE-CONTROLLING/USE-CANDIDATE/MESSAGE-
+# INTEGRITY/FINGERPRINT) sent over the wire to a UdpTransport+IceAgent; asserts a
+# Binding Success with XOR-MAPPED-ADDRESS == client addr + valid MI + FINGERPRINT
+# + nominated selected pair. Negative: wrong integrity rejected, malformed input
+# survives. Plus host-candidate gathering + candidate round-trip.
+boltapi_add_test(boltapi_ice_test ice_test.cpp)
+if(WIN32)
+    target_link_libraries(boltapi_ice_test PRIVATE ws2_32 mswsock iphlpapi)
+endif()
+
 # M3: HTTP/3 + WebRTC seam — ProtocolRegistry mechanism (register/has/create),
 # a dummy IProtocol returning NotImplemented, and (when the compile flags are
 # ON) the real H3/WebRTC stub factories registering. Flag-AWARE: passes in the

@@ -155,6 +155,10 @@ add_library(boltapi STATIC
     # covers them. Only protocol/transport WIRING is gated behind BOLTAPI_WITH_WEBRTC.
     src/webrtc/sdp.cpp      # SDP parse/generate (ADAPTED from FasterAPI)
     src/webrtc/stun.cpp     # STUN message codec (REBUILT, RFC 5389/8489)
+    # WebRTC connection machinery — also compiled UNCONDITIONALLY (standalone,
+    # no engine deps, zero cost unless started) so the default suite covers it.
+    src/net/udp_transport.cpp  # real async UDP transport (own socket + rx thread)
+    src/webrtc/ice.cpp         # ICE-lite agent (gather + STUN binding responder)
     ${BOLTAPI_ENGINE_SOURCES}
 )
 add_library(boltapi::boltapi ALIAS boltapi)
@@ -168,7 +172,9 @@ target_compile_features(boltapi PUBLIC cxx_std_20)
 # transitively re-exports it when BOLT_BUILD_PARSE=ON.
 target_link_libraries(boltapi PUBLIC bolt::bolt bolt::parse OpenSSL::SSL OpenSSL::Crypto)
 if(WIN32)
-    target_link_libraries(boltapi PUBLIC ws2_32 mswsock)
+    # ws2_32/mswsock for sockets; iphlpapi for GetAdaptersAddresses (ICE host
+    # candidate enumeration in src/webrtc/ice.cpp).
+    target_link_libraries(boltapi PUBLIC ws2_32 mswsock iphlpapi)
 endif()
 
 # gzip seam: PUBLIC so app.h/compression.h consumers and tests compile against
