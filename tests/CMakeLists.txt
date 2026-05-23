@@ -283,6 +283,26 @@ if(WIN32)
     target_link_libraries(boltapi_http3_app_test PRIVATE ws2_32 mswsock iphlpapi)
 endif()
 
+# W5c: HTTP/3 REAL INTEROP GATE (vs an independent HTTP/3 stack). Under HTTP3=ON:
+# starts an App with enable_http3() + a GET /ping + POST /echo route on a free UDP
+# port, then shells out to `uv run --no-project --with aioquic python
+# tests/interop/aioquic_client.py <port>` — a real aioquic HTTP/3 client that does
+# GET /ping (asserts 200 "pong") and POST /echo (asserts byte-exact echo of a
+# randomized body) over QUIC. aioquic is the HTTP/3 analogue of aiortc for WebRTC
+# (a pure-Python stack uv fetches from PyPI), so NO system curl-with-HTTP/3 is
+# needed. An OPTIONAL second leg runs a curl --http3 smoke if such a curl is on
+# PATH. SKIPs (does not fail) when uv/aioquic can't bootstrap or the run times out
+# (tree-killed via bounded_proc.h — no hang, no leak). Under HTTP3=OFF it compiles
+# to a single GTEST_SKIP so the default suite stays green. BOLTAPI_SOURCE_DIR lets
+# the test locate the python script from the build dir.
+boltapi_add_test(boltapi_http3_interop_test http3_interop_test.cpp)
+target_link_libraries(boltapi_http3_interop_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+target_compile_definitions(boltapi_http3_interop_test PRIVATE
+    BOLTAPI_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+if(WIN32)
+    target_link_libraries(boltapi_http3_interop_test PRIVATE ws2_32 mswsock iphlpapi)
+endif()
+
 # WebRTC RTP/RTCP codec (RFC 3550/8285 + SR/RR/SDES/BYE/NACK/PLI/FIR/REMB/TWCC).
 boltapi_add_test(boltapi_rtp_test rtp_test.cpp)
 

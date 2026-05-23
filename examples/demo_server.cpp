@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <string>
 
 int main(int argc, char** argv) {
@@ -41,6 +42,31 @@ int main(int argc, char** argv) {
     wcfg.ice_lite         = true;          // Bolt is the ICE-lite controlled peer
     wcfg.max_message_size = 262144;
     app.enable_webrtc(wcfg);
+
+    // HTTP/3 (W5c): serve H3 alongside H1/H2 on the SAME port number over UDP
+    // (QUIC). enable_http3(port) binds the QUIC server endpoint to that UDP port;
+    // requests bridge through the SAME App dispatch path as H1/H2. Under a build
+    // without BOLTAPI_WITH_HTTP3 this is a harmless no-op (it logs + ignores).
+    app.enable_http3(port);
+
+    // Alt-Svc advertisement (RFC 7838) so browsers (Chrome/Firefox) learn the
+    // HTTP/3 endpoint and upgrade. Added as DEMO middleware (App::use) — NOT in
+    // core app.cpp — so every H1/H2 response carries `alt-svc: h3=":<port>"`.
+    // `ma` is the advertisement lifetime (seconds); `persist=1` keeps it across
+    // network changes. The middleware runs the rest of the chain, then stamps the
+    // header on the way out.
+    {
+        char alt_svc[64];
+        std::snprintf(alt_svc, sizeof(alt_svc),
+                      "h3=\":%u\"; ma=86400; persist=1",
+                      static_cast<unsigned>(port));
+        const std::string alt_svc_value = alt_svc;
+        app.use([alt_svc_value](bolt::api::Request&, bolt::api::Response& res,
+                                std::function<void()> next) {
+            next();  // run the matched handler first
+            res.header("alt-svc", alt_svc_value);  // then advertise H3
+        });
+    }
 
     // WM6: MEDIA ECHO (aiortc `server` shape). Loop received audio + video RTP
     // straight back out (re-SRTP, relay, no transcode). The signaling answer
@@ -83,8 +109,9 @@ int main(int argc, char** argv) {
         "  open  http://127.0.0.1:%u/media.html   (browser audio+video echo)\n"
         "  GET   /health   WS /ws                 (HTTP/WS surfaces)\n"
         "  POST  /webrtc/offer                    (signaling: data + media)\n"
+        "  HTTP/3 (QUIC) on UDP :%u (ALPN h3); H1/H2 advertise alt-svc h3=\":%u\"\n"
         "  static root: %s\n",
-        port, port, port, web_root.c_str());
+        port, port, port, port, port, web_root.c_str());
 
     return app.run("127.0.0.1", port);
 }
