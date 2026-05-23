@@ -68,6 +68,16 @@ if(WIN32)
     target_link_libraries(boltapi_compression_test PRIVATE ws2_32 mswsock)
 endif()
 
+# JSON facility — fionn (bolt::parse) wrapper. UNIT: parse objects/arrays/
+# scalars/nested, member+element iteration, missing keys, type mismatches,
+# malformed input -> error (no throw). INTEGRATION: a real App route reads
+# req.json(), pulls typed/nested fields, replies — driven by a raw client
+# socket with randomized JSON bodies. See docs/JSON.md.
+boltapi_add_test(boltapi_json_test json_test.cpp)
+if(WIN32)
+    target_link_libraries(boltapi_json_test PRIVATE ws2_32 mswsock)
+endif()
+
 # M3: HTTP/3 + WebRTC seam — ProtocolRegistry mechanism (register/has/create),
 # a dummy IProtocol returning NotImplemented, and (when the compile flags are
 # ON) the real H3/WebRTC stub factories registering. Flag-AWARE: passes in the

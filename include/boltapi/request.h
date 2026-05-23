@@ -14,6 +14,7 @@
 //   * Case-insensitive header lookup without allocating a lowercased key.
 #pragma once
 
+#include "boltapi/json.h"
 #include "boltapi/router.h"
 #include "boltapi/server/coro_unified_server.h"
 
@@ -67,6 +68,28 @@ public:
     // Body view — never copied.
     std::string_view body() const noexcept {
         return std::string_view(req_.body);
+    }
+
+    // --- JSON ---
+    // Parse the request body as JSON using Bolt's own parser (fionn, via
+    // boltapi/json.h). Returns a json::Document; check doc.ok() before use
+    // (malformed bodies yield ok()==false — NO exception, NO crash).
+    //
+    // LIFETIME CONTRACT: the returned Document's string/key views ALIAS the
+    // request body buffer (req.body()), which is owned by the engine and stays
+    // alive for the WHOLE handler invocation. The Document also owns the parse
+    // tape (its internal arena). Therefore:
+    //   * Keep the Document alive (on the handler stack) for as long as you read
+    //     fields from it.
+    //   * Do NOT stash a Document, a json::Value, or any std::string_view taken
+    //     from it past the handler return — the body buffer is recycled after.
+    // Typical use:
+    //   auto doc = req.json();
+    //   if (!doc.ok()) { res.bad_request(); return; }
+    //   std::string_view name = doc["name"].as_string();
+    //   int64_t age = doc["age"].as_int();
+    json::Document json() const noexcept {
+        return json::parse(body());
     }
 
     // --- Headers ---

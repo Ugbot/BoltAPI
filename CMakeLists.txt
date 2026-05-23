@@ -49,7 +49,9 @@ endif()
 set(BOLT_BUILD_TESTS      OFF CACHE BOOL "" FORCE)
 set(BOLT_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
 set(BOLT_BUILD_IO         OFF CACHE BOOL "" FORCE)
-set(BOLT_BUILD_PARSE      OFF CACHE BOOL "" FORCE)
+# bolt::parse hosts fionn — Bolt's skip-aware JSON parser. It is the canonical
+# JSON path for Bolt API (include/boltapi/json.h wraps it). See docs/JSON.md.
+set(BOLT_BUILD_PARSE      ON  CACHE BOOL "" FORCE)
 set(BOLT_BUILD_INGEST     OFF CACHE BOOL "" FORCE)
 add_subdirectory(extern/bolt EXCLUDE_FROM_ALL)
 
@@ -147,6 +149,7 @@ add_library(boltapi STATIC
     src/router.cpp          # Bolt-native dictionary/SwissTable router
     src/app.cpp             # M1: App facade + dispatch bridge + middleware fold
     src/compression.cpp     # M2: gzip codec seam (zlib stopgap, BOLTAPI_HAVE_GZIP)
+    src/json.cpp            # JSON: thin facade over bolt::parse (fionn)
     ${BOLTAPI_ENGINE_SOURCES}
 )
 add_library(boltapi::boltapi ALIAS boltapi)
@@ -155,7 +158,10 @@ target_include_directories(boltapi PUBLIC
     $<INSTALL_INTERFACE:include>
 )
 target_compile_features(boltapi PUBLIC cxx_std_20)
-target_link_libraries(boltapi PUBLIC bolt::bolt OpenSSL::SSL OpenSSL::Crypto)
+# bolt::parse hosts fionn (the JSON parser); link it explicitly so the json
+# facade's TU resolves bolt::parse::json::* even though bolt::bolt also
+# transitively re-exports it when BOLT_BUILD_PARSE=ON.
+target_link_libraries(boltapi PUBLIC bolt::bolt bolt::parse OpenSSL::SSL OpenSSL::Crypto)
 if(WIN32)
     target_link_libraries(boltapi PUBLIC ws2_32 mswsock)
 endif()
@@ -221,7 +227,9 @@ target_include_directories(boltapi_headers INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
-target_link_libraries(boltapi_headers INTERFACE bolt::bolt)
+# bolt::parse so header-only consumers that pull in boltapi/json.h (directly or
+# via request.h) resolve fionn's parse symbols.
+target_link_libraries(boltapi_headers INTERFACE bolt::bolt bolt::parse)
 
 # ---------------------------------------------------------------------------
 # Examples / Tests
