@@ -223,6 +223,35 @@ if(WIN32)
     target_link_libraries(boltapi_quic_connection_test PRIVATE ws2_32 mswsock iphlpapi)
 endif()
 
+# Wave 5a: QUIC TRANSPORT — RFC 9002 loss recovery + NewReno congestion control
+# + QUIC streams + flow control (boltapi/quic/{loss,stream}.h wired into
+# connection.h). UNIT: stream-id encoding (RFC 9000 §2.1), RTT/PTO math (RFC 9002
+# §5.3/§6.2.1), NewReno transitions (§7), ordered reassembly. GATE (loopback UDP
+# after a real handshake): (1) client opens a bidi stream, sends a multi-KB
+# message spanning many STREAM frames/packets, server receives it byte-exact +
+# in order and echoes it back with FIN, client receives the echo + FIN; (2) a
+# ~15% seeded datagram-drop variant STILL completes via loss recovery/retransmit
+# with cwnd growth then back-off; (3) a flow-controlled variant forcing window
+# updates completes with no deadlock. Bounded by wall-clock deadlines (no hang).
+# OpenSSL + ws2_32/mswsock on Windows. Runs in the default suite.
+boltapi_add_test(boltapi_quic_stream_test quic_stream_test.cpp)
+target_link_libraries(boltapi_quic_stream_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+if(WIN32)
+    target_link_libraries(boltapi_quic_stream_test PRIVATE ws2_32 mswsock iphlpapi)
+endif()
+
+# QPACK (HTTP/3 RFC 9204) — static table + RFC 7541 Huffman, encoder/decoder,
+# bounded dynamic table. RFC 7541 C.4.1 Huffman vector byte-exact + round-trips.
+boltapi_add_test(boltapi_qpack_test qpack_test.cpp)
+
+# WebRTC RTP/RTCP codec (RFC 3550/8285 + SR/RR/SDES/BYE/NACK/PLI/FIR/REMB/TWCC).
+boltapi_add_test(boltapi_rtp_test rtp_test.cpp)
+
+# WebRTC SRTP/SRTCP (RFC 3711) — KDF (Appendix B.3 vectors byte-exact), AES-CM-
+# HMAC-SHA1-80 + AEAD-AES-128-GCM protect/unprotect, ROC + replay window.
+boltapi_add_test(boltapi_srtp_test srtp_test.cpp)
+target_link_libraries(boltapi_srtp_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+
 # M3: HTTP/3 + WebRTC seam — ProtocolRegistry mechanism (register/has/create),
 # a dummy IProtocol returning NotImplemented, and (when the compile flags are
 # ON) the real H3/WebRTC stub factories registering. Flag-AWARE: passes in the

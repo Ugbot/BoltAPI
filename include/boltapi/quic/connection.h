@@ -33,20 +33,27 @@
 #pragma once
 
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <new>
 #include <vector>
 
 #include "boltapi/quic/ack.h"
 #include "boltapi/quic/frames.h"
+#include "boltapi/quic/loss.h"
 #include "boltapi/quic/packet.h"
 #include "boltapi/quic/packet_protection.h"
 #include "boltapi/quic/pn_space.h"
+#include "boltapi/quic/stream.h"
 #include "boltapi/quic/tls.h"
 #include "boltapi/quic/transport_params.h"
 #include "boltapi/quic/varint.h"
+
+#include "bolt/bolt_arena.h"
+#include "bolt/join/bolt_swiss.h"
 
 #ifdef BOLTAPI_QUIC_TRACE
 #include <cstdio>
@@ -193,6 +200,19 @@ private:
 using QuicSendFn =
     std::function<void(const std::uint8_t* data, std::size_t len)>;
 
+// Raised when contiguous, in-order stream bytes are available (RFC 9000 §2);
+// `fin` is true on the final delivery for the stream. The bytes are valid only
+// for the duration of the call (borrowed from the stream's reassembly buffer).
+using QuicStreamDataFn =
+    std::function<void(std::uint64_t stream_id, const std::uint8_t* data,
+                       std::size_t len, bool fin)>;
+
+// STREAM payload budget per frame (leaves room for the frame header in a
+// packet). Bounded so a multi-KB message spans several frames/packets.
+inline constexpr std::size_t kMaxStreamChunk = 1024;
+// Default connection-level recv window growth step + advertise threshold.
+inline constexpr std::uint64_t kConnFlowChunk = 64 * 1024;
+
 // ============================================================================
 // QuicConnection — one endpoint (client or server) of a QUIC connection.
 // ============================================================================
@@ -276,18 +296,46 @@ public:
         flush();
     }
 
-    // tick — drive retransmission of unacked CRYPTO + send a pending ACK. Called
-    // periodically by the owner to make a lossy/loopback handshake reliable
-    // (minimal stand-in for RFC 9002 PTO — wave 5 replaces it).
+    // tick — RFC 9002 §6.2 PTO driver. On expiry, re-arm exponential backoff and
+    // re-frame the oldest unacked CRYPTO/STREAM data into fresh packets, then
+    // flush (which also emits any due ACKs / new data within cwnd).
     void tick() noexcept {
         if (state_ == ConnState::kClosed || state_ == ConnState::kDraining)
             return;
         tls_.advance();
         maybe_promote_state();
-        // Re-send still-pending CRYPTO (TLS re-buffers nothing, so we replay our
-        // own send offsets) and an ACK if one is due, then any new CRYPTO.
-        retransmit_pending();
+        maybe_pto_expire();
         flush();
+    }
+
+    // Check the PTO timer across spaces; on expiry, mark the oldest in-flight
+    // ack-eliciting packet for retransmit (rewind its frontiers) and back off.
+    void maybe_pto_expire() noexcept {
+        const std::uint64_t now = now_us();
+        bool fired = false;
+        for (std::size_t si = 0; si < kPacketNumberSpaceCount; ++si) {
+            SentPacketTracker& tr = sent_[si];
+            std::uint64_t earliest = 0;
+            if (!tr.earliest_in_flight_time(earliest)) continue;
+            const std::uint64_t pto = rtt_.pto(max_ack_delay_us(), pto_backoff_);
+            if (now < earliest + pto) continue;
+            // PTO expired for this space: re-frame its oldest unacked packet.
+            // RFC 9002 §6.2.4 lets a PTO probe ignore the congestion window, so
+            // tail loss (no later packet to trigger packet-threshold) recovers.
+            for (std::size_t i = 0; i < tr.count(); ++i) {
+                SentPacketInfo& s = tr.at(i);
+                if (s.acked || s.lost || !s.ack_eliciting) continue;
+                requeue_lost(s);
+                s.lost = true;
+                if (s.in_flight) { s.in_flight = false; cc_.on_packet_lost(s.size); }
+                fired = true;
+                break;
+            }
+        }
+        if (fired) {
+            if (pto_probes_ < 2) ++pto_probes_;  // up to 2 probe packets
+            if (pto_backoff_ < kMaxPtoBackoffShift) ++pto_backoff_;
+        }
     }
 
     // ------------------------------------------------------------------------
@@ -337,8 +385,43 @@ public:
         payload[plen++] = static_cast<std::uint8_t>(FrameType::kPing);
         plen += maybe_append_ack(PacketNumberSpace::kApplication,
                                  payload + plen, sizeof(payload) - plen);
-        return send_app_packet(payload, plen);
+        FrameRange ranges[kMaxFrameRangesPerPacket];
+        std::size_t rc = 0;
+        return send_app_packet(payload, plen, /*ack_eliciting=*/true, ranges, rc);
     }
+
+    // ------------------------------------------------------------------------
+    // Stream API (RFC 9000 §2-§4). Available once 1-RTT keys exist.
+    // ------------------------------------------------------------------------
+    void set_stream_data_handler(QuicStreamDataFn fn) noexcept {
+        on_stream_data_ = std::move(fn);
+    }
+
+    // Open a client/server-initiated bidirectional stream. Returns its id.
+    std::uint64_t open_bidi() noexcept {
+        return open_stream(/*uni=*/false);
+    }
+    // Open a unidirectional stream. Returns its id.
+    std::uint64_t open_uni() noexcept {
+        return open_stream(/*uni=*/true);
+    }
+
+    // Queue `data` (and optional FIN) on `id`, creating the stream if needed.
+    // Returns bytes queued; respects per-stream + connection flow control on
+    // flush. Does not itself send — flush()/tick() drain under cwnd.
+    std::size_t stream_write(std::uint64_t id, const std::uint8_t* data,
+                             std::size_t len, bool fin) noexcept {
+        assert((data != nullptr || len == 0) && "stream_write: null");
+        Stream* s = get_or_create_stream(id);
+        if (s == nullptr) return 0;
+        const std::size_t n = s->write(data, len, fin);
+        flush();
+        return n;
+    }
+
+    NewRenoCongestion& congestion() noexcept { return cc_; }
+    const NewRenoCongestion& congestion() const noexcept { return cc_; }
+    const RttEstimator& rtt() const noexcept { return rtt_; }
 
 private:
     // ===================================================================
@@ -484,6 +567,11 @@ private:
         std::size_t pos = 0;
         while (pos < len) {
             const std::uint8_t type = data[pos];
+            // RFC 9002 §2: any frame other than ACK/PADDING (and CONNECTION_CLOSE)
+            // is ack-eliciting -> we owe the peer an ACK for this packet.
+            if (type != 0x00 && type != 0x02 && type != 0x03 && type != 0x1c &&
+                type != 0x1d)
+                ack_pending_[space_idx(level)] = true;
             std::size_t consumed = 0;
             if (!handle_one_frame(level, data + pos, len - pos, consumed))
                 return false;
@@ -517,13 +605,26 @@ private:
             return true;
         }
         if (is_stream_frame_type(type)) {
-            // Streams are wave 5; skip the frame body cleanly (parse framing).
-            StreamFrame sf;
-            std::size_t c = 0;
-            if (sf.parse(type, data + 1, len - 1, c) != kFrameOk) return false;
-            out_consumed = 1 + c;
-            return true;
+            return handle_stream(type, data + 1, len - 1, out_consumed);
         }
+        if (type == static_cast<std::uint8_t>(FrameType::kMaxData))
+            return handle_max_data(data + 1, len - 1, out_consumed);
+        if (type == static_cast<std::uint8_t>(FrameType::kMaxStreamData))
+            return handle_max_stream_data(data + 1, len - 1, out_consumed);
+        if (type == static_cast<std::uint8_t>(FrameType::kMaxStreamsBidi) ||
+            type == static_cast<std::uint8_t>(FrameType::kMaxStreamsUni))
+            return handle_max_streams(data + 1, len - 1, out_consumed);
+        if (type == static_cast<std::uint8_t>(FrameType::kDataBlocked))
+            return skip_one_varint(data + 1, len - 1, out_consumed);
+        if (type == static_cast<std::uint8_t>(FrameType::kStreamsBlockedBidi) ||
+            type == static_cast<std::uint8_t>(FrameType::kStreamsBlockedUni))
+            return skip_one_varint(data + 1, len - 1, out_consumed);
+        if (type == static_cast<std::uint8_t>(FrameType::kStreamDataBlocked))
+            return skip_two_varint(data + 1, len - 1, out_consumed);
+        if (type == static_cast<std::uint8_t>(FrameType::kResetStream))
+            return handle_reset_stream(data + 1, len - 1, out_consumed);
+        if (type == static_cast<std::uint8_t>(FrameType::kStopSending))
+            return handle_stop_sending(data + 1, len - 1, out_consumed);
         return false;  // unknown frame -> protocol error
     }
 
@@ -533,12 +634,127 @@ private:
         std::size_t c = 0;
         if (ack.parse(data + 1, len - 1, ecn, c) != kFrameOk) return false;
         spaces_[space_for(level)].on_largest_acked(ack.largest_acked);
-        // Mark our CRYPTO at/below largest_acked as acked (coarse: clears the
-        // pending flag so we stop retransmitting once the peer has it).
-        crypto_acked_[static_cast<std::size_t>(level)] = true;
+        process_ack(level, ack);  // RFC 9002 §A.7: RTT, free acked, detect loss
         out_consumed = 1 + c;
         return true;
     }
+
+    // RFC 9002 §A.7: walk the ACK ranges, mark our sent packets acked (RTT
+    // sample on the largest), free their flow/cwnd accounting, then detect loss.
+    void process_ack(TlsLevel level, const AckFrame& ack) noexcept {
+        assert(ack.range_count <= kMaxAckRanges && "ack range overflow");
+        SentPacketTracker& tr = sent_[space_idx(level)];
+        const std::uint64_t now = now_us();
+        bool acked_largest = false;
+        ack_range(tr, ack.largest_acked - ack.first_ack_range, ack.largest_acked,
+                  ack.largest_acked, now, acked_largest);
+        std::uint64_t smallest = ack.largest_acked - ack.first_ack_range;
+        for (std::size_t i = 0; i < ack.range_count; ++i) {
+            if (smallest < ack.ranges[i].gap + 2) break;  // malformed; stop
+            smallest -= ack.ranges[i].gap + 2;
+            const std::uint64_t hi = smallest;
+            if (smallest < ack.ranges[i].length) break;
+            smallest -= ack.ranges[i].length;
+            ack_range(tr, smallest, hi, ack.largest_acked, now, acked_largest);
+        }
+        if (acked_largest && rtt_sample_us_ > 0) {
+            // RFC 9002 §5.1/§5.3: ack_delay is encoded with the peer's exponent;
+            // we advertised the default (3 -> microsecond * 8). Decode + clamp.
+            const std::uint64_t ack_delay = ack.ack_delay << kDefaultAckDelayExponent;
+            rtt_.on_rtt_sample(rtt_sample_us_, ack_delay);
+            rtt_sample_us_ = 0;
+        }
+        pto_backoff_ = 0;  // RFC 9002 §6.2.1: reset on ack of new data
+        pto_probes_ = 0;
+        detect_loss(level, now);
+    }
+
+    // Mark every still-unacked packet in [lo,hi] acked; sample RTT + record the
+    // send time of the largest acked packet (used by time-threshold loss).
+    void ack_range(SentPacketTracker& tr, std::uint64_t lo, std::uint64_t hi,
+                   std::uint64_t largest, std::uint64_t now,
+                   bool& acked_largest) noexcept {
+        assert(lo <= hi && "ack range inverted");
+        // Iterate inclusive [lo,hi]. Use a do/while-style guard so pn never wraps
+        // below 0 (lo can be 0). A not-found pn is simply already-acked/evicted.
+        for (std::uint64_t pn = lo;; ++pn) {
+            SentPacketInfo* s = tr.find_unacked(pn);
+            if (s != nullptr) {
+                s->acked = true;
+                if (s->in_flight) {
+                    s->in_flight = false;
+                    cc_.on_packet_acked(s->size, s->time_sent_us);
+                }
+                if (pn == largest) {
+                    time_largest_acked_sent_ = s->time_sent_us;
+                    if (s->ack_eliciting) {
+                        rtt_sample_us_ = now - s->time_sent_us;
+                        acked_largest = true;
+                    }
+                }
+            }
+            if (pn == hi) break;  // inclusive upper bound reached
+        }
+    }
+
+    // RFC 9002 §6.1: declare packets lost by packet-threshold (>= 3 higher-
+    // numbered packets acked) or time-threshold (a later-acked packet was sent
+    // more than 9/8*max(srtt,latest) after this one — true reordering evidence,
+    // measured against the largest-acked send time, NOT wall-clock now, so a
+    // clean link never false-positives). Re-frame lost frames; one cc event.
+    void detect_loss(TlsLevel level, std::uint64_t now) noexcept {
+        SentPacketTracker& tr = sent_[space_idx(level)];
+        const std::int64_t largest_acked = spaces_[space_for(level)].largest_acked();
+        if (largest_acked < 0) return;
+        std::uint64_t rtt = rtt_.smoothed();
+        if (rtt_.latest() > rtt) rtt = rtt_.latest();
+        std::uint64_t loss_delay = (kTimeThresholdNum * rtt) / kTimeThresholdDen;
+        if (loss_delay < kGranularityUs) loss_delay = kGranularityUs;
+        bool any_lost = false;
+        std::uint64_t earliest_lost_sent = 0;
+        for (std::size_t i = 0; i < tr.count(); ++i) {
+            SentPacketInfo& s = tr.at(i);
+            if (s.acked || s.lost || !s.ack_eliciting) continue;
+            if (static_cast<std::uint64_t>(largest_acked) <= s.packet_number)
+                continue;  // no later packet acked -> not yet lost
+            const bool by_pkt = static_cast<std::uint64_t>(largest_acked) >=
+                                s.packet_number + kPacketThreshold;
+            const bool by_time = time_largest_acked_sent_ >=
+                                 s.time_sent_us + loss_delay;
+            if (!by_pkt && !by_time) continue;
+            s.lost = true;
+            if (s.in_flight) { s.in_flight = false; cc_.on_packet_lost(s.size); }
+            requeue_lost(s);
+            if (!any_lost || s.time_sent_us < earliest_lost_sent)
+                earliest_lost_sent = s.time_sent_us;
+            any_lost = true;
+        }
+        if (any_lost) cc_.on_congestion_event(earliest_lost_sent, now);
+    }
+
+    // Re-frame a lost packet's content by rewinding the relevant send frontier
+    // so flush() re-emits the bytes under a FRESH packet number (never reused).
+    void requeue_lost(const SentPacketInfo& s) noexcept {
+        assert(s.range_count <= kMaxFrameRangesPerPacket && "range overflow");
+        for (std::size_t i = 0; i < s.range_count; ++i) {
+            const FrameRange& r = s.ranges[i];
+            if (r.is_crypto) {
+                const std::size_t li = static_cast<std::size_t>(r.id);
+                if (li < kNumTlsLevels && r.offset < crypto_sent_off_[li])
+                    crypto_sent_off_[li] = static_cast<std::size_t>(r.offset);
+            } else {
+                Stream* st = find_stream(r.id);
+                if (st != nullptr) st->rewind_sent(r.offset, r.fin);
+            }
+        }
+    }
+
+    static std::uint64_t now_us() noexcept {
+        const auto t = std::chrono::steady_clock::now().time_since_epoch();
+        return static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(t).count());
+    }
+    std::uint64_t max_ack_delay_us() const noexcept { return 25000; }  // 25 ms
 
     bool handle_crypto(TlsLevel level, const std::uint8_t* data, std::size_t len,
                        std::size_t& out_consumed) noexcept {
@@ -553,6 +769,120 @@ private:
             return false;
         drain_crypto_to_tls(level);
         out_consumed = 1 + c;
+        return true;
+    }
+
+    // Inbound STREAM frame: deliver to its stream's ordered reassembly, raise
+    // the data callback for newly-contiguous bytes, advance conn flow control.
+    bool handle_stream(std::uint8_t type, const std::uint8_t* data,
+                       std::size_t len, std::size_t& out_consumed) noexcept {
+        StreamFrame sf;
+        std::size_t c = 0;
+        if (sf.parse(type, data, len, c) != kFrameOk) return false;
+        out_consumed = 1 + c;
+        Stream* s = get_or_create_stream(sf.stream_id);
+        if (s == nullptr) return false;
+        if (!s->receive(sf.offset, sf.data, static_cast<std::size_t>(sf.length),
+                        sf.fin))
+            return false;
+        conn_recv_total_ += static_cast<std::uint64_t>(sf.length);
+        deliver_stream(*s);
+        return true;
+    }
+
+    // Hand all contiguous unread bytes to the app callback; bump windows. The
+    // FIN is signalled on the delivery that carries the final byte (i.e. once
+    // consuming `avail` would reach the FIN offset), or on a FIN-only frame.
+    void deliver_stream(Stream& s) noexcept {
+        const std::size_t avail = s.recv_available();
+        s.recv_consume(avail);                 // advance the read cursor first
+        const bool fin = s.recv_finished();    // now reflects bytes just consumed
+        if (avail > 0 || fin) {
+            if (on_stream_data_)
+                on_stream_data_(s.id(), s.recv_peek_consumed(avail), avail, fin);
+        }
+        if (s.needs_window_update(kConnFlowChunk / 2)) {
+            s.grow_recv_window(kConnFlowChunk);
+            stream_window_dirty_ = true;
+        }
+        if (conn_recv_max_ - conn_recv_total_ < kConnFlowChunk / 2) {
+            conn_recv_max_ += kConnFlowChunk;
+            conn_window_dirty_ = true;
+        }
+    }
+
+    bool handle_max_data(const std::uint8_t* data, std::size_t len,
+                         std::size_t& out_consumed) noexcept {
+        std::uint64_t v = 0;
+        const int c = varint_decode(data, len, v);
+        if (c < 0) return false;
+        if (v > conn_send_max_) conn_send_max_ = v;
+        out_consumed = 1 + static_cast<std::size_t>(c);
+        return true;
+    }
+
+    bool handle_max_stream_data(const std::uint8_t* data, std::size_t len,
+                                std::size_t& out_consumed) noexcept {
+        std::uint64_t id = 0, v = 0;
+        int c1 = varint_decode(data, len, id);
+        if (c1 < 0) return false;
+        int c2 = varint_decode(data + c1, len - c1, v);
+        if (c2 < 0) return false;
+        Stream* s = get_or_create_stream(id);
+        if (s != nullptr && v > s->flow().send_max) s->flow().send_max = v;
+        out_consumed = 1 + static_cast<std::size_t>(c1 + c2);
+        return true;
+    }
+
+    bool handle_max_streams(const std::uint8_t* data, std::size_t len,
+                            std::size_t& out_consumed) noexcept {
+        std::uint64_t v = 0;
+        const int c = varint_decode(data, len, v);
+        if (c < 0) return false;
+        out_consumed = 1 + static_cast<std::size_t>(c);
+        return true;  // we never approach the limit at this scope
+    }
+
+    bool handle_reset_stream(const std::uint8_t* data, std::size_t len,
+                             std::size_t& out_consumed) noexcept {
+        std::uint64_t id = 0, err = 0, fsize = 0;
+        int c1 = varint_decode(data, len, id);
+        if (c1 < 0) return false;
+        int c2 = varint_decode(data + c1, len - c1, err);
+        if (c2 < 0) return false;
+        int c3 = varint_decode(data + c1 + c2, len - c1 - c2, fsize);
+        if (c3 < 0) return false;
+        out_consumed = 1 + static_cast<std::size_t>(c1 + c2 + c3);
+        return true;
+    }
+
+    bool handle_stop_sending(const std::uint8_t* data, std::size_t len,
+                             std::size_t& out_consumed) noexcept {
+        std::uint64_t id = 0, err = 0;
+        int c1 = varint_decode(data, len, id);
+        if (c1 < 0) return false;
+        int c2 = varint_decode(data + c1, len - c1, err);
+        if (c2 < 0) return false;
+        out_consumed = 1 + static_cast<std::size_t>(c1 + c2);
+        return true;
+    }
+
+    static bool skip_one_varint(const std::uint8_t* data, std::size_t len,
+                                std::size_t& out_consumed) noexcept {
+        std::uint64_t v = 0;
+        const int c = varint_decode(data, len, v);
+        if (c < 0) return false;
+        out_consumed = 1 + static_cast<std::size_t>(c);
+        return true;
+    }
+    static bool skip_two_varint(const std::uint8_t* data, std::size_t len,
+                                std::size_t& out_consumed) noexcept {
+        std::uint64_t a = 0, b = 0;
+        int c1 = varint_decode(data, len, a);
+        if (c1 < 0) return false;
+        int c2 = varint_decode(data + c1, len - c1, b);
+        if (c2 < 0) return false;
+        out_consumed = 1 + static_cast<std::size_t>(c1 + c2);
         return true;
     }
 
@@ -623,36 +953,176 @@ private:
         for (std::size_t i = 0; i <= kMaxCoalescedPackets; ++i) {
             std::uint8_t payload[kMaxPayloadSize];
             std::size_t plen = 0;
+            FrameRange ranges[kMaxFrameRangesPerPacket];
+            std::size_t rc = 0;
             if (first) {
                 plen += maybe_append_ack(space_for(level), payload + plen,
                                          sizeof(payload) - plen);
             }
-            plen += frame_crypto(level, payload + plen, sizeof(payload) - plen);
+            bool has_range = false;
+            plen += frame_crypto(level, payload + plen, sizeof(payload) - plen,
+                                 &ranges[rc], &has_range);
+            if (has_range) ++rc;
             if (plen == 0) break;  // nothing more to send at this level
             QTRACE("flush_level level=%d send payload=%zu", (int)level, plen);
-            build_and_send_long(level, form, payload, plen);
+            build_and_send_long(level, form, payload, plen, rc > 0, ranges, rc);
             first = false;
             if (!has_unsent_crypto(level)) break;
         }
     }
 
-    // Build + send 1-RTT short-header packets (server's HANDSHAKE_DONE + any
-    // pending ACK once 1-RTT write keys exist).
+    // Build + send 1-RTT short-header packets: control frames (HANDSHAKE_DONE,
+    // ACK, flow-control window updates) plus STREAM data, packetized under cwnd
+    // and flow control. Each ack-eliciting packet is recorded for loss recovery.
     void flush_app_level() noexcept {
         PacketProtection* pp = write_protection(TlsLevel::kApplication);
         if (pp == nullptr || !pp->is_initialized()) return;
+
+        // Packet 0: control frames + ACK (always sendable; ACK-only is not in
+        // flight, so cwnd does not gate it).
+        flush_app_control();
+
+        // STREAM data packets, bounded by coalesce count, cwnd and flow control.
+        // A pending PTO probe may send up to two packets ignoring cwnd (§6.2.4).
+        for (std::size_t i = 0; i < kMaxCoalescedPackets; ++i) {
+            const bool probe = pto_probes_ > 0;
+            if (!probe && !cc_.can_send(NewRenoCongestion::kMaxDatagram)) break;
+            if (!flush_app_stream_packet()) break;  // nothing more to send
+            if (probe && pto_probes_ > 0) --pto_probes_;
+        }
+    }
+
+    // One packet of control frames (HANDSHAKE_DONE, window updates) + an ACK.
+    void flush_app_control() noexcept {
         std::uint8_t payload[kMaxPayloadSize];
         std::size_t plen = 0;
+        bool ack_eliciting = false;
         if (is_server_ && tls_.is_complete() && !handshake_done_sent_) {
             payload[plen++] = static_cast<std::uint8_t>(FrameType::kHandshakeDone);
             handshake_done_sent_ = true;
+            ack_eliciting = true;
         }
+        plen += frame_flow_updates(payload + plen, sizeof(payload) - plen,
+                                   &ack_eliciting);
         plen += maybe_append_ack(PacketNumberSpace::kApplication, payload + plen,
                                  sizeof(payload) - plen);
         if (plen == 0) return;
-        QTRACE("flush_app send payload=%zu hs_done_sent=%d", plen,
-               handshake_done_sent_);
-        send_app_packet(payload, plen);
+        FrameRange ranges[kMaxFrameRangesPerPacket];
+        std::size_t rc = 0;
+        send_app_packet(payload, plen, ack_eliciting, ranges, rc);
+    }
+
+    // Build one 1-RTT packet of STREAM data across ready streams. Returns false
+    // when there is nothing left to send.
+    bool flush_app_stream_packet() noexcept {
+        std::uint8_t payload[kMaxPayloadSize];
+        std::size_t plen = 0;
+        FrameRange ranges[kMaxFrameRangesPerPacket];
+        std::size_t rc = 0;
+        for (std::size_t si = 0; si < stream_count_ && rc < kMaxFrameRangesPerPacket;
+             ++si) {
+            Stream& s = streams_[si];
+            if (!s.in_use() || !s.has_send_work()) continue;
+            const std::size_t before = plen;
+            plen += frame_one_stream(s, payload + plen, sizeof(payload) - plen,
+                                     &ranges[rc]);
+            if (plen > before) ++rc;
+        }
+        if (plen == 0) return false;
+        send_app_packet(payload, plen, /*ack_eliciting=*/true, ranges, rc);
+        return true;
+    }
+
+    // Frame the next chunk of one stream into a STREAM frame, honoring per-stream
+    // + connection send windows. Returns bytes written (0 if blocked/empty).
+    std::size_t frame_one_stream(Stream& s, std::uint8_t* out, std::size_t cap,
+                                 FrameRange* range) noexcept {
+        assert(range != nullptr && "frame_one_stream: null range");
+        std::uint64_t off = 0; const std::uint8_t* ptr = nullptr;
+        std::size_t len = 0; bool fin = false;
+        std::size_t chunk = (cap > 32) ? cap - 32 : 0;  // header budget
+        if (chunk > kMaxStreamChunk) chunk = kMaxStreamChunk;
+        if (chunk == 0) return 0;
+        if (!s.peek_unsent(off, ptr, len, fin, chunk)) return 0;
+        // Apply per-stream + connection flow-control caps.
+        len = clamp_send_window(s, off, len);
+        if (len == 0 && !(fin && off == s.flow().send_off)) return 0;
+        StreamFrame sf;
+        sf.stream_id = s.id();
+        sf.offset = off;
+        sf.length = len;
+        sf.data = (len > 0) ? ptr : nullptr;
+        sf.fin = fin;
+        const std::size_t need = 1 + varint_encoded_size(sf.stream_id) +
+                                 varint_encoded_size(sf.offset) +
+                                 varint_encoded_size(sf.length) + len;
+        if (need > cap) return 0;
+        const std::size_t wrote = sf.serialize(out);
+        const std::size_t fresh = s.mark_sent(len, fin);
+        conn_send_total_ += fresh;  // count unique bytes only (not retransmits)
+        range->is_crypto = false;
+        range->id = s.id();
+        range->offset = off;
+        range->length = len;
+        range->fin = fin;
+        return wrote;
+    }
+
+    // Clamp a stream chunk to the smaller of the per-stream and connection send
+    // windows (RFC 9000 §4.1). Emits DATA_BLOCKED/STREAM_DATA_BLOCKED next tick.
+    std::size_t clamp_send_window(Stream& s, std::uint64_t off,
+                                  std::size_t len) noexcept {
+        assert(off <= (1ULL << 62) && "send offset absurd");
+        std::uint64_t stream_room = (off < s.flow().send_max)
+                                        ? s.flow().send_max - off : 0;
+        std::uint64_t conn_room = (conn_send_total_ < conn_send_max_)
+                                      ? conn_send_max_ - conn_send_total_ : 0;
+        if (stream_room == 0) stream_blocked_ = true;
+        if (conn_room == 0) conn_blocked_ = true;
+        if (len > stream_room) len = static_cast<std::size_t>(stream_room);
+        if (len > conn_room) len = static_cast<std::size_t>(conn_room);
+        return len;
+    }
+
+    // Emit MAX_DATA / MAX_STREAM_DATA window updates + DATA_BLOCKED /
+    // STREAM_DATA_BLOCKED frames as needed. Returns bytes written.
+    std::size_t frame_flow_updates(std::uint8_t* out, std::size_t cap,
+                                   bool* ack_eliciting) noexcept {
+        assert(ack_eliciting != nullptr && "flow updates: null flag");
+        std::size_t pos = 0;
+        if (conn_window_dirty_ && cap - pos >= 9) {
+            pos += serialize_single_varint(FrameType::kMaxData, conn_recv_max_,
+                                           out + pos);
+            conn_window_dirty_ = false;
+            *ack_eliciting = true;
+        }
+        for (std::size_t si = 0; si < stream_count_ && cap - pos >= 18; ++si) {
+            Stream& s = streams_[si];
+            if (!s.in_use()) continue;
+            if (stream_window_dirty_) {
+                pos += serialize_stream_pair(FrameType::kMaxStreamData, s.id(),
+                                             s.flow().recv_max, out + pos);
+                *ack_eliciting = true;
+            }
+        }
+        stream_window_dirty_ = false;
+        if (conn_blocked_ && cap - pos >= 9) {
+            pos += serialize_single_varint(FrameType::kDataBlocked,
+                                           conn_send_max_, out + pos);
+            conn_blocked_ = false;
+            *ack_eliciting = true;
+        }
+        if (stream_blocked_ && cap - pos >= 18) {
+            for (std::size_t si = 0; si < stream_count_ && cap - pos >= 18; ++si) {
+                Stream& s = streams_[si];
+                if (!s.in_use() || s.flow().send_window() != 0) continue;
+                pos += serialize_stream_pair(FrameType::kStreamDataBlocked,
+                                             s.id(), s.flow().send_max, out + pos);
+                *ack_eliciting = true;
+            }
+            stream_blocked_ = false;
+        }
+        return pos;
     }
 
     // Move all pending TLS CRYPTO for `level` into our send buffer (so it can be
@@ -674,9 +1144,10 @@ private:
     }
 
     // Frame the unsent tail of crypto_tx_[level] into a CRYPTO frame (bounded by
-    // kCryptoChunk and cap). Returns bytes written.
-    std::size_t frame_crypto(TlsLevel level, std::uint8_t* out,
-                             std::size_t cap) noexcept {
+    // kCryptoChunk and cap). Returns bytes written; records the framed range.
+    std::size_t frame_crypto(TlsLevel level, std::uint8_t* out, std::size_t cap,
+                             FrameRange* range, bool* has_range) noexcept {
+        assert(range != nullptr && has_range != nullptr && "frame_crypto: null out");
         const std::size_t li = static_cast<std::size_t>(level);
         const std::size_t total = crypto_tx_[li].size();
         if (crypto_sent_off_[li] >= total) return 0;
@@ -686,24 +1157,32 @@ private:
         cf.offset = crypto_sent_off_[li];
         cf.length = n;
         cf.data = crypto_tx_[li].data() + crypto_sent_off_[li];
-        // header: type(1) + varint(offset) + varint(len) + payload.
         const std::size_t need = 1 + varint_encoded_size(cf.offset) +
                                  varint_encoded_size(cf.length) + n;
         if (need > cap) return 0;
         const std::size_t wrote = cf.serialize(out);
+        range->is_crypto = true;
+        range->id = static_cast<std::uint64_t>(level);
+        range->offset = crypto_sent_off_[li];
+        range->length = n;
+        range->fin = false;
+        *has_range = true;
         crypto_sent_off_[li] += n;
         assert(wrote == need && "frame_crypto: size mismatch");
         return wrote;
     }
 
-    // Append an ACK frame if the space has received packets and an ACK is due.
+    // Append an ACK frame only when one is DUE (an ack-eliciting packet has been
+    // received in this space since our last ACK, RFC 9002 §2). Clears the
+    // pending flag. Avoids ACK-only-packet spam + PN inflation.
     std::size_t maybe_append_ack(std::size_t space, std::uint8_t* out,
                                  std::size_t cap) noexcept {
         assert(space < kPacketNumberSpaceCount && "ack: bad space");
+        if (!ack_pending_[space]) return 0;
         AckFrame ack;
         if (!acks_[space].build_ack_frame(ack, 0)) return 0;
-        // Worst case ACK size is bounded; cap-guard before serialize.
-        if (cap < 64) return 0;
+        if (cap < 64) return 0;  // worst-case ACK is bounded; cap-guard
+        ack_pending_[space] = false;
         return ack.serialize(out);
     }
 
@@ -713,11 +1192,13 @@ private:
     }
 
     // Build a long-header packet around `payload`, AEAD-seal, header-protect,
-    // and send. Initial packets are padded to >=1200 bytes (RFC 9000 §14.1).
+    // send, and record it for loss recovery. Initial packets pad to >=1200B.
     void build_and_send_long(TlsLevel level, PacketForm form,
-                             const std::uint8_t* payload,
-                             std::size_t payload_len) noexcept {
+                             const std::uint8_t* payload, std::size_t payload_len,
+                             bool ack_eliciting, const FrameRange* ranges,
+                             std::size_t range_count) noexcept {
         assert(payload_len <= kMaxPayloadSize && "long: oversize payload");
+        assert(range_count <= kMaxFrameRangesPerPacket && "range overflow");
         PacketProtection* pp = write_protection(level);
         if (pp == nullptr) return;
         const std::uint64_t pn = spaces_[space_for(level)].next_packet_number();
@@ -725,20 +1206,24 @@ private:
 
         std::uint8_t dgram[kMaxDatagramSize];
         std::size_t hdr_len = 0;
-        const std::size_t length_field =
-            pn_len + payload_len + kAeadTagLength;
+        const std::size_t length_field = pn_len + payload_len + kAeadTagLength;
         if (!write_long_header(dgram, &hdr_len, form, level, length_field))
             return;
         const std::size_t pn_offset = hdr_len;
         write_pn(dgram + pn_offset, pn, pn_len);
-        seal_and_send(dgram, pn_offset, pn_len, payload, payload_len, pn, pp,
-                      level == TlsLevel::kInitial);
+        const std::size_t wire =
+            seal_and_send(dgram, pn_offset, pn_len, payload, payload_len, pn, pp,
+                          level == TlsLevel::kInitial);
+        record_sent(space_for(level), pn, wire, ack_eliciting, ranges,
+                    range_count);
     }
 
-    // Build a 1-RTT short-header packet and send it.
-    bool send_app_packet(const std::uint8_t* payload,
-                         std::size_t payload_len) noexcept {
+    // Build a 1-RTT short-header packet, send it, and record it.
+    bool send_app_packet(const std::uint8_t* payload, std::size_t payload_len,
+                         bool ack_eliciting, const FrameRange* ranges,
+                         std::size_t range_count) noexcept {
         assert(payload_len <= kMaxPayloadSize && "app: oversize payload");
+        assert(range_count <= kMaxFrameRangesPerPacket && "range overflow");
         PacketProtection* pp = write_protection(TlsLevel::kApplication);
         if (pp == nullptr || !pp->is_initialized()) return false;
         const std::uint64_t pn =
@@ -746,30 +1231,49 @@ private:
         const std::uint8_t pn_len = 4;
 
         std::uint8_t dgram[kMaxDatagramSize];
-        // Short header: first byte 0x40 | (pn_len-1), then DCID, then PN.
         std::size_t pos = 0;
         dgram[pos++] = static_cast<std::uint8_t>(0x40 | (pn_len - 1));
         std::memcpy(dgram + pos, peer_cid_.data, peer_cid_.length);
         pos += peer_cid_.length;
         const std::size_t pn_offset = pos;
         write_pn(dgram + pn_offset, pn, pn_len);
-        seal_and_send(dgram, pn_offset, pn_len, payload, payload_len, pn, pp,
-                      false);
+        const std::size_t wire = seal_and_send(dgram, pn_offset, pn_len, payload,
+                                               payload_len, pn, pp, false);
+        record_sent(PacketNumberSpace::kApplication, pn, wire, ack_eliciting,
+                    ranges, range_count);
         return true;
     }
 
-    // Shared seal + header-protect + send for both header shapes.
-    void seal_and_send(std::uint8_t* dgram, std::size_t pn_offset,
-                       std::uint8_t pn_len, const std::uint8_t* payload,
-                       std::size_t payload_len, std::uint64_t pn,
-                       PacketProtection* pp, bool pad_initial) noexcept {
+    // Record a sent packet into its space tracker + cwnd in-flight accounting.
+    void record_sent(PacketNumberSpace space, std::uint64_t pn,
+                     std::size_t wire, bool ack_eliciting,
+                     const FrameRange* ranges, std::size_t range_count) noexcept {
+        assert(range_count <= kMaxFrameRangesPerPacket && "range overflow");
+        if (wire == 0) return;  // seal failed; nothing sent
+        std::uint64_t evicted = 0;
+        SentPacketInfo& s = sent_[static_cast<std::size_t>(space)].record(
+            pn, now_us(), wire, ack_eliciting, &evicted);
+        // A bounded ring must not leak bytes_in_flight: if it overwrote a still
+        // in-flight (very old, effectively lost) packet, free its bytes.
+        if (evicted > 0) cc_.on_packet_lost(evicted);
+        s.range_count = range_count;
+        for (std::size_t i = 0; i < range_count; ++i) s.ranges[i] = ranges[i];
+        if (ack_eliciting) cc_.on_packet_sent(wire);
+    }
+
+    // Shared seal + header-protect + send for both header shapes. Returns the
+    // on-wire datagram length (0 on seal failure).
+    std::size_t seal_and_send(std::uint8_t* dgram, std::size_t pn_offset,
+                              std::uint8_t pn_len, const std::uint8_t* payload,
+                              std::size_t payload_len, std::uint64_t pn,
+                              PacketProtection* pp, bool pad_initial) noexcept {
         assert(pp != nullptr && "seal_and_send: null pp");
         const std::size_t aad_len = pn_offset + pn_len;
         std::uint8_t sealed[kMaxDatagramSize];
         std::size_t sealed_len = 0;
         if (!pp->encrypt(pn, dgram, aad_len, payload, payload_len, sealed,
                          &sealed_len)) {
-            return;
+            return 0;
         }
         std::memcpy(dgram + aad_len, sealed, sealed_len);
         std::size_t total = aad_len + sealed_len;
@@ -783,6 +1287,7 @@ private:
         }
         assert(total <= kMaxDatagramSize && "datagram overflow");
         send_(dgram, total);
+        return total;
     }
 
     // Write a long header up to (excluding) the packet number. *out_len receives
@@ -824,18 +1329,88 @@ private:
                 (pn >> ((pn_len - 1 - i) * 8)) & 0xFF);
     }
 
-    // Retransmit unacked CRYPTO for Initial/Handshake by rewinding the send
-    // offset so flush() re-frames it. Minimal stand-in for PTO.
-    void retransmit_pending() noexcept {
-        for (std::size_t li = 0; li < kNumTlsLevels; ++li) {
-            if (li == static_cast<std::size_t>(TlsLevel::kEarlyData)) continue;
-            if (crypto_acked_[li]) continue;
-            if (crypto_sent_off_[li] > 0 &&
-                crypto_sent_off_[li] >= crypto_tx_[li].size() &&
-                !crypto_tx_[li].empty()) {
-                crypto_sent_off_[li] = 0;  // re-send from the start
-            }
+    // ===================================================================
+    // Stream pool + SwissTable map (stream_id -> pool index).
+    // ===================================================================
+    void ensure_stream_map() noexcept {
+        if (stream_map_ready_) return;
+        const bool ok = bolt::SwissTable::create(&stream_map_, kMaxStreams,
+                                                 &stream_arena_);
+        assert(ok && "stream map alloc failed");
+        // Pre-allocate the bounded Stream pool from the arena (placement-new so
+        // each Stream's default member initializers run). No per-stream malloc.
+        void* raw = stream_arena_.allocate(kMaxStreams * sizeof(Stream),
+                                           alignof(Stream));
+        assert(raw != nullptr && "stream pool alloc failed");
+        streams_ = static_cast<Stream*>(raw);
+        for (std::size_t i = 0; i < kMaxStreams; ++i) new (&streams_[i]) Stream();
+        (void)ok;
+        stream_map_ready_ = true;
+    }
+
+    // Allocate a new locally-initiated stream and return its id.
+    std::uint64_t open_stream(bool uni) noexcept {
+        ensure_stream_map();
+        assert(stream_count_ < kMaxStreams && "stream pool exhausted");
+        std::uint64_t& seq = uni ? next_uni_seq_ : next_bidi_seq_;
+        const std::uint64_t id = make_stream_id(seq++, is_server_, uni);
+        Stream* s = alloc_stream(id);
+        assert(s != nullptr && "open_stream alloc failed");
+        (void)s;
+        return id;
+    }
+
+    Stream* find_stream(std::uint64_t id) noexcept {
+        if (!stream_map_ready_) return nullptr;
+        const std::int32_t idx = stream_map_.find(id);
+        if (idx < 0) return nullptr;
+        assert(static_cast<std::size_t>(idx) < kMaxStreams && "stream idx oob");
+        return &streams_[static_cast<std::size_t>(idx)];
+    }
+
+    Stream* get_or_create_stream(std::uint64_t id) noexcept {
+        Stream* s = find_stream(id);
+        if (s != nullptr) return s;
+        return alloc_stream(id);
+    }
+
+    Stream* alloc_stream(std::uint64_t id) noexcept {
+        ensure_stream_map();
+        if (stream_count_ >= kMaxStreams) return nullptr;
+        const std::size_t idx = stream_count_++;
+        const std::uint64_t init_send_max = peer_initial_stream_window(id);
+        Stream& s = streams_[idx];
+        s.open(id, init_send_max, kStreamRecvWindow);
+        if (!stream_map_.insert(id, static_cast<std::uint32_t>(idx))) {
+            --stream_count_;
+            return nullptr;
         }
+        return &s;
+    }
+
+    // The peer's advertised initial per-stream send window for `id` (RFC 9000
+    // §3.1): for a stream we initiate, our send limit is the peer's "remote"
+    // window; for a peer-initiated bidi stream, the peer's "local" window. Uni
+    // streams use initial_max_stream_data_uni. Defaults conservatively.
+    std::uint64_t peer_initial_stream_window(std::uint64_t id) const noexcept {
+        assert(id <= kVarIntMax && "stream id overflow");
+        if (!tls_.have_peer_transport_params()) return kStreamRecvWindow;
+        const TransportParameters& tp = tls_.peer_transport_params();
+        std::uint64_t w = kStreamRecvWindow;
+        const bool we_initiated =
+            stream_is_server_initiated(id) == is_server_;
+        if (stream_is_uni(id)) {
+            if (tp.initial_max_stream_data_uni_present)
+                w = tp.initial_max_stream_data_uni;
+        } else if (we_initiated) {
+            if (tp.initial_max_stream_data_bidi_remote_present)
+                w = tp.initial_max_stream_data_bidi_remote;
+        } else {
+            if (tp.initial_max_stream_data_bidi_local_present)
+                w = tp.initial_max_stream_data_bidi_local;
+        }
+        if (w > kStreamBufferSize) w = kStreamBufferSize;
+        return w;
     }
 
     // ===================================================================
@@ -881,6 +1456,7 @@ private:
             state_ = ConnState::kHandshaking;
         const bool keys = one_rtt_keys_ready();
         const bool done = is_server_ ? tls_.is_complete() : handshake_confirmed_;
+        const ConnState before = state_;
         if (keys && done && state_ != ConnState::kEstablished) {
             state_ = ConnState::kEstablished;
         }
@@ -890,6 +1466,23 @@ private:
             state_ != ConnState::kEstablished) {
             state_ = ConnState::kEstablished;
         }
+        if (before != ConnState::kEstablished &&
+            state_ == ConnState::kEstablished) {
+            // Handshake confirmed: Initial/Handshake packets leave flight
+            // (RFC 9002 §6.4 / §9.3) so 1-RTT data starts with a clean window.
+            cc_.reset_in_flight();
+        }
+        adopt_peer_flow_limits();
+    }
+
+    // Once the peer's transport params arrive, adopt its connection-level
+    // MAX_DATA (initial_max_data) as our send limit (RFC 9000 §4.1 / §7.4).
+    void adopt_peer_flow_limits() noexcept {
+        if (conn_send_max_ != 0 || !tls_.have_peer_transport_params()) return;
+        const TransportParameters& tp = tls_.peer_transport_params();
+        conn_send_max_ = tp.initial_max_data_present ? tp.initial_max_data
+                                                     : (1u << 20);
+        assert(conn_send_max_ > 0 && "peer MAX_DATA zero");
     }
 
     TransportParameters make_local_params() const noexcept {
@@ -937,12 +1530,48 @@ private:
 
     PacketNumberSpaceManager spaces_;
     AckRangeTracker acks_[kPacketNumberSpaceCount];
+    bool ack_pending_[kPacketNumberSpaceCount] = {false, false, false};
     CryptoReassembly crypto_rx_[kNumTlsLevels];
 
     // Outbound CRYPTO bytes per level + the running send offset + acked flag.
     std::vector<std::uint8_t> crypto_tx_[kNumTlsLevels];
     std::size_t crypto_sent_off_[kNumTlsLevels] = {0, 0, 0, 0};
     bool crypto_acked_[kNumTlsLevels] = {false, false, false, false};
+
+    // ---- RFC 9002 loss recovery + NewReno (wave 5) ----
+    SentPacketTracker sent_[kPacketNumberSpaceCount];
+    RttEstimator rtt_;
+    NewRenoCongestion cc_;
+    std::uint32_t pto_backoff_ = 0;
+    std::uint64_t rtt_sample_us_ = 0;  // staged latest RTT pending ack of largest
+    std::uint64_t time_largest_acked_sent_ = 0;  // send time of largest acked pkt
+    std::uint32_t pto_probes_ = 0;     // outstanding PTO probes (bypass cwnd)
+
+    // ---- streams + flow control (wave 5) ----
+    static constexpr std::uint64_t kStreamRecvWindow = 128 * 1024;
+    QuicStreamDataFn on_stream_data_;
+    // The Stream pool is pre-allocated from the connection arena (each Stream
+    // carries large fixed send/recv buffers; embedding kMaxStreams of them by
+    // value would blow the stack). Pool-style allocation per CLAUDE.md — no
+    // per-stream heap churn; bounded by kMaxStreams.
+    Stream* streams_ = nullptr;
+    std::size_t stream_count_ = 0;
+    std::uint64_t next_bidi_seq_ = 0;
+    std::uint64_t next_uni_seq_ = 0;
+
+    bolt::Arena stream_arena_;
+    bolt::SwissTable stream_map_{};
+    bool stream_map_ready_ = false;
+
+    // Connection-level flow control (RFC 9000 §4.1).
+    std::uint64_t conn_send_max_ = 0;            // peer's MAX_DATA (set on init)
+    std::uint64_t conn_send_total_ = 0;          // total stream bytes we've sent
+    std::uint64_t conn_recv_max_ = 1u << 20;     // our advertised MAX_DATA
+    std::uint64_t conn_recv_total_ = 0;          // total stream bytes received
+    bool conn_window_dirty_ = false;
+    bool stream_window_dirty_ = false;
+    bool conn_blocked_ = false;
+    bool stream_blocked_ = false;
 };
 
 }  // namespace bolt::api::quic

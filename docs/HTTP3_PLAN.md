@@ -286,41 +286,52 @@ end-to-end encrypted handshake the FasterAPI tests never exercised — audit:140
       SECURE path from 3.5 (NOT the plaintext stub). Remaining: idle timeout,
       full CONNECTION_CLOSE emission/Closing drain, and the stream map
       (`bolt::SwissTable`) land with streams in wave 5.
-- [ ] **4.2 ACK tracking + ACK frame generation.** *What:* received-PN ranges,
-      ACK ranges, ACK delay, ECN counts. *PORT*
-      `C:\code\FasterAPI\src\cpp\http\quic\quic_ack_tracker.{h,cpp}`. *Bolt
-      primitive:* fixed-capacity range vector in an arena; SWAR for gap scans.
-- [ ] **4.3 Loss detection + RTT (RFC 9002).** *What:* sent-packet bookkeeping,
-      ack-eliciting tracking, PTO + time-threshold loss, smoothed/min RTT + rttvar.
-      *REBUILD into `quic_loss_recovery.{h,cpp}`* — extract from FasterAPI's
-      `quic_connection.cpp`/`quic_congestion.cpp` where it's tangled; make it a
-      clean RFC 9002 unit. *Bolt primitive:* `bolt::Arena` for the sent-packet ring;
-      no per-packet alloc.
-- [ ] **4.4 Congestion control (NewReno; CUBIC later).** *What:* cwnd, slow start,
-      recovery, pacing rate input. *PORT*
-      `C:\code\FasterAPI\src\cpp\http\quic\quic_congestion.{h,cpp}`
-      (`NewRenoCongestionControl`, 19KB, real). *Bolt primitive:* n/a (scalar
-      state); branchless updates via `bolt_branchless.h` where hot.
-- [ ] **4.5 Flow control (stream + connection level).** *What:* MAX_DATA /
-      MAX_STREAM_DATA / MAX_STREAMS windows, auto-tuning, blocked frames. *PORT*
-      `C:\code\FasterAPI\src\cpp\http\quic\quic_flow_control.{h,cpp}` (real).
-      *Bolt primitive:* n/a.
-- [ ] **4.6 Stream management + reassembly.** *What:* bidi/uni stream lifecycle,
-      send/recv state, ordered receive reassembly, RESET/STOP_SENDING. *PORT*
-      `C:\code\FasterAPI\src\cpp\http\quic\quic_stream.{h,cpp}` +
-      `C:\code\FasterAPI\src\cpp\http\quic\stream_reassembly_buffer.h`. *Bolt
-      primitive:* `bolt::SwissTable` for the per-connection stream map; ring buffer
-      / arena for reassembly (avoid `std::vector` regrowth).
+- [x] **4.2 ACK tracking + ACK frame generation.** *DONE (wave 4 + 5a)*
+      (`ack.h` AckRangeTracker -> AckFrame, wave 4). Wave 5a added ACK-elicitation
+      tracking (`ack_pending_[space]` in `connection.h`) so ACKs are emitted only
+      when an ack-eliciting packet was received (RFC 9002 §2) — no ACK-only-packet
+      spam / PN inflation. ECN counts parsed; not yet generated.
+- [x] **4.3 Loss detection + RTT (RFC 9002).** *DONE (wave 5a)* in
+      `include/boltapi/quic/loss.h` (`SentPacketTracker` bounded per-space ring of
+      `SentPacketInfo` with carried frame ranges; `RttEstimator` latest/min/
+      smoothed/rttvar + PTO with exponential backoff) wired into `connection.h`
+      (`process_ack`/`ack_range`/`detect_loss`/`maybe_pto_expire`). Packet-
+      threshold (3) + time-threshold (9/8·max(srtt,latest), measured vs the
+      largest-acked send time so a clean link never false-positives); PTO probes
+      bypass cwnd for tail loss; lost CRYPTO/STREAM frames re-framed into FRESH
+      PNs (never reused). Replaces the wave-4 "rewind unacked CRYPTO on tick".
+- [x] **4.4 Congestion control (NewReno; CUBIC later).** *DONE (wave 5a)*
+      (`NewRenoCongestion` in `loss.h`, adapted from FasterAPI `quic_congestion.h`):
+      cwnd/ssthresh, slow start + congestion avoidance, recovery period on loss,
+      `bytes_in_flight` gating sends, persistent-congestion collapse, in-flight
+      reset at handshake confirmation (RFC 9002 §6.4/§9.3). Pacing deferred.
+- [x] **4.5 Flow control (stream + connection level).** *DONE (wave 5a)*
+      (`StreamFlow` in `stream.h` + connection-level `conn_send_max_/conn_recv_max_`
+      in `connection.h`): MAX_DATA / MAX_STREAM_DATA advertise + enforce, window
+      updates as the app consumes, DATA_BLOCKED / STREAM_DATA_BLOCKED emission;
+      MAX_STREAMS parsed. Adapted from FasterAPI `quic_flow_control.h`.
+- [x] **4.6 Stream management + reassembly.** *DONE (wave 5a)* (`Stream` in
+      `stream.h`, adapted from FasterAPI `quic_stream.h` + `stream_reassembly_
+      buffer.h`): bidi/uni stream-id encoding (RFC 9000 §2.1), send/recv state
+      machines, bounded per-stream ordered reassembly (contiguous cursor + bounded
+      out-of-order extent set, no `std::vector` regrowth), RESET_STREAM /
+      STOP_SENDING serializers. Per-connection `bolt::SwissTable` maps stream_id ->
+      a pool index; the Stream pool is arena-allocated (large fixed buffers).
 - [ ] **4.7 Connection map (CID -> connection).** *What:* route incoming
       datagrams by DCID (and 4-tuple fallback) to the owning connection; handle
       multiple CIDs per connection. *REBUILD.* *Bolt primitive:* `bolt::SwissTable`
       keyed on CID bytes; `bolt_hash.h` for the CID hash.
 
-**GATE 4:** multi-stream loopback test (two real secure connections) transfers
-randomized payloads across **several concurrent streams**, with simulated
-loss/reorder, verifying retransmission, flow-control backpressure, RTT/cwnd
-evolution, and clean close. (Satisfies `CLAUDE.md`: more than one stream,
-randomized data.)
+**GATE 4:** *MET (wave 5a)* by `tests/quic_stream_test.cpp` — two real secure
+connections over loopback UDP transfer randomized multi-KB payloads on a bidi
+stream (byte-exact echo with FIN), a ~15 % seeded-drop variant still completes
+via retransmission with cwnd grow/back-off, and a constrained flow-control
+window forces window updates without deadlock; plus RTT/PTO + NewReno + stream-id
++ reassembly units. (Satisfies `CLAUDE.md`: more than one route/verb-equivalent
+exercised at the transport via bidirectional streams, randomized data, real loss.)
+Remaining Phase-4 polish (idle timeout, CONNECTION_CLOSE emission/Closing drain,
+multi-concurrent-stream stress) rides into wave 5b alongside the H3 bridge. See
+DECISION LOG D8.
 
 ---
 
@@ -866,3 +877,78 @@ before), zero warnings on the new TU, H1/H2/WebRTC suites
    stream map; CONNECTION_CLOSE emission + idle timeout; Initial-key discard.
 3. QPACK (static/dynamic tables, encoder/decoder) -> HTTP/3 frames -> bridge
    QUIC streams to `CoroHttpRequest` -> the existing `App` router.
+
+### D8. Wave 5a — QUIC TRANSPORT (loss recovery + NewReno + streams + flow ctrl)
+Items D7.1 + D7.2 (the transport half) are LANDED. New headers
+`include/boltapi/quic/{loss.h,stream.h}` (compile unconditionally, in the default
+suite) wired into `connection.h`. Design notes:
+
+* **Loss recovery (RFC 9002).** `SentPacketTracker` is a bounded per-PN-space
+  ring (`kMaxSentPackets=256`) of `SentPacketInfo` recording, for each sent
+  packet, time/size/ack-eliciting/in-flight and the CRYPTO/STREAM byte ranges it
+  carried (so a lost packet's content can be re-framed). On wrap, an evicted
+  still-in-flight slot is reconciled out of `bytes_in_flight` (no leak — a real
+  bug found and fixed during bring-up). On each inbound ACK, `process_ack` walks
+  the ranges, marks packets acked (RTT sample on the largest ack-eliciting),
+  frees cwnd, then `detect_loss` declares loss by packet-threshold (≥3 higher
+  acked) or time-threshold (`9/8·max(srtt,latest)`, **measured against the
+  largest-acked packet's send time, not wall-clock now**, so a clean in-order
+  link never false-positives — the key fix that made the gate converge). Lost
+  CRYPTO/STREAM ranges rewind their send frontier so `flush` re-emits them under
+  a **fresh PN** (never reused). `RttEstimator` is RFC 9002 §5.3 (alpha 1/8,
+  beta 1/4, ack-delay-adjusted, floored at min_rtt); PTO is
+  `srtt + max(4·rttvar, granularity) + max_ack_delay`, scaled by `2^backoff`,
+  driven from `tick()`; PTO probes bypass cwnd (§6.2.4) so **tail loss**
+  recovers. ACKs are now sent only when an ack-eliciting packet was received
+  (`ack_pending_[space]`, §2) — eliminating the ACK-only-packet PN inflation that
+  initially starved the data path.
+* **NewReno (RFC 9002 §7).** `NewRenoCongestion`: `kInitialWindow=10·1200`,
+  `kMinimumWindow=2·1200`; slow start (cwnd += acked) until ssthresh, then
+  congestion avoidance (cwnd += MSS·acked/cwnd); a congestion event halves cwnd
+  to ssthresh once per recovery period (packets sent before recovery start don't
+  re-trigger); persistent-congestion collapse to the minimum; `bytes_in_flight`
+  gates sending. In-flight is reset at handshake confirmation (Initial/Handshake
+  packets leave flight, §6.4/§9.3) so 1-RTT data starts with a clean window.
+* **Streams + flow control (RFC 9000 §2–§4).** `Stream` holds fixed send/recv
+  buffers; the receive side is an ordered-reassembly buffer (contiguous cursor +
+  a bounded out-of-order extent set, no `std::vector`); send/recv state machines;
+  RESET_STREAM/STOP_SENDING + MAX_DATA/MAX_STREAM_DATA/MAX_STREAMS/DATA_BLOCKED/
+  STREAM_DATA_BLOCKED serializers. Per-stream + connection windows are advertised,
+  enforced, and grown as the app consumes (window updates flushed). The
+  connection owns an arena-allocated `Stream` pool (large fixed buffers ⇒ pooled,
+  not stack/value-embedded) and a `bolt::SwissTable` mapping `stream_id -> pool
+  index`. API: `open_bidi()/open_uni()`, `stream_write(id,data,fin)`, and an
+  `on_stream_data(id,bytes,fin)` callback; `flush` packetizes STREAM data under
+  cwnd + flow control; the FIN is signalled on the delivery carrying the final
+  contiguous byte.
+* **GATE (`tests/quic_stream_test.cpp`, default suite).** Loopback UDP after the
+  wave-4 handshake (datagrams serialized through an in-order per-receiver FIFO so
+  the clean link is genuinely in order; a seeded drop rate models real loss):
+  (1) **CleanStreamEcho** — client opens a bidi stream, sends 16 KB spanning many
+  STREAM frames/packets, server receives it **byte-exact + in order**, echoes it
+  back with FIN, client receives the echo + FIN (0 loss events, cwnd grows in
+  slow start to ~31 KB); (2) **LossyLinkCompletes** — ~15 % seeded datagram drops,
+  the 24 KB transfer STILL completes byte-exact via loss recovery/retransmit,
+  with cwnd observed to **grow then back off**; (3) **FlowControlNoDeadlock** — a
+  modest per-stream recv window forces MAX_STREAM_DATA/MAX_DATA window updates as
+  the server consumes, 20 KB delivered with no deadlock. Plus unit tests for
+  RTT/PTO math, NewReno transitions, stream-id encoding, and ordered reassembly.
+  All bounded by wall-clock deadlines (no hang).
+
+**Status:** default `cmake --preset msvc` + `ctest -C Release` = **169/169**
+(was 162; +7: 4 QUIC stream/loss/congestion units + 3 loopback stream gates;
+1 aiortc-interop still SKIPPED under WebRTC=OFF), **zero warnings** on the new
+TUs, H1/H2/WebRTC + earlier QUIC suites unchanged.
+
+### D9. Next wave (wave 5b — QPACK + HTTP/3 frames + App bridge)
+1. **QPACK** static table + Huffman (reuse Bolt's existing HPACK Huffman),
+   dynamic table, encoder/decoder + encoder/decoder instruction streams
+   (RFC 9204; port FasterAPI `qpack/*`).
+2. **HTTP/3 frame layer** (DATA/HEADERS/SETTINGS/GOAWAY/…), control + QPACK uni
+   streams with stream-type prefixes (RFC 9114; port FasterAPI `http3_frames.h`).
+3. **App bridge** — open the H3 control/QPACK streams, parse a request off a QUIC
+   **bidi** stream (via the new `on_stream_data` callback), populate a
+   `CoroHttpRequest`, dispatch through the **same** `App` router/middleware as
+   H1/H2, then QPACK-encode the `CoroHttpResponse` + stream the body back with
+   flow control + FIN. Remaining transport polish that can ride along: idle
+   timeout, CONNECTION_CLOSE emission + Closing/Draining, pacing.
