@@ -42,18 +42,23 @@ include(BoltApiSanitizers)   # option(BOLTAPI_SANITIZE) + boltapi_apply_sanitize
 # ---------------------------------------------------------------------------
 # Bolt submodule (zero-dependency compute core). Build only what we link.
 # ---------------------------------------------------------------------------
-if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/extern/bolt/CMakeLists.txt)
-    message(FATAL_ERROR
-        "extern/bolt is missing. Run: git submodule update --init --recursive")
+# Gestalt2: share one top-level bolt across all consumers so a single
+# bolt::bolt target is defined. Standalone boltapi builds (target absent)
+# still vendor extern/bolt. See Gestalt2/README.md.
+if(NOT TARGET bolt::bolt)
+    if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/extern/bolt/CMakeLists.txt)
+        message(FATAL_ERROR
+            "extern/bolt is missing. Run: git submodule update --init --recursive")
+    endif()
+    set(BOLT_BUILD_TESTS      OFF CACHE BOOL "" FORCE)
+    set(BOLT_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
+    set(BOLT_BUILD_IO         OFF CACHE BOOL "" FORCE)
+    # bolt::parse hosts fionn — Bolt's skip-aware JSON parser. It is the canonical
+    # JSON path for Bolt API (include/boltapi/json.h wraps it). See docs/JSON.md.
+    set(BOLT_BUILD_PARSE      ON  CACHE BOOL "" FORCE)
+    set(BOLT_BUILD_INGEST     OFF CACHE BOOL "" FORCE)
+    add_subdirectory(extern/bolt EXCLUDE_FROM_ALL)
 endif()
-set(BOLT_BUILD_TESTS      OFF CACHE BOOL "" FORCE)
-set(BOLT_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
-set(BOLT_BUILD_IO         OFF CACHE BOOL "" FORCE)
-# bolt::parse hosts fionn — Bolt's skip-aware JSON parser. It is the canonical
-# JSON path for Bolt API (include/boltapi/json.h wraps it). See docs/JSON.md.
-set(BOLT_BUILD_PARSE      ON  CACHE BOOL "" FORCE)
-set(BOLT_BUILD_INGEST     OFF CACHE BOOL "" FORCE)
-add_subdirectory(extern/bolt EXCLUDE_FROM_ALL)
 
 # ---------------------------------------------------------------------------
 # OpenSSL — required by the forked coroutine HTTP engine (TLS/ALPN, WebSocket
