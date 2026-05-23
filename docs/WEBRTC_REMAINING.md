@@ -111,8 +111,40 @@ Every WebRTC test/interop MUST be non-hanging:
 - [ ] WebTransport over HTTP/3 (RFC 9297): CONNECT-UDP / H3 datagrams + streams. Depends on HTTP/3 (see HTTP3_REMAINING W5e datagrams). Reuses UdpTransport.
 
 ## WP — Performance
-- [ ] SRTP encrypt/decrypt + RTP demux **inline on the I/O thread** (no per-packet worker hop — same fix as UDP/STUN).
-- [ ] Batched UDP recv/send (recvmmsg/WSARecvMsg/GSO); zero-copy RTP via `bolt::wire`; per-SSRC `bolt::SwissTable`; per-packet `bolt::Arena`; no malloc on the media path. Bench vs aiortc/Pion.
+- [x] SRTP encrypt/decrypt + RTP demux **inline on the I/O thread** (no per-packet
+      worker hop). The `net::UdpTransport` datagram handler already runs inline on
+      the IOCP/I/O thread (see udp_transport.h "INLINE FAST PATH"); `WebRtcPeerHub::feed`
+      → `feed_media` (SRTP unprotect + RFC5761 demux + parse + per-SSRC lookup) runs
+      there with NO worker handoff — confirmed; same model as UDP/QUIC.
+- [x] No malloc on the media path; per-packet `bolt::Arena` evaluated. `benchmarks/
+      media_throughput_bench.cpp` A/Bs stack-scratch vs `bolt::Arena` scratch and
+      reports **0 heap allocs** on both the protect and unprotect+demux per-packet
+      paths. The Arena variant measured NEUTRAL-to-slightly-worse for single-use
+      per-packet scratch (≈9405→9435 ns/pkt protect; ≈362→376 ns/pkt unpr+demux on
+      this box) so the production hub KEEPS its fixed stack scratch (zero-alloc,
+      faster). Per-SSRC lookup uses the bounded `TrackRegistry` (≤`kMaxTracks`=16) —
+      a `bolt::SwissTable` is not a win at that size (linear scan over ≤16 hot
+      entries beats a hash probe); revisit if `kMaxTracks` grows large.
+- [ ] Batched UDP recv/send (recvmmsg/WSARecvMsg/GSO); zero-copy RTP via `bolt::wire`. Bench vs aiortc/Pion. (Future — measured no benefit yet on loopback.)
+
+### WA live-wiring (interceptor chain wired into the production peer_hub)
+- [x] The WA codecs are now LIVE-WIRED into `WebRtcPeerHub`, not just unit-gated:
+      `MediaConfig` + `configure_media()` carry the negotiated RTX (apt/rtx),
+      transport-cc / abs-send-time extmap ids, and a pacer target. When RTX is
+      negotiated the per-peer chain runs `RtxInterceptor` (caches outbound media,
+      answers an inbound Generic NACK with a true RTX packet on the rtx SSRC/PT +
+      OSN) instead of plain NACK-by-resend; otherwise `NackResponder` (same-SSRC
+      resend). Inbound RTP records transport-cc arrivals (`TwccFeedbackBuilder`);
+      `tick_media()` emits transport-cc feedback (RTPFB FMT 15). A `bwe::Pacer`
+      token-bucket shapes the outbound send path (never drops an echo packet —
+      correctness first). `app.cpp` reads the offer's video m-line for the
+      transport-cc/abs-send-time extmap + the RTX apt mapping and calls
+      `configure_media()` from the echo-answer build path. (Emitting NEW `a=` lines
+      — a=rtcp-fb/rtx/ulpfec/extmap — in the answer SDP is blocked by the read-only
+      sdp.* ownership; the hub-side wiring is complete and gated.)
+      Gate `tests/media_pipeline_test.cpp` (real DTLS-SRTP loopback: inbound NACK →
+      live RTX retransmit recovered byte-exact; transport-cc arrivals → TWCC
+      feedback the client parses; pacer-enabled echo still delivers).
 
 ## WX — Interop + harness (bounded, no-stall)
 - [x] `tests/interop/aiortc_media.py` (uv): send synthetic audio+video track, assert echo (hard timeout). Bounded `AiortcMediaInterop` gtest — PASSES vs aiortc 1.14.

@@ -33,6 +33,7 @@
 #include "boltapi/webrtc/rtp.h"
 #include "boltapi/webrtc/rtcp.h"
 #include "boltapi/webrtc/interceptor.h"
+#include "boltapi/webrtc/bwe.h"
 #include "boltapi/webrtc/track.h"
 
 #include <cstddef>
@@ -92,6 +93,30 @@ public:
     void add_track_spec(MediaKind kind, std::uint32_t ssrc, std::uint8_t pt,
                         const char* codec) noexcept;
 
+    // Negotiated media options fed from the signaling answer (app.cpp). All knobs
+    // default to "off" so an unconfigured hub behaves exactly as before (the
+    // existing media-echo path). Applied when a peer's media chain is built.
+    struct MediaConfig {
+        // RTX (RFC 4588): one media<->rtx mapping. When rtx_pt != 0 the live
+        // outbound chain caches media for `media_ssrc`/`media_pt` and answers an
+        // inbound Generic NACK with a true RTX packet on rtx_ssrc/rtx_pt (OSN
+        // prefix). rtx_pt == 0 disables RTX (falls back to NACK-by-resend).
+        std::uint32_t media_ssrc = 0;
+        std::uint8_t  media_pt   = 0;
+        std::uint32_t rtx_ssrc   = 0;
+        std::uint8_t  rtx_pt     = 0;
+        // a=extmap ids (1..14, 0 = not negotiated). transport-cc drives TWCC
+        // arrival recording + feedback; abs-send-time is recorded for the pacer.
+        std::uint8_t  transport_cc_ext_id = 0;
+        std::uint8_t  abs_send_time_ext_id = 0;
+        // Pacer target (bits/sec). 0 = no pacing (send immediately).
+        std::uint32_t pacer_target_bps = 0;
+    };
+
+    // Apply the negotiated media options. Idempotent; takes effect for peers whose
+    // media is built AFTER this call (call right after negotiating the answer).
+    void configure_media(const MediaConfig& cfg) noexcept;
+
     // The transport datagram handler: feed DTLS, then drive SCTP. noexcept,
     // safe on malformed input.
     void feed(const sockaddr* peer, int peer_len, const std::uint8_t* data,
@@ -134,6 +159,11 @@ public:
         bool track_write(const std::uint8_t* data, std::size_t len) noexcept;
     };
 
+    // A monotonic microsecond clock for the pacer / TWCC arrival timestamps. One
+    // implementation, used on both the I/O thread and the tick timer.
+    static std::int64_t now_us() noexcept;
+    static std::uint64_t now_ms() noexcept;
+
 private:
     // Per-peer media state: role-mapped SRTP sessions + interceptor chain (with
     // its built-ins) + the track registry. Heap-allocated once per peer (NOT on
@@ -146,10 +176,24 @@ private:
         NackGenerator     nack_gen{0};
         NackResponder     nack_resp;
         ReportInterceptor reporter{0};
+        // WA live-wire: RTX (RFC 4588) — present only when negotiated (rtx_pt!=0).
+        // Stored as raw storage + a placement-constructed pointer so the Media
+        // ctor stays trivial and we never default-construct an invalid RtxInterceptor
+        // (its ctor asserts rtx_ssrc != media_ssrc). No heap on the packet path.
+        alignas(RtxInterceptor) unsigned char rtx_store[sizeof(RtxInterceptor)]{};
+        RtxInterceptor*   rtx = nullptr;
+        bwe::TwccFeedbackBuilder twcc;   // receiver-side arrival window
+        bwe::Pacer        pacer{bwe::kStartBitrateBps};
+        bool              pace_enabled = false;
+        std::uint8_t      twcc_ext_id = 0;   // transport-cc a=extmap id (0=off)
+        std::uint8_t      abs_send_ext_id = 0;
+        std::uint32_t     self_ssrc = 0;     // our SSRC for TWCC feedback sender id
         TrackRegistry     tracks;
         MediaAccess       access{};         // ctx for the sink trampolines
         Peer*             owner = nullptr;  // back-pointer for the sinks
         WebRtcPeerHub*    hub   = nullptr;  // for the C-style sink callbacks
+
+        ~Media() noexcept { if (rtx != nullptr) { rtx->~RtxInterceptor(); rtx = nullptr; } }
     };
 
     struct Peer {
@@ -178,6 +222,10 @@ private:
                              std::size_t len) noexcept;
     // Send one already-built RTCP compound for a peer: SRTCP-protect -> transport.
     bool  send_rtcp(Peer& p, const std::uint8_t* data, std::size_t len) noexcept;
+    // Record an inbound packet's transport-cc seq (if present) for TWCC feedback.
+    void  record_twcc_arrival(Media& m, const rtp::Packet& pkt) noexcept;
+    // Build + emit one TWCC feedback compound from the recorded window (if any).
+    std::size_t emit_twcc_feedback(Media& m) noexcept;
 
     DtlsSessionManager* dtls_      = nullptr;  // borrowed
     net::UdpTransport*  transport_ = nullptr;  // borrowed
@@ -187,6 +235,10 @@ private:
     // Outbound track declarations (negotiated). Pre-registered per peer.
     MediaTrackSpec track_specs_[kMaxTrackSpecs]{};
     std::size_t    track_spec_count_ = 0;
+
+    // Negotiated media options (RTX/TWCC/abs-send-time/pacer). Applied per peer
+    // when its media chain is built. Defaults => off (legacy echo behavior).
+    MediaConfig    media_cfg_{};
 
     Peer        peers_[kMaxPeers];
     std::size_t count_ = 0;

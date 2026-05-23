@@ -54,3 +54,15 @@ if(WIN32)
 endif()
 boltapi_apply_hardening(boltapi_quic_throughput_bench)
 boltapi_apply_sanitizers(boltapi_quic_throughput_bench)
+
+# Media loopback throughput: SRTP protect/unprotect + RFC5761 demux MB/s + ns/pkt
+# + a per-packet heap-alloc count, A/B over stack-scratch vs bolt::Arena scratch.
+# The WP media hot-path harness. Needs OpenSSL (SRTP crypto) like the WebRTC TUs.
+add_executable(boltapi_media_throughput_bench media_throughput_bench.cpp)
+target_link_libraries(boltapi_media_throughput_bench PRIVATE boltapi::boltapi
+    OpenSSL::SSL OpenSSL::Crypto)
+if(WIN32)
+    target_link_libraries(boltapi_media_throughput_bench PRIVATE ws2_32 mswsock iphlpapi)
+endif()
+boltapi_apply_hardening(boltapi_media_throughput_bench)
+boltapi_apply_sanitizers(boltapi_media_throughput_bench)

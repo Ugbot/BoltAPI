@@ -400,6 +400,21 @@ if(WIN32)
     target_link_libraries(boltapi_media_echo_test PRIVATE ws2_32 mswsock iphlpapi)
 endif()
 
+# WP/WA: MEDIA PIPELINE LIVE-WIRING GATE (default suite, no external deps,
+# deadline-bounded). Proves the WA codecs are LIVE-WIRED into the production
+# WebRtcPeerHub over a REAL DTLS-SRTP loopback session (same server stack as the
+# media-echo gate): (1) with hub.configure_media({rtx}), an inbound Generic NACK
+# makes the live hub emit a true RTX retransmission (rtx SSRC/PT + 16-bit OSN)
+# that parse_rtx reconstructs BYTE-EXACT; (2) with a transport-cc extmap, the hub
+# records inbound arrivals and tick_media() emits transport-cc feedback (RTPFB
+# FMT 15) the client parses; (3) a pacer-enabled echo still delivers media. Links
+# OpenSSL + ws2_32/mswsock/iphlpapi (Win), like the other live WebRTC TUs.
+boltapi_add_test(boltapi_media_pipeline_test media_pipeline_test.cpp)
+target_link_libraries(boltapi_media_pipeline_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+if(WIN32)
+    target_link_libraries(boltapi_media_pipeline_test PRIVATE ws2_32 mswsock iphlpapi)
+endif()
+
 # WA: SIMULCAST (RFC 8851/8852) + SVC PASSTHROUGH — in-process, deterministic,
 # deadline-bounded (DEFAULT suite, no external deps). (1) A 3-rid (q;h;f)
 # simulcast video offer parses; negotiate_media echoes the rids + RID header-

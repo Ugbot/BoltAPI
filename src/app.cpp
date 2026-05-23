@@ -874,6 +874,64 @@ bool App::handle_webrtc_trickle(std::string_view body) noexcept {
     return idx < webrtc::kMaxCandidates;
 }
 
+namespace {
+// Find the a=extmap:<id> ... line whose URI ENDS WITH `uri` in this m-line, and
+// return its id (1..14), or 0 if absent. Bounded scan; no allocation. (The offer
+// may carry direction/attr suffixes after the URI, so we match a prefix token.)
+std::uint8_t extmap_id_for_uri(const webrtc::SdpMedia& m,
+                               std::string_view uri) noexcept {
+    assert(uri.size() > 0 && "extmap_id_for_uri: empty uri");
+    assert(m.attr_count <= webrtc::kSdpMaxAttrsPerSection && "extmap: overflow");
+    for (std::size_t i = 0; i < m.attr_count; ++i) {
+        if (m.attrs[i].key != "extmap") continue;
+        std::string_view v = m.attrs[i].value;        // "<id>[/dir] <uri> ..."
+        std::size_t sp = v.find(' ');
+        if (sp == std::string_view::npos) continue;
+        std::string_view id_tok = v.substr(0, sp);
+        std::size_t slash = id_tok.find('/');
+        if (slash != std::string_view::npos) id_tok = id_tok.substr(0, slash);
+        std::string_view rest = v.substr(sp + 1);
+        if (rest.find(uri) == std::string_view::npos) continue;
+        unsigned id = 0;
+        for (char c : id_tok) { if (c < '0' || c > '9') { id = 0; break; }
+                                id = id * 10 + static_cast<unsigned>(c - '0'); }
+        if (id >= 1 && id <= 14) return static_cast<std::uint8_t>(id);
+    }
+    return 0;
+}
+
+// Find an RTX (RFC 4588) mapping in this m-line: a rtpmap "rtx/<clock>" PT whose
+// fmtp "apt=<media_pt>" references one of `media_pts`. Returns true + fills
+// rtx_pt/media_pt. Bounded scan over the m-line PTs; no allocation.
+bool find_rtx_mapping(const webrtc::SdpMedia& m, std::uint8_t* rtx_pt,
+                      std::uint8_t* media_pt) noexcept {
+    assert(rtx_pt != nullptr && media_pt != nullptr && "find_rtx: null out");
+    assert(m.format_count <= webrtc::kSdpMaxFormatsPerMedia && "find_rtx: fmt");
+    std::uint8_t pts[webrtc::kSdpMaxFormatsPerMedia];
+    const std::size_t n = m.payload_types(pts, sizeof(pts));
+    for (std::size_t i = 0; i < n; ++i) {
+        const std::string_view rm = m.rtpmap_for(pts[i]);
+        if (rm.size() < 4) continue;
+        if (!(rm[0] == 'r' && rm[1] == 't' && rm[2] == 'x' && rm[3] == '/'))
+            continue;                                   // not "rtx/..."
+        const std::string_view fp = m.fmtp_for(pts[i]); // "apt=<pt>"
+        const std::size_t apt = fp.find("apt=");
+        if (apt == std::string_view::npos) continue;
+        unsigned ap = 0; bool any = false;
+        for (std::size_t k = apt + 4; k < fp.size(); ++k) {
+            const char c = fp[k];
+            if (c < '0' || c > '9') break;
+            ap = ap * 10 + static_cast<unsigned>(c - '0'); any = true;
+        }
+        if (!any || ap > 127) continue;
+        *rtx_pt = pts[i];
+        *media_pt = static_cast<std::uint8_t>(ap);
+        return true;
+    }
+    return false;
+}
+}  // namespace
+
 // WM6: COMBINED media+data echo answer (audio/video sendrecv so the peer's media
 // is echoed back, + the data m-line when present), all BUNDLEd. Returns false if
 // no audio/video could be negotiated (the caller then tries the data-only path).
@@ -898,7 +956,38 @@ bool App::build_echo_answer_for(const webrtc::SdpSession& offer,
     ep.max_message_size = webrtc_config_.max_message_size;
     ep.candidates       = cands;
     ep.candidate_count  = ncand;
-    return webrtc::build_echo_answer(ep, out_answer) == webrtc::SdpError::Ok;
+    if (webrtc::build_echo_answer(ep, out_answer) != webrtc::SdpError::Ok)
+        return false;
+
+    // WA live-wire: read the offered RTX / TWCC / abs-send-time from the offer's
+    // video m-line and configure the live peer hub's interceptor chain. (The
+    // answer SDP itself only echoes what the read-only sdp.* builder emits; this
+    // wiring makes the inbound NACK->RTX and TWCC-arrival paths run for real.)
+    if (webrtc_hub_ != nullptr) {
+        webrtc::WebRtcPeerHub::MediaConfig mc;
+        for (std::size_t i = 0; i < offer.media_count; ++i) {
+            const webrtc::SdpMedia& m = offer.media[i];
+            if (m.media_type != "video") continue;       // RTX/TWCC ride video
+            std::uint8_t cc = extmap_id_for_uri(m, webrtc::kTransportCcExtUri);
+            std::uint8_t ast = extmap_id_for_uri(m, webrtc::kAbsSendTimeExtUri);
+            if (cc != 0)  mc.transport_cc_ext_id  = cc;
+            if (ast != 0) mc.abs_send_time_ext_id = ast;
+            std::uint8_t rtx_pt = 0, media_pt = 0;
+            if (find_rtx_mapping(m, &rtx_pt, &media_pt)) {
+                mc.media_pt = media_pt;
+                mc.rtx_pt   = rtx_pt;
+                // Echo/relay reuses the inbound SSRC; pick distinct rtx SSRC.
+                for (const WebRtcConfig::MediaTrackSpec& ms :
+                         webrtc_config_.media_tracks) {
+                    if (ms.payload_type == media_pt) { mc.media_ssrc = ms.ssrc;
+                        mc.rtx_ssrc = ms.ssrc ^ 0x52545800u /*"RTX"*/; break; }
+                }
+            }
+            break;  // first video m-line drives the transport-wide config
+        }
+        webrtc_hub_->configure_media(mc);
+    }
+    return true;
 }
 
 // WM6: data-channel-only answer (the original behavior) for an offer with an

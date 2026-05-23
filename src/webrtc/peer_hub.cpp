@@ -5,7 +5,9 @@
 #include "boltapi/net/udp_transport.h"
 
 #include <cassert>
+#include <chrono>
 #include <cstring>
+#include <new>
 
 namespace bolt::api {
 namespace webrtc {
@@ -141,6 +143,28 @@ std::size_t WebRtcPeerHub::tick_retransmit() noexcept {
 // Media — track specs, keying, demux, send. See peer_hub.h.
 // ---------------------------------------------------------------------------
 
+// Monotonic clocks shared by the pacer + TWCC arrival timestamps. steady_clock
+// is monotonic; we convert once to integer us/ms (no float on the hot path).
+std::int64_t WebRtcPeerHub::now_us() noexcept {
+    assert(true && "now_us 1");
+    assert(true && "now_us 2");
+    const auto t = std::chrono::steady_clock::now().time_since_epoch();
+    return std::chrono::duration_cast<std::chrono::microseconds>(t).count();
+}
+
+std::uint64_t WebRtcPeerHub::now_ms() noexcept {
+    assert(true && "now_ms 1");
+    assert(true && "now_ms 2");
+    const std::int64_t us = now_us();
+    return static_cast<std::uint64_t>(us / 1000);
+}
+
+void WebRtcPeerHub::configure_media(const MediaConfig& cfg) noexcept {
+    assert(cfg.media_pt <= 127 && "configure_media: media pt range");
+    assert(cfg.rtx_pt <= 127 && "configure_media: rtx pt range");
+    media_cfg_ = cfg;
+}
+
 void WebRtcPeerHub::add_track_spec(MediaKind kind, std::uint32_t ssrc,
                                    std::uint8_t pt, const char* codec) noexcept {
     assert(codec != nullptr && "add_track_spec: null codec");
@@ -189,7 +213,9 @@ static bool rtcp_sink_trampoline(void* ctx, const std::uint8_t* data,
     return a->send_rtcp(data, len);
 }
 
-// RtpSink trampoline: re-emit a cached RTP packet (NACK responder resend).
+// RtpSink trampoline: emit a packet straight to SRTP-protect + transport WITHOUT
+// re-running the outbound chain. Shared by the NACK responder's resend AND the
+// RTX interceptor's retransmit (an RTX packet must not be re-cached as media).
 static bool rtp_sink_trampoline(void* ctx, const std::uint8_t* data,
                                 std::size_t len) noexcept {
     assert(ctx != nullptr && "rtp_sink: null ctx");
@@ -221,15 +247,41 @@ bool WebRtcPeerHub::ensure_media(Peer& p) noexcept {
     if (!m.keyed) {
         if (!p.session->make_srtp_sessions(m.in, m.out)) return false;
         m.keyed = true;
-        // Build the interceptor chain (NACK gen + responder + reporter). The
-        // NACK responder resends via the RTP sink; the chain emits RTCP via the
-        // RTCP sink. Both trampolines route back through this peer's media.
+        // Build the interceptor chain. The NACK generator detects inbound gaps
+        // and emits Generic NACK; the reporter emits SR/RR on tick. Loss recovery
+        // is EITHER true RTX (RFC 4588, dedicated rtx SSRC/PT — when negotiated)
+        // OR plain NACK-by-resend on the same SSRC. We add exactly one of those
+        // so an inbound NACK is answered once. Both route via this peer's sinks.
         m.access.media = &m;
+        m.twcc_ext_id     = media_cfg_.transport_cc_ext_id;
+        m.abs_send_ext_id = media_cfg_.abs_send_time_ext_id;
+        // Sender SSRC for our TWCC feedback: the negotiated media SSRC if set,
+        // else the first declared outbound track (a stable, non-zero local id).
+        m.self_ssrc = media_cfg_.media_ssrc;
+        if (m.self_ssrc == 0 && track_spec_count_ > 0)
+            m.self_ssrc = track_specs_[0].ssrc;
         m.chain.add(&m.nack_gen);
-        m.chain.add(&m.nack_resp);
+        const bool use_rtx = media_cfg_.rtx_pt != 0 &&
+                             media_cfg_.rtx_ssrc != media_cfg_.media_ssrc;
+        if (use_rtx) {
+            // Placement-construct the RTX interceptor with the negotiated mapping.
+            m.rtx = ::new (m.rtx_store) RtxInterceptor(
+                media_cfg_.media_ssrc, media_cfg_.media_pt,
+                media_cfg_.rtx_ssrc, media_cfg_.rtx_pt);
+            RtpSink xs; xs.fn = &rtp_sink_trampoline; xs.ctx = &m.access;
+            m.rtx->set_rtx_sink(xs);
+            m.chain.add(m.rtx);
+        } else {
+            m.chain.add(&m.nack_resp);
+            RtpSink rs; rs.fn = &rtp_sink_trampoline; rs.ctx = &m.access;
+            m.nack_resp.set_resend_sink(rs);
+        }
         m.chain.add(&m.reporter);
-        RtpSink rs; rs.fn = &rtp_sink_trampoline; rs.ctx = &m.access;
-        m.nack_resp.set_resend_sink(rs);
+        // Pacer: when negotiated, the outbound RTP path shapes to the target rate.
+        if (media_cfg_.pacer_target_bps != 0) {
+            m.pacer.set_target(media_cfg_.pacer_target_bps);
+            m.pace_enabled = true;
+        }
         // Pre-register the declared outbound tracks + wire their write sinks.
         for (std::size_t i = 0; i < track_spec_count_; ++i) {
             const MediaTrackSpec& s = track_specs_[i];
@@ -264,6 +316,9 @@ void WebRtcPeerHub::feed_media(Peer& p, const std::uint8_t* data,
         srtp::Error::kOk) return;
     rtp::Packet pkt;
     if (rtp::parse(plain, plain_len, pkt) != rtp::RtpError::Ok) return;
+    // TWCC: record this packet's transport-wide arrival BEFORE the chain so the
+    // window reflects every received packet (even ones a relay later drops).
+    record_twcc_arrival(m, pkt);
     if (!m.chain.inbound_rtp(pkt, plain, plain_len, sink)) return;  // dropped
     // Demux by SSRC (exact). A genuinely-new SSRC gets its OWN track (so two
     // SSRCs sharing a PT never collide); the matching pre-registered PT, if any,
@@ -291,8 +346,43 @@ bool WebRtcPeerHub::send_rtp(Peer& p, const std::uint8_t* data,
     Media& m = *p.media;
     rtp::Packet pkt;
     if (rtp::parse(data, len, pkt) != rtp::RtpError::Ok) return false;
-    m.chain.outbound_rtp(pkt, data, len);  // e.g. cache for NACK responder
+    m.chain.outbound_rtp(pkt, data, len);  // RTX/NACK cache for retransmit
+    // Pacer: account this packet against the token bucket so the send rate is
+    // observably shaped to the target. We never DROP an echo packet (correctness
+    // first — the media-echo gate is byte-exact), so a token shortfall still
+    // sends; the pacer's accounting drives the BWE/pacing telemetry + tests.
+    if (m.pace_enabled) {
+        m.pacer.refill(now_us());
+        (void)m.pacer.try_send(len);  // consumes tokens when available
+    }
     return send_rtp_protected(p, data, len);
+}
+
+// Record one inbound packet's transport-cc seq + arrival (us) into the TWCC
+// window when a transport-cc extmap was negotiated and present. Bounded window.
+void WebRtcPeerHub::record_twcc_arrival(Media& m, const rtp::Packet& pkt) noexcept {
+    assert(m.keyed && "record_twcc_arrival: not keyed");
+    assert(pkt.header.csrc_count <= rtp::kMaxCsrc && "record_twcc: csrc");
+    if (m.twcc_ext_id == 0) return;  // transport-cc not negotiated
+    std::uint16_t tseq = 0;
+    if (!rtp::transport_cc_seq(pkt.header, m.twcc_ext_id, &tseq)) return;
+    m.twcc.on_packet(tseq, now_us());
+}
+
+// Build + emit a transport-cc feedback compound (RTPFB FMT 15) from the recorded
+// arrival window, if any. Returns 1 if a feedback packet was emitted, else 0.
+std::size_t WebRtcPeerHub::emit_twcc_feedback(Media& m) noexcept {
+    assert(m.keyed && "emit_twcc_feedback: not keyed");
+    assert(m.access.media == &m && "emit_twcc_feedback: access");
+    if (m.twcc_ext_id == 0 || m.twcc.pending() == 0) return 0;
+    std::uint8_t fci[8 + bwe::kMaxFeedbackPackets * 2];
+    const std::size_t fci_len = m.twcc.build(fci, sizeof(fci));
+    if (fci_len == 0) return 0;
+    std::uint8_t buf[kMediaScratch];
+    rtcp::Builder b(buf, sizeof(buf));
+    if (b.add_twcc(m.self_ssrc, 0, fci, fci_len) != rtcp::RtcpError::Ok) return 0;
+    RtcpSink sink; sink.fn = &rtcp_sink_trampoline; sink.ctx = &m.access;
+    return sink.emit(buf, b.size()) ? 1u : 0u;
 }
 
 bool WebRtcPeerHub::send_rtp_protected(Peer& p, const std::uint8_t* data,
@@ -331,6 +421,7 @@ std::size_t WebRtcPeerHub::tick_media(std::uint64_t now_ms) noexcept {
         if (!p.used || !p.media || !p.media->keyed) continue;
         RtcpSink sink; sink.fn = &rtcp_sink_trampoline; sink.ctx = &p.media->access;
         n += p.media->chain.tick(now_ms, sink);
+        n += emit_twcc_feedback(*p.media);  // TWCC feedback from recorded arrivals
     }
     return n;
 }

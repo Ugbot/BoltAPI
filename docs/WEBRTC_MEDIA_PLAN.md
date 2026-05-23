@@ -85,8 +85,15 @@
       `testing/web/media.html`. All interop legs run through the no-stall runner
       `tests/interop/bounded_proc.h` (hard timeout + WHOLE-tree kill; can never
       hang/leak — proven). (`videostream`/`webcam` shapes: later.)
-- [ ] Perf: SRTP on the I/O thread (inline), batched recv, zero-copy RTP via
-      bolt::wire, per-SSRC SwissTable; no per-packet malloc.
+- [x] Perf: SRTP on the I/O thread (inline) — `UdpTransport` runs the datagram
+      handler inline on the I/O thread; `WebRtcPeerHub::feed`→`feed_media` (SRTP
+      unprotect + RFC5761 demux + parse + per-SSRC lookup) runs there with NO
+      worker hop. No per-packet malloc — proven 0 heap allocs by
+      `benchmarks/media_throughput_bench.cpp` (A/B stack vs `bolt::Arena` scratch;
+      Arena neutral-to-worse for single-use scratch so the hub keeps stack
+      scratch). Per-SSRC lookup is the bounded `TrackRegistry` (≤16) — a
+      `bolt::SwissTable` is not a win at that size. (Batched recv / zero-copy RTP
+      via bolt::wire: future, no measured benefit on loopback yet.)
 
 ## Phase M7 — Full ICE / TURN / trickle (connectivity beyond ice-lite)
 - [x] **Full ICE agent** (`webrtc::FullIceAgent`, RFC 8445) as an OPTION alongside
@@ -133,8 +140,19 @@
       build/parse; a GCC delay-based rate estimate; a token-bucket `Pacer`.
 - [x] Gates (DEFAULT suite, deadline-bounded, no external deps):
       `tests/simulcast_test.cpp`, `tests/rtx_fec_test.cpp`, `tests/bwe_test.cpp`.
-- [ ] Wire the interceptors (RTX/SVC) + pacer into the live `WebRtcPeerHub` send
-      path + negotiate RTX/FEC/TWCC in the App signaling answer (follow-up).
+- [x] Wire the interceptors (RTX) + pacer + TWCC into the live `WebRtcPeerHub`
+      path. `WebRtcPeerHub::MediaConfig`/`configure_media()` carry the negotiated
+      RTX (apt/rtx), transport-cc/abs-send-time extmap ids + a pacer target; the
+      per-peer chain runs `RtxInterceptor` on inbound NACK (RTX retransmit), records
+      transport-cc arrivals on inbound RTP, emits TWCC feedback (RTPFB FMT 15) on
+      `tick_media()`, and shapes the outbound path via `bwe::Pacer` (no echo drop).
+      `app.cpp` reads the offer's video m-line (transport-cc/abs-send-time extmap +
+      RTX apt mapping) and calls `configure_media()` from the echo-answer build
+      path. Gate `tests/media_pipeline_test.cpp` (real DTLS-SRTP loopback through
+      the live hub: NACK → RTX recovered byte-exact; arrivals → TWCC feedback;
+      pacer-enabled echo delivers). NOTE: emitting NEW `a=rtcp-fb`/`a=rtx`/
+      `a=ulpfec`/`a=extmap` lines in the answer SDP needs the read-only `sdp.*`
+      builder extended (other owner) — the hub-side wiring is complete + gated.
 - [ ] Key update / DTLS renegotiation.
 
 ## Salvage map (media)
