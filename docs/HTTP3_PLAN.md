@@ -224,13 +224,18 @@ production-grade**, but the *base* `quic_connection.cpp` never invoked it
       [nonce:12]). `EVP_CIPHER_CTX` reused per ctx; no per-op alloc. Compiled
       UNCONDITIONALLY (OpenSSL always linked) so the default suite covers it.
       *Bolt primitive:* fixed stack buffers for nonce/mask.
-- [ ] **3.3 TLS 1.3 QUIC method (quictls callbacks).** *What:* `SSL_QUIC_METHOD`
-      with set_encryption_secrets / add_handshake_data / flush_flight /
-      send_alert; `SSL_provide_quic_data` + `SSL_do_handshake` driver; ALPN `h3`;
-      QUIC transport parameters extension (encode/decode). *PORT*
-      `C:\code\FasterAPI\src\cpp\http\quic\quic_tls.h` (974 lines, real
-      `SSL_QUIC_METHOD` integration per audit). *Bolt primitive:* n/a (delegates
-      to quictls); transport-params codec uses `quic_varint.h`.
+- [x] **3.3 TLS 1.3 QUIC method — RE-SCOPED to OpenSSL 3.5+ `SSL_set_quic_tls_cbs`
+      (D0/D4).** *DONE (wave 3)* (`include/boltapi/quic/tls.h` +
+      `include/boltapi/quic/transport_params.h`, tests `tests/quic_tls_test.cpp`).
+      Adapted FasterAPI's `quic_tls.h` *flow* (not its absent BoringSSL calls) to
+      the OpenSSL 3.6 QUIC-TLS dispatch API: `SSL_set_quic_tls_cbs(ssl,
+      OSSL_DISPATCH[], arg)` with the six `OSSL_FUNC_SSL_QUIC_TLS_*` callbacks
+      (crypto_send / crypto_recv_rcd / crypto_release_rcd / yield_secret /
+      got_transport_params / alert), `SSL_set_quic_tls_transport_params` for our
+      params, `TLS_method()` SSL_CTX (TLS 1.3 only), ALPN `h3`, self-signed P-256
+      cert (reusing the WebRTC DTLS pattern). Transport-params codec (RFC 9000
+      §18) uses our `quic/varint.h`. Each yielded secret drives a wave-2
+      `PacketProtection` via `derive_packet_keys`. See DECISION LOG D4.
 - [ ] **3.4 Handshake manager (level transitions, key install).** *What:* drives
       handshake state across Initial/Handshake/1-RTT, installs read/write keys per
       level as secrets arrive, derives Initial keys from the DCID. *PORT*
@@ -677,11 +682,107 @@ auth-fail (tampered tag/body, wrong key, wrong AAD); randomized AEAD round-trip 
 all three suites. **Status:** default `cmake --preset msvc` + `ctest -C Release`
 = **156/156** (was 150; +6), zero warnings on the new TU, H1/H2/WebRTC untouched.
 
-### D3. Next wave (wave 3 — TLS 1.3 handshake; gated on D0)
-1. TLS 1.3 QUIC handshake via `SSL_set_quic_tls_cbs` / `OSSL_DISPATCH` +
-   transport-params codec (adapts `quic_tls.h` + `quic_handshake.h`).
+### D3. Next wave (wave 3 — TLS 1.3 handshake; gated on D0) — item 1 LANDED in D4
+1. ~~TLS 1.3 QUIC handshake via `SSL_set_quic_tls_cbs` / `OSSL_DISPATCH` +
+   transport-params codec~~ **DONE — see D4.**
 2. Secure connection (encrypt/decrypt, drives wave-2 `PacketProtection`) ->
    connection state machine (RFC 9002 loss recovery extracted clean) -> streams
    + flow control.
 3. QPACK (static/dynamic tables, encoder/decoder) -> HTTP/3 frames.
 4. Bridge QUIC streams -> `CoroHttpRequest` -> the existing `App` router.
+
+### D4. TLS 1.3 QUIC handshake LANDED (wave 3) — OpenSSL 3.6 QUIC-TLS callback API
+
+`include/boltapi/quic/transport_params.h` + `include/boltapi/quic/tls.h`
+(+ `tests/quic_tls_test.cpp`), namespace `bolt::api::quic`, Tiger Style (≥2
+asserts/fn, bounded buffers, noexcept, no exceptions, bool returns). Header-only;
+OpenSSL is always linked into boltapi and the test links `OpenSSL::SSL/Crypto`, so
+it compiles UNCONDITIONALLY — no `BOLTAPI_WITH_HTTP3` gate. **NO QUIC
+packet/connection wiring** (that is wave 4).
+
+**Exact OpenSSL 3.6.1 API used** (grepped from the installed headers, implemented
+against the real signatures):
+- `int SSL_set_quic_tls_cbs(SSL *s, const OSSL_DISPATCH *qtdis, void *arg);`
+  (`ssl.h:2937`) — installs the QUIC-TLS dispatch table on a plain `TLS_method()`
+  SSL object (the OpenSSL 3.5+ "external QUIC stack" hook; the BoringSSL
+  `SSL_QUIC_METHOD` / `SSL_provide_quic_data` surface is ABSENT here, per D0).
+- `int SSL_set_quic_tls_transport_params(SSL *s, const unsigned char *params,
+  size_t params_len);` (`ssl.h:2938`). **GOTCHA (found + fixed): OpenSSL RETAINS
+  this pointer (does not copy)** — the encoded block must outlive the handshake,
+  so `QuicTls` keeps it in a member buffer (`local_tp_`). A stack-local buffer
+  caused the peer to receive garbage and the decode to fail; this is the one real
+  trap of this API.
+- Dispatch callbacks (`core_dispatch.h:258-279`, ids 2001-2006), wired with their
+  typed signatures:
+  - 2001 `OSSL_FUNC_SSL_QUIC_TLS_CRYPTO_SEND` `(SSL*, const uchar* buf, size_t
+    buf_len, size_t* consumed, void* arg)` — buffer handshake bytes at the current
+    write level; report all consumed.
+  - 2002 `OSSL_FUNC_SSL_QUIC_TLS_CRYPTO_RECV_RCD` `(SSL*, const uchar** buf,
+    size_t* bytes_read, void* arg)` — hand TLS a contiguous view of the
+    unconsumed received CRYPTO at the current read level (pull model).
+  - 2003 `OSSL_FUNC_SSL_QUIC_TLS_CRYPTO_RELEASE_RCD` `(SSL*, size_t bytes_read,
+    void* arg)` — advance the consumed mark; compact when drained.
+  - 2004 `OSSL_FUNC_SSL_QUIC_TLS_YIELD_SECRET` `(SSL*, uint32_t prot_level, int
+    direction, const uchar* secret, size_t secret_len, void* arg)` — store the
+    per-level read(`direction==0`)/write(`direction==1`) secret, track the active
+    read/write level, and derive a wave-2 `PacketProtection` via
+    `derive_packet_keys`. `prot_level` maps via `OSSL_RECORD_PROTECTION_LEVEL_*`
+    (NONE=Initial, EARLY=0-RTT, HANDSHAKE, APPLICATION=1-RTT).
+  - 2005 `OSSL_FUNC_SSL_QUIC_TLS_GOT_TRANSPORT_PARAMS` `(SSL*, const uchar*
+    params, size_t params_len, void* arg)` — decode the peer's params (RFC 9000
+    §18).
+  - 2006 `OSSL_FUNC_SSL_QUIC_TLS_ALERT` `(SSL*, uchar alert_code, void* arg)`.
+  Dispatch table is a `static const OSSL_DISPATCH[]` terminated by
+  `OSSL_DISPATCH_END`; the `arg` is the `QuicTls*`. (`OSSL_QUIC_client_method()` /
+  `OSSL_QUIC_server_method()` in `quic.h` are for OpenSSL's OWN built-in QUIC
+  stack — NOT used here; the callback API rides on `TLS_method()`.)
+
+**Transport-params codec (`transport_params.h`, RFC 9000 §18):** encode/decode the
+varint-id + varint-len + value TLV list — initial_max_data,
+initial_max_stream_data_{bidi_local,bidi_remote,uni}, initial_max_streams_{bidi,
+uni}, max_idle_timeout, max_udp_payload_size, ack_delay_exponent, max_ack_delay,
+active_connection_id_limit, disable_active_migration (zero-len flag),
+initial_source_connection_id / original_destination_connection_id /
+retry_source_connection_id (raw CID bytes, ≤20), stateless_reset_token (16B).
+Per-field presence flags so encode emits exactly what was set; decode SKIPS
+unknown ids (§18.1) and rejects truncated values / over-long CIDs. Uses our
+`quic/varint.h`. Pure code (no OpenSSL), bounded.
+
+**`QuicTls` flow:** `init_client()` / `init_server()` build a TLS-1.3-only
+`TLS_method()` SSL_CTX (+ self-signed P-256 cert + ALPN-select for the server;
+permissive verify for the client self-test) and install the dispatch table; then
+`set_alpn` + `set_transport_params` before `advance()` (= `SSL_do_handshake`,
+WANT_READ/WANT_WRITE = need more peer CRYPTO, not an error). `feed_crypto(level,
+data)` buffers received CRYPTO per level; `pull_crypto(level)` drains our outbound
+CRYPTO per level; `read_secret/write_secret(level)`, `read_protection/
+write_protection(level)`, `peer_transport_params()`, `is_complete()`/`failed()`.
+
+**In-process handshake test RESULT** (`tests/quic_tls_test.cpp`, default suite, no
+UDP): a client + server `QuicTls` are stepped in lockstep, each side's pulled
+CRYPTO (per level) fed into the other, with a bounded 64-iteration budget. **Both
+reach `is_complete()`**; **client `write_secret(level)` == server
+`read_secret(level)` and vice-versa at BOTH the Handshake and 1-RTT (Application)
+levels** (32-byte SHA-256 secrets — the shared-secret proof); **transport params
+round-trip** (each side decodes the other's: initial_max_data, max_streams,
+CIDs, disable_active_migration); ALPN negotiates to `h3`; and a `PacketProtection`
+derived from those secrets **cross-seals/opens** a randomized payload in BOTH
+directions at the 1-RTT and Handshake levels, with a tamper-the-tag negative
+check — tying wave 2 (`packet_protection.h`) and wave 3 together. Plus four
+standalone transport-params codec tests (round-trip, skip-unknown, reject
+truncated, reject over-long CID).
+
+**Status:** default `cmake --preset msvc` + `ctest -C Release` = **161/161** (was
+156; +5: 4 transport-params + 1 handshake gate), zero warnings on the new TUs,
+H1/H2/WebRTC/QUIC-primitives/protection suites unchanged.
+
+### D5. Next wave (wave 4 — QUIC connection)
+1. Process Initial packets end-to-end: parse (wave-1 `packet.h`) -> unprotect
+   (wave-2 `PacketProtection` from DCID) -> reassemble CRYPTO (per-level buffer)
+   -> drive `QuicTls` (wave 3) -> install Handshake/1-RTT keys from the yielded
+   secrets -> seal/open subsequent packets.
+2. Connection state machine (IDLE -> HANDSHAKE -> ESTABLISHED -> CLOSING/
+   DRAINING -> CLOSED) + RFC 9002 loss recovery (PTO, time-threshold, RTT)
+   extracted as a clean unit; ACK tracking already in `ack.h`.
+3. Streams + flow control -> QPACK (static/dynamic, encoder/decoder) -> HTTP/3
+   frames -> bridge QUIC streams to `CoroHttpRequest` -> the existing `App`
+   router.

@@ -197,6 +197,17 @@ boltapi_add_test(boltapi_quic_primitives_test quic_primitives_test.cpp)
 boltapi_add_test(boltapi_quic_protection_test quic_protection_test.cpp)
 target_link_libraries(boltapi_quic_protection_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 
+# Wave 3: TLS 1.3 QUIC handshake driver (boltapi/quic/tls.h) over OpenSSL 3.6's
+# native QUIC-TLS callback API (SSL_set_quic_tls_cbs + OSSL_DISPATCH) + the QUIC
+# transport-parameters codec (boltapi/quic/transport_params.h, RFC 9000 §18).
+# GATE: an in-process client<->server handshake (no UDP) shuttling CRYPTO bytes
+# per encryption level until both complete, then proving client/server secrets
+# MATCH at Handshake + 1-RTT, transport params round-trip across the wire, and a
+# PacketProtection derived from those secrets cross-seals/opens a packet (ties
+# wave 2 + wave 3). OpenSSL is always linked, so this runs in the default suite.
+boltapi_add_test(boltapi_quic_tls_test quic_tls_test.cpp)
+target_link_libraries(boltapi_quic_tls_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+
 # M3: HTTP/3 + WebRTC seam — ProtocolRegistry mechanism (register/has/create),
 # a dummy IProtocol returning NotImplemented, and (when the compile flags are
 # ON) the real H3/WebRTC stub factories registering. Flag-AWARE: passes in the
