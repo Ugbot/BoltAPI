@@ -884,7 +884,7 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
             // Default response
             response.status = 200;
             response.status_message = "OK";
-            response.headers["Content-Type"] = "text/plain";
+            response.headers.set("Content-Type", "text/plain");
             response.body = "Hello, World!";
         }
 
@@ -892,7 +892,7 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
         bool use_chunked = false;
         auto transfer_encoding_it = response.headers.find("Transfer-Encoding");
         if (transfer_encoding_it != response.headers.end()) {
-            std::string te_lower = transfer_encoding_it->second;
+            std::string te_lower = transfer_encoding_it->value;
             for (char& c : te_lower) c = std::tolower(c);
             if (te_lower.find("chunked") != std::string::npos) {
                 use_chunked = true;
@@ -1106,7 +1106,7 @@ core::coro_task<void> CoroUnifiedServer::handle_http2_connection(
                 // Default response
                 response.status = 200;
                 response.status_message = "OK";
-                response.headers["Content-Type"] = "text/plain";
+                response.headers.set("Content-Type", "text/plain");
                 response.body = "Hello, World!";
             }
 

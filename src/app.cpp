@@ -70,7 +70,7 @@ AsyncMiddleware make_compression_middleware() {
 
         // Already encoded? Leave it.
         if (raw.headers.find("Content-Encoding") != raw.headers.end()) {
-            co_return;
+            co_return;  // CoroResponseHeaders::find is case-insensitive, end()==entries+count
         }
         // Body below the threshold? Not worth the gzip framing overhead.
         if (raw.body.size() <= kMinCompressBytes) {
@@ -89,10 +89,10 @@ AsyncMiddleware make_compression_middleware() {
         }
 
         raw.body.swap(encoded);
-        raw.headers["Content-Encoding"] = "gzip";
-        raw.headers["Content-Length"] = std::to_string(raw.body.size());
+        raw.headers.set("Content-Encoding", "gzip");
+        raw.headers.set("Content-Length", std::to_string(raw.body.size()));
         // Caches must key on Accept-Encoding now that the body varies by it.
-        raw.headers["Vary"] = "Accept-Encoding";
+        raw.headers.set("Vary", "Accept-Encoding");
         co_return;
     };
 }
@@ -221,7 +221,7 @@ void App::build_dispatch() {
                 // No route. 404. (405 is a documented optional for v1.)
                 cresp.status = 404;
                 cresp.status_message = "Not Found";
-                cresp.headers["Content-Type"] = "text/plain; charset=utf-8";
+                cresp.headers.set("Content-Type", "text/plain; charset=utf-8");
                 cresp.body = "Not Found";
                 co_return cresp;
             }

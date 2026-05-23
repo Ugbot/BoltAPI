@@ -382,7 +382,7 @@ void Http2Connection::commit_output(size_t len) noexcept {
 core::result<void> Http2Connection::send_response(
     uint32_t stream_id,
     uint16_t status,
-    const std::unordered_map<std::string, std::string>& headers,
+    const http::CoroResponseHeaders& headers,
     const std::string& body
 ) noexcept {
     Http2Stream* stream = stream_manager_.get_stream(stream_id);

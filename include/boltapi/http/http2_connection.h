@@ -3,6 +3,7 @@
 #include "boltapi/http/http2_frame.h"
 #include "boltapi/http/http2_stream.h"
 #include "boltapi/http/hpack.h"
+#include "boltapi/http/response_headers.h"
 #include "boltapi/core/result.h"
 #include <cstdint>
 #include <vector>
@@ -316,7 +317,7 @@ public:
     core::result<void> send_response(
         uint32_t stream_id,
         uint16_t status,
-        const std::unordered_map<std::string, std::string>& headers,
+        const http::CoroResponseHeaders& headers,
         const std::string& body
     ) noexcept;
 

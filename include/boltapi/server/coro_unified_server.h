@@ -26,9 +26,11 @@
 #include "boltapi/http/http1_parser.h"
 #include "boltapi/http/http1_connection.h"
 #include "boltapi/http/http2_connection.h"
+#include "boltapi/http/response_headers.h"
 #include "boltapi/http/websocket.h"
 #include "boltapi/http/websocket_parser.h"
 #include <atomic>
+#include <cassert>
 #include <condition_variable>
 #include <csignal>
 #include <deque>
@@ -160,10 +162,13 @@ private:
     std::deque<std::string> owned_storage_;  // empty on the H1 zero-copy path
 };
 
+// CoroResponseHeaders: owned, flat, bounded response-header store that replaces
+// the per-response std::unordered_map. Defined in its own header so the HTTP/2
+// path can consume it without an include cycle. See response_headers.h.
 struct CoroHttpResponse {
     uint16_t status = 200;
     std::string status_message = "OK";
-    std::unordered_map<std::string, std::string> headers;
+    CoroResponseHeaders headers;
     std::string body;
 };
 

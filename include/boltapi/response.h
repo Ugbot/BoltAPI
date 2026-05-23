@@ -43,14 +43,14 @@ public:
     Response& content_type(std::string_view ct) & {
         assert(!ct.empty());
         assert(ct.size() < 256);
-        out_.headers["Content-Type"] = std::string(ct);
+        out_.headers.set("Content-Type", ct);
         return *this;
     }
 
     Response& header(std::string_view key, std::string_view value) & {
         assert(!key.empty());
         assert(key.size() < 256);
-        out_.headers[std::string(key)] = std::string(value);
+        out_.headers.set(key, value);  // replace-or-append (map operator[] semantics)
         return *this;
     }
 
@@ -70,7 +70,7 @@ public:
     Response& json(std::string_view payload) & {
         assert(payload.size() <= (1u << 30));
         assert(out_.status >= 100);
-        out_.headers["Content-Type"] = "application/json";
+        out_.headers.set("Content-Type", "application/json");
         out_.body.assign(payload.data(), payload.size());
         return *this;
     }
@@ -79,7 +79,7 @@ public:
     Response& text(std::string_view payload) & {
         assert(payload.size() <= (1u << 30));
         assert(out_.status >= 100);
-        out_.headers["Content-Type"] = "text/plain; charset=utf-8";
+        out_.headers.set("Content-Type", "text/plain; charset=utf-8");
         out_.body.assign(payload.data(), payload.size());
         return *this;
     }
@@ -88,7 +88,7 @@ public:
     Response& html(std::string_view payload) & {
         assert(payload.size() <= (1u << 30));
         assert(out_.status >= 100);
-        out_.headers["Content-Type"] = "text/html; charset=utf-8";
+        out_.headers.set("Content-Type", "text/html; charset=utf-8");
         out_.body.assign(payload.data(), payload.size());
         return *this;
     }
