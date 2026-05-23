@@ -38,6 +38,7 @@
 #if defined(BOLTAPI_WITH_WEBRTC)
 #include "boltapi/net/udp_transport.h"
 #include "boltapi/webrtc/ice.h"
+#include "boltapi/webrtc/dtls.h"
 #endif
 
 #include <cassert>
@@ -72,6 +73,13 @@ struct WebRtcConfig {
     // SCTP association parameters surfaced into the SDP answer.
     uint16_t    sctp_port        = 5000;
     uint32_t    max_message_size = 262144;
+
+    // The remote (browser/offerer) DTLS certificate fingerprint extracted from
+    // the SDP offer's a=fingerprint line. When set, the DTLS server verifies the
+    // peer cert's SHA-256 against it after the handshake (the WebRTC identity
+    // binding) and rejects on mismatch. Empty => verification skipped (the
+    // handshake alone establishes the channel — used before signaling lands).
+    std::string offer_fingerprint;
 };
 
 class App {
@@ -285,6 +293,12 @@ private:
     // None of this touches the H1/H2 server.
     std::unique_ptr<net::UdpTransport>   webrtc_transport_;
     std::unique_ptr<webrtc::IceAgent>    webrtc_agent_;
+    // DTLS server (answerer, setup:passive): a shared context (self-signed cert
+    // + SHA-256 fingerprint for the SDP a=fingerprint) and a per-peer session
+    // manager wired as the transport's datagram handler (first byte 20..63).
+    // Created in init_protocol_seams(); torn down before the transport in stop().
+    std::unique_ptr<webrtc::DtlsContext>        webrtc_dtls_ctx_;
+    std::unique_ptr<webrtc::DtlsSessionManager> webrtc_dtls_mgr_;
 #endif
 
     std::unique_ptr<Router>                   router_;

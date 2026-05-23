@@ -159,6 +159,7 @@ add_library(boltapi STATIC
     # no engine deps, zero cost unless started) so the default suite covers it.
     src/net/udp_transport.cpp  # real async UDP transport (own socket + rx thread)
     src/webrtc/ice.cpp         # ICE-lite agent (gather + STUN binding responder)
+    src/webrtc/dtls.cpp        # DTLS server (answerer) over UDP via OpenSSL memory BIOs
     ${BOLTAPI_ENGINE_SOURCES}
 )
 add_library(boltapi::boltapi ALIAS boltapi)

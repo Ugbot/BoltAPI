@@ -311,28 +311,66 @@ the audit's "mostly REBUILD."
 > security footgun. We treat OpenSSL as a vendored crypto provider behind a thin
 > Bolt-style wrapper; the *transport, demux, framing* around it stay Bolt-native.
 
-- [ ] **Self-signed cert + key generation at startup** (ECDSA P-256). Compute the
+- [x] **Self-signed cert + key generation at startup** (ECDSA P-256). Compute the
       **SHA-256 fingerprint** for the SDP `a=fingerprint` line (§3). **REBUILD**
       (wrapper over OpenSSL `EVP`/`X509`). Bolt primitive: none (one-time setup).
-- [ ] **DTLS server endpoint over UDP-via-ICE.** Drive OpenSSL DTLS with a
+      DONE (DTLS wave): `include/boltapi/webrtc/dtls.h` + `src/webrtc/dtls.cpp`
+      `DtlsContext::create()` builds an `SSL_CTX(DTLS_server_method())` with a
+      fresh self-signed ECDSA P-256 cert (RSA-2048 fallback), and computes our
+      cert's SHA-256 DER fingerprint as "AA:BB:.." via `x509_sha256_fingerprint`
+      / `X509_digest`. One-time at App startup. Compiled UNCONDITIONALLY.
+- [x] **DTLS server endpoint over UDP-via-ICE.** Drive OpenSSL DTLS with a
       **memory BIO** so we feed it datagrams from the UDP demux (§2) and pull out
       records to send — never letting OpenSSL own the socket (it must go through
       the ICE-selected 4-tuple). DTLS **1.2 first**, then enable **1.3**.
       **REBUILD.** Bolt primitive: `bolt_arena.h` for the per-record scratch;
       SPSC for the handshake datagram flow.
-- [ ] **Server/client role from SDP `a=setup`.** Browser offers `actpass`; Bolt
+      DONE (DTLS wave): `DtlsSession` wraps a server-role `SSL` over a read BIO +
+      write BIO (`BIO_s_mem`). `feed(datagram)` → `BIO_write(rbio)` →
+      `SSL_do_handshake()` (handles WANT_READ/WANT_WRITE) → drain `wbio` with
+      `BIO_read` → `UdpTransport::send(peer,…)` each record. `DtlsSessionManager`
+      keys sessions by peer sockaddr (bounded fixed table; SwissTable is the §11
+      perf upgrade) and is wired as `UdpTransport`'s datagram handler (first byte
+      20..63). DTLS 1.2 floor (`set_min_proto_version`); 1.3 negotiates up. State:
+      New → Handshaking → Established / Failed. (Per-record arena/SPSC is the §11
+      perf phase; the wbio drain uses a fixed `kDtlsDrainBuf` stack scratch.)
+- [x] **Server/client role from SDP `a=setup`.** Browser offers `actpass`; Bolt
       answers `setup:passive` → Bolt is DTLS **server**. Honor an offer that
       forces us active if it ever occurs. **REBUILD.**
-- [ ] **Fingerprint verification.** After handshake, verify the peer cert's
+      DONE (DTLS wave): `DtlsContext::new_ssl()` calls `SSL_set_accept_state`
+      (server role); the SDP answer emits `a=setup:passive` (§3). The server is
+      purely reactive — the manager creates a session on the first ClientHello
+      and never speaks first. (An offer forcing us active is a later edge case.)
+- [x] **Fingerprint verification.** After handshake, verify the peer cert's
       SHA-256 matches the `a=fingerprint` from the offer (§3). Reject on
       mismatch. **REBUILD** (this is the actual security check). Bolt primitive:
       none.
-- [ ] **Export keying material** (`SCTP` needs none; **DTLS-SRTP export is media
+      DONE (DTLS wave): `SSL_VERIFY_PEER` + a permissive verify callback (WebRTC
+      binds identity by fingerprint, not CA chain). On handshake completion,
+      `verify_peer()` pulls the peer cert (`SSL_get1_peer_certificate`), computes
+      its SHA-256, and compares to the offer's `a=fingerprint`
+      (`fingerprints_equal`, tolerant of the "sha-256 " algo prefix + case).
+      Mismatch → `State::Failed` (rejected). Validated by a NEGATIVE test.
+- [x] **Export keying material** (`SCTP` needs none; **DTLS-SRTP export is media
       only**, deferred to §8). For v1 just confirm the handshake completes and
       the secure record layer is up. **REBUILD.**
-- [ ] **Correctness gate:** standalone test does a full DTLS 1.2 then 1.3
+      DONE (DTLS wave): handshake completion → `Established`; `send_app`/`read_app`
+      (SSL_write/SSL_read over the BIOs) expose the secure record layer — the
+      byte channel SCTP runs on next. DTLS-SRTP keying export is a documented
+      TODO (media phase §12), not needed for data channels.
+- [x] **Correctness gate:** standalone test does a full DTLS 1.2 then 1.3
       handshake against OpenSSL's `openssl s_client -dtls` and against a browser;
       assert fingerprint match enforced (negative test: wrong fp → rejected).
+      DONE (DTLS wave): `tests/dtls_test.cpp` (gtest, UNCONDITIONAL) stands up our
+      `UdpTransport`+`DtlsContext`+`DtlsSessionManager` (server) and runs a REAL
+      OpenSSL DTLS CLIENT over a connected loopback UDP socket
+      (`BIO_new_dgram`+`DTLS_client_method`, `SSL_connect`). Asserts BOTH sides
+      reach handshake-complete, the server session is `Established`, the server
+      reads the client cert and fingerprint verification PASSES (client cert
+      SHA-256 fed in as the offer fp), a fingerprint MISMATCH is REJECTED
+      (session `Failed`), and a DTLS app-data round-trip (client SSL_write →
+      server read_app echoes → client SSL_read) works. Bounded by a 10s deadline.
+      Browser + `s_client -dtls` interop is a later live-interop gate (§10).
 
 ---
 
@@ -463,8 +501,15 @@ the audit's "mostly REBUILD."
       shutdown. PENDING: full pairing/priority math vs RFC 8445 examples +
       role-conflict (not needed for the ICE-lite responder; revisit if we add a
       controlling path).
-- [ ] **DTLS handshake test** — vs `openssl s_client -dtls` and a browser; DTLS
+- [~] **DTLS handshake test** — vs `openssl s_client -dtls` and a browser; DTLS
       1.2 and 1.3; negative fingerprint-mismatch rejection.
+      DONE (DTLS wave): `tests/dtls_test.cpp` — a LIVE DTLS handshake over
+      loopback UDP between our `DtlsContext`/`DtlsSession`/manager (server) and a
+      real OpenSSL `DTLS_client_method` client; both sides complete, server
+      session `Established`, peer-cert fingerprint verify PASSES, fingerprint
+      MISMATCH REJECTED, and an app-data round-trip echoes. Plus context-level
+      fingerprint generation + `fingerprints_equal` unit cases. PENDING: live
+      `openssl s_client -dtls` CLI + browser interop (live-interop gate).
 - [ ] **SCTP/DCEP roundtrip** — Bolt↔Bolt loopback (INIT/SACK/retransmit under
       injected loss + reorder) and DCEP open/ack/echo vs `aiortc`.
 - [ ] **Browser interop** — automated Chrome + Firefox `RTCPeerConnection` +

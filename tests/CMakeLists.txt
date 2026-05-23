@@ -108,6 +108,23 @@ if(WIN32)
     target_link_libraries(boltapi_ice_test PRIVATE ws2_32 mswsock iphlpapi)
 endif()
 
+# WebRTC DTLS handshake — THE LIVE DTLS GATE. Stands up our UdpTransport +
+# DtlsContext + DtlsSessionManager (the server / answerer, setup:passive) on an
+# ephemeral loopback UDP port, then runs a REAL OpenSSL DTLS CLIENT (connected
+# UDP socket + BIO_new_dgram + DTLS_client_method, SSL_connect) against it. The
+# server feeds inbound datagrams to its DtlsSession and sends records back via
+# the transport. Asserts: BOTH sides reach handshake-complete; the server-side
+# session is Established; fingerprint verification PASSES (client cert SHA-256
+# fed in as the "offer fingerprint"); a fingerprint MISMATCH is REJECTED; and a
+# DTLS app-data round-trip (client SSL_write -> server read_app echoes ->
+# client SSL_read) works. Bounded by a wall-clock deadline so it can't hang.
+# Links OpenSSL + ws2_32/mswsock (Windows) for the live socket + crypto.
+boltapi_add_test(boltapi_dtls_test dtls_test.cpp)
+target_link_libraries(boltapi_dtls_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+if(WIN32)
+    target_link_libraries(boltapi_dtls_test PRIVATE ws2_32 mswsock iphlpapi)
+endif()
+
 # M3: HTTP/3 + WebRTC seam — ProtocolRegistry mechanism (register/has/create),
 # a dummy IProtocol returning NotImplemented, and (when the compile flags are
 # ON) the real H3/WebRTC stub factories registering. Flag-AWARE: passes in the

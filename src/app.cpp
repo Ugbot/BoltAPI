@@ -349,6 +349,30 @@ void App::init_protocol_seams() {
                          const std::uint8_t* data, std::size_t len) {
                     ag->handle_stun(*tp, peer, plen, data, len);
                 });
+
+            // DTLS server (answerer, setup:passive): build the shared context
+            // (self-signed cert + SHA-256 fingerprint) and a per-peer session
+            // manager, then route inbound DTLS datagrams (first byte 20..63) to
+            // it. The manager creates a session on the first ClientHello and
+            // drives SSL_do_handshake over memory BIOs, sending records back via
+            // the transport. The offer's a=fingerprint (when known from
+            // signaling) is the identity the peer cert is verified against.
+            webrtc_dtls_ctx_ = webrtc::DtlsContext::create();
+            if (webrtc_dtls_ctx_ && webrtc_dtls_ctx_->is_valid()) {
+                webrtc_dtls_mgr_ = std::make_unique<webrtc::DtlsSessionManager>(
+                    *webrtc_dtls_ctx_, *webrtc_transport_);
+                if (!webrtc_config_.offer_fingerprint.empty()) {
+                    webrtc_dtls_mgr_->set_offer_fingerprint(
+                        webrtc_config_.offer_fingerprint);
+                }
+                webrtc::DtlsSessionManager* dm = webrtc_dtls_mgr_.get();
+                webrtc_transport_->set_datagram_handler(
+                    [dm](const sockaddr* peer, int plen,
+                         const std::uint8_t* data, std::size_t len) {
+                        dm->feed(peer, plen, data, len);
+                    });
+            }
+
             webrtc_transport_->start();
 
             std::fprintf(stderr,
@@ -360,6 +384,12 @@ void App::init_protocol_seams() {
                 static_cast<int>(ag->ufrag().size()), ag->ufrag().data(),
                 static_cast<int>(ag->pwd().size()), ag->pwd().data(),
                 ncand, dc_handlers_.size());
+            if (webrtc_dtls_ctx_ && webrtc_dtls_ctx_->is_valid()) {
+                std::fprintf(stderr,
+                    "[boltapi] WebRTC:   DTLS server ready (setup:passive) "
+                    "a=fingerprint:sha-256 %s\n",
+                    webrtc_dtls_ctx_->fingerprint().c_str());
+            }
             for (std::size_t i = 0; i < ncand; ++i) {
                 const std::string line = ag->candidate(i).to_string();
                 std::fprintf(stderr, "[boltapi] WebRTC:   a=%s\n", line.c_str());
@@ -369,6 +399,8 @@ void App::init_protocol_seams() {
                 "[boltapi] WebRTC: failed to bind UDP :%u; ICE transport not "
                 "started. H1/H2 unaffected.\n",
                 static_cast<unsigned>(udp_port));
+            webrtc_dtls_mgr_.reset();
+            webrtc_dtls_ctx_.reset();
             webrtc_transport_.reset();
             webrtc_agent_.reset();
         }
@@ -422,10 +454,16 @@ void App::stop() {
         server_->stop();
     }
 #if defined(BOLTAPI_WITH_WEBRTC)
-    // Clean WebRTC teardown: stop the receive thread + close the UDP socket
-    // before the agent is destroyed. Idempotent (stop() guards on handle).
+    // Clean WebRTC teardown: stop the receive loop + close the UDP socket BEFORE
+    // freeing the DTLS sessions (the manager's sessions send through the
+    // transport), then free the DTLS context, then the agent. Idempotent
+    // (transport.stop() guards on handle; resets are no-ops if already null).
     if (webrtc_transport_) {
         webrtc_transport_->stop();
+    }
+    webrtc_dtls_mgr_.reset();   // frees all DtlsSessions (SSL/BIO)
+    webrtc_dtls_ctx_.reset();   // frees the SSL_CTX
+    if (webrtc_transport_) {
         webrtc_transport_.reset();
     }
     webrtc_agent_.reset();
