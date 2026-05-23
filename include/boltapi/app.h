@@ -67,7 +67,7 @@ namespace bolt::api {
 // only ever fires under BOLTAPI_WITH_WEBRTC (it needs the transport up), so the
 // incomplete type is fine for the std::function declaration; the App wiring that
 // dereferences it is itself gated by BOLTAPI_WITH_WEBRTC.
-namespace webrtc { class DataChannel; }
+namespace webrtc { class DataChannel; class MediaTrack; }
 
 // ---------------------------------------------------------------------------
 // WebRtcConfig — minimal additive config for the WebRTC data-channel surface
@@ -107,6 +107,22 @@ struct WebRtcConfig {
     // binding) and rejects on mismatch. Empty => verification skipped (the
     // handshake alone establishes the channel — used before signaling lands).
     std::string offer_fingerprint;
+
+    // -----------------------------------------------------------------------
+    // Media (WM5). Outbound media tracks the App will write to. Each spec is a
+    // negotiated SSRC + payload type + codec; the peer hub pre-registers them so
+    // the on_track handler can write media (echo/relay). Inbound tracks are
+    // discovered from received RTP (by SSRC/PT), so this list is only needed for
+    // tracks Bolt SENDS. Bounded; mirrors the data-channel handler list shape.
+    // 0 = audio, 1 = video (matches webrtc::MediaKind).
+    // -----------------------------------------------------------------------
+    struct MediaTrackSpec {
+        uint8_t     kind = 0;          // 0 audio, 1 video
+        uint32_t    ssrc = 0;
+        uint8_t     payload_type = 0;
+        std::string codec;             // "opus" / "VP8" / "H264" / ...
+    };
+    std::vector<MediaTrackSpec> media_tracks;
 };
 
 class App {
@@ -125,6 +141,16 @@ public:
     using DataChannelHandler =
         std::function<void(webrtc::DataChannel& ch, const void* data,
                            std::size_t len, bool is_binary)>;
+
+    // Media-track handler (WM5): fired once per inbound RTP packet on a media
+    // track, with (track, rtp_data, rtp_len). `rtp_data` is the decrypted RTP
+    // packet (header + payload). The handler may RELAY/ECHO by calling
+    // track.write(rtp_data, rtp_len) (or a re-stamped packet). Only ever invoked
+    // under BOLTAPI_WITH_WEBRTC (the SRTP transport must be up). Mirrors
+    // DataChannelHandler. The MediaTrack reference exposes ssrc()/kind()/codec().
+    using MediaTrackHandler =
+        std::function<void(webrtc::MediaTrack& track, const std::uint8_t* rtp_data,
+                           std::size_t rtp_len)>;
 
     // Forwarding config: wraps a CoroUnifiedServerConfig plus facade-level knobs.
     struct Config {
@@ -296,6 +322,19 @@ public:
         return *this;
     }
 
+    // Register a media-track handler (WM5), mirroring on_data_channel. The
+    // handler is invoked for every inbound RTP packet on every media track once
+    // the SRTP transport is up. Recorded now; wired into the WebRtcPeerHub in
+    // init_protocol_seams(). Only one handler (the latest registration) is kept —
+    // tracks are demuxed by SSRC inside the hub, so a single handler that
+    // switches on track.kind()/ssrc() is the FastAPI-style shape. Returns *this.
+    App& on_track(MediaTrackHandler handler) {
+        assert(handler != nullptr);
+        assert(!started_);
+        track_handler_ = std::move(handler);
+        return *this;
+    }
+
     // -----------------------------------------------------------------------
     // Middleware (global). Folded right-to-left at build time.
     // -----------------------------------------------------------------------
@@ -464,6 +503,15 @@ private:
     // m-line). Returns false (out_answer cleared) on a malformed offer or when
     // the WebRTC transport isn't up. Defined in app.cpp. Single active peer (v1).
     bool handle_webrtc_offer(std::string_view body, std::string& out_answer);
+
+    // WM5: the C-style deliver trampoline bound as each MediaTrack's deliver
+    // sink. `ctx` is &track_handler_ (a stable MediaTrackHandler*); it forwards
+    // the inbound RTP to the App's on_track handler. noexcept (the handler must
+    // not throw — the build is exception-free). Defined in app.cpp.
+    static void media_deliver_trampoline(void* ctx, webrtc::MediaTrack& track,
+                                         const webrtc::rtp::Packet& pkt,
+                                         const std::uint8_t* data,
+                                         std::size_t len) noexcept;
 #endif
 
     // Run the middleware chain for one matched route, terminal = handler.
@@ -491,6 +539,8 @@ private:
     struct DcReg { std::string label; DataChannelHandler handler; };
     WebRtcConfig        webrtc_config_{};
     std::vector<DcReg>  dc_handlers_;
+    // WM5 media: a single on_track handler (tracks demuxed by SSRC in the hub).
+    MediaTrackHandler   track_handler_;
 
 #if defined(BOLTAPI_WITH_WEBRTC)
     // When enable_webrtc is set AND the flag is on, App owns a real UdpTransport
