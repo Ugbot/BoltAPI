@@ -240,6 +240,27 @@ if(WIN32)
     target_link_libraries(boltapi_quic_stream_test PRIVATE ws2_32 mswsock iphlpapi)
 endif()
 
+# Wave 5d: QUIC/HTTP3 PROTOCOL ROBUSTNESS — RFC 9000 §8/§10/§17 + RFC 9001
+# §5.8/§6 (boltapi/quic/robustness.h + connection.h wiring). UNIT: Version
+# Negotiation packet build/parse, Retry integrity tag + address-validation token
+# mint/verify (forged token rejected), anti-amplification 3x budget, stateless
+# reset token derive + recognize. GATE (loopback UDP): (1) client offers a BOGUS
+# version -> our server emits a VN -> client retries with v1 -> Established;
+# (2) server REQUIRES Retry -> client's first Initial gets a Retry -> retries
+# with the token -> Established; (3) one side sends CONNECTION_CLOSE -> peer
+# Draining; a short max_idle_timeout fires -> closes (no hang); (4) a key update
+# flips the key-phase -> a fresh 1-RTT PING round-trips under new keys + both
+# generations advance; (5) GREASE: unknown transport param + unknown frame type
+# ignored; (6) FUZZ: thousands of seeded random/truncated/malformed packets fed
+# to the parser + a live connection never crash, never reach Established on
+# noise, stay bounded. Wall-clock deadlines (no hang); seeded RNG. OpenSSL +
+# ws2_32/mswsock/iphlpapi on Windows. Runs in the DEFAULT suite.
+boltapi_add_test(boltapi_quic_robustness_test quic_robustness_test.cpp)
+target_link_libraries(boltapi_quic_robustness_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+if(WIN32)
+    target_link_libraries(boltapi_quic_robustness_test PRIVATE ws2_32 mswsock iphlpapi)
+endif()
+
 # QPACK (HTTP/3 RFC 9204) — static table + RFC 7541 Huffman, encoder/decoder,
 # bounded dynamic table. RFC 7541 C.4.1 Huffman vector byte-exact + round-trips.
 boltapi_add_test(boltapi_qpack_test qpack_test.cpp)

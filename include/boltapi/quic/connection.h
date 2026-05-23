@@ -47,6 +47,7 @@
 #include "boltapi/quic/packet.h"
 #include "boltapi/quic/packet_protection.h"
 #include "boltapi/quic/pn_space.h"
+#include "boltapi/quic/robustness.h"
 #include "boltapi/quic/stream.h"
 #include "boltapi/quic/tls.h"
 #include "boltapi/quic/transport_params.h"
@@ -83,6 +84,14 @@ inline constexpr std::size_t kMaxPayloadSize = 1400;      // pre-AEAD frame budg
 inline constexpr std::uint8_t kLocalCidLen = 8;           // our SCID length
 inline constexpr std::size_t kCryptoChunk = 1024;         // CRYPTO bytes per frame
 inline constexpr std::size_t kInitialMinDatagram = 1200;  // RFC 9000 §14.1
+
+// W5d robustness bounds (RFC 9000 §8/§10, RFC 9001 §6).
+inline constexpr std::uint64_t kDefaultIdleTimeoutMs = 30000;  // local default
+inline constexpr std::uint64_t kKeyUpdateGuardPkts = 8;  // reorder window margin
+
+// QUIC transport error codes used by CONNECTION_CLOSE (RFC 9000 §20.1).
+inline constexpr std::uint64_t kNoError = 0x00;
+inline constexpr std::uint64_t kInternalError = 0x01;
 
 // Connection lifecycle (RFC 9000 §10 / §17.2 handshake progression).
 enum class ConnState : std::uint8_t {
@@ -252,6 +261,7 @@ public:
             if (!derive_initial_keys(initial_dcid_)) return false;
         }
         state_ = ConnState::kNew;
+        last_activity_us_ = now_us();  // arm the idle timer at creation
         return true;
     }
 
@@ -261,6 +271,7 @@ public:
         assert(send_ && "start before init");
         assert(!is_server_ && "server starts on first client Initial");
         state_ = ConnState::kHandshaking;
+        last_activity_us_ = now_us();
         tls_.advance();             // produces ClientHello CRYPTO at Initial
         flush();                    // build + send Initial packet(s)
         return !tls_.failed();
@@ -275,6 +286,18 @@ public:
         if (state_ == ConnState::kClosed || state_ == ConnState::kDraining)
             return;
         QTRACE("feed_datagram len=%zu state=%s", len, conn_state_name(state_));
+        // RFC 9000 §10.3.1: a datagram whose tail matches the peer's stateless
+        // reset token tears the connection down (we have no other recourse).
+        if (have_peer_reset_token_ &&
+            is_stateless_reset(data, len, peer_reset_token_)) {
+            got_stateless_reset_ = true;
+            state_ = ConnState::kDraining;
+            return;
+        }
+        // RFC 9000 §8.1: count received bytes toward the anti-amplification
+        // budget; any inbound also restarts the idle timer (§10.1).
+        amp_.on_received(len);
+        last_activity_us_ = now_us();
         std::size_t off = 0;
         for (std::size_t i = 0; i < kMaxCoalescedPackets && off < len; ++i) {
             std::size_t consumed = 0;
@@ -300,8 +323,23 @@ public:
     // re-frame the oldest unacked CRYPTO/STREAM data into fresh packets, then
     // flush (which also emits any due ACKs / new data within cwnd).
     void tick() noexcept {
-        if (state_ == ConnState::kClosed || state_ == ConnState::kDraining)
+        if (state_ == ConnState::kClosed) return;
+        // RFC 9000 §10.2: Closing/Draining only wind down. After a bounded
+        // closing period, drop to Closed (no app traffic either way).
+        if (state_ == ConnState::kClosing || state_ == ConnState::kDraining) {
+            if (now_us() >= closing_since_us_ + closing_period_us()) {
+                state_ = ConnState::kClosed;
+            }
             return;
+        }
+        // RFC 9000 §10.1: idle timeout. On expiry the connection silently closes
+        // (no CONNECTION_CLOSE) — enter Draining so it cannot hang.
+        if (idle_expired()) {
+            QTRACE("idle timeout -> Draining");
+            state_ = ConnState::kDraining;
+            closing_since_us_ = now_us();
+            return;
+        }
         tls_.advance();
         maybe_promote_state();
         maybe_pto_expire();
@@ -423,7 +461,97 @@ public:
     const NewRenoCongestion& congestion() const noexcept { return cc_; }
     const RttEstimator& rtt() const noexcept { return rtt_; }
 
+    // ------------------------------------------------------------------------
+    // W5d robustness configuration + control surface.
+    // ------------------------------------------------------------------------
+    bool is_closing() const noexcept { return state_ == ConnState::kClosing; }
+    bool is_draining() const noexcept { return state_ == ConnState::kDraining; }
+    bool is_closed() const noexcept { return state_ == ConnState::kClosed; }
+
+    // Server: require a Retry round-trip before completing the handshake
+    // (RFC 9000 §8.1 address validation). Call before start()/first Initial.
+    void set_require_retry(bool on) noexcept { require_retry_ = on; }
+
+    // Client: force a specific offered version in the first Initial. A value
+    // other than kQuicVersion1 provokes a Version Negotiation from a real peer
+    // (RFC 9000 §6). Call before start().
+    void set_offered_version(std::uint32_t v) noexcept {
+        assert(v != 0 && "offered version 0 is reserved for VN");
+        offered_version_ = v;
+    }
+
+    // Local idle timeout in ms (RFC 9000 §10.1). 0 disables. Effective timeout
+    // is min(local, peer) once peer params arrive.
+    void set_idle_timeout_ms(std::uint64_t ms) noexcept { local_idle_ms_ = ms; }
+
+    // CONNECTION_CLOSE (RFC 9000 §10.2). Emits a close frame (transport 0x1c or
+    // application 0x1d) and enters Closing. Idempotent.
+    void close(std::uint64_t error_code, bool application,
+               const char* reason) noexcept {
+        assert(error_code <= kVarIntMax && "close: error code overflow");
+        if (state_ == ConnState::kClosing || state_ == ConnState::kDraining ||
+            state_ == ConnState::kClosed)
+            return;
+        close_error_ = error_code;
+        close_is_app_ = application;
+        close_reason_ = reason;
+        close_reason_len_ = (reason != nullptr) ? std::strlen(reason) : 0;
+        if (close_reason_len_ > kMaxCloseReason)
+            close_reason_len_ = kMaxCloseReason;
+        close_pending_ = true;
+        state_ = ConnState::kClosing;
+        closing_since_us_ = now_us();
+        emit_connection_close();
+    }
+
+    // Initiate a 1-RTT key update (RFC 9001 §6.1): flip our key phase and derive
+    // next-generation keys. Returns true if a new generation was installed.
+    bool initiate_key_update() noexcept {
+        assert(one_rtt_keys_ready() && "key update before 1-RTT");
+        return rotate_keys(/*peer_initiated=*/false);
+    }
+    std::uint64_t key_phase_generation() const noexcept { return key_gen_; }
+
+    // Enable stateless reset: derive our token for `local_cid_` from `secret`
+    // and (server) advertise it. Recognizing a peer reset needs the peer's token
+    // from its transport params (set via expect_peer_reset_token).
+    bool enable_stateless_reset(const std::uint8_t* secret,
+                                std::size_t secret_len) noexcept {
+        assert(secret != nullptr && secret_len > 0 && "srt: null secret");
+        if (!derive_stateless_reset_token(secret, secret_len, local_cid_,
+                                          local_reset_token_))
+            return false;
+        have_local_reset_token_ = true;
+        return true;
+    }
+    const std::uint8_t* local_reset_token() const noexcept {
+        return have_local_reset_token_ ? local_reset_token_ : nullptr;
+    }
+    void expect_peer_reset_token(const std::uint8_t* token /*[16]*/) noexcept {
+        assert(token != nullptr && "peer reset token null");
+        std::memcpy(peer_reset_token_, token, kStatelessResetTokenLen);
+        have_peer_reset_token_ = true;
+    }
+    bool got_stateless_reset() const noexcept { return got_stateless_reset_; }
+
+    // True if the idle timer has fired (no activity within the negotiated idle
+    // timeout). tick() also closes on idle expiry; this is for the gate.
+    bool idle_expired() const noexcept {
+        const std::uint64_t to = effective_idle_us();
+        if (to == 0) return false;
+        return now_us() >= last_activity_us_ + to;
+    }
+
+    // True when a peer that sent a bogus version received our VN.
+    bool sent_version_negotiation() const noexcept { return sent_vn_; }
+    // True when this (client) connection re-keyed after a Retry.
+    bool did_retry() const noexcept { return did_retry_; }
+    std::uint32_t negotiated_version() const noexcept { return negotiated_version_; }
+
 private:
+    // CONNECTION_CLOSE reason cap (RFC 9000 §19.19 — bounded, no unbounded copy).
+    static constexpr std::size_t kMaxCloseReason = 256;
+
     // ===================================================================
     // Inbound: process a single (possibly coalesced) packet at `data`.
     // Returns false on a fatal parse/decrypt error; sets out_consumed to the
@@ -442,12 +570,149 @@ private:
         if (form == PacketForm::kShort) {
             return process_short_packet(data, len, out_consumed);
         }
+        if (form == PacketForm::kVersionNegotiation) {
+            return process_version_negotiation(data, len, out_consumed);
+        }
+        if (form == PacketForm::kLongRetry) {
+            return process_retry(data, len, out_consumed);
+        }
+        // RFC 9000 §6.1: a server that gets an unsupported version replies with
+        // a Version Negotiation packet (client never sends VN).
+        if (is_server_) {
+            std::uint32_t ver = 0;
+            if (read_version(data, len, ver) == kParseOk &&
+                !is_supported_version(ver)) {
+                emit_version_negotiation(data, len);
+                out_consumed = len;  // consume the whole datagram
+                return true;
+            }
+        }
         if (form == PacketForm::kLongInitial ||
             form == PacketForm::kLongHandshake) {
             return process_long_packet(data, len, form, out_consumed);
         }
-        // 0-RTT / Retry / VN are out of scope this wave; skip the datagram.
+        // 0-RTT remains out of scope this wave; skip the datagram.
         return false;
+    }
+
+    // ===================================================================
+    // W5d: Version Negotiation (RFC 9000 §6, §17.2.1).
+    // ===================================================================
+    // Server: build + send a VN listing our supported versions, echoing the
+    // client's CIDs. Bounded scratch; never throws.
+    void emit_version_negotiation(const std::uint8_t* data,
+                                  std::size_t len) noexcept {
+        assert(is_server_ && "VN only emitted by server");
+        LongHeader hdr;
+        std::size_t consumed = 0;
+        if (parse_long_header(data, len, hdr, consumed) != kParseOk &&
+            hdr.dest_cid.length == 0)
+            return;  // could not read CIDs; drop silently
+        const std::uint32_t supported[1] = {kQuicVersion1};
+        std::uint8_t out[kMaxVnPacketLen];
+        const std::size_t n = build_version_negotiation(
+            hdr.dest_cid, hdr.source_cid, supported, 1, out, sizeof(out));
+        assert(n <= sizeof(out) && "VN overran scratch");
+        if (n == 0) return;
+        send_raw(out, n);
+        sent_vn_ = true;
+    }
+
+    // Client: parse the offered versions; if we support one, re-key + restart
+    // the handshake under it (RFC 9000 §6.2). Consumes the whole datagram.
+    bool process_version_negotiation(const std::uint8_t* data, std::size_t len,
+                                     std::size_t& out_consumed) noexcept {
+        out_consumed = len;
+        if (is_server_) return true;  // servers ignore VN
+        if (vn_handled_) return true;  // RFC 9000 §6.2: act on the first only
+        LongHeader hdr;
+        std::size_t body_off = 0;
+        if (parse_long_header(data, len, hdr, body_off) != kParseOk) return true;
+        std::uint32_t versions[kMaxVnVersions];
+        const std::size_t cnt = parse_version_negotiation_versions(
+            data, len, body_off, versions, kMaxVnVersions);
+        std::uint32_t chosen = 0;
+        for (std::size_t i = 0; i < cnt; ++i)
+            if (is_supported_version(versions[i])) { chosen = versions[i]; break; }
+        if (chosen == 0) { state_ = ConnState::kClosed; return true; }
+        vn_handled_ = true;
+        negotiated_version_ = chosen;
+        offered_version_ = chosen;
+        restart_handshake();
+        return true;
+    }
+
+    // ===================================================================
+    // W5d: Retry (RFC 9000 §8.1, §17.2.5, RFC 9001 §5.8).
+    // ===================================================================
+    // Client: validate the Retry integrity tag over our ORIGINAL DCID, adopt the
+    // server's new SCID as our DCID (re-keying Initial), store the token, and
+    // restart the handshake including the token on the next Initial.
+    bool process_retry(const std::uint8_t* data, std::size_t len,
+                       std::size_t& out_consumed) noexcept {
+        out_consumed = len;
+        if (is_server_ || did_retry_) return true;  // one Retry only (§17.2.5)
+        if (!verify_retry_integrity(initial_dcid_, data, len)) return true;
+        LongHeader hdr;
+        std::size_t body_off = 0;
+        if (parse_long_header(data, len, hdr, body_off) != kParseOk) return true;
+        // Retry body = token || 16-byte tag (body_off points past the CIDs).
+        if (len < body_off + kRetryIntegrityTagLen) return true;
+        const std::size_t token_len = len - body_off - kRetryIntegrityTagLen;
+        if (token_len == 0 || token_len > kMaxRetryToken) return true;
+        std::memcpy(retry_token_, data + body_off, token_len);
+        retry_token_len_ = token_len;
+        // Server's SCID becomes our new DCID + new Initial keying (§7.2/§5.2).
+        peer_cid_ = hdr.source_cid;
+        std::memcpy(initial_dcid_.data, hdr.source_cid.data, hdr.source_cid.length);
+        initial_dcid_.length = hdr.source_cid.length;
+        did_retry_ = true;
+        restart_handshake();
+        return true;
+    }
+
+    // Server: build + send a Retry to `hdr`'s client. Mints an address-validation
+    // token over the client's ORIGINAL DCID and offers a fresh SCID that the
+    // client will use to re-key its retried Initial (RFC 9000 §8.1, §17.2.5).
+    void emit_retry(const LongHeader& hdr) noexcept {
+        assert(is_server_ && "emit_retry: not server");
+        // Our Retry SCID (the client adopts this as its new DCID). Generate it
+        // ONCE: a client may retransmit its first Initial, and every Retry MUST
+        // carry the SAME SCID so the retried Initial's DCID matches (RFC 9000
+        // §8.1 / §17.2.5) — regenerating it each time would deadlock validation.
+        if (!sent_retry_) {
+            gen_random(retry_scid_.data, kLocalCidLen);
+            retry_scid_.length = kLocalCidLen;
+        }
+        std::uint8_t token[kMaxRetryToken];
+        const std::size_t tlen =
+            validator_.mint_token(hdr.dest_cid, token, sizeof(token));
+        if (tlen == 0) return;
+        std::uint8_t out[kMaxRetryPacketLen];
+        const std::size_t n = build_retry(hdr.dest_cid, hdr.source_cid,
+                                          retry_scid_, token, tlen, out,
+                                          sizeof(out));
+        assert(n <= sizeof(out) && "retry overran scratch");
+        if (n == 0) return;
+        send_raw(out, n);
+        sent_retry_ = true;
+    }
+
+    // Server: validate the token on a retried Initial. The token MUST verify AND
+    // the Initial's DCID MUST equal the Retry SCID we offered (RFC 9000 §8.1).
+    bool server_check_token(const LongHeader& hdr) noexcept {
+        assert(is_server_ && "server_check_token: not server");
+        if (hdr.token == nullptr || hdr.token_length == 0) return false;
+        if (hdr.token_length > kMaxRetryToken) return false;
+        ConnectionId odcid;
+        if (!validator_.verify_token(hdr.token,
+                                     static_cast<std::size_t>(hdr.token_length),
+                                     &odcid))
+            return false;
+        if (sent_retry_ && hdr.dest_cid != retry_scid_) return false;
+        address_validated_ = true;
+        amp_.validate();  // §8.1: a valid token lifts the 3x limit
+        return true;
     }
 
     // Handle a long-header Initial/Handshake packet (parse -> unprotect ->
@@ -463,8 +728,15 @@ private:
             is_initial ? TlsLevel::kInitial : TlsLevel::kHandshake;
 
         // Server learns the client's DCID (== our Initial keying) + SCID on the
-        // first Initial.
+        // first Initial. With require_retry_, an untokened/invalid first Initial
+        // gets a Retry instead (RFC 9000 §8.1 address validation).
         if (is_server_ && is_initial && !server_initialized_) {
+            if (require_retry_ && !address_validated_ &&
+                !server_check_token(hdr)) {
+                emit_retry(hdr);
+                out_consumed = hdr_len + static_cast<std::size_t>(hdr.length);
+                return out_consumed <= len;
+            }
             if (!server_on_first_initial(hdr)) return false;
         }
 
@@ -519,8 +791,10 @@ private:
                          std::size_t pn_offset, TlsLevel level) noexcept {
         assert(pkt_len <= kMaxDatagramSize && "open: oversize packet");
         assert(pn_offset < pkt_len && "open: pn_offset past packet");
-        PacketProtection* pp = read_protection(level);
-        if (pp == nullptr) return false;
+        // Header protection uses the (unchanging) original keys; AEAD may use a
+        // rotated key-update generation for 1-RTT (RFC 9001 §6.1: HP NOT updated).
+        PacketProtection* hp = read_protection(level);
+        if (hp == nullptr) return false;
 
         std::uint8_t buf[kMaxDatagramSize];
         std::memcpy(buf, data, pkt_len);
@@ -528,16 +802,18 @@ private:
         if (sample_off + kHpSampleLength > pkt_len) return false;
 
         std::size_t pn_len = 0;
-        if (!pp->unprotect_header(buf, pn_offset, data + sample_off, &pn_len))
+        if (!hp->unprotect_header(buf, pn_offset, data + sample_off, &pn_len))
             return false;
+        const bool key_phase = (buf[0] & 0x04) != 0;  // §17.3 short-header bit
         const std::uint64_t pn = decode_pn(buf, pn_offset, pn_len, space_for(level));
         const std::size_t payload_off = pn_offset + pn_len;
         if (payload_off >= pkt_len) return false;
 
         std::uint8_t plain[kMaxDatagramSize];
         std::size_t plain_len = 0;
-        if (!pp->decrypt(pn, buf, payload_off, data + payload_off,
-                         pkt_len - payload_off, plain, &plain_len)) {
+        if (!aead_open_app(level, key_phase, pn, buf, payload_off,
+                           data + payload_off, pkt_len - payload_off, plain,
+                           &plain_len, hp)) {
             return false;  // auth failure: drop
         }
         spaces_[space_for(level)].on_packet_received(pn);
@@ -545,6 +821,38 @@ private:
         QTRACE("  opened level=%d pn=%llu plain_len=%zu", (int)level,
                (unsigned long long)pn, plain_len);
         return handle_frames(level, plain, plain_len);
+    }
+
+    // AEAD-open with key-update awareness (RFC 9001 §6). For non-application
+    // levels this is a plain decrypt with the level keys. For 1-RTT, the
+    // key-phase bit selects the generation: matching phase -> current keys;
+    // flipped phase -> the NEXT generation (and, on success, we commit the
+    // update); the previous generation covers reordered pre-update packets.
+    bool aead_open_app(TlsLevel level, bool key_phase, std::uint64_t pn,
+                       const std::uint8_t* hdr, std::size_t hdr_len,
+                       const std::uint8_t* ct, std::size_t ct_len,
+                       std::uint8_t* out, std::size_t* out_len,
+                       PacketProtection* fallback) noexcept {
+        assert(fallback != nullptr && "aead_open_app: null fallback");
+        if (level != TlsLevel::kApplication || !ku_ready_) {
+            return fallback->decrypt(pn, hdr, hdr_len, ct, ct_len, out, out_len);
+        }
+        const bool cur_phase = (key_gen_ & 1ULL) != 0;
+        if (key_phase == cur_phase) {
+            return app_read_cur_.decrypt(pn, hdr, hdr_len, ct, ct_len, out,
+                                         out_len);
+        }
+        // Flipped phase: try the next generation. Success commits the update.
+        if (app_read_next_.is_initialized() &&
+            app_read_next_.decrypt(pn, hdr, hdr_len, ct, ct_len, out, out_len)) {
+            commit_peer_key_update();
+            return true;
+        }
+        // Otherwise it may be a reordered packet from the previous generation.
+        if (key_gen_ > 0 && app_read_prev_.is_initialized())
+            return app_read_prev_.decrypt(pn, hdr, hdr_len, ct, ct_len, out,
+                                          out_len);
+        return false;
     }
 
     // Decode the truncated packet number from the unprotected header bytes.
@@ -625,7 +933,78 @@ private:
             return handle_reset_stream(data + 1, len - 1, out_consumed);
         if (type == static_cast<std::uint8_t>(FrameType::kStopSending))
             return handle_stop_sending(data + 1, len - 1, out_consumed);
-        return false;  // unknown frame -> protocol error
+        if (type == static_cast<std::uint8_t>(FrameType::kNewToken))
+            return handle_new_token(data + 1, len - 1, out_consumed);
+        if (type == static_cast<std::uint8_t>(FrameType::kRetireConnectionId))
+            return skip_one_varint(data + 1, len - 1, out_consumed);
+        if (type == static_cast<std::uint8_t>(FrameType::kNewConnectionId))
+            return handle_new_connection_id(data + 1, len - 1, out_consumed);
+        if (type == static_cast<std::uint8_t>(FrameType::kPathChallenge) ||
+            type == static_cast<std::uint8_t>(FrameType::kPathResponse))
+            return handle_path(data + 1, len - 1, out_consumed);
+        return handle_unknown_frame(level, data, len, out_consumed);
+    }
+
+    // RFC 9000 §12.4: a frame type we do not recognize. GREASE frame types
+    // (0x1f*N+0x21, RFC 9000 §18.1 spirit for frames) are reserved no-ops the
+    // peer may send to exercise extensibility; we tolerate any single-byte/
+    // varint-typed unknown frame by consuming just its type and ignoring it
+    // (bounded; never reads past the buffer). This keeps us robust to GREASE.
+    bool handle_unknown_frame(TlsLevel /*level*/, const std::uint8_t* data,
+                              std::size_t len,
+                              std::size_t& out_consumed) noexcept {
+        assert(len > 0 && "unknown frame: empty");
+        std::uint64_t type = 0;
+        const int c = varint_decode(data, len, type);
+        if (c < 0) return false;  // truncated type varint -> drop the packet
+        out_consumed = static_cast<std::size_t>(c);
+        return true;  // ignore the GREASE/unknown frame, keep parsing
+    }
+
+    bool handle_new_token(const std::uint8_t* data, std::size_t len,
+                          std::size_t& out_consumed) noexcept {
+        std::uint64_t tlen = 0;
+        const int c = varint_decode(data, len, tlen);
+        if (c < 0) return false;
+        if (static_cast<std::uint64_t>(c) + tlen > len) return false;
+        out_consumed = 1 + static_cast<std::size_t>(c) +
+                       static_cast<std::size_t>(tlen);
+        return true;  // we do not cache NEW_TOKEN at this scope (RFC 9000 §8.1)
+    }
+
+    // NEW_CONNECTION_ID (RFC 9000 §19.15): seq | retire_prior | cid_len | cid |
+    // 16-byte stateless reset token. We record only the peer's reset token so we
+    // can recognize a future stateless reset (§10.3.1); the CID itself is not
+    // adopted at this scope (single-path loopback).
+    bool handle_new_connection_id(const std::uint8_t* data, std::size_t len,
+                                  std::size_t& out_consumed) noexcept {
+        std::uint64_t seq = 0, retire = 0;
+        int c1 = varint_decode(data, len, seq);
+        if (c1 < 0) return false;
+        int c2 = varint_decode(data + c1, len - c1, retire);
+        if (c2 < 0) return false;
+        std::size_t pos = static_cast<std::size_t>(c1 + c2);
+        if (pos >= len) return false;
+        const std::uint8_t cid_len = data[pos++];
+        if (cid_len > kMaxConnectionIdLen) return false;
+        if (pos + cid_len + kStatelessResetTokenLen > len) return false;
+        pos += cid_len;
+        std::memcpy(peer_reset_token_, data + pos, kStatelessResetTokenLen);
+        have_peer_reset_token_ = true;
+        pos += kStatelessResetTokenLen;
+        out_consumed = 1 + pos;
+        return true;
+    }
+
+    // PATH_CHALLENGE / PATH_RESPONSE carry an 8-byte opaque payload (RFC 9000
+    // §19.17/§19.18). We consume it (path validation proper is W5e).
+    bool handle_path(const std::uint8_t* data, std::size_t len,
+                     std::size_t& out_consumed) noexcept {
+        assert((data != nullptr || len == 0) && "handle_path: null");
+        (void)data;
+        if (len < 8) return false;
+        out_consumed = 1 + 8;
+        return true;
     }
 
     bool handle_ack(TlsLevel level, const std::uint8_t* data, std::size_t len,
@@ -755,6 +1134,54 @@ private:
             std::chrono::duration_cast<std::chrono::microseconds>(t).count());
     }
     std::uint64_t max_ack_delay_us() const noexcept { return 25000; }  // 25 ms
+
+    // RFC 9000 §10.1: effective idle timeout (us) = min(local, peer) of the
+    // advertised max_idle_timeout values (each in ms; 0 disables that side).
+    std::uint64_t effective_idle_us() const noexcept {
+        std::uint64_t local_ms = local_idle_ms_;
+        std::uint64_t peer_ms = 0;
+        if (tls_.have_peer_transport_params()) {
+            const TransportParameters& tp = tls_.peer_transport_params();
+            if (tp.max_idle_timeout_present) peer_ms = tp.max_idle_timeout;
+        }
+        std::uint64_t eff = 0;
+        if (local_ms != 0 && peer_ms != 0)
+            eff = (local_ms < peer_ms) ? local_ms : peer_ms;
+        else
+            eff = (local_ms != 0) ? local_ms : peer_ms;
+        return eff * 1000ULL;
+    }
+
+    // RFC 9000 §10.2.3: a closing/draining endpoint holds for 3x PTO. Bounded.
+    std::uint64_t closing_period_us() const noexcept {
+        const std::uint64_t pto = rtt_.pto(max_ack_delay_us(), 0);
+        return 3 * pto;
+    }
+
+    // RFC 9000 §10.2: build + send a CONNECTION_CLOSE in the highest level we
+    // have keys for (1-RTT if Established, else Initial). Bounded scratch.
+    void emit_connection_close() noexcept {
+        assert(close_pending_ && "emit close: not pending");
+        std::uint8_t payload[kMaxPayloadSize];
+        ConnectionCloseFrame cc;
+        cc.error_code = close_error_;
+        cc.is_application = close_is_app_;
+        cc.frame_type = 0;
+        cc.reason_length = close_reason_len_;
+        cc.reason_phrase = (close_reason_len_ > 0) ? close_reason_ : nullptr;
+        const std::size_t n = cc.serialize(payload);
+        assert(n <= sizeof(payload) && "close frame overran");
+        close_pending_ = false;
+        if (one_rtt_keys_ready()) {
+            FrameRange ranges[kMaxFrameRangesPerPacket];
+            std::size_t rc = 0;
+            send_app_packet(payload, n, /*ack_eliciting=*/false, ranges, rc);
+        } else if (write_protection(TlsLevel::kInitial)->is_initialized()) {
+            FrameRange ranges[kMaxFrameRangesPerPacket];
+            build_and_send_long(TlsLevel::kInitial, PacketForm::kLongInitial,
+                                payload, n, false, ranges, 0);
+        }
+    }
 
     bool handle_crypto(TlsLevel level, const std::uint8_t* data, std::size_t len,
                        std::size_t& out_consumed) noexcept {
@@ -1213,7 +1640,7 @@ private:
         write_pn(dgram + pn_offset, pn, pn_len);
         const std::size_t wire =
             seal_and_send(dgram, pn_offset, pn_len, payload, payload_len, pn, pp,
-                          level == TlsLevel::kInitial);
+                          pp, level == TlsLevel::kInitial);
         record_sent(space_for(level), pn, wire, ack_eliciting, ranges,
                     range_count);
     }
@@ -1224,21 +1651,25 @@ private:
                          std::size_t range_count) noexcept {
         assert(payload_len <= kMaxPayloadSize && "app: oversize payload");
         assert(range_count <= kMaxFrameRangesPerPacket && "range overflow");
-        PacketProtection* pp = write_protection(TlsLevel::kApplication);
-        if (pp == nullptr || !pp->is_initialized()) return false;
+        PacketProtection* hp = write_protection(TlsLevel::kApplication);
+        if (hp == nullptr || !hp->is_initialized()) return false;
+        // AEAD uses the current key-update generation (HP stays original).
+        PacketProtection* aead = ku_ready_ ? &app_write_cur_ : hp;
         const std::uint64_t pn =
             spaces_[PacketNumberSpace::kApplication].next_packet_number();
         const std::uint8_t pn_len = 4;
 
         std::uint8_t dgram[kMaxDatagramSize];
         std::size_t pos = 0;
-        dgram[pos++] = static_cast<std::uint8_t>(0x40 | (pn_len - 1));
+        std::uint8_t first = static_cast<std::uint8_t>(0x40 | (pn_len - 1));
+        if (ku_ready_ && (key_gen_ & 1ULL)) first |= 0x04;  // key-phase bit
+        dgram[pos++] = first;
         std::memcpy(dgram + pos, peer_cid_.data, peer_cid_.length);
         pos += peer_cid_.length;
         const std::size_t pn_offset = pos;
         write_pn(dgram + pn_offset, pn, pn_len);
         const std::size_t wire = seal_and_send(dgram, pn_offset, pn_len, payload,
-                                               payload_len, pn, pp, false);
+                                               payload_len, pn, aead, hp, false);
         record_sent(PacketNumberSpace::kApplication, pn, wire, ack_eliciting,
                     ranges, range_count);
         return true;
@@ -1266,27 +1697,37 @@ private:
     std::size_t seal_and_send(std::uint8_t* dgram, std::size_t pn_offset,
                               std::uint8_t pn_len, const std::uint8_t* payload,
                               std::size_t payload_len, std::uint64_t pn,
-                              PacketProtection* pp, bool pad_initial) noexcept {
-        assert(pp != nullptr && "seal_and_send: null pp");
+                              PacketProtection* aead, PacketProtection* hp,
+                              bool pad_initial) noexcept {
+        assert(aead != nullptr && hp != nullptr && "seal_and_send: null pp");
+        // RFC 9000 §8.1: respect the 3x anti-amplification budget. A padded
+        // Initial may exceed budget but is permitted (the client's Initial is at
+        // least 1200B, giving 3600B headroom for the server's first flight).
+        const std::size_t projected =
+            (pad_initial && payload_len + pn_offset + pn_len + kAeadTagLength <
+             kInitialMinDatagram)
+                ? kInitialMinDatagram
+                : pn_offset + pn_len + payload_len + kAeadTagLength;
+        if (!amp_allows(projected)) return 0;
         const std::size_t aad_len = pn_offset + pn_len;
         std::uint8_t sealed[kMaxDatagramSize];
         std::size_t sealed_len = 0;
-        if (!pp->encrypt(pn, dgram, aad_len, payload, payload_len, sealed,
-                         &sealed_len)) {
+        if (!aead->encrypt(pn, dgram, aad_len, payload, payload_len, sealed,
+                           &sealed_len)) {
             return 0;
         }
         std::memcpy(dgram + aad_len, sealed, sealed_len);
         std::size_t total = aad_len + sealed_len;
         const std::size_t sample_off = PacketProtection::sample_offset(pn_offset);
         assert(sample_off + kHpSampleLength <= total && "HP sample past packet");
-        pp->protect_header(dgram, pn_offset, pn_len, dgram + sample_off);
+        hp->protect_header(dgram, pn_offset, pn_len, dgram + sample_off);
 
         if (pad_initial && total < kInitialMinDatagram) {
             std::memset(dgram + total, 0, kInitialMinDatagram - total);
             total = kInitialMinDatagram;
         }
         assert(total <= kMaxDatagramSize && "datagram overflow");
-        send_(dgram, total);
+        send_raw(dgram, total);
         return total;
     }
 
@@ -1303,17 +1744,31 @@ private:
                 : static_cast<std::uint8_t>(LongPacketType::kHandshake);
         // first byte: form(1) fixed(1) type(2) reserved(2)=0 pn_len(2)=3 (4B PN)
         out[pos++] = static_cast<std::uint8_t>(0xC0 | (type_bits << 4) | 0x03);
-        out[pos++] = (kQuicVersion1 >> 24) & 0xFF;
-        out[pos++] = (kQuicVersion1 >> 16) & 0xFF;
-        out[pos++] = (kQuicVersion1 >> 8) & 0xFF;
-        out[pos++] = kQuicVersion1 & 0xFF;
+        // The client offers offered_version_ (defaults to v1; a bogus value
+        // provokes a Version Negotiation, RFC 9000 §6). The server always
+        // answers under v1 (negotiated_version_).
+        const std::uint32_t ver = is_server_ ? negotiated_version_ : offered_version_;
+        out[pos++] = (ver >> 24) & 0xFF;
+        out[pos++] = (ver >> 16) & 0xFF;
+        out[pos++] = (ver >> 8) & 0xFF;
+        out[pos++] = ver & 0xFF;
         out[pos++] = peer_cid_.length;
         std::memcpy(out + pos, peer_cid_.data, peer_cid_.length);
         pos += peer_cid_.length;
         out[pos++] = local_cid_.length;
         std::memcpy(out + pos, local_cid_.data, local_cid_.length);
         pos += local_cid_.length;
-        if (level == TlsLevel::kInitial) out[pos++] = 0x00;  // token length 0
+        if (level == TlsLevel::kInitial) {
+            // Initial token (RFC 9000 §17.2.2): empty unless the client holds a
+            // Retry token, which it MUST echo on the retried Initial (§8.1).
+            if (!is_server_ && retry_token_len_ > 0) {
+                pos += varint_encode(retry_token_len_, out + pos);
+                std::memcpy(out + pos, retry_token_, retry_token_len_);
+                pos += retry_token_len_;
+            } else {
+                out[pos++] = 0x00;  // token length 0
+            }
+        }
         pos += varint_encode(length_field, out + pos);
         (void)level;
         *out_len = pos;
@@ -1430,6 +1885,61 @@ private:
                               initial_read_);
     }
 
+    // Client: tear down handshake-in-progress state and re-run start() under a
+    // (possibly new) version/DCID/token. Used by VN (§6.2) + Retry (§17.2.5).
+    // Bounded: rebuilds the TLS driver + Initial keys once; no recursion.
+    void restart_handshake() noexcept {
+        assert(!is_server_ && "restart_handshake: client only");
+        assert(send_ && "restart_handshake: no send fn");
+        // Rebuild the TLS driver (placement-new over the destructed member; no
+        // heap churn beyond what one SSL object holds).
+        tls_.~QuicTls();
+        new (&tls_) QuicTls();
+        const bool ok = tls_.init_client();
+        assert(ok && "restart: tls init failed");
+        (void)ok;
+        static const std::uint8_t kAlpn[] = {2, 'h', '3'};
+        tls_.set_alpn(kAlpn, sizeof(kAlpn));
+        tls_.set_transport_params(make_local_params());
+        // Reset packet-number spaces, ACK state, sent trackers, crypto buffers.
+        spaces_ = PacketNumberSpaceManager{};
+        for (std::size_t i = 0; i < kPacketNumberSpaceCount; ++i) {
+            acks_[i] = AckRangeTracker{};
+            ack_pending_[i] = false;
+            sent_[i] = SentPacketTracker{};
+        }
+        for (std::size_t i = 0; i < kNumTlsLevels; ++i) {
+            crypto_rx_[i] = CryptoReassembly{};
+            crypto_tx_[i].clear();
+            crypto_sent_off_[i] = 0;
+            crypto_acked_[i] = false;
+        }
+        // For a Retry we keep the server-chosen DCID; for VN we keep our random
+        // DCID. Either way, re-derive Initial keys for the current DCID.
+        const bool keyed = derive_initial_keys(initial_dcid_);
+        assert(keyed && "restart: initial key derive failed");
+        (void)keyed;
+        state_ = ConnState::kHandshaking;
+        tls_.advance();  // fresh ClientHello
+        flush();
+    }
+
+    // Send a raw datagram (already a full packet) tracking the amplification
+    // budget + idle activity, bypassing the per-level flush machinery.
+    void send_raw(const std::uint8_t* data, std::size_t len) noexcept {
+        assert((data != nullptr || len == 0) && "send_raw: null");
+        amp_.on_sent(len);
+        send_(data, len);
+    }
+
+    // RFC 9000 §8.1: the server MUST NOT send > 3x received bytes before the
+    // peer's address is validated. Returns true if `len` is within budget. The
+    // client and a validated server are always allowed.
+    bool amp_allows(std::size_t len) const noexcept {
+        if (!is_server_ || address_validated_) return true;
+        return amp_.can_send(len);
+    }
+
     PacketProtection* read_protection(TlsLevel level) noexcept {
         if (level == TlsLevel::kInitial) return &initial_read_;
         return &tls_.read_protection(level);
@@ -1471,8 +1981,92 @@ private:
             // Handshake confirmed: Initial/Handshake packets leave flight
             // (RFC 9002 §6.4 / §9.3) so 1-RTT data starts with a clean window.
             cc_.reset_in_flight();
+            seed_key_update_keys();   // RFC 9001 §6: capture gen-0 1-RTT secrets
+            amp_.validate();          // handshake completion validates the path
+            address_validated_ = true;
         }
         adopt_peer_flow_limits();
+    }
+
+    // RFC 9001 §6.1: capture the gen-0 1-RTT secrets yielded by TLS so we can
+    // derive next-generation AEAD keys for key updates. Idempotent.
+    void seed_key_update_keys() noexcept {
+        if (ku_ready_) return;
+        std::size_t rl = 0, wl = 0;
+        const std::uint8_t* rs = tls_.read_secret(TlsLevel::kApplication, &rl);
+        const std::uint8_t* ws = tls_.write_secret(TlsLevel::kApplication, &wl);
+        if (rs == nullptr || ws == nullptr || rl != kSecretLength ||
+            wl != kSecretLength)
+            return;
+        std::memcpy(app_read_secret_, rs, kSecretLength);
+        std::memcpy(app_write_secret_, ws, kSecretLength);
+        ku_algo_ = tls_.aead_algorithm();
+        const bool ok = install_app_protection(app_read_cur_, app_read_secret_,
+                                               app_write_cur_, app_write_secret_);
+        if (!ok) return;
+        // Pre-derive the next generation so an inbound flip opens immediately.
+        derive_next_app_protection();
+        key_gen_ = 0;
+        ku_ready_ = true;
+    }
+
+    // Derive + initialize a read/write PacketProtection pair from 1-RTT secrets.
+    bool install_app_protection(PacketProtection& read_pp,
+                                const std::uint8_t* read_secret,
+                                PacketProtection& write_pp,
+                                const std::uint8_t* write_secret) noexcept {
+        assert(read_secret != nullptr && write_secret != nullptr && "iap: null");
+        PacketProtectionKeys rk, wk;
+        if (!derive_packet_keys(read_secret, kSecretLength, ku_algo_, rk))
+            return false;
+        if (!derive_packet_keys(write_secret, kSecretLength, ku_algo_, wk))
+            return false;
+        read_pp = PacketProtection{};
+        write_pp = PacketProtection{};
+        return read_pp.initialize(rk) && write_pp.initialize(wk);
+    }
+
+    // RFC 9001 §6.1: compute the NEXT-generation secrets + read protection so a
+    // peer-initiated update opens on arrival. The write side is installed only
+    // when WE commit the update (so we never seal under keys the peer lacks).
+    void derive_next_app_protection() noexcept {
+        if (!next_generation_secret(app_read_secret_, next_read_secret_)) return;
+        if (!next_generation_secret(app_write_secret_, next_write_secret_)) return;
+        PacketProtectionKeys rk;
+        if (!derive_packet_keys(next_read_secret_, kSecretLength, ku_algo_, rk))
+            return;
+        app_read_next_ = PacketProtection{};
+        app_read_next_.initialize(rk);
+    }
+
+    // Advance one key-update generation (RFC 9001 §6.1). `peer_initiated` is true
+    // when we are responding to a flipped key-phase bit. Returns true on success.
+    bool rotate_keys(bool peer_initiated) noexcept {
+        if (!ku_ready_) return false;
+        // Shift current -> previous (reorder window for the OLD generation).
+        app_read_prev_ = std::move(app_read_cur_);
+        // Promote the pre-derived next read keys to current.
+        app_read_cur_ = std::move(app_read_next_);
+        // Roll secrets forward and install the new write keys.
+        std::memcpy(app_read_secret_, next_read_secret_, kSecretLength);
+        std::memcpy(app_write_secret_, next_write_secret_, kSecretLength);
+        PacketProtectionKeys wk;
+        if (!derive_packet_keys(app_write_secret_, kSecretLength, ku_algo_, wk))
+            return false;
+        app_write_cur_ = PacketProtection{};
+        if (!app_write_cur_.initialize(wk)) return false;
+        ++key_gen_;
+        derive_next_app_protection();  // pre-derive the following generation
+        (void)peer_initiated;
+        assert(key_gen_ > 0 && "rotate: generation did not advance");
+        return true;
+    }
+
+    // A peer flipped the key-phase bit and we decrypted with the next keys:
+    // commit the update so our subsequent sends use the new phase (RFC 9001 §6.2).
+    void commit_peer_key_update() noexcept {
+        assert(ku_ready_ && "commit: key update not ready");
+        rotate_keys(/*peer_initiated=*/true);
     }
 
     // Once the peer's transport params arrive, adopt its connection-level
@@ -1572,6 +2166,56 @@ private:
     bool stream_window_dirty_ = false;
     bool conn_blocked_ = false;
     bool stream_blocked_ = false;
+
+    // ---- W5d robustness (RFC 9000 §8/§10, RFC 9001 §6) --------------------
+    // Version negotiation.
+    std::uint32_t offered_version_ = kQuicVersion1;     // client's offered ver
+    std::uint32_t negotiated_version_ = kQuicVersion1;  // the agreed version
+    bool vn_handled_ = false;                            // client acted on VN
+    bool sent_vn_ = false;                               // server emitted a VN
+
+    // Retry + address validation (RFC 9000 §8.1).
+    bool require_retry_ = false;                         // server config
+    bool sent_retry_ = false;                            // server emitted Retry
+    bool did_retry_ = false;                             // client re-keyed
+    bool address_validated_ = false;                     // server validated peer
+    ConnectionId retry_scid_;                            // server's Retry SCID
+    AddressValidator validator_;                         // token mint/verify
+    std::uint8_t retry_token_[kMaxRetryToken] = {};      // client-held token
+    std::size_t retry_token_len_ = 0;
+    AntiAmplification amp_;                              // 3x limit (§8.1)
+
+    // CONNECTION_CLOSE + idle timeout (RFC 9000 §10).
+    std::uint64_t local_idle_ms_ = kDefaultIdleTimeoutMs;
+    std::uint64_t last_activity_us_ = 0;
+    std::uint64_t closing_since_us_ = 0;
+    std::uint64_t close_error_ = 0;
+    bool close_is_app_ = false;
+    bool close_pending_ = false;
+    const char* close_reason_ = nullptr;
+    std::size_t close_reason_len_ = 0;
+
+    // Stateless reset (RFC 9000 §10.3).
+    std::uint8_t local_reset_token_[kStatelessResetTokenLen] = {};
+    std::uint8_t peer_reset_token_[kStatelessResetTokenLen] = {};
+    bool have_local_reset_token_ = false;
+    bool have_peer_reset_token_ = false;
+    bool got_stateless_reset_ = false;
+
+    // Key update (RFC 9001 §6). gen-0 secrets captured at Established; current/
+    // next/previous AEAD protections drive seal/open across phase flips. The HP
+    // keys are NEVER rotated (§6.1) — those stay in tls_.{read,write}_protection.
+    bool ku_ready_ = false;
+    std::uint64_t key_gen_ = 0;
+    AeadAlgorithm ku_algo_ = AeadAlgorithm::kAes128Gcm;
+    std::uint8_t app_read_secret_[kSecretLength] = {};
+    std::uint8_t app_write_secret_[kSecretLength] = {};
+    std::uint8_t next_read_secret_[kSecretLength] = {};
+    std::uint8_t next_write_secret_[kSecretLength] = {};
+    PacketProtection app_read_cur_;   // current generation read AEAD
+    PacketProtection app_write_cur_;  // current generation write AEAD
+    PacketProtection app_read_next_;  // pre-derived next-gen read AEAD
+    PacketProtection app_read_prev_;  // previous-gen read AEAD (reorder window)
 };
 
 }  // namespace bolt::api::quic

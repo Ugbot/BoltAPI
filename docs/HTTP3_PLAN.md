@@ -1015,3 +1015,89 @@ also builds clean (new app.cpp H3 wiring).
 ### D11. Next wave (wave 5c — real interop)
 - curl --http3 / quiche / nghttp3 client interop (independent stacks — the real
   gate, like aiortc for WebRTC); Chrome/Firefox via Alt-Svc; QUIC Interop Runner.
+
+### D12. Wave 5d — QUIC/HTTP3 PROTOCOL ROBUSTNESS — LANDED
+RFC 9000 §8/§10/§17 + RFC 9001 §5.8/§6 robustness wired around the established
+connection path. All Tiger Style: header-only, >=2 asserts/fn on substantive
+functions, bounded fixed buffers (NO unbounded std::vector on hot paths — all
+new state is fixed arrays / fixed-cap PacketProtection objects), no exceptions,
+functions <70 lines, warning-clean on the new TUs (MSVC VS2022, build/msvc).
+
+**What landed:**
+1. **`include/boltapi/quic/robustness.h`** (NEW) — pure wire builders/parsers +
+   small state machines, compiled UNCONDITIONALLY (OpenSSL always linked):
+   - `build_version_negotiation` / `parse_version_negotiation_versions` /
+     `is_supported_version` (RFC 9000 §6, §17.2.1).
+   - `retry_integrity_tag` / `build_retry` / `verify_retry_integrity` — AES-128-
+     GCM Retry integrity over the ODCID pseudo-packet (RFC 9001 §5.8, fixed v1
+     key/nonce).
+   - `AddressValidator` — HMAC-SHA256 address-validation token = MAC(secret,
+     odcid)||odcid (mints + verifies, recovers the original DCID; per-instance
+     random secret) (RFC 9000 §8.1).
+   - `AntiAmplification` — the 3x received/sent budget with `validate()` lift.
+   - `derive_stateless_reset_token` / `build_stateless_reset` /
+     `is_stateless_reset` (RFC 9000 §10.3).
+   - `next_generation_secret` — HKDF-Expand-Label "quic ku" (RFC 9001 §6.1).
+2. **`connection.h` wiring** (only file edited besides the new header + test):
+   - **VN**: server emits a VN listing v1 when an inbound long packet carries an
+     unsupported version; client parses the offered list, picks v1, and re-keys/
+     restarts the handshake (`restart_handshake` rebuilds the TLS driver via
+     placement-new + resets PN spaces/ACK/sent/crypto state; bounded, no
+     recursion). The client's offered version is configurable
+     (`set_offered_version`) to provoke a real VN.
+   - **Retry**: `set_require_retry` makes the server answer an untokened/invalid
+     first Initial with a Retry carrying a minted token + a single stable Retry
+     SCID (generated once — regenerating per Initial-retransmit would deadlock
+     token validation). The client validates the Retry integrity tag, adopts the
+     server SCID as its new DCID (re-keying Initial), stores the token, and
+     echoes it on the retried Initial. The server validates the token (and that
+     the Initial DCID == the Retry SCID) before proceeding;
+     `amp_.validate()` lifts the 3x limit on success.
+   - **Anti-amplification**: every send routes through `send_raw`/`amp_allows`;
+     `seal_and_send` refuses to exceed 3x received bytes until the address is
+     validated (handshake completion or a valid token validates it). The padded-
+     Initial headroom (>=1200B in -> 3600B budget) covers the server's first
+     flight, so the existing loopback handshake stays green.
+   - **Close/idle/states**: `close()` serializes a CONNECTION_CLOSE (transport
+     0x1c / application 0x1d) at the highest keyed level and enters Closing;
+     receiving CONNECTION_CLOSE -> Draining (no further app delivery); `tick()`
+     winds Closing/Draining down to Closed after 3x PTO; idle timeout =
+     min(local, peer) max_idle_timeout, fires in `tick()` -> Draining (never
+     hangs).
+   - **Stateless reset**: `enable_stateless_reset` derives our token;
+     NEW_CONNECTION_ID records the peer's token; an inbound datagram whose tail
+     matches the expected token tears the connection down (Draining).
+   - **Key update (RFC 9001 §6.1)**: gen-0 1-RTT secrets are captured at
+     Established; `initiate_key_update` flips our key-phase bit and installs the
+     next-generation AEAD keys; an inbound flipped-phase packet is opened with
+     the pre-derived next keys and commits the update; a previous-generation
+     PacketProtection is retained as the reorder window. CRITICAL: the header-
+     protection keys are NOT rotated (§6.1) — HP always uses
+     `tls_.{read,write}_protection(kApplication)`; only the AEAD key/iv rotate,
+     so `seal_and_send`/`open_and_handle` now take separate AEAD vs HP
+     protections.
+   - **GREASE**: unknown transport params were already skipped (§18.1); unknown
+     frame types are now ignored (consume the type varint, keep parsing) instead
+     of erroring the packet; NEW_TOKEN / NEW_CONNECTION_ID / RETIRE_CONNECTION_ID
+     / PATH_CHALLENGE / PATH_RESPONSE are parsed/consumed.
+3. **Gate** — `tests/quic_robustness_test.cpp` (DEFAULT suite, 11 tests): unit
+   round-trips for VN, Retry integrity + token (forged rejected), anti-amp budget
+   + stateless reset; loopback gates for VN-retried handshake, Retry round-trip,
+   CONNECTION_CLOSE->Draining, idle-timeout fires, key-update PING round-trip +
+   generation advance, GREASE transport param tolerated, and a seeded fuzz gate
+   (20k parser + 4k live-connection iterations — never crash, never Established
+   on noise). All bounded by wall-clock deadlines; seeded RNG.
+
+**New quic/* public API (on `QuicConnection`):** `set_require_retry`,
+`set_offered_version`, `set_idle_timeout_ms`, `close`, `initiate_key_update`,
+`key_phase_generation`, `enable_stateless_reset`/`local_reset_token`/
+`expect_peer_reset_token`/`got_stateless_reset`, `is_closing`/`is_draining`/
+`is_closed`, `idle_expired`, `sent_version_negotiation`, `did_retry`,
+`negotiated_version`. Plus the entire `boltapi/quic/robustness.h` surface.
+
+**Verification:** default `ctest` = 217/217 (1 expected skip: aiortc interop
+without WebRTC), the 11 new `QuicRobustness*` tests included; the wave-4 handshake
+gate + wave-5a stream gates stay green. Warning-clean on connection.h /
+robustness.h / the new test (MSVC VS2022, build/msvc).
+
+### D13. Next wave (wave 5f — performance; or 5c interop)

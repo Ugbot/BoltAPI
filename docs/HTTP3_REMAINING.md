@@ -31,12 +31,13 @@
 - [ ] Wire H3 into `examples/demo_server.cpp` + a `testing/` page/script; GTEST_SKIP gating when clients absent.
 - [ ] Add to the QUIC Interop Runner test matrix (handshake, transfer, retry, resumption rows).
 
-## W5d — Protocol robustness
-- [ ] Version Negotiation packet (server) + handling (client).
-- [ ] Retry packet + token validation (anti-amplification address validation, RFC 9000 §8).
-- [ ] Stateless reset; idle timeout; CONNECTION_CLOSE (app + transport) + draining; key update (RFC 9001 §6).
-- [ ] Anti-amplification limit (3×) before address validation; ECN (optional); GREASE tolerance.
-- [ ] Packet-parser fuzzing + malformed-input hardening (bounded, never UB).
+## W5d — Protocol robustness  *(LANDED — see HTTP3_PLAN DECISION LOG D12)*
+- [x] Version Negotiation packet (server) + handling (client). `robustness.h` build/parse + `connection.h` emit-on-unsupported-version + client re-key/restart.
+- [x] Retry packet + token validation (anti-amplification address validation, RFC 9000 §8). `build_retry`/`verify_retry_integrity` (RFC 9001 §5.8 tag) + `AddressValidator` (HMAC token mint/verify, recovers ODCID); server `set_require_retry`, client echoes token on retried Initial.
+- [x] Stateless reset; idle timeout; CONNECTION_CLOSE (app + transport) + draining; key update (RFC 9001 §6). `close()`/Closing/Draining state machine, `set_idle_timeout_ms` (min of local/peer), `derive_stateless_reset_token`/`build_stateless_reset`/`is_stateless_reset`, current/next/previous-keys window key update (HP keys NOT rotated per §6.1).
+- [x] Anti-amplification limit (3×) before address validation (`AntiAmplification`, gated in `seal_and_send`); GREASE tolerance (unknown transport params already skipped; unknown frame types now ignored, + NEW/RETIRE_CONNECTION_ID / PATH_CHALLENGE/RESPONSE / NEW_TOKEN handled). ECN deferred (optional).
+- [x] Packet-parser fuzzing + malformed-input hardening (bounded, never UB). Seeded fuzz gate: 20k parser iterations + 4k live-connection-input iterations, never crash, never reach Established on noise.
+- Gate: `tests/quic_robustness_test.cpp` (DEFAULT suite) — 11 tests, all green; see DECISION LOG D12.
 
 ## W5e — Advanced (optional / later)
 - [ ] 0-RTT + session resumption (early data; transport-params remembered).
