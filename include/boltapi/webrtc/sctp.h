@@ -65,10 +65,17 @@ namespace webrtc {
 inline constexpr std::uint16_t kSctpPort         = 5000;   // WebRTC standard
 inline constexpr std::size_t   kSctpMaxPacket    = 1280;   // conservative MTU
 inline constexpr std::size_t   kSctpMaxStreams   = 256;    // per association
-// Per-DATA-chunk user payload cap. The on-wire packet is 12 (common hdr) +
-// 16 (DATA hdr) + payload; with a conservative 1100 B payload we stay well
-// under kSctpMaxPacket (1280) leaving room for DTLS record overhead upstream.
+// Per-DATA-chunk user payload cap for OUR SENDER. The on-wire packet is 12
+// (common hdr) + 16 (DATA hdr) + payload; with a conservative 1100 B payload we
+// stay well under kSctpMaxPacket (1280) leaving room for DTLS record overhead.
 inline constexpr std::size_t   kSctpMaxChunkData = 1100;
+// Largest inbound DATA-chunk payload we ACCEPT from a PEER. A peer (browser /
+// aiortc) frames to ITS own path MTU, which is larger than our conservative send
+// chunk: aiortc emits ~1200 B SCTP payloads (≈1265 B DTLS records). The receiver
+// must accept whatever the peer sends up to a full Ethernet MTU, so this is
+// sized independently of (and larger than) kSctpMaxChunkData. Anything beyond
+// this is rejected (bounded; never UB).
+inline constexpr std::size_t   kSctpMaxRecvChunkData = 1500;
 // Largest single user message we will send or reassemble. Browsers send data
 // channel messages up to 256 KiB (RFC 8831). We support exactly that.
 inline constexpr std::size_t   kSctpMaxMessage   = 256 * 1024;
@@ -359,7 +366,7 @@ private:
         std::uint32_t ppid = 0;
         std::uint8_t  flags = 0;          // B/M/E/U
         std::uint16_t len = 0;            // payload bytes
-        std::uint8_t  data[kSctpMaxChunkData]{};
+        std::uint8_t  data[kSctpMaxRecvChunkData]{};  // sized for the PEER's MTU
     };
     static constexpr std::size_t kSctpMaxFrags = 512;  // bounded reorder of fragments
 

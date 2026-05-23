@@ -157,11 +157,25 @@ the audit's "mostly REBUILD."
       `protocol.h`'s `ISignaling::on_offer` / `on_ice_candidate`
       (`include/boltapi/protocol.h:216-230`) backed by the peer-connection
       factory. **REBUILD** (the sketch is declaration-only).
-- [ ] **HTTP signaling route:** `App.post("/webrtc/offer", ...)` accepts the
+- [x] **HTTP signaling route:** `App.post("/webrtc/offer", ...)` accepts the
       browser's SDP offer (JSON `{type:"offer", sdp:"..."}`), drives ICE gather +
       SDP answer generation, returns the answer JSON. Reuses `Router`/`Request`/
       `Response` unchanged. **REBUILD** wiring; **ADAPT** JSON shapes from
       `webrtc/message_parser.cpp:91-132`.
+      DONE (Signaling/interop wave): under `BOLTAPI_WITH_WEBRTC` + `enable_webrtc`,
+      `build_dispatch()` registers a POST route at `WebRtcConfig.signaling_path`
+      (default `/webrtc/offer`) backed by `App::handle_webrtc_offer(body, answer)`
+      (`src/app.cpp`): accepts the OFFER as raw SDP **or** a JSON `{"sdp":...}`
+      envelope (both), parses it with our SDP codec, extracts the peer
+      ice-ufrag/ice-pwd (pinned on the `IceAgent` via `set_expected_remote` for
+      STUN USERNAME validation) and the sha-256 DTLS fingerprint (pinned on the
+      `DtlsSessionManager` for peer-cert verification), and returns OUR ANSWER
+      (`build_answer`: ice-lite, setup:passive, our ufrag/pwd, our
+      fingerprint:sha-256, our host `a=candidate` lines, the application m-line,
+      sctp-port + max-message-size, group:BUNDLE/mid/msid-semantic). The route is
+      an ordinary `App` POST — H1/H2 serving is untouched. V1 = single active peer
+      (a new offer re-pins the stack); multi-peer keyed by ufrag is §13. Unit
+      test: `tests/signaling_test.cpp`. Validated end-to-end against aiortc (§10).
 - [ ] **WebSocket signaling route** (for trickle ICE / renegotiation):
       `App.websocket("/webrtc/signal", ...)` (mirrors `app.h:117`). Messages:
       `offer`/`answer`/`ice-candidate` — shapes **ADAPT** from
@@ -591,11 +605,42 @@ the audit's "mostly REBUILD."
       `createDataChannel` against a live `App` (headless via Playwright/Puppeteer):
       full offer → answer → ICE → DTLS → SCTP → echo. Both browsers, multiple
       channels, multiple verbs of signaling route (HTTP POST and WS).
-- [ ] **libwebrtc / aiortc interop** — a non-browser native peer (`aiortc`
+- [x] **libwebrtc / aiortc interop** — a non-browser native peer (`aiortc`
       easiest) as a second oracle independent of browser quirks.
-- [ ] **e2e through `App`** — data-channel echo handler registered via
+      DONE (Signaling/interop wave): `tests/interop/aiortc_datachannel.py` (run via
+      `uv run --no-project --with aiortc python ...` — ephemeral env, no global
+      install) is a REAL aiortc `RTCPeerConnection`: `createDataChannel("chat")`,
+      createOffer, POST the offer to the Bolt signaling route, setRemoteDescription
+      on the answer, then on "open" send a text + a 64 KiB binary message and
+      assert both echoes return byte-exact (bounded ~20s, exit 0/nonzero).
+      `tests/aiortc_interop_test.cpp` (gtest, guarded by `BOLTAPI_WITH_WEBRTC`)
+      starts the full App (UDP ICE/DTLS/SCTP + signaling route + on_data_channel
+      echo) on a free port and shells out to the script; SKIPs (never fails) if
+      uv/aiortc can't bootstrap. **RESULT: PASSED here** (uv 0.8.17, aiortc 1.14.0)
+      — first proof of the Bolt stack vs an independent WebRTC implementation:
+      aiortc ICE ↔ our ICE-lite, aiortc DTLS client ↔ our DTLS server, aiortc SCTP
+      ↔ our Bolt-native SCTP, DCEP both ways. INTEROP BUGS FOUND + FIXED for this
+      gate: (1) **DTLS-SRTP** — aiortc's DTLS client aborts with "no SRTP profile"
+      unless the server echoes a `use_srtp` profile, so `DtlsContext::create` now
+      advertises `SRTP_AEAD_AES_128_GCM:SRTP_AES128_CM_SHA1_80` (data channels
+      never use the keys, but the extension must be negotiated); (2) **same-host
+      ICE** — always advertise a `127.0.0.1` host candidate (in addition to NIC
+      candidates) with the UDP socket bound to `0.0.0.0` so a same-host peer is
+      reachable; (3) **SCTP peer MTU** — accept inbound DATA chunks up to
+      `kSctpMaxRecvChunkData` (aiortc frames ~1200 B payloads, larger than our
+      conservative 1100 B send chunk) in `handle_data`/`ingest_fragment`;
+      (4) **ICE USERNAME** — validate the request's peer-side ufrag token against
+      the offer's ice-ufrag (`set_expected_remote`).
+- [~] **e2e through `App`** — data-channel echo handler registered via
       `on_data_channel`; randomized text/binary/empty/large payloads; assert
       ordered vs unordered semantics.
+      DONE (Signaling/interop wave): the aiortc interop gate above runs a real
+      `App` with `on_data_channel("chat")` echo end-to-end over the signaling route
+      + UDP ICE/DTLS/SCTP, proving a text message AND a 64 KiB binary message
+      (fragmented/reassembled) round-trip byte-exact through the live App surface.
+      PENDING: empty-payload + unordered-channel assertions and randomized payload
+      fuzz over the interop path (the loopback `sctp_robust_test` already covers
+      empty/unordered/randomised against our own stack).
 - [ ] **Concurrency/soak** — N simultaneous peer connections, each multiple
       channels, sustained for minutes; assert zero leaks (arena/pool accounting)
       and stable memory. **REBUILD.**

@@ -273,6 +273,28 @@ if(BOLTAPI_BUILD_EXAMPLES)
         target_link_libraries(boltapi_sse_stream PRIVATE ws2_32 mswsock)
     endif()
     boltapi_apply_hardening(boltapi_sse_stream)
+
+    # WebRTC data-channel echo server (debug/example; meaningful under WEBRTC=ON).
+    add_executable(boltapi_webrtc_echo examples/webrtc_echo.cpp)
+    target_link_libraries(boltapi_webrtc_echo PRIVATE boltapi::boltapi)
+    if(WIN32)
+        target_link_libraries(boltapi_webrtc_echo PRIVATE ws2_32 mswsock iphlpapi)
+    endif()
+    boltapi_apply_hardening(boltapi_webrtc_echo)
+
+    # WebRTC interop DEMO server: enable_webrtc + on_data_channel("chat") echo +
+    # static_files("/", "testing/web") serving the browser test page + the
+    # POST /webrtc/offer signaling route. The harness (browser + aiortc) points
+    # at this on :8080. Guarded under BOLTAPI_WITH_WEBRTC so the default build is
+    # unaffected.
+    if(BOLTAPI_WITH_WEBRTC)
+        add_executable(boltapi_demo_server examples/demo_server.cpp)
+        target_link_libraries(boltapi_demo_server PRIVATE boltapi::boltapi)
+        if(WIN32)
+            target_link_libraries(boltapi_demo_server PRIVATE ws2_32 mswsock iphlpapi)
+        endif()
+        boltapi_apply_hardening(boltapi_demo_server)
+    endif()
 endif()
 
 if(BOLTAPI_BUILD_TESTS)

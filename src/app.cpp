@@ -9,8 +9,13 @@
 #include "boltapi/compression.h"
 #include "boltapi/core/logger.h"
 
+#if defined(BOLTAPI_WITH_WEBRTC)
+#include "boltapi/webrtc/sdp.h"
+#endif
+
 #include <cassert>
 #include <cstdio>
+#include <string>
 #include <utility>
 
 // M3 seam: the protocol registry header is always available (header-only,
@@ -161,6 +166,33 @@ core::coro_task<void> App::run_chain(std::size_t route_index,
 void App::build_dispatch() {
     assert(!started_);
     assert(server_ != nullptr);
+
+#if defined(BOLTAPI_WITH_WEBRTC)
+    // WebRTC signaling route (additive; never touches H1/H2). When enable_webrtc
+    // is set AND a signaling_path is configured, register an ordinary POST route
+    // that accepts the peer OFFER SDP and returns OUR ANSWER SDP. The handler
+    // reads the live WebRTC stack (ICE/DTLS) lazily at request time — that state
+    // is created in init_protocol_seams(), which runs after build_dispatch() but
+    // before any request is served, so the captured `this` is fully wired.
+    if (config_.enable_webrtc && !webrtc_config_.signaling_path.empty()) {
+        App* self = this;
+        routes_.push_back(RouteEntry{
+            Method::Post, webrtc_config_.signaling_path,
+            [self](Request& req, Response& res) {
+                std::string answer;
+                if (!self->handle_webrtc_offer(req.body(), answer)) {
+                    res.status(400)
+                       .content_type("text/plain; charset=utf-8")
+                       .send("invalid WebRTC offer");
+                    return;
+                }
+                // application/sdp is the canonical answer media type; aiortc /
+                // browsers accept the raw SDP body for an HTTP-POST exchange.
+                res.status(200).content_type("application/sdp").send(answer);
+            },
+            AsyncHandler{}, false});
+    }
+#endif
 
     // Prepend the CORS middleware so it wraps everything (must run before any
     // user middleware / handler). Done before the router so order is fixed.
@@ -335,12 +367,21 @@ void App::init_protocol_seams() {
         webrtc_agent_->generate_credentials(0);  // fills any missing creds
 
         webrtc_transport_ = std::make_unique<net::UdpTransport>();
-        const bool bound =
-            webrtc_transport_->bind(config_.server.host.c_str(), udp_port);
+        // Bind the WebRTC UDP socket to ALL interfaces (0.0.0.0), independent of
+        // the HTTP listen host. A peer (browser / aiortc) reaches us by sending
+        // STUN from ITS host candidate (a real NIC) to OUR advertised candidate;
+        // a socket bound to a single address (e.g. 127.0.0.1) would NOT receive
+        // a datagram whose destination is a different local interface, which
+        // breaks same-host interop on Windows (NIC source -> loopback dest is not
+        // delivered to a loopback-bound socket). 0.0.0.0 receives on every
+        // interface, so every advertised host candidate is actually reachable.
+        const bool bound = webrtc_transport_->bind("0.0.0.0", udp_port);
         if (bound) {
             const uint16_t actual = webrtc_transport_->bound_port();
+            // Gather host candidates from all real interfaces (+ loopback) so a
+            // peer on the LAN, same host, or loopback can all reach us.
             const std::size_t ncand =
-                webrtc_agent_->gather_host_candidates(actual);
+                webrtc_agent_->gather_host_candidates(actual, "0.0.0.0");
 
             net::UdpTransport* tp = webrtc_transport_.get();
             webrtc::IceAgent*  ag = webrtc_agent_.get();
@@ -392,11 +433,10 @@ void App::init_protocol_seams() {
                         }
                         if (!matched) return;  // no handler for this label
                         webrtc::DataChannel* chp = &ch;
-                        std::string lbl = label;
                         ch.on_message(
-                            [matched, lbl, chp](const void* data,
-                                                std::size_t len, bool) {
-                                matched(lbl, data, len);
+                            [matched, chp](const void* data, std::size_t len,
+                                           bool is_binary) {
+                                matched(*chp, data, len, is_binary);
                             });
                     });
 
@@ -413,12 +453,14 @@ void App::init_protocol_seams() {
             std::fprintf(stderr,
                 "[boltapi] WebRTC: ICE-lite agent up on UDP :%u — "
                 "ufrag=%.*s pwd=%.*s, %zu host candidate(s), %zu data-channel "
-                "handler(s); signaling route is a next-wave TODO. H1/H2 "
-                "unaffected.\n",
+                "handler(s); signaling route POST %s. H1/H2 unaffected.\n",
                 static_cast<unsigned>(actual),
                 static_cast<int>(ag->ufrag().size()), ag->ufrag().data(),
                 static_cast<int>(ag->pwd().size()), ag->pwd().data(),
-                ncand, dc_handlers_.size());
+                ncand, dc_handlers_.size(),
+                webrtc_config_.signaling_path.empty()
+                    ? "(disabled)"
+                    : webrtc_config_.signaling_path.c_str());
             if (webrtc_dtls_ctx_ && webrtc_dtls_ctx_->is_valid()) {
                 std::fprintf(stderr,
                     "[boltapi] WebRTC:   DTLS server ready (setup:passive) "
@@ -453,6 +495,114 @@ void App::init_protocol_seams() {
 #endif
     }
 }
+
+#if defined(BOLTAPI_WITH_WEBRTC)
+// ---------------------------------------------------------------------------
+// handle_webrtc_offer — the signaling exchange (offer parse -> stack config ->
+// answer). Reused by the POST signaling route and the interop/unit tests.
+//
+//   1. Accept the OFFER SDP from `body`: raw SDP, or a JSON envelope
+//      {"sdp":"...", "type":"offer"} (browsers/aiortc often POST either form).
+//   2. Parse with our SDP codec; locate the m=application (data-channel) media.
+//   3. Extract the peer ice-ufrag/ice-pwd (the STUN USERNAME the peer will use)
+//      and the offer's DTLS a=fingerprint (the identity to bind the peer cert
+//      to). Configure the live stack: pin the agent's EXPECTED remote ufrag/pwd
+//      for USERNAME validation (ourUfrag:peerUfrag), and set the offer
+//      fingerprint on the DTLS session manager.
+//   4. Build OUR ANSWER (ice-lite, setup:passive, our ufrag/pwd, our
+//      a=fingerprint:sha-256, our host a=candidate lines, the application
+//      m-line, sctp-port + max-message-size, a=group:BUNDLE/mid).
+//
+// V1: a SINGLE active peer. A second offer re-pins the stack to the new peer.
+// Multi-peer keyed by ufrag is a documented follow-up (WEBRTC_PLAN §13).
+// ---------------------------------------------------------------------------
+bool App::handle_webrtc_offer(std::string_view body, std::string& out_answer) {
+    out_answer.clear();
+    // The transport must be up (init_protocol_seams ran and bound the socket).
+    if (!webrtc_agent_ || !webrtc_dtls_ctx_ || !webrtc_dtls_ctx_->is_valid()) {
+        return false;
+    }
+
+    // Accept a JSON {"sdp":"..."} envelope OR a raw SDP body. Detect JSON by a
+    // leading '{' (after optional whitespace). The extracted SDP must outlive
+    // the parse below, so copy it into an owned buffer when it comes from JSON.
+    std::string sdp_owned;
+    std::string_view sdp_text = body;
+    {
+        std::size_t i = 0;
+        while (i < body.size() && (body[i] == ' ' || body[i] == '\t' ||
+                                   body[i] == '\r' || body[i] == '\n')) {
+            ++i;
+        }
+        if (i < body.size() && body[i] == '{') {
+            json::Document doc = json::parse(body);
+            if (!doc.ok()) return false;
+            const std::string_view s = doc["sdp"].as_string();
+            if (s.empty()) return false;
+            sdp_owned.assign(s.data(), s.size());
+            sdp_text = sdp_owned;
+        }
+    }
+
+    webrtc::SdpSession offer;
+    if (webrtc::parse(sdp_text, offer) != webrtc::SdpError::Ok) return false;
+    const webrtc::SdpMedia* app_m = offer.application_media();
+    if (app_m == nullptr) return false;
+
+    // Peer ICE credentials: m-line first, then session-level (Firefox places
+    // some attrs at session scope). Both ufrag and pwd are required for STUN.
+    std::string_view peer_ufrag = app_m->ice_ufrag();
+    std::string_view peer_pwd   = app_m->ice_pwd();
+    if (peer_ufrag.empty()) peer_ufrag = offer.session_attr("ice-ufrag");
+    if (peer_pwd.empty())   peer_pwd   = offer.session_attr("ice-pwd");
+    if (peer_ufrag.empty() || peer_pwd.empty()) return false;
+
+    // Offer DTLS fingerprint: m-line first, then session-level. Used to bind the
+    // peer cert at DTLS-handshake completion (the WebRTC identity check).
+    std::string_view offer_fp = app_m->fingerprint();
+    if (offer_fp.empty()) offer_fp = offer.session_attr("fingerprint");
+    if (offer_fp.empty()) return false;
+
+    // ----- Configure the live stack for this peer. -----
+    // Pin the expected remote ICE credentials so the IceAgent validates inbound
+    // STUN Binding Requests carrying USERNAME "ourUfrag:peerUfrag".
+    webrtc_agent_->set_expected_remote(peer_ufrag, peer_pwd);
+    if (webrtc_dtls_mgr_) {
+        webrtc_dtls_mgr_->set_offer_fingerprint(offer_fp);
+    }
+
+    // ----- Build OUR answer. -----
+    webrtc::AnswerParams p;
+    // Echo the offer's mid so a=group:BUNDLE references the right section.
+    const std::string_view offer_mid = app_m->mid();
+    if (!offer_mid.empty()) p.mid = offer_mid;
+    p.ice_ufrag          = webrtc_agent_->ufrag();
+    p.ice_pwd            = webrtc_agent_->pwd();
+    p.fingerprint_sha256 = webrtc_dtls_ctx_->fingerprint();
+    p.setup              = "passive";   // we are the DTLS server (answerer)
+    p.ice_lite           = true;         // Bolt is the ICE-lite controlled peer
+    p.sctp_port          = webrtc_config_.sctp_port;
+    p.max_message_size   = webrtc_config_.max_message_size;
+
+    // Our host ICE candidate lines (IceCandidate::to_string form). Stored owned
+    // so the string_views handed to build_answer outlive the call.
+    const std::size_t ncand = webrtc_agent_->candidate_count();
+    std::vector<std::string>      cand_strings;
+    std::vector<std::string_view> cand_views;
+    cand_strings.reserve(ncand);
+    cand_views.reserve(ncand);
+    for (std::size_t i = 0; i < ncand; ++i) {
+        cand_strings.emplace_back(webrtc_agent_->candidate(i).to_string());
+    }
+    for (const std::string& s : cand_strings) cand_views.emplace_back(s);
+    if (!cand_views.empty()) {
+        p.candidates      = cand_views.data();
+        p.candidate_count = cand_views.size();
+    }
+
+    return webrtc::build_answer(p, out_answer) == webrtc::SdpError::Ok;
+}
+#endif  // BOLTAPI_WITH_WEBRTC
 
 // ---------------------------------------------------------------------------
 // Lifecycle.

@@ -23,3 +23,10 @@ cmake_install.cmake
 # OS
 .DS_Store
 Thumbs.db
+
+# Test/interop run artifacts (not source)
+interop_*.txt
+demo_server.log
+demo_server.out
+ctest_*.txt
+testing/**/__pycache__/

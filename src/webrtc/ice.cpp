@@ -197,6 +197,12 @@ void IceAgent::set_credentials(std::string_view ufrag, std::string_view pwd) noe
     if (pwd.size()   >= 22) pwd_.assign(pwd.data(), pwd.size());
 }
 
+void IceAgent::set_expected_remote(std::string_view ufrag,
+                                   std::string_view pwd) noexcept {
+    remote_ufrag_.assign(ufrag.data(), ufrag.size());
+    remote_pwd_.assign(pwd.data(), pwd.size());
+}
+
 void IceAgent::generate_credentials(std::uint64_t seed) noexcept {
     if (seed == 0) {
         const auto now = std::chrono::steady_clock::now().time_since_epoch();
@@ -211,7 +217,8 @@ void IceAgent::generate_credentials(std::uint64_t seed) noexcept {
 // ---------------------------------------------------------------------------
 // Host candidate gathering
 // ---------------------------------------------------------------------------
-std::size_t IceAgent::gather_host_candidates(std::uint16_t port) noexcept {
+std::size_t IceAgent::gather_host_candidates(std::uint16_t port,
+                                             std::string_view bind_host) noexcept {
     candidate_count_ = 0;
     net::sys::startup();
 
@@ -233,6 +240,20 @@ std::size_t IceAgent::gather_host_candidates(std::uint16_t port) noexcept {
         (void)is_loopback;
         ++candidate_count_;
     };
+
+    // Specific bind address: the socket only receives datagrams sent to it, so
+    // advertise EXACTLY that one host candidate (RFC 8445 — a candidate is a
+    // transport address the peer can actually reach us on). A wildcard / empty
+    // bind falls through to full interface enumeration.
+    if (!bind_host.empty() && bind_host != "0.0.0.0") {
+        char hostbuf[INET6_ADDRSTRLEN] = {0};
+        const std::size_t n =
+            bind_host.size() < sizeof(hostbuf) ? bind_host.size()
+                                               : sizeof(hostbuf) - 1;
+        std::memcpy(hostbuf, bind_host.data(), n);
+        add_candidate(hostbuf, std::strncmp(hostbuf, "127.", 4) == 0);
+        return candidate_count_;
+    }
 
     char loopback_ip[INET_ADDRSTRLEN] = {0};
     bool have_nonloopback = false;
@@ -301,11 +322,15 @@ std::size_t IceAgent::gather_host_candidates(std::uint16_t port) noexcept {
     }
 #endif
 
-    // Include loopback only if no other usable IPv4 host candidate was found
-    // (so a tightly-firewalled / no-NIC CI box still yields >= 1 candidate).
-    if (!have_nonloopback) {
+    // Always advertise a loopback host candidate too (in addition to the real
+    // interfaces) when the socket is bound to all interfaces: a peer on the SAME
+    // host (incl. the aiortc interop gate) reaches us over 127.0.0.1, and a
+    // no-NIC / tightly-firewalled box still yields >= 1 candidate. The socket is
+    // bound to 0.0.0.0, so the loopback candidate is genuinely reachable.
+    if (candidate_count_ < kIceMaxCandidates) {
         add_candidate(loopback_ip[0] ? loopback_ip : "127.0.0.1", true);
     }
+    (void)have_nonloopback;
 
     return candidate_count_;
 }
@@ -347,6 +372,16 @@ IceAgent::HandleResult IceAgent::handle_stun(net::UdpTransport& transport,
         // Wrong username (not addressed to us / unknown ufrag) -> 401.
         send_error(transport, msg, 401, "Unauthorized", peer, peer_len);
         return HandleResult::ErrorResponse;
+    }
+    // When the peer ufrag is known from signaling, the request's peer-side token
+    // must match it too (RFC 8445 §7.3 — addressed FROM the expected peer).
+    if (!remote_ufrag_.empty()) {
+        const std::string_view req_peer_ufrag = username.substr(colon + 1);
+        if (req_peer_ufrag !=
+            std::string_view(remote_ufrag_.data(), remote_ufrag_.size())) {
+            send_error(transport, msg, 401, "Unauthorized", peer, peer_len);
+            return HandleResult::ErrorResponse;
+        }
     }
 
     // MESSAGE-INTEGRITY must verify against OUR ice-pwd.

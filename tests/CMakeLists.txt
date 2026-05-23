@@ -83,6 +83,14 @@ endif()
 # malformed input -> error (no throw/crash). Pure codec, no engine deps.
 boltapi_add_test(boltapi_sdp_test sdp_test.cpp)
 
+# WebRTC SIGNALING (offer->answer) — UNIT: parse a REAL captured aiortc 1.x
+# data-channel OFFER SDP (srflx + multi-algo fingerprints + creds-after-
+# candidates), extract peer ufrag/pwd + sha-256 fingerprint, and build OUR
+# ANSWER asserting it is well-formed (ufrag/pwd, fingerprint:sha-256,
+# setup:passive, ice-lite, >=1 candidate, application m-line) and round-trips.
+# Pure codec, no engine deps, no python — keeps the default suite green.
+boltapi_add_test(boltapi_signaling_test signaling_test.cpp)
+
 # WebRTC STUN codec — UNIT: RFC 5769 test vectors (sample request, IPv4
 # response, long-term credential) asserting byte-exact encode + correct decode
 # incl. MESSAGE-INTEGRITY (HMAC-SHA1) and FINGERPRINT (CRC-32). Correctness gate.
@@ -152,6 +160,22 @@ endif()
 boltapi_add_test(boltapi_sctp_robust_test sctp_robust_test.cpp)
 if(WIN32)
     target_link_libraries(boltapi_sctp_robust_test PRIVATE ws2_32)
+endif()
+
+# WebRTC AIORTC INTEROP — THE REAL INTEROP GATE (vs an independent WebRTC stack).
+# Under WEBRTC=ON: starts the full App (signaling route + UDP ICE/DTLS/SCTP +
+# on_data_channel("chat") echo) on a free port, then shells out to
+# `uv run --with aiortc python tests/interop/aiortc_datachannel.py <port>` — a
+# real aiortc RTCPeerConnection that offers a data channel, POSTs the offer,
+# applies the answer, and asserts a text + 64 KiB binary echo round-trip. SKIPs
+# (does not fail) when uv/aiortc can't bootstrap. Under WEBRTC=OFF it compiles to
+# a single GTEST_SKIP so the default suite stays green. BOLTAPI_SOURCE_DIR lets
+# the test locate the python script from the build dir.
+boltapi_add_test(boltapi_aiortc_interop_test aiortc_interop_test.cpp)
+target_compile_definitions(boltapi_aiortc_interop_test PRIVATE
+    BOLTAPI_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+if(WIN32)
+    target_link_libraries(boltapi_aiortc_interop_test PRIVATE ws2_32 mswsock iphlpapi)
 endif()
 
 # M3: HTTP/3 + WebRTC seam — ProtocolRegistry mechanism (register/has/create),

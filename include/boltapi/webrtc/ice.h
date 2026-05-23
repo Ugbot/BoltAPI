@@ -108,13 +108,36 @@ public:
     // be deterministic; pass 0 to derive a seed from a clock + address entropy.
     void generate_credentials(std::uint64_t seed = 0) noexcept;
 
+    // Record the PEER (offerer) ICE credentials extracted from the SDP offer.
+    // When the remote ufrag is set, handle_stun ADDITIONALLY checks the inbound
+    // USERNAME's peer-side token ("ourUfrag:peerUfrag") matches it (RFC 8445
+    // §7.3 — the request must be addressed FROM the known peer). Empty ufrag =>
+    // peer-side check skipped (back-compat: integrity over our pwd still gates).
+    // The remote pwd is stored for completeness (the controlled responder
+    // verifies MESSAGE-INTEGRITY with OUR pwd, not the peer's).
+    void set_expected_remote(std::string_view ufrag, std::string_view pwd) noexcept;
+
     std::string_view ufrag() const noexcept { return ufrag_; }
     std::string_view pwd()   const noexcept { return pwd_; }
+    std::string_view remote_ufrag() const noexcept { return remote_ufrag_; }
+    std::string_view remote_pwd()   const noexcept { return remote_pwd_; }
 
     // Gather host candidates from local interfaces, each on `port` (the bound
     // UDP port of the transport). Returns the number gathered (>= 1 in a normal
     // environment; loopback included only if no other usable IPv4 exists).
-    std::size_t gather_host_candidates(std::uint16_t port) noexcept;
+    //
+    // `bind_host` is the address the UDP socket is actually bound to. When it is
+    // a SPECIFIC address (not empty and not "0.0.0.0"), the socket only receives
+    // datagrams sent to THAT address, so we advertise EXACTLY one host candidate
+    // for it (e.g. "127.0.0.1" for a loopback bind — required for ICE to succeed
+    // against a peer on the same host, incl. the aiortc interop gate). When
+    // `bind_host` is empty or a wildcard, we enumerate all usable interfaces.
+    std::size_t gather_host_candidates(std::uint16_t port,
+                                       std::string_view bind_host) noexcept;
+    // Back-compat overload: enumerate all interfaces (wildcard bind).
+    std::size_t gather_host_candidates(std::uint16_t port) noexcept {
+        return gather_host_candidates(port, std::string_view{});
+    }
 
     std::size_t candidate_count() const noexcept { return candidate_count_; }
     const IceCandidate& candidate(std::size_t i) const noexcept {
@@ -162,6 +185,8 @@ private:
 
     std::string ufrag_;
     std::string pwd_;
+    std::string remote_ufrag_;  // peer ufrag from the SDP offer (optional check)
+    std::string remote_pwd_;    // peer pwd from the SDP offer (stored only)
 
     IceCandidate candidates_[kIceMaxCandidates]{};
     std::size_t  candidate_count_ = 0;

@@ -1,0 +1,64 @@
+<!doctype html>
+<!--
+  Bolt API — WebRTC data-channel connect test (browser side).
+
+  Open this against a running demo server (which serves it + the /webrtc/offer
+  signaling route). It creates an RTCPeerConnection, opens a data channel,
+  POSTs the offer SDP to the server, applies the answer, then sends a text and a
+  binary message and shows the echoes. Pure browser WebRTC — the real interop
+  gate. No build step.
+
+  Usage: start the demo server, browse to  http://<host>:<port>/webrtc.html
+-->
+<html>
+<head><meta charset="utf-8"><title>Bolt API WebRTC test</title>
+<style>body{font:14px monospace;margin:2rem} #log div{white-space:pre-wrap}
+.ok{color:#0a0}.err{color:#c00}.tx{color:#06c}.rx{color:#a0a}</style></head>
+<body>
+<h3>Bolt API — WebRTC data channel</h3>
+<button id="go">Connect &amp; echo</button>
+<div id="log"></div>
+<script>
+const log = (m, c='') => { const d=document.createElement('div'); d.className=c; d.textContent=m; document.getElementById('log').appendChild(d); };
+const SIGNAL = '/webrtc/offer';
+
+async function run() {
+  log('creating RTCPeerConnection…');
+  const pc = new RTCPeerConnection();
+  pc.oniceconnectionstatechange = () => log('ice: ' + pc.iceConnectionState);
+  pc.onconnectionstatechange   = () => log('pc:  ' + pc.connectionState);
+
+  const dc = pc.createDataChannel('chat');
+  dc.binaryType = 'arraybuffer';
+  let got = 0;
+  dc.onopen = () => {
+    log('datachannel OPEN', 'ok');
+    dc.send('hello from browser');                  log('tx: hello from browser', 'tx');
+    dc.send(new Uint8Array(64 * 1024).fill(7));     log('tx: 64KiB binary', 'tx');
+  };
+  dc.onmessage = (e) => {
+    if (typeof e.data === 'string') { log('rx: ' + e.data, 'rx'); }
+    else { log('rx: binary ' + e.data.byteLength + ' bytes', 'rx'); }
+    if (++got === 2) log('ECHO ROUND-TRIP OK ✔', 'ok');
+  };
+  dc.onerror = (e) => log('dc error: ' + e, 'err');
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  // wait for ICE gathering to finish so the offer carries candidates (non-trickle)
+  await new Promise(r => pc.iceGatheringState === 'complete'
+    ? r() : pc.addEventListener('icegatheringstatechange',
+        () => pc.iceGatheringState === 'complete' && r()));
+
+  log('POST ' + SIGNAL + ' (offer)…');
+  const resp = await fetch(SIGNAL, { method: 'POST', headers: {'Content-Type':'application/sdp'},
+                                     body: pc.localDescription.sdp });
+  if (!resp.ok) { log('signaling failed: ' + resp.status, 'err'); return; }
+  const answerSdp = await resp.text();
+  await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+  log('answer applied; negotiating…');
+}
+document.getElementById('go').onclick = () => { document.getElementById('log').innerHTML=''; run().catch(e=>log('fatal: '+e,'err')); };
+</script>
+</body>
+</html>

@@ -44,7 +44,9 @@
 #endif
 
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <memory>
 #include <string>
@@ -52,6 +54,13 @@
 #include <vector>
 
 namespace bolt::api {
+
+// Forward declaration so the data-channel handler signature is well-formed even
+// in default (WEBRTC=OFF) builds, where the full type isn't included. A handler
+// only ever fires under BOLTAPI_WITH_WEBRTC (it needs the transport up), so the
+// incomplete type is fine for the std::function declaration; the App wiring that
+// dereferences it is itself gated by BOLTAPI_WITH_WEBRTC.
+namespace webrtc { class DataChannel; }
 
 // ---------------------------------------------------------------------------
 // WebRtcConfig — minimal additive config for the WebRTC data-channel surface
@@ -76,6 +85,15 @@ struct WebRtcConfig {
     uint16_t    sctp_port        = 5000;
     uint32_t    max_message_size = 262144;
 
+    // HTTP signaling route. When enable_webrtc is set AND the build has
+    // BOLTAPI_WITH_WEBRTC, App registers a POST route at this path that accepts
+    // the peer's OFFER SDP (raw body, or JSON {"sdp":"..."} — both accepted),
+    // configures the WebRTC stack for that peer (remote ufrag/pwd + DTLS
+    // fingerprint), and returns OUR ANSWER SDP. Empty disables the route (the
+    // App still brings the ICE/DTLS/SCTP transport up; signaling is then the
+    // caller's responsibility). Default "/webrtc/offer".
+    std::string signaling_path = "/webrtc/offer";
+
     // The remote (browser/offerer) DTLS certificate fingerprint extracted from
     // the SDP offer's a=fingerprint line. When set, the DTLS server verifies the
     // peer cert's SHA-256 against it after the handshake (the WebRTC identity
@@ -92,12 +110,14 @@ public:
     using AsyncHandler =
         std::function<core::coro_task<void>(Request&, Response&)>;
 
-    // Data-channel message handler: (label, data, len). Mirrors the WS handler
-    // registration shape. Wired to a real SCTP stream in a later wave; today it
-    // is recorded and the surface logs that transport is not yet implemented.
+    // Data-channel message handler: (channel, data, len, is_binary). The channel
+    // reference lets the handler REPLY (echo) via ch.send_text/ch.send_binary,
+    // and exposes ch.label(). Fired once per inbound message on an established
+    // data channel whose label matched the registration (or the "" wildcard).
+    // Only ever invoked under BOLTAPI_WITH_WEBRTC (the transport must be up).
     using DataChannelHandler =
-        std::function<void(std::string_view label, const void* data,
-                           std::size_t len)>;
+        std::function<void(webrtc::DataChannel& ch, const void* data,
+                           std::size_t len, bool is_binary)>;
 
     // Forwarding config: wraps a CoroUnifiedServerConfig plus facade-level knobs.
     struct Config {
@@ -171,6 +191,50 @@ public:
         assert(!path.empty());
         assert(handler != nullptr);
         sse_handlers_.push_back({path, std::move(handler)});
+        return *this;
+    }
+
+    // -----------------------------------------------------------------------
+    // Static file serving (demo / dev convenience).
+    //
+    // static_files(mount_prefix, fs_root) serves the files under the on-disk
+    // directory `fs_root` at the URL space rooted at `mount_prefix`. It is a
+    // demo/dev helper (the WebRTC harness page is served this way), NOT a hot
+    // path: files are read from disk at request time with a hard size cap and a
+    // path-traversal guard. A request to exactly `mount_prefix` (or
+    // `mount_prefix/`) serves `index.html`.
+    //
+    // Implementation: registers a single GET wildcard route at
+    // "<prefix>*" plus the exact "<prefix>" so both "/" and "/file" resolve.
+    // The wildcard captures the path tail (router exposes it as param "*"),
+    // which is appended to fs_root after a guard rejecting "..", embedded NUL,
+    // backslashes and absolute/drive-letter escapes. MIME is by extension.
+    // Returns *this for chaining.
+    // -----------------------------------------------------------------------
+    App& static_files(std::string mount_prefix, std::string fs_root) {
+        assert(!mount_prefix.empty());
+        assert(mount_prefix.front() == '/');
+        assert(!started_);
+
+        // Normalize the prefix to a single trailing form. We register two
+        // routes: the exact prefix (serves index.html) and prefix + "*".
+        std::string exact = mount_prefix;
+        // strip a trailing '/' from exact unless it IS "/"
+        if (exact.size() > 1 && exact.back() == '/') exact.pop_back();
+        std::string wild = (exact == "/") ? std::string("/*")
+                                          : (exact + "/*");
+
+        auto serve = [root = std::move(fs_root)](Request& req, Response& res) {
+            // The wildcard tail (everything after the mount). For the exact-
+            // prefix route there is no '*' param, so tail is empty -> index.
+            std::string_view tail = req.path_param_view("*");
+            serve_file_(root, tail, res);
+        };
+
+        routes_.push_back(RouteEntry{Method::Get, exact, serve,
+                                     AsyncHandler{}, false});
+        routes_.push_back(RouteEntry{Method::Get, wild, serve,
+                                     AsyncHandler{}, false});
         return *this;
     }
 
@@ -258,6 +322,89 @@ private:
         return *this;
     }
 
+    // Content-Type for a file by extension (lower-case match). Conservative
+    // default of application/octet-stream for the unknown case. Total + simple.
+    static std::string_view mime_for_(std::string_view path) noexcept {
+        const std::size_t dot = path.rfind('.');
+        if (dot == std::string_view::npos) return "application/octet-stream";
+        std::string_view ext = path.substr(dot + 1);
+        // Tiny fixed table (extend as needed). All lower-case.
+        if (ext == "html" || ext == "htm") return "text/html; charset=utf-8";
+        if (ext == "js"  || ext == "mjs")  return "text/javascript; charset=utf-8";
+        if (ext == "css")  return "text/css; charset=utf-8";
+        if (ext == "json") return "application/json";
+        if (ext == "txt")  return "text/plain; charset=utf-8";
+        if (ext == "svg")  return "image/svg+xml";
+        if (ext == "png")  return "image/png";
+        if (ext == "jpg" || ext == "jpeg") return "image/jpeg";
+        if (ext == "gif")  return "image/gif";
+        if (ext == "ico")  return "image/x-icon";
+        if (ext == "wasm") return "application/wasm";
+        return "application/octet-stream";
+    }
+
+    // Resolve `tail` (the wildcard remainder, "" => index.html) against `root`,
+    // reject path traversal, read the file (bounded), and fill `res`. 404 when
+    // missing/forbidden. Static (no App state) so static_files() can capture it.
+    static void serve_file_(const std::string& root, std::string_view tail,
+                            Response& res) {
+        // Default document for a directory-style request.
+        std::string rel(tail);
+        if (rel.empty() || rel.back() == '/') rel += "index.html";
+
+        // Path-traversal / escape guard. Reject any segment that could climb
+        // out of root or smuggle a drive/absolute path on Windows. We keep the
+        // guard strict and allocation-light: scan the relative path once.
+        bool bad = rel.find('\0') != std::string::npos ||
+                   rel.find("..") != std::string::npos ||
+                   rel.find('\\') != std::string::npos ||
+                   (rel.size() >= 1 && rel.front() == '/') ||
+                   (rel.size() >= 2 && rel[1] == ':');  // C:\ style
+        if (bad) {
+            res.status(404).content_type("text/plain; charset=utf-8")
+               .send("Not Found");
+            return;
+        }
+
+        std::string full = root;
+        if (!full.empty() && full.back() != '/' && full.back() != '\\') {
+            full += '/';
+        }
+        full += rel;
+
+        // Read the file in binary, bounded. Demo helper: a hard cap keeps a
+        // pathological file from ballooning the response buffer.
+        constexpr long kMaxFileBytes = 16L * 1024 * 1024;  // 16 MiB
+        std::FILE* f = std::fopen(full.c_str(), "rb");
+        if (f == nullptr) {
+            res.status(404).content_type("text/plain; charset=utf-8")
+               .send("Not Found");
+            return;
+        }
+        std::fseek(f, 0, SEEK_END);
+        const long sz = std::ftell(f);
+        if (sz < 0 || sz > kMaxFileBytes) {
+            std::fclose(f);
+            res.status(404).content_type("text/plain; charset=utf-8")
+               .send("Not Found");
+            return;
+        }
+        std::fseek(f, 0, SEEK_SET);
+        std::string buf;
+        buf.resize(static_cast<std::size_t>(sz));
+        const std::size_t got =
+            (sz == 0) ? 0
+                      : std::fread(buf.data(), 1, static_cast<std::size_t>(sz), f);
+        std::fclose(f);
+        if (got != static_cast<std::size_t>(sz)) {
+            res.status(404).content_type("text/plain; charset=utf-8")
+               .send("Not Found");
+            return;
+        }
+
+        res.status(200).content_type(mime_for_(rel)).send(buf);
+    }
+
     // Build the router + the engine handler. Called once from run/start.
     void build_dispatch();
 
@@ -266,6 +413,16 @@ private:
     // serving is unaffected. Safe no-op when no seam flags are set. Called once
     // from run/start_background after build_dispatch().
     void init_protocol_seams();
+
+#if defined(BOLTAPI_WITH_WEBRTC)
+    // WebRTC signaling: parse the peer OFFER SDP (raw body or JSON {"sdp":...}),
+    // configure the live ICE/DTLS stack for that peer (expected remote ufrag/pwd,
+    // offer DTLS fingerprint), and fill `out_answer` with OUR ANSWER SDP
+    // (ice-lite, setup:passive, our fingerprint + candidates, the application
+    // m-line). Returns false (out_answer cleared) on a malformed offer or when
+    // the WebRTC transport isn't up. Defined in app.cpp. Single active peer (v1).
+    bool handle_webrtc_offer(std::string_view body, std::string& out_answer);
+#endif
 
     // Run the middleware chain for one matched route, terminal = handler.
     core::coro_task<void> run_chain(std::size_t route_index,

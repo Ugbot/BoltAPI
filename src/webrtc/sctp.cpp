@@ -557,7 +557,8 @@ void SctpAssociation::handle_data(const std::uint8_t* chunk, std::size_t len) no
     const bool end   = (flags & kDataFlagEnd) != 0;
 
     if (sid >= kSctpMaxStreams) return;
-    if (payload_len > kSctpMaxChunkData) return;
+    // Accept the PEER's MTU-sized chunks (larger than our send chunk size).
+    if (payload_len > kSctpMaxRecvChunkData) return;
 
     // Record the TSN; duplicates / out-of-window get a SACK but no redelivery.
     const bool fresh = record_received(tsn);
@@ -589,7 +590,7 @@ void SctpAssociation::ingest_fragment(std::uint32_t tsn, std::uint16_t sid,
                                       std::uint8_t flags,
                                       const std::uint8_t* payload,
                                       std::size_t plen) noexcept {
-    if (!infrag_ || plen > kSctpMaxChunkData) { send_abort(); state_ = State::Failed; return; }
+    if (!infrag_ || plen > kSctpMaxRecvChunkData) { send_abort(); state_ = State::Failed; return; }
     // Already buffered? (retransmit). Ignore the duplicate.
     for (std::size_t i = 0; i < kSctpMaxFrags; ++i) {
         if (infrag_[i].used && infrag_[i].tsn == tsn) return;

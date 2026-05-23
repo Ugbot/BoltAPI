@@ -184,6 +184,19 @@ std::unique_ptr<DtlsContext> DtlsContext::create() {
                        SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
                        permissive_verify);
 
+    // DTLS-SRTP extension (RFC 5764). WebRTC peers — incl. aiortc and browsers —
+    // ALWAYS send the use_srtp extension on the DTLS ClientHello (the same DTLS
+    // transport carries both media SRTP keys and data-channel SCTP). aiortc's
+    // client FAILS the handshake ("no SRTP profile negotiated") unless the server
+    // echoes a profile, so we MUST advertise the standard profiles even though
+    // data channels never use the exported SRTP keys. Offer the two mandatory
+    // AES-128 profiles; the peer picks one. Returns 0 on success.
+    if (SSL_CTX_set_tlsext_use_srtp(
+            ctx, "SRTP_AEAD_AES_128_GCM:SRTP_AES128_CM_SHA1_80") != 0) {
+        SSL_CTX_free(ctx);
+        return nullptr;
+    }
+
     // Self-signed cert + key.
     EVP_PKEY* pkey = nullptr;
     X509*     cert = nullptr;
