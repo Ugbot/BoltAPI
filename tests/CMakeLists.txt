@@ -380,6 +380,41 @@ if(WIN32)
     target_link_libraries(boltapi_media_echo_test PRIVATE ws2_32 mswsock iphlpapi)
 endif()
 
+# WA: SIMULCAST (RFC 8851/8852) + SVC PASSTHROUGH — in-process, deterministic,
+# deadline-bounded (DEFAULT suite, no external deps). (1) A 3-rid (q;h;f)
+# simulcast video offer parses; negotiate_media echoes the rids + RID header-
+# extension id; the answer carries a=rid recv x3 + a=simulcast:recv and round-
+# trips. (2) Inbound RTP carrying the rtp-stream-id (RID) header extension
+# demuxes into 3 per-encoding streams of a SimulcastTrack, each bound to its own
+# SSRC, over seeded randomized rounds. (3) An SvcRelay classifies (spatial,
+# temporal) from the Dependency Descriptor header extension and drops layers
+# above a target WITHOUT decoding — keep/drop counts match the induced pattern.
+# Pure codec/headers, no engine deps.
+boltapi_add_test(boltapi_simulcast_test simulcast_test.cpp)
+
+# WA: RTX (RFC 4588) + RED/ULPFEC (RFC 2198/5109) — in-process, deterministic,
+# deadline-bounded (DEFAULT suite, no external deps). (1) Media packets flow
+# through the RtxInterceptor (bounded cache); an inbound Generic NACK (PID + BLP
+# bitmask) yields RTX packets on the dedicated rtx SSRC/PT whose OSN==N, and
+# parse_rtx reconstructs each original payload BYTE-EXACT (seeded random
+# payloads). (2) build_fec builds a ULPFEC packet over a media group; with ONE
+# member dropped, recover() reconstructs it BYTE-EXACT from the FEC packet + the
+# survivors over many randomized group sizes / drop indices; two-missing returns
+# NotRecoverable. Pure codec/headers, no engine deps.
+boltapi_add_test(boltapi_rtx_fec_test rtx_fec_test.cpp)
+
+# WA: TWCC BANDWIDTH ESTIMATION + PACER — in-process, deterministic, deadline-
+# bounded (DEFAULT suite, no external deps). (1) The receiver records (transport
+# seq, arrival) and builds the transport-cc FCI (rides RTPFB FMT 15 via rtcp.h);
+# the sender parses it back to (seq, arrival) records with the arrival spacing
+# preserved. (2) A delay-based (GCC-style) estimator fed a timed sequence with
+# GROWING one-way delay decreases its target rate (bounded, > floor) with a
+# positive delay trend, then RECOVERS when delay goes flat. (3) A token-bucket
+# Pacer driven by the estimate emits at ~the target rate over a 1s virtual window
+# (bounded relative-error band) and a lower target emits proportionally fewer
+# bytes. Pure headers (rtcp.h), no engine deps.
+boltapi_add_test(boltapi_bwe_test bwe_test.cpp)
+
 # M3: HTTP/3 + WebRTC seam — ProtocolRegistry mechanism (register/has/create),
 # a dummy IProtocol returning NotImplemented, and (when the compile flags are
 # ON) the real H3/WebRTC stub factories registering. Flag-AWARE: passes in the

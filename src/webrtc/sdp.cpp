@@ -174,6 +174,41 @@ std::string_view SdpMedia::fmtp_for(std::uint8_t pt) const noexcept {
     return std::string_view{};
 }
 
+std::size_t SdpMedia::rids(std::string_view* out, std::size_t cap) const noexcept {
+    assert(out != nullptr || cap == 0);
+    assert(attr_count <= kSdpMaxAttrsPerSection && "rids: attr overflow");
+    std::size_t n = 0;
+    for (std::size_t i = 0; i < attr_count && n < cap; ++i) {
+        if (attrs[i].key != "rid") continue;
+        // a=rid:<id> <direction> [<restrictions>] — the id is the first token.
+        const std::string_view v = attrs[i].value;
+        const std::size_t sp = v.find(' ');
+        const std::string_view id = (sp == std::string_view::npos) ? v
+                                                                   : v.substr(0, sp);
+        if (!id.empty() && id.size() <= kMaxRidLen) out[n++] = trim(id);
+    }
+    return n;
+}
+
+std::uint8_t SdpMedia::rid_extmap_id() const noexcept {
+    assert(attr_count <= kSdpMaxAttrsPerSection && "rid_extmap_id: overflow");
+    assert(kRidExtUri.size() > 0 && "rid_extmap_id: uri");
+    for (std::size_t i = 0; i < attr_count; ++i) {
+        if (attrs[i].key != "extmap") continue;
+        // a=extmap:<id>[/<dir>] <uri> ...
+        const std::string_view v = attrs[i].value;
+        const std::size_t sp = v.find(' ');
+        if (sp == std::string_view::npos) continue;
+        if (v.find(kRidExtUri) == std::string_view::npos) continue;
+        std::string_view idtok = v.substr(0, sp);
+        const std::size_t slash = idtok.find('/');
+        if (slash != std::string_view::npos) idtok = idtok.substr(0, slash);
+        std::uint8_t id = 0;
+        if (parse_uint(idtok, &id) && id >= 1 && id <= 14) return id;
+    }
+    return 0;
+}
+
 std::size_t SdpMedia::payload_types(std::uint8_t* out,
                                     std::size_t cap) const noexcept {
     assert(out != nullptr || cap == 0);
@@ -513,6 +548,16 @@ SdpError negotiate_media(const SdpSession& offer,
             c.rtpmap = rm;
             c.fmtp = m.fmtp_for(pts[i]);
         }
+        // WA — simulcast: if the offer m-line has a=simulcast + a=rid lines,
+        // echo the rids (bounded) and the RID header-extension id so the answer
+        // can mirror the simulcast (RFC 8851/8852). Bounded by kMaxRids.
+        if (m.has_simulcast()) {
+            std::string_view rid_views[kMaxRids];
+            const std::size_t nr = m.rids(rid_views, kMaxRids);
+            for (std::size_t r = 0; r < nr; ++r) nm.rids[nm.rid_count++] = rid_views[r];
+            nm.rid_ext_id = m.rid_extmap_id();
+        }
+
         // Keep the section even if empty so the answer can mark it inactive; but
         // only count sections that had at least one common codec.
         if (nm.codec_count > 0) ++out.media_count;
@@ -555,6 +600,31 @@ static void append_media_section(std::string& out, const NegotiatedMedia& nm) {
             v.append(c.fmtp.data(), c.fmtp.size());
             append_attr(out, "fmtp", v);
         }
+    }
+
+    // WA — simulcast answer (RFC 8851/8852): echo the RID header-extension map,
+    // one a=rid:<id> recv line per offered layer, then a=simulcast:recv <list>.
+    assert(nm.rid_count <= kMaxRids && "append_media_section: rid overflow");
+    if (nm.rid_count > 0) {
+        if (nm.rid_ext_id != 0) {  // a=extmap:<id> <RID uri>
+            std::string v;
+            append_uint(v, nm.rid_ext_id);
+            v.push_back(' ');
+            v.append(kRidExtUri.data(), kRidExtUri.size());
+            append_attr(out, "extmap", v);
+        }
+        for (std::size_t r = 0; r < nm.rid_count; ++r) {  // a=rid:<id> recv
+            std::string v;
+            v.append(nm.rids[r].data(), nm.rids[r].size());
+            v.append(" recv", 5);
+            append_attr(out, "rid", v);
+        }
+        std::string sc("recv ");  // a=simulcast:recv q;h;f
+        for (std::size_t r = 0; r < nm.rid_count; ++r) {
+            if (r != 0) sc.push_back(';');
+            sc.append(nm.rids[r].data(), nm.rids[r].size());
+        }
+        append_attr(out, "simulcast", sc);
     }
 }
 

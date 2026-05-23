@@ -69,6 +69,14 @@ inline constexpr std::size_t kSdpMaxCandidates      = 16;   // a=candidate lines
 inline constexpr std::size_t kMaxMediaSections    = kSdpMaxMediaSections;
 inline constexpr std::size_t kMaxCodecsPerSection = 16;
 
+// WA — simulcast (RFC 8851 a=simulcast + RFC 8852 a=rid). A simulcast track
+// offers up to kMaxRids alternative encodings keyed by a short restriction id
+// (the "rid"); each is carried as a separate RTP stream tagged with the RID
+// header extension (urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id). Both bounded
+// (TigerStyle: fixed capacity, no growth).
+inline constexpr std::size_t kMaxRids    = 4;   // alt encodings per simulcast m-line
+inline constexpr std::size_t kMaxRidLen  = 16;  // a RID is a short token (RFC 8852)
+
 // ----------------------------------------------------------------------------
 // Result codes — no exceptions.
 // ----------------------------------------------------------------------------
@@ -140,6 +148,20 @@ struct SdpMedia {
     bool rtcp_mux() const noexcept { return has_attr("rtcp-mux"); }
     // First a=ssrc:<id> ... value (the "<id> cname:.." string), empty if absent.
     std::string_view ssrc() const noexcept { return attr("ssrc"); }
+
+    // ---- Simulcast (WA: RFC 8851 / RFC 8852) ------------------------------
+    // True if this m-line carries a=simulcast (a simulcast offer/answer).
+    bool has_simulcast() const noexcept { return has_attr("simulcast"); }
+    // The a=simulcast:<...> value (e.g. "send q;h;f" / "recv q;h;f"), empty if
+    // none. Caller parses the direction + alternative list (see parse_rids()).
+    std::string_view simulcast() const noexcept { return attr("simulcast"); }
+    // Collect the rids declared by a=rid:<id> ... lines into `out` (each a view
+    // into the source buffer), up to `cap`. Returns the count written. The order
+    // is the SDP order (matches the simulcast layer list order). No allocation.
+    std::size_t rids(std::string_view* out, std::size_t cap) const noexcept;
+    // The id of the a=extmap line whose URI is the RID (rtp-stream-id) extension,
+    // or 0 if no such extmap is present. Used to demux inbound layers by RID.
+    std::uint8_t rid_extmap_id() const noexcept;
 };
 
 // ----------------------------------------------------------------------------
@@ -234,6 +256,14 @@ struct NegotiatedMedia {
     std::string_view direction = "recvonly";    // our answer direction
     NegotiatedCodec  codecs[kMaxCodecsPerSection]{};
     std::size_t      codec_count = 0;
+
+    // WA — simulcast: the rids offered for this m-line (echoed from a=rid lines)
+    // and the RID header-extension id we answer with. When rid_count > 0 the
+    // answer emits a=rid:<id> recv lines + an a=simulcast:recv <list> line + an
+    // a=extmap for the RID extension. rid_count == 0 means no simulcast.
+    std::string_view rids[kMaxRids]{};
+    std::size_t      rid_count = 0;
+    std::uint8_t     rid_ext_id = 0;            // a=extmap id for the RID ext (0=absent)
 };
 
 // The result of intersecting an offer against Bolt's supported codec set: the
@@ -242,6 +272,16 @@ struct MediaNegotiation {
     NegotiatedMedia media[kMaxMediaSections]{};
     std::size_t     media_count = 0;
 };
+
+// WA — the RFC 8852 RID header-extension URI and the RFC 8888 / abs-send-time +
+// transport-cc URIs. These are the extmap URIs we recognize/emit. Constants so
+// both the SDP layer and the RTP-extension demux agree on one spelling.
+inline constexpr std::string_view kRidExtUri =
+    "urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id";
+inline constexpr std::string_view kTransportCcExtUri =
+    "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01";
+inline constexpr std::string_view kAbsSendTimeExtUri =
+    "http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time";
 
 // negotiate_media — intersect the parsed `offer`'s audio/video m-lines against
 // Bolt's supported codecs (audio: Opus/PCMU/PCMA; video: VP8/VP9/H264), keeping

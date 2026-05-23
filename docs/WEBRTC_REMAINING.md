@@ -72,11 +72,40 @@ Every WebRTC test/interop MUST be non-hanging:
 - [ ] mDNS `.local` candidates; IPv6 / dual-stack (IPv4 only today; IPv6 mapped-address is a documented hook).
 
 ## WA — Media advanced (Pion-level)
-- [ ] **Simulcast** (multiple encodings per track, rid/mid extensions).
-- [ ] **SVC** (scalable video coding) passthrough.
-- [ ] **RTX** retransmission stream; **RED/ULPFEC** forward error correction.
-- [ ] Bandwidth estimation (GCC / TWCC-based) + media pacing/congestion control.
-- [ ] Key update / DTLS renegotiation; abs-send-time / transport-cc header extensions.
+- [x] **Simulcast** (multiple encodings per track, rid/mid extensions). SDP:
+      `SdpMedia::{has_simulcast,simulcast,rids,rid_extmap_id}` parse a=simulcast
+      (RFC 8851) + a=rid (RFC 8852); `negotiate_media` echoes the rids + RID
+      header-extension id; `build_media_answer`/`build_echo_answer` emit
+      `a=extmap`(RID uri) + `a=rid:<id> recv` + `a=simulcast:recv <list>`. RTP:
+      `rtp::rid_value` reads the rtp-stream-id one-byte header ext; `webrtc::
+      SimulcastTrack` (bounded `kMaxEncodings`) demuxes inbound layers by RID into
+      per-encoding streams (RID->SSRC bound lazily). Gate `tests/simulcast_test.cpp`
+      (3-rid offer→answer round-trip; RID-ext inbound RTP → 3 encodings byte-exact).
+- [x] **SVC** (scalable video coding) passthrough. `webrtc::SvcRelay` interceptor
+      classifies (spatial,temporal) from the Dependency Descriptor header ext (or
+      the VP8/VP9 payload-descriptor temporal id) WITHOUT decoding and drops
+      layers above a target — the layer-selection primitive for an SFU relay.
+      Gate `tests/simulcast_test.cpp` (induced layer pattern → keep/drop counts).
+- [x] **RTX** retransmission stream; **RED/ULPFEC** forward error correction.
+      RTX: `webrtc::RtxInterceptor` (RFC 4588) caches outbound media (bounded ring),
+      on inbound Generic NACK emits RTX packets on the dedicated rtx SSRC/PT with a
+      16-bit OSN prefix, and `parse_rtx` reconstructs the original byte-exact. FEC:
+      `webrtc/fec.h` (RFC 2198/5109) `build_fec` builds a ULPFEC XOR packet over a
+      bounded group (`kMaxFecGroup`) and `recover` reconstructs ONE dropped member
+      byte-exact from the FEC packet + survivors (two-missing → NotRecoverable).
+      Gate `tests/rtx_fec_test.cpp`.
+- [x] Bandwidth estimation (GCC / TWCC-based) + media pacing/congestion control.
+      `webrtc/bwe.h`: `TwccFeedbackBuilder`/`parse_twcc_feedback` (transport-cc FCI,
+      rides RTPFB FMT 15); `DelayBasedEstimator` (GCC delay controller: trend of
+      the inter-arrival/inter-departure gradient → multiplicative decrease on
+      over-use, additive increase on steady, clamped to [`kMin`,`kMax`]); `Pacer`
+      (token bucket releasing at the estimate, burst-bounded). Gate
+      `tests/bwe_test.cpp` (FCI round-trip; rate decreases under growing delay then
+      recovers; pacer emits at ~target within a bounded band).
+- [x] abs-send-time / transport-cc header extensions: `rtp::{abs_send_time,
+      transport_cc_seq}` decode the respective one-/few-byte header exts;
+      `webrtc::{kRidExtUri,kTransportCcExtUri,kAbsSendTimeExtUri}` are the agreed
+      extmap URIs. (Key update / DTLS renegotiation remains TODO.)
 
 ## WT — WebTransport (optional; shares HTTP/3)
 - [ ] WebTransport over HTTP/3 (RFC 9297): CONNECT-UDP / H3 datagrams + streams. Depends on HTTP/3 (see HTTP3_REMAINING W5e datagrams). Reuses UdpTransport.

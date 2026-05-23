@@ -347,6 +347,87 @@ inline RtpError serialize(const Header& hdr, const std::uint8_t* payload,
     return RtpError::Ok;
 }
 
+// ----------------------------------------------------------------------------
+// build_one_byte_extensions — pack `count` RFC 8285 one-byte extension elements
+// into `buf` (a 4-byte-aligned block, zero-padded) and set hdr.extension /
+// extension_profile / ext_raw / ext_raw_len so a following serialize() emits
+// them. `buf` is caller-owned and must outlive the serialize call. Returns the
+// byte length written (multiple of 4), or 0 on overflow / bad input. No heap.
+// ----------------------------------------------------------------------------
+inline std::size_t build_one_byte_extensions(Header& hdr, const Extension* exts,
+                                             std::size_t count, std::uint8_t* buf,
+                                             std::size_t cap) noexcept {
+    assert(exts != nullptr || count == 0);
+    assert(buf != nullptr && cap > 0);
+    std::size_t off = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        assert(exts[i].id >= 1 && exts[i].id <= 14 && "ext: one-byte id");
+        assert(exts[i].length >= 1 && exts[i].length <= 16 && "ext: one-byte len");
+        if (off + 1 + exts[i].length > cap) return 0;
+        buf[off++] = static_cast<std::uint8_t>(
+            (exts[i].id << 4) | ((exts[i].length - 1) & 0x0F));
+        std::memcpy(buf + off, exts[i].value, exts[i].length);
+        off += exts[i].length;
+    }
+    while (off % 4 != 0) {                 // zero-pad to a 4-byte boundary
+        if (off >= cap) return 0;
+        buf[off++] = 0;
+    }
+    hdr.extension = true;
+    hdr.extension_profile = kExtProfileOneByte;
+    hdr.ext_raw = buf;
+    hdr.ext_raw_len = static_cast<std::uint16_t>(off);
+    return off;
+}
+
+// ============================================================================
+// WA — header-extension value accessors for media demux / BWE.
+// ============================================================================
+
+// rid_value — copy the RFC 8852 RID (rtp-stream-id) extension value carried with
+// header-extension id `ext_id` into `out` (NUL-terminated, capacity `cap`).
+// Returns the length, or 0 if the extension is absent / too long. No allocation.
+inline std::size_t rid_value(const Header& hdr, std::uint8_t ext_id,
+                             char* out, std::size_t cap) noexcept {
+    assert(out != nullptr && cap > 0);
+    assert(ext_id >= 1 && "rid_value: ext id");
+    const Extension* e = hdr.find_extension(ext_id);
+    if (e == nullptr || e->length == 0) return 0;
+    if (static_cast<std::size_t>(e->length) + 1 > cap) return 0;
+    std::memcpy(out, e->value, e->length);
+    out[e->length] = '\0';
+    return e->length;
+}
+
+// abs_send_time — decode the 24-bit absolute send time (6.18 fixed-point seconds,
+// RTP abs-send-time extension) carried with id `ext_id`. Returns true + the raw
+// 24-bit value via `out`; false if the extension is absent / malformed.
+inline bool abs_send_time(const Header& hdr, std::uint8_t ext_id,
+                          std::uint32_t* out) noexcept {
+    assert(out != nullptr && "abs_send_time: null out");
+    assert(ext_id >= 1 && "abs_send_time: ext id");
+    const Extension* e = hdr.find_extension(ext_id);
+    if (e == nullptr || e->length != 3) return false;
+    *out = (static_cast<std::uint32_t>(e->value[0]) << 16) |
+           (static_cast<std::uint32_t>(e->value[1]) << 8) |
+            static_cast<std::uint32_t>(e->value[2]);
+    return true;
+}
+
+// transport_cc_seq — decode the 16-bit transport-wide sequence number (RFC 8888
+// transport-cc extension) carried with id `ext_id`. Returns true + the value via
+// `out`; false if absent / malformed (the ext is exactly 2 bytes).
+inline bool transport_cc_seq(const Header& hdr, std::uint8_t ext_id,
+                             std::uint16_t* out) noexcept {
+    assert(out != nullptr && "transport_cc_seq: null out");
+    assert(ext_id >= 1 && "transport_cc_seq: ext id");
+    const Extension* e = hdr.find_extension(ext_id);
+    if (e == nullptr || e->length != 2) return false;
+    *out = static_cast<std::uint16_t>((static_cast<std::uint16_t>(e->value[0]) << 8) |
+                                      e->value[1]);
+    return true;
+}
+
 }  // namespace rtp
 }  // namespace webrtc
 }  // namespace bolt::api

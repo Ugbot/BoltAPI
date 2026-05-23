@@ -22,7 +22,7 @@
 #pragma once
 
 #include "boltapi/webrtc/rtp.h"
-#include "boltapi/webrtc/sdp.h"   // for webrtc::MediaKind (kAudio/kVideo)
+#include "boltapi/webrtc/sdp.h"   // for webrtc::MediaKind (kAudio/kVideo) + kMaxRids
 
 #include <cassert>
 #include <cstddef>
@@ -37,6 +37,7 @@ namespace webrtc {
 // ----------------------------------------------------------------------------
 inline constexpr std::size_t kMaxTracks      = 16;  // per-peer media tracks
 inline constexpr std::size_t kMaxCodecName   = 24;  // "VP8"/"opus"/"H264"/...
+inline constexpr std::size_t kMaxEncodings   = kMaxRids;  // simulcast layers/track
 
 // MediaKind (kAudio/kVideo) is defined in sdp.h (WM4); MediaTrack reuses it so a
 // negotiated SdpMedia kind maps straight onto a track with no conversion.
@@ -208,6 +209,120 @@ public:
 private:
     MediaTrack  tracks_[kMaxTracks]{};
     std::size_t count_ = 0;
+};
+
+// ----------------------------------------------------------------------------
+// SimulcastTrack (WA) — one logical video track carrying multiple simulcast
+// ENCODINGS (RFC 8851/8852), each identified by a RID string and demuxed from
+// the RID header extension (RFC 8852, urn:...:sdes:rtp-stream-id). The peer
+// sends each layer as its own RTP stream (own SSRC + own seq space); the first
+// packet of a layer binds RID -> SSRC. Per-encoding packet/byte counters let the
+// App pick a layer to relay (a real SFU forwards exactly one encoding). Bounded:
+// kMaxEncodings, fixed RID/codec buffers, no heap on the demux path.
+// ----------------------------------------------------------------------------
+class SimulcastTrack {
+public:
+    struct Encoding {
+        char          rid[kMaxRidLen + 1]{};   // restriction id (NUL-terminated)
+        std::uint32_t ssrc = 0;                // learned from the first packet
+        bool          ssrc_bound = false;
+        std::uint64_t packets = 0;
+        std::uint64_t bytes = 0;
+        bool          used = false;
+    };
+
+    SimulcastTrack() noexcept = default;
+    SimulcastTrack(const SimulcastTrack&) = delete;
+    SimulcastTrack& operator=(const SimulcastTrack&) = delete;
+
+    // Declare identity + the RID header-extension id (from the SDP). `rid_ext_id`
+    // is the a=extmap id of the RID extension (1..14). Pre-registering rids from
+    // the SDP is optional — they are also learned lazily on the first packet.
+    void init(MediaKind kind, std::uint8_t rid_ext_id) noexcept {
+        assert(rid_ext_id >= 1 && rid_ext_id <= 14 && "simulcast init: ext id");
+        assert(static_cast<int>(kind) <= 1 && "simulcast init: kind");
+        kind_ = kind;
+        rid_ext_id_ = rid_ext_id;
+        used_ = true;
+    }
+
+    // Pre-register a RID from the SDP (so layer order is deterministic). Returns
+    // the encoding slot, or nullptr if full / not initialised.
+    Encoding* add_rid(const char* rid) noexcept {
+        assert(rid != nullptr && "add_rid: null");
+        assert(used_ && "add_rid before init");
+        return encoding_for_rid(rid);
+    }
+
+    // Demux one inbound RTP packet into its per-encoding stream by RID. Binds
+    // RID -> SSRC on first sight; updates that encoding's counters. Returns the
+    // Encoding it was routed to, or nullptr if the packet carried no RID ext and
+    // no SSRC match (caller may then treat it as a plain track). No allocation.
+    Encoding* demux(const rtp::Packet& pkt, std::size_t len) noexcept {
+        assert(used_ && "simulcast demux before init");
+        assert(len >= rtp::kFixedHeaderSize && "simulcast demux: short");
+        char rid[kMaxRidLen + 1];
+        const std::size_t n = rtp::rid_value(pkt.header, rid_ext_id_, rid,
+                                             sizeof(rid));
+        Encoding* e = nullptr;
+        if (n > 0) e = encoding_for_rid(rid);
+        else       e = encoding_for_ssrc(pkt.header.ssrc);
+        if (e == nullptr) return nullptr;
+        if (!e->ssrc_bound) { e->ssrc = pkt.header.ssrc; e->ssrc_bound = true; }
+        ++e->packets;
+        e->bytes += len;
+        return e;
+    }
+
+    bool          in_use() const noexcept { return used_; }
+    MediaKind     kind() const noexcept { return kind_; }
+    std::uint8_t  rid_ext_id() const noexcept { return rid_ext_id_; }
+    std::size_t   encoding_count() const noexcept { return count_; }
+    const Encoding* encoding_at(std::size_t i) const noexcept {
+        assert(i < count_ && "encoding_at: oob");
+        assert(encodings_[i].used && "encoding_at: unused");
+        return &encodings_[i];
+    }
+    Encoding* encoding_by_rid(const char* rid) noexcept {
+        assert(rid != nullptr && "encoding_by_rid: null");
+        assert(used_ && "encoding_by_rid: init");
+        for (std::size_t i = 0; i < count_; ++i)
+            if (encodings_[i].used && std::strcmp(encodings_[i].rid, rid) == 0)
+                return &encodings_[i];
+        return nullptr;
+    }
+
+private:
+    Encoding* encoding_for_rid(const char* rid) noexcept {
+        assert(rid != nullptr && "encoding_for_rid: null");
+        assert(count_ <= kMaxEncodings && "encoding_for_rid: bound");
+        for (std::size_t i = 0; i < count_; ++i)
+            if (encodings_[i].used && std::strcmp(encodings_[i].rid, rid) == 0)
+                return &encodings_[i];
+        if (count_ >= kMaxEncodings) return nullptr;
+        Encoding& e = encodings_[count_++];
+        e.used = true;
+        std::size_t k = 0;
+        while (rid[k] != '\0' && k < kMaxRidLen) { e.rid[k] = rid[k]; ++k; }
+        e.rid[k] = '\0';
+        return &e;
+    }
+
+    Encoding* encoding_for_ssrc(std::uint32_t ssrc) noexcept {
+        assert(count_ <= kMaxEncodings && "encoding_for_ssrc: bound");
+        assert(used_ && "encoding_for_ssrc: init");
+        for (std::size_t i = 0; i < count_; ++i)
+            if (encodings_[i].used && encodings_[i].ssrc_bound &&
+                encodings_[i].ssrc == ssrc)
+                return &encodings_[i];
+        return nullptr;
+    }
+
+    MediaKind    kind_ = MediaKind::kVideo;
+    std::uint8_t rid_ext_id_ = 0;
+    bool         used_ = false;
+    Encoding     encodings_[kMaxEncodings]{};
+    std::size_t  count_ = 0;
 };
 
 }  // namespace webrtc
