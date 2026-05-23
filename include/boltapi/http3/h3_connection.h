@@ -355,8 +355,28 @@ private:
             if (!scheme.empty())    refs[rc++] = {":scheme", scheme};
             if (!authority.empty()) refs[rc++] = {":authority", authority};
         }
-        for (std::size_t i = 0; i < extra_n; ++i) refs[rc++] = {extra[i].name,
-                                                                extra[i].value};
+        // RFC 9114 §4.1.1 / §4.2: field names in HTTP/3 MUST be lowercase, or the
+        // peer treats it as malformed (aioquic/Chrome close with H3_MESSAGE_ERROR).
+        // Pseudo-headers above are already lowercase; lowercase the regular names
+        // into a bounded scratch (string_views must stay alive through the encode).
+        constexpr std::size_t kH3HeaderNameScratch = 2048;
+        char namelc[kH3HeaderNameScratch];
+        std::size_t lc_off = 0;
+        for (std::size_t i = 0; i < extra_n; ++i) {
+            const std::string_view nm = extra[i].name;
+            assert(nm.size() <= kQpackMaxStringLen && "header name too long");
+            assert(lc_off + nm.size() <= sizeof(namelc) && "name scratch overflow");
+            if (lc_off + nm.size() > sizeof(namelc)) return false;
+            char* const dst = namelc + lc_off;
+            for (std::size_t j = 0; j < nm.size(); ++j) {
+                const char c = nm[j];
+                dst[j] = (c >= 'A' && c <= 'Z')
+                             ? static_cast<char>(c - 'A' + 'a') : c;
+            }
+            refs[rc++] = {std::string_view(dst, nm.size()), extra[i].value};
+            lc_off += nm.size();
+        }
+        assert(rc <= kH3MaxRespHeaders + 4 && "header ref overflow");
         std::size_t blk = 0;
         if (qpack_enc_.encode_field_section(refs, rc, hdr_block_, sizeof(hdr_block_),
                                             blk) != 0) {
