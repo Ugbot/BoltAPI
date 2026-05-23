@@ -192,6 +192,30 @@ void App::build_dispatch() {
             },
             AsyncHandler{}, false});
     }
+
+    // WI — Trickle ICE (RFC 8838): a POST route that accepts ONE incremental
+    // remote candidate (RTCIceCandidateInit JSON, a bare candidate line, or
+    // "end-of-candidates") after the offer/answer. Mirrors the /webrtc/offer
+    // route style. Only wired when full_ice is set (trickle needs the full
+    // agent's checklist) AND a trickle_path is configured.
+    if (config_.enable_webrtc && webrtc_config_.full_ice &&
+        !webrtc_config_.trickle_path.empty()) {
+        App* self = this;
+        routes_.push_back(RouteEntry{
+            Method::Post, webrtc_config_.trickle_path,
+            [self](Request& req, Response& res) {
+                if (!self->handle_webrtc_trickle(req.body())) {
+                    res.status(400)
+                       .content_type("text/plain; charset=utf-8")
+                       .send("invalid trickle candidate");
+                    return;
+                }
+                // 204 No Content — the candidate was accepted (RFC 8838 has no
+                // response body for incremental candidate delivery).
+                res.status(204).send("");
+            },
+            AsyncHandler{}, false});
+    }
 #endif
 
     // Prepend the CORS middleware so it wraps everything (must run before any
@@ -388,6 +412,19 @@ void App::init_protocol_seams() {
         }
         webrtc_agent_->generate_credentials(0);  // fills any missing creds
 
+        // WI — Full ICE (RFC 8445). When configured, stand up a FullIceAgent in
+        // the CONTROLLED role (the browser/offerer is controlling) sharing OUR
+        // ice-lite ufrag/pwd so a single signaled credential pair works for both
+        // the ice-lite responder and the full agent. The STUN handler routes
+        // inbound checks to it; trickle candidates are fed via the trickle route.
+        if (webrtc_config_.full_ice) {
+            webrtc_full_ice_ = std::make_unique<webrtc::FullIceAgent>();
+            webrtc_full_ice_->set_role(webrtc::IceRole::Controlled);
+            webrtc_full_ice_->set_credentials(webrtc_agent_->ufrag(),
+                                              webrtc_agent_->pwd());
+            webrtc_full_ice_->generate_credentials(0);
+        }
+
         webrtc_transport_ = std::make_unique<net::UdpTransport>();
         // Bind the WebRTC UDP socket to ALL interfaces (0.0.0.0), independent of
         // the HTTP listen host. A peer (browser / aiortc) reaches us by sending
@@ -405,11 +442,21 @@ void App::init_protocol_seams() {
             const std::size_t ncand =
                 webrtc_agent_->gather_host_candidates(actual, "0.0.0.0");
 
-            net::UdpTransport* tp = webrtc_transport_.get();
-            webrtc::IceAgent*  ag = webrtc_agent_.get();
+            net::UdpTransport*    tp = webrtc_transport_.get();
+            webrtc::IceAgent*     ag = webrtc_agent_.get();
+            webrtc::FullIceAgent* fa = webrtc_full_ice_.get();  // null if !full_ice
             webrtc_transport_->set_stun_handler(
-                [tp, ag](const sockaddr* peer, int plen,
-                         const std::uint8_t* data, std::size_t len) {
+                [tp, ag, fa](const sockaddr* peer, int plen,
+                             const std::uint8_t* data, std::size_t len) {
+                    // Full ICE first (when configured): it both RESPONDS to peer
+                    // checks AND matches responses to its own checks. If it does
+                    // not own the datagram it falls through to the ice-lite
+                    // responder, preserving the existing live-STUN path.
+                    if (fa != nullptr) {
+                        const auto r = fa->handle_stun(*tp, peer, plen, data, len);
+                        if (r != webrtc::FullIceAgent::HandleResult::Ignored)
+                            return;
+                    }
                     ag->handle_stun(*tp, peer, plen, data, len);
                 });
 
@@ -746,6 +793,23 @@ bool App::handle_webrtc_offer(std::string_view body, std::string& out_answer) {
         webrtc_dtls_mgr_->set_offer_fingerprint(offer_fp);
     }
 
+    // WI — Full ICE: pin the peer credentials on the full agent and register OUR
+    // host candidates as locals so trickle/in-SDP remote candidates form pairs.
+    if (webrtc_full_ice_) {
+        webrtc_full_ice_->set_remote_credentials(peer_ufrag, peer_pwd);
+        register_local_ice_candidates();
+        // Any candidates already present in the offer SDP (non-trickle) form
+        // pairs immediately.
+        if (xport != nullptr) {
+            for (std::size_t i = 0; i < xport->attr_count; ++i) {
+                if (xport->attrs[i].key != "candidate") continue;
+                webrtc::IceCandidate rc;
+                if (webrtc::IceCandidate::from_string(xport->attrs[i].value, rc))
+                    webrtc_full_ice_->add_remote_candidate(rc);
+            }
+        }
+    }
+
     // Our host ICE candidate lines (IceCandidate::to_string form). Stored owned
     // so the string_views handed to the answer builder outlive the call.
     std::vector<std::string>      cand_strings;
@@ -777,6 +841,37 @@ void App::gather_candidate_views(std::vector<std::string>& owned,
         owned.emplace_back(webrtc_agent_->candidate(i).to_string());
     }
     for (const std::string& s : owned) views.emplace_back(s);
+}
+
+// WI — register our gathered host candidates as the FullIceAgent's locals.
+void App::register_local_ice_candidates() noexcept {
+    if (!webrtc_full_ice_ || !webrtc_agent_ || !webrtc_transport_) return;
+    if (webrtc_full_ice_->local_count() > 0) return;  // idempotent
+    sockaddr_in base{};
+    base.sin_family = AF_INET;
+    base.sin_addr.s_addr = htonl(INADDR_ANY);
+    base.sin_port = htons(webrtc_transport_->bound_port());
+    const std::size_t n = webrtc_agent_->candidate_count();
+    for (std::size_t i = 0; i < n; ++i) {
+        webrtc_full_ice_->add_local_candidate(
+            webrtc_agent_->candidate(i),
+            reinterpret_cast<const sockaddr*>(&base), sizeof(base));
+    }
+    assert(webrtc_full_ice_->local_count() <= n);
+}
+
+// WI — Trickle ICE (RFC 8838): ingest one incremental remote candidate.
+bool App::handle_webrtc_trickle(std::string_view body) noexcept {
+    if (!webrtc_full_ice_) return false;  // trickle requires the full agent
+    webrtc::TrickleCandidate tc;
+    if (webrtc::parse_trickle(body, tc) != webrtc::SdpError::Ok) return false;
+    if (tc.end_of_candidates) return true;  // end-of-candidates: nothing to add
+    if (tc.candidate.empty()) return false;
+    webrtc::IceCandidate rc;
+    if (!webrtc::IceCandidate::from_string(tc.candidate, rc)) return false;
+    register_local_ice_candidates();  // ensure locals exist to pair against
+    const std::size_t idx = webrtc_full_ice_->add_remote_candidate(rc);
+    return idx < webrtc::kMaxCandidates;
 }
 
 // WM6: COMBINED media+data echo answer (audio/video sendrecv so the peer's media
@@ -925,6 +1020,7 @@ void App::stop() {
     if (webrtc_transport_) {
         webrtc_transport_.reset();
     }
+    webrtc_full_ice_.reset();   // WI: full ICE agent (borrows the transport)
     webrtc_agent_.reset();
 #endif
     started_ = false;

@@ -116,6 +116,35 @@ if(WIN32)
     target_link_libraries(boltapi_ice_test PRIVATE ws2_32 mswsock iphlpapi)
 endif()
 
+# WI: WebRTC FULL ICE (RFC 8445) — THE FULL-ICE GATE (default suite, no external
+# servers, deadline-bounded). Two of OUR OWN FullIceAgents (controlling +
+# controlled) on two net::UdpTransports over ephemeral loopback UDP ports run
+# connectivity checks in BOTH directions and converge on a NOMINATED valid pair;
+# a redundant candidate is deduped + a dead candidate Fails without deadlocking;
+# trickle delivers a candidate AFTER checks start; the role-conflict path (two
+# controlling agents) resolves via the tie-breaker and still converges; ICE
+# restart clears the checklist + regenerates credentials. Bounded by wall-clock
+# deadlines + iteration caps (no hang). Links ws2_32/mswsock/iphlpapi on Windows.
+boltapi_add_test(boltapi_ice_full_test ice_full_test.cpp)
+if(WIN32)
+    target_link_libraries(boltapi_ice_full_test PRIVATE ws2_32 mswsock iphlpapi)
+endif()
+
+# WI: WebRTC TURN (RFC 5766/8656) — THE TURN GATE (default suite, no external
+# servers, deadline-bounded). Our OWN TurnClient against our OWN minimal
+# in-process TurnServer over loopback UDP (control + relay sockets): Allocate
+# (long-term cred: 401 -> authed retry -> XOR-RELAYED-ADDRESS relay candidate),
+# CreatePermission, ChannelBind, then a datagram relayed THROUGH the server to a
+# real peer socket and a reply forwarded back as ChannelData (both directions),
+# then Refresh(0) releases the allocation. Plus a unit (MD5 long-term key +
+# ChannelData classifier) and the ChannelData fast path. Links OpenSSL (HMAC/MD5)
+# + ws2_32/mswsock/iphlpapi on Windows.
+boltapi_add_test(boltapi_turn_test turn_test.cpp)
+target_link_libraries(boltapi_turn_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+if(WIN32)
+    target_link_libraries(boltapi_turn_test PRIVATE ws2_32 mswsock iphlpapi)
+endif()
+
 # WebRTC DTLS handshake — THE LIVE DTLS GATE. Stands up our UdpTransport +
 # DtlsContext + DtlsSessionManager (the server / answerer, setup:passive) on an
 # ephemeral loopback UDP port, then runs a REAL OpenSSL DTLS CLIENT (connected

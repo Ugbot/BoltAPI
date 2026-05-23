@@ -159,6 +159,8 @@ add_library(boltapi STATIC
     # no engine deps, zero cost unless started) so the default suite covers it.
     src/net/udp_transport.cpp  # real async UDP transport (own socket + rx thread)
     src/webrtc/ice.cpp         # ICE-lite agent (gather + STUN binding responder)
+    src/webrtc/ice_full.cpp    # WI: FULL ICE agent (RFC 8445: pairs/checks/roles/trickle/restart)
+    src/webrtc/turn.cpp        # WI: TURN client + minimal TURN server (RFC 5766/8656)
     src/webrtc/dtls.cpp        # DTLS server (answerer) over UDP via OpenSSL memory BIOs
     # SCTP / DCEP / data channels — Bolt-native minimal SCTP over DTLS (RFC 4960
     # subset + RFC 8261 framing), DCEP (RFC 8832), and the App-facing channel

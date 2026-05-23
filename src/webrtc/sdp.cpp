@@ -11,6 +11,7 @@
 #include "boltapi/webrtc/sdp.h"
 
 #include <charconv>
+#include <cstring>
 
 namespace bolt::api {
 namespace webrtc {
@@ -692,6 +693,123 @@ SdpError build_echo_answer(const EchoAnswerParams& p, std::string& out) {
                     [&] { std::string s; append_uint(s, p.max_message_size);
                           return s; }());
     }
+    return SdpError::Ok;
+}
+
+// ===========================================================================
+// WI — Trickle ICE (RFC 8838)
+// ===========================================================================
+namespace {
+
+// Skip ASCII whitespace from `i` in `s`.
+void skip_ws(std::string_view s, std::size_t& i) noexcept {
+    while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' ||
+                            s[i] == '\n')) {
+        ++i;
+    }
+}
+
+// Extract a JSON string value for `key` from a flat object `body` (no nesting,
+// no escapes beyond the bounded keys we use). Returns the value view + found.
+// Bounded scan, noexcept, no allocation.
+bool json_string_field(std::string_view body, std::string_view key,
+                       std::string_view& out) noexcept {
+    // Look for "<key>" then ':' then a quoted string.
+    char pat[40];
+    if (key.size() + 2 >= sizeof(pat)) return false;
+    pat[0] = '"';
+    std::memcpy(pat + 1, key.data(), key.size());
+    pat[key.size() + 1] = '"';
+    const std::string_view needle(pat, key.size() + 2);
+    const std::size_t k = body.find(needle);
+    if (k == std::string_view::npos) return false;
+    std::size_t i = k + needle.size();
+    skip_ws(body, i);
+    if (i >= body.size() || body[i] != ':') return false;
+    ++i;
+    skip_ws(body, i);
+    if (i >= body.size() || body[i] != '"') return false;
+    ++i;
+    const std::size_t start = i;
+    while (i < body.size() && body[i] != '"') ++i;
+    if (i >= body.size()) return false;
+    out = body.substr(start, i - start);
+    return true;
+}
+
+// Extract an unsigned integer field (e.g. "sdpMLineIndex": 0). Best-effort.
+bool json_uint_field(std::string_view body, std::string_view key,
+                     std::uint16_t& out) noexcept {
+    char pat[40];
+    if (key.size() + 2 >= sizeof(pat)) return false;
+    pat[0] = '"';
+    std::memcpy(pat + 1, key.data(), key.size());
+    pat[key.size() + 1] = '"';
+    const std::string_view needle(pat, key.size() + 2);
+    const std::size_t k = body.find(needle);
+    if (k == std::string_view::npos) return false;
+    std::size_t i = k + needle.size();
+    skip_ws(body, i);
+    if (i >= body.size() || body[i] != ':') return false;
+    ++i;
+    skip_ws(body, i);
+    const std::size_t start = i;
+    while (i < body.size() && body[i] >= '0' && body[i] <= '9') ++i;
+    if (i == start) return false;
+    return parse_uint(body.substr(start, i - start), &out);
+}
+
+}  // namespace
+
+SdpError parse_trickle(std::string_view body, TrickleCandidate& out) noexcept {
+    out = TrickleCandidate{};
+    std::size_t i = 0;
+    skip_ws(body, i);
+    if (i >= body.size()) return SdpError::Empty;
+
+    // JSON envelope?
+    if (body[i] == '{') {
+        std::string_view cand;
+        const bool has_cand = json_string_field(body, "candidate", cand);
+        json_string_field(body, "sdpMid", out.sdp_mid);
+        json_uint_field(body, "sdpMLineIndex", out.sdp_mline_index);
+        if (!has_cand || cand.empty()) {
+            out.end_of_candidates = true;
+            return SdpError::Ok;  // {"candidate":""} == end-of-candidates
+        }
+        out.candidate = cand;
+        return SdpError::Ok;
+    }
+
+    // Bare line: "end-of-candidates" or "candidate:...".
+    std::string_view line = body.substr(i);
+    // strip a trailing CRLF
+    while (!line.empty() && (line.back() == '\r' || line.back() == '\n' ||
+                            line.back() == ' ')) {
+        line.remove_suffix(1);
+    }
+    if (line == "end-of-candidates" || line == "a=end-of-candidates") {
+        out.end_of_candidates = true;
+        return SdpError::Ok;
+    }
+    constexpr std::string_view kA = "a=";
+    if (line.substr(0, kA.size()) == kA) line.remove_prefix(kA.size());
+    constexpr std::string_view kC = "candidate:";
+    if (line.substr(0, kC.size()) != kC) return SdpError::MalformedLine;
+    out.candidate = line;
+    return SdpError::Ok;
+}
+
+SdpError generate_trickle(const TrickleCandidate& c, std::string& out) {
+    out.append("{\"candidate\":\"");
+    if (!c.end_of_candidates) out.append(c.candidate.data(), c.candidate.size());
+    out.append("\",\"sdpMid\":\"");
+    out.append(c.sdp_mid.data(), c.sdp_mid.size());
+    out.append("\",\"sdpMLineIndex\":");
+    char buf[8];
+    auto r = std::to_chars(buf, buf + sizeof(buf), c.sdp_mline_index);
+    out.append(buf, static_cast<std::size_t>(r.ptr - buf));
+    out.push_back('}');
     return SdpError::Ok;
 }
 

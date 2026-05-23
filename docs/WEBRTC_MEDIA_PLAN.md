@@ -88,6 +88,31 @@
 - [ ] Perf: SRTP on the I/O thread (inline), batched recv, zero-copy RTP via
       bolt::wire, per-SSRC SwissTable; no per-packet malloc.
 
+## Phase M7 — Full ICE / TURN / trickle (connectivity beyond ice-lite)
+- [x] **Full ICE agent** (`webrtc::FullIceAgent`, RFC 8445) as an OPTION alongside
+      ice-lite (`WebRtcConfig::full_ice`): controlling/controlled roles, candidate
+      pairs + checklist with pair states, connectivity checks in BOTH directions
+      (Binding req/resp w/ PRIORITY + ICE-CONTROLLING/CONTROLLED + USE-CANDIDATE),
+      role-conflict resolution (tie-breaker), nomination, bounded retransmit, and
+      ICE restart. Bounded `kMaxCandidates`/`kMaxPairs`, no exceptions. PRIMARY
+      GATE `tests/ice_full_test.cpp` (default suite, no external servers,
+      deadline-bounded): two of OUR agents converge on a nominated valid pair
+      both directions; redundant candidate deduped + dead candidate Fails without
+      deadlock; role-conflict resolves; restart clears state.
+- [x] **Trickle ICE** (RFC 8838): `webrtc/sdp` `parse_trickle`/`generate_trickle`
+      (RTCIceCandidateInit JSON / bare candidate line / `end-of-candidates`) +
+      the `App` trickle route `POST /webrtc/candidate` (mirrors `/webrtc/offer`)
+      feeding `FullIceAgent::add_remote_candidate`. The gate delivers a candidate
+      AFTER checks start and still converges.
+- [x] **TURN client + minimal TURN server** (`webrtc/turn`, RFC 5766/8656):
+      client Allocate (long-term cred, REALM/NONCE 401 retry), Refresh,
+      CreatePermission, ChannelBind, Send/Data + ChannelData, relay candidate from
+      XOR-RELAYED-ADDRESS; an in-process server (control + relay sockets) gates it
+      over loopback. GATE `tests/turn_test.cpp` (default suite, deadline-bounded):
+      Allocate → relay candidate → CreatePermission/ChannelBind → datagram relayed
+      THROUGH the server end-to-end (both directions) → Refresh(0) releases.
+- [ ] Live srflx against a public STUN server; mDNS `.local`; IPv6 / dual-stack.
+
 ## Salvage map (media)
 | FasterAPI | Verdict | Reason |
 |---|---|---|

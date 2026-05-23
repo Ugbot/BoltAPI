@@ -316,5 +316,32 @@ struct EchoAnswerParams {
 // not a per-packet hot path).
 SdpError build_echo_answer(const EchoAnswerParams& p, std::string& out);
 
+// ===========================================================================
+// WI — Trickle ICE (RFC 8838) candidate exchange over signaling.
+// ===========================================================================
+
+// A trickled candidate as carried in the signaling JSON envelope browsers use
+// (RTCIceCandidateInit): the SDP "candidate:..." line + the m-line identity. An
+// END-OF-CANDIDATES signal is an empty `candidate` (RFC 8838 §10).
+struct TrickleCandidate {
+    std::string_view candidate;        // "candidate:..." (empty => end-of-cands)
+    std::string_view sdp_mid;          // a=mid this candidate belongs to
+    std::uint16_t    sdp_mline_index = 0;
+    bool             end_of_candidates = false;
+};
+
+// parse_trickle — parse a single trickle candidate from a JSON envelope
+//   {"candidate":"candidate:...","sdpMid":"0","sdpMLineIndex":0}
+// OR a bare "candidate:..." line OR the literal "end-of-candidates". Views point
+// into `body`, which must outlive `out`. Returns SdpError::Ok, or
+// SdpError::MalformedLine on a body that is neither JSON nor a candidate line.
+// noexcept, no allocation, bounded.
+SdpError parse_trickle(std::string_view body, TrickleCandidate& out) noexcept;
+
+// generate_trickle — emit the JSON envelope for `c` (the form a browser's
+// onicecandidate handler POSTs) into `out` (append). An empty/end candidate
+// emits {"candidate":""}. Returns SdpError::Ok.
+SdpError generate_trickle(const TrickleCandidate& c, std::string& out);
+
 }  // namespace webrtc
 }  // namespace bolt::api

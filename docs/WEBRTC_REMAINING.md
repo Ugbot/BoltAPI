@@ -65,10 +65,11 @@ Every WebRTC test/interop MUST be non-hanging:
 - [ ] **broadcast** (1 publisher → N viewers) and **SFU** (per-subscriber RTP forwarding, PLI/NACK via interceptors, no transcode).
 
 ## WI — Full ICE / TURN / trickle  (Pion ICE parity, beyond ice-lite)
-- [ ] **Trickle ICE** (incremental candidate exchange over signaling + end-of-candidates).
-- [ ] **Full ICE agent** (controlling/controlled, connectivity checks both directions, role conflict, restart) as an option alongside ice-lite.
-- [ ] STUN srflx via external STUN server; **TURN client** (relay candidates, allocations, channels); optional **TURN server** (`webrtc/turn`).
-- [ ] mDNS `.local` candidates; IPv6 / dual-stack; candidate prioritization/pairing.
+- [x] **Trickle ICE** (incremental candidate exchange over signaling + end-of-candidates). `webrtc/sdp` `parse_trickle`/`generate_trickle` (RTCIceCandidateInit JSON / bare line / `end-of-candidates`); `App` trickle route `POST /webrtc/candidate` (mirrors `/webrtc/offer`) feeds `FullIceAgent::add_remote_candidate`. Gate `tests/ice_full_test.cpp` delivers a candidate AFTER checks start and still converges.
+- [x] **Full ICE agent** (`webrtc::FullIceAgent`, RFC 8445): controlling/controlled roles, candidate pairs + checklist with pair states (Frozen/Waiting/In-Progress/Succeeded/Failed), connectivity checks in BOTH directions (Binding req/resp w/ PRIORITY + ICE-CONTROLLING/CONTROLLED + USE-CANDIDATE), role-conflict resolution (tie-breaker), nomination, bounded retransmit/retries, and ICE restart — an OPTION alongside ice-lite (`WebRtcConfig::full_ice`; App wires it as the controlled agent sharing creds). Bounded `kMaxCandidates`/`kMaxPairs`. PRIMARY GATE `tests/ice_full_test.cpp` (default suite, no external servers, deadline-bounded): two of OUR agents converge on a nominated valid pair both directions; redundant candidate deduped + dead candidate Fails w/o deadlock; role-conflict (two controlling) resolves; restart clears state.
+- [x] **TURN client** (`webrtc::turn::TurnClient`, RFC 5766/8656): Allocate (long-term cred MD5(user:realm:pass) + REALM/NONCE 401 retry), Refresh, CreatePermission, ChannelBind, Send/Data + ChannelData fast path, relay candidate from XOR-RELAYED-ADDRESS. **Minimal in-process TURN server** (`webrtc::turn::TurnServer`, control + relay sockets) sufficient to gate the client over loopback. Self-contained TURN message codec (the base STUN codec doesn't enumerate TURN methods/attrs). GATE `tests/turn_test.cpp` (default suite, deadline-bounded): Allocate → relay candidate → CreatePermission/ChannelBind → a datagram relayed THROUGH the server to a real peer + a reply forwarded back (both directions) → Refresh(0) releases.
+- [ ] STUN srflx via an external STUN server (the FullIceAgent's srflx/relay priority + pairing is in; live srflx gathering against a public STUN server is a follow-up).
+- [ ] mDNS `.local` candidates; IPv6 / dual-stack (IPv4 only today; IPv6 mapped-address is a documented hook).
 
 ## WA — Media advanced (Pion-level)
 - [ ] **Simulcast** (multiple encodings per track, rid/mid extensions).
