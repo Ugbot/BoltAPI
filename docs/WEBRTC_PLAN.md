@@ -1,0 +1,505 @@
+# Bolt API — WebRTC Implementation Punch-Card
+
+> Ordered, tickable plan to take WebRTC from the M3 **seam stub**
+> (`src/proto/webrtc_stub.cpp` → `NotImplemented`) to a real, correctness-first,
+> then-performance implementation. **Data-channels first**; media (RTP/SRTP)
+> deferred. Correctness gates precede every performance item.
+>
+> **Hard rule (from the seam):** none of this touches the live HTTP/1.1 + HTTP/2
+> + TLS + WebSocket + SSE core (`src/server/coro_unified_server.cpp`, `App`).
+> Everything plugs in via `IProtocol` + `ProtocolRegistry` over `UdpTransport`,
+> and via ordinary `App` routes for signaling. All new code is compiled only
+> under `BOLTAPI_WITH_WEBRTC`.
+>
+> Status legend: `- [ ]` not started · `- [~]` in progress · `- [x]` done.
+> Each item tags: **PORT** (lift a FasterAPI file, cite path) / **ADAPT**
+> (reshape it) / **REBUILD** (write fresh) / **DROP**, plus the **Bolt primitive**.
+
+---
+
+## 0. Honest assessment of the FasterAPI WebRTC inheritance
+
+The audit (`FasterAPI/AUDIT_NOTES.md:99-102`, `FASTERAPI_AUDIT.md:35`) rates the
+FasterAPI WebRTC at **~40% scaffold: interfaces exist, transport + crypto do
+not.** Confirmed by reading the source:
+
+- **`webrtc/sdp_parser.{h,cpp}`** — *the one genuinely reusable piece.* A real
+  line-by-line SDP parser/generator (v/o/s/c/t/m/a), zero-copy `string_view`
+  views, handles flag vs `name:value` attributes and media format lists. Caveat:
+  uses `std::unordered_map`/`std::ostringstream` (allocates) and `std::stoi`
+  (throws — violates `-fno-exceptions`). **ADAPT**, don't rewrite.
+- **`webrtc/ice.{h,cpp}`** — *stub.* `ICECandidate::from_string` returns a
+  hardcoded candidate (`ice.cpp:50-54`); `gather_host_candidates` only adds
+  `127.0.0.1` (`:181-201`); `gather_srflx_candidates` is 4 TODOs, no STUN
+  (`:203-215`); `STUNMessage::parse/generate` handle only the 20-byte header, no
+  attributes (`:63-125`); `start_connectivity_checks` returns 0 doing nothing
+  (`:160-164`); `get_selected_pair` returns `candidates[0]` (`:166-179`).
+  **REBUILD.** The candidate `to_string` (`:13-39`) is correct and small — keep.
+- **`webrtc/data_channel.{h,cpp}`** — *stub above a missing layer.* `send_sctp`
+  just `std::cout`s (`data_channel.cpp:145-154`); `close` doesn't send anything
+  (`:60-76`). No SCTP exists at all. The PPID enum (RFC 8831) and the
+  text/binary dispatch in `receive_data` (`:96-143`) are correct and worth
+  keeping. **ADAPT** the message-layer shell; **REBUILD** everything under it.
+- **`webrtc/signaling.{h,cpp}`** + `fasterapi/webrtc/signaling.py` — a
+  *room/relay SFU-signaling* model (peers, rooms, relay offer/answer/ICE). Real
+  logic but `send_to_peer` only `std::cout`s (`signaling.cpp:148-165`) and it
+  models browser↔browser relay, not browser↔**our server** answerer. Bolt's v1
+  is "WebRTC as transport" (peer = browser, answerer = us). **ADAPT** the
+  message shapes; **REBUILD** the wiring against an `App` route.
+- **`webrtc/message_parser.{h,cpp}`** — simdjson-based signaling JSON
+  parse/generate. `ostringstream` generate + `new`/`delete` parser, and
+  ICE-candidate parse is `"{}"` TODO (`message_parser.cpp:71`). **ADAPT** (swap
+  generation to manual append; reuse Bolt's existing JSON if present).
+- **`webrtc/rtp.{h,cpp}`** — RTP header parse/serialize is real and correct
+  (`rtp.cpp:18-115`). **SRTP encrypt/decrypt/derive_session_keys are all TODO**
+  (`:147-205`) — they *memcpy and zero a fake tag*, i.e. no crypto. Media is out
+  of v1: **DEFER** rtp parse (PORT later), **REBUILD** SRTP later.
+- **`http/webtransport_connection.{h,cpp}`** — WebTransport-over-HTTP/3, a
+  different stack (CONNECT-UDP / HTTP/3 datagrams). Not on the WebRTC critical
+  path. **DROP** for this plan; revisit only if WebTransport is requested (it
+  shares the H3 `UdpTransport`).
+- **`fasterapi/webrtc/sdp.py`** — Python SDP munging. Bolt is C++-first; **DROP**
+  (a thin Python wrapper can come after the C++ path works).
+
+**Net:** salvage SDP parsing (adapt), candidate `to_string`, the PPID enum +
+text/binary dispatch, and the RTP header codec (later). **Everything that makes
+WebRTC actually connect — ICE/STUN, DTLS, SCTP — must be built.** This matches
+the audit's "mostly REBUILD."
+
+### Salvage map
+
+| FasterAPI file | Verdict | One-line reason |
+|---|---|---|
+| `webrtc/sdp_parser.{h,cpp}` | **ADAPT** | Real SDP parse/gen; strip `unordered_map`/`ostringstream`/`stoi`, make `-fno-exceptions`-safe. |
+| `webrtc/ice.cpp` `ICECandidate::to_string` (`:13-39`) | **PORT** | Correct candidate serializer, tiny, no deps. |
+| `webrtc/ice.cpp` `from_string` (`:41-57`) | **REBUILD** | Returns hardcoded candidate; no real parse. |
+| `webrtc/ice.cpp` `gather_host/srflx` (`:181-215`) | **REBUILD** | Host = only `127.0.0.1`; srflx = 4 TODOs, no STUN. |
+| `webrtc/ice.cpp` `STUNMessage::parse/generate` (`:63-125`) | **REBUILD** | Header-only; no attributes, no MAPPED-ADDRESS, no MESSAGE-INTEGRITY/FINGERPRINT. |
+| `webrtc/ice.cpp` connectivity/`get_selected_pair` (`:160-179`) | **REBUILD** | No checks; returns `candidates[0]`. |
+| `webrtc/data_channel.h` PPID enum + `receive_data` dispatch (`:65-73`, `cpp:96-143`) | **ADAPT** | Correct RFC 8831 PPIDs + text/binary split; reuse over real SCTP. |
+| `webrtc/data_channel.cpp` `send_sctp`/`close` (`:60-76`, `:145-154`) | **REBUILD** | `std::cout` placeholder; no SCTP/DTLS underneath. |
+| `webrtc/signaling.{h,cpp}` | **ADAPT** | Message shapes useful; rewire from browser-relay to App-route answerer; `send_to_peer` is `cout`. |
+| `webrtc/message_parser.{h,cpp}` | **ADAPT** | simdjson parse OK; manual JSON gen; candidate parse is `"{}"` TODO. |
+| `webrtc/rtp.cpp` header parse/serialize (`:18-115`) | **PORT (later)** | Correct RTP codec; media is a later phase. |
+| `webrtc/rtp.cpp` SRTP (`:147-205`) | **REBUILD (later)** | encrypt/decrypt/derive all TODO; fake auth tag. |
+| `http/webtransport_connection.*` | **DROP** | Different stack (WebTransport/H3); not WebRTC critical path. |
+| `fasterapi/webrtc/sdp.py`, `signaling.py` | **DROP / later** | Python wrappers; do C++ path first. |
+
+---
+
+## 1. Scope decision (v1 vs later)
+
+- [ ] **Lock v1 scope = data channels only ("WebRTC as transport").** The
+      browser is the *offerer*; Bolt is the *answerer*. One `RTCPeerConnection`
+      with `createDataChannel(...)`, terminated by Bolt, surfaced to `App` as
+      `IDataChannel`. **REBUILD** (decision/doc). No Bolt primitive.
+- [ ] **v1 in-scope:** signaling over an `App` route; SDP offer/answer; ICE host
+      + server-reflexive (STUN) candidates with full connectivity checks; DTLS
+      1.2 (then 1.3) handshake (server role); SCTP association + DCEP +
+      ordered/reliable channels; `IDataChannel` send/receive to `App`.
+- [ ] **v1 explicitly OUT (later phases):** media (RTP/RTCP/SRTP/jitter/codecs);
+      TURN relay candidates; trickle-ICE renegotiation; multi-m-line / BUNDLE of
+      media; SFU/room relay; Python binding. Document each as a later phase below.
+- [ ] **Define the public `App` surface** (sketch, to refine): `App::Config`
+      already has `enable_webrtc` (`include/boltapi/app.h:72`). Add
+      `App::enable_webrtc(WebRtcConfig)` returning `*this`, and an
+      `on_data_channel(label, handler)` registration mirroring `websocket(...)`
+      (`app.h:117`). **REBUILD.** No core edits — additive like the WS/SSE regs.
+
+---
+
+## 2. Shared UDP transport (prerequisite — co-owned with HTTP/3)
+
+> WebRTC and HTTP/3 share **one** `UdpTransport`. The real socket loop is
+> specified in `docs/HTTP3_PLAN.md`; this section lists only what WebRTC needs
+> from it and the demux WebRTC adds. Do not duplicate the socket code.
+
+- [ ] **Depend on the real `UdpTransport`** (replaces the stub at
+      `src/proto/udp_transport.cpp:34-37`). Needs: UDP bind, batched recv into a
+      preallocated pool, batched send, 4-tuple of each datagram. **REBUILD** (in
+      H3 plan). Bolt primitive: `bolt_batch_pool.h` for recv buffers,
+      `bolt_arena_ring.h` for the receive ring.
+- [ ] **First-byte packet demultiplexer on the UDP socket** (RFC 7983). One UDP
+      port multiplexes STUN, DTLS, and (post-DTLS) SRTP/SCTP. Classify by first
+      byte: `0..3` → STUN, `20..63` → DTLS, `128..191` → RTP/RTCP (media, later).
+      Route to the per-peer state machine keyed by source 4-tuple. **REBUILD.**
+      Bolt primitive: `join/bolt_swiss.h` (`bolt::SwissTable`) mapping
+      4-tuple → `PeerConnection*`.
+- [ ] **I/O→worker handoff for WebRTC packets.** Inbound classified datagrams
+      cross from the I/O thread to the peer's worker via a lock-free SPSC. One
+      SPSC per peer connection. **REBUILD.** Bolt primitive: `bolt_channel.h`
+      SPSC (fall back to `bolt_disruptor.h` if multi-producer needed).
+- [ ] **Per-packet arena.** Each inbound datagram processed in a thread-local
+      `bolt::Arena` reset per packet — STUN parse, DTLS record, SCTP chunk parse
+      all allocate from it, zero `malloc` in the hot path. **REBUILD.** Bolt
+      primitive: `bolt_arena.h`.
+
+---
+
+## 3. Signaling (offer/answer over App routes)
+
+> Reuses the existing routing + WS engine. No new core. Two transports offered:
+> HTTP POST (simplest) and WebSocket (for trickle ICE).
+
+- [ ] **`ISignaling` concrete impl** wired to a real `App` endpoint. Implement
+      `protocol.h`'s `ISignaling::on_offer` / `on_ice_candidate`
+      (`include/boltapi/protocol.h:216-230`) backed by the peer-connection
+      factory. **REBUILD** (the sketch is declaration-only).
+- [ ] **HTTP signaling route:** `App.post("/webrtc/offer", ...)` accepts the
+      browser's SDP offer (JSON `{type:"offer", sdp:"..."}`), drives ICE gather +
+      SDP answer generation, returns the answer JSON. Reuses `Router`/`Request`/
+      `Response` unchanged. **REBUILD** wiring; **ADAPT** JSON shapes from
+      `webrtc/message_parser.cpp:91-132`.
+- [ ] **WebSocket signaling route** (for trickle ICE / renegotiation):
+      `App.websocket("/webrtc/signal", ...)` (mirrors `app.h:117`). Messages:
+      `offer`/`answer`/`ice-candidate` — shapes **ADAPT** from
+      `fasterapi/webrtc/signaling.py:225-240` and `webrtc/signaling.cpp:68-117`.
+      Drop the room/SFU relay logic (out of v1 scope §1). **ADAPT/REBUILD.**
+- [ ] **SDP parser/generator (ADAPT `webrtc/sdp_parser.{h,cpp}`).** Lift the
+      line parser; replace `std::unordered_map` attribute store with a small
+      fixed-capacity vector of `{key,val}` `string_view`s, replace
+      `std::ostringstream generate` with manual buffer append into a
+      `bolt::Arena`, and replace `std::stoi` (`sdp_parser.cpp:124`) with a
+      noexcept `from_chars`. **ADAPT.** Bolt primitive: `bolt_arena.h` +
+      `bolt::wire` byte append.
+- [ ] **SDP answer builder for the data-channel m-line.** Emit
+      `m=application <port> UDP/DTLS/SCTP webrtc-datachannel`, plus
+      `a=setup:passive`, `a=fingerprint:sha-256 <cert fp>`, `a=ice-ufrag`,
+      `a=ice-pwd`, `a=sctp-port:5000`, `a=mid:0`, and our host/srflx
+      `a=candidate:` lines. **REBUILD** (FasterAPI never produced a real answer).
+      Bolt primitive: `bolt_arena.h`.
+- [ ] **Parse the offer's required fields:** remote `ice-ufrag`/`ice-pwd`, remote
+      DTLS `fingerprint` + `setup` role, `mid`, `sctp-port`, and the offerer's
+      `candidate:` lines (trickle or in-SDP). **REBUILD** the field extraction on
+      top of the adapted parser.
+- [ ] **Correctness gate:** unit test parses real Chrome + Firefox offers (fixed
+      fixtures) and round-trips an answer that those browsers accept (validated
+      in the interop test §10). No Bolt primitive.
+
+---
+
+## 4. STUN client + message codec
+
+> RFC 5389/8489. Needed for connectivity checks (mandatory) and srflx gathering.
+
+- [ ] **Full STUN message codec (REBUILD `STUNMessage`, `ice.cpp:63-125`).**
+      Parse/generate header **and attributes**: `MAPPED-ADDRESS`,
+      `XOR-MAPPED-ADDRESS`, `USERNAME`, `MESSAGE-INTEGRITY` (HMAC-SHA1),
+      `FINGERPRINT` (CRC-32), `PRIORITY`, `USE-CANDIDATE`, `ICE-CONTROLLING/
+      CONTROLLED`, `ERROR-CODE`. Keep the existing magic-cookie check
+      (`ice.cpp:79`). **REBUILD.** Bolt primitive: `bolt::wire` for fixed-layout
+      attribute TLV framing; `bolt_arena.h` for the message buffer.
+- [ ] **Transaction-ID generation + matching table.** 96-bit random TID per
+      request, matched on response. **REBUILD.** Bolt primitive:
+      `join/bolt_swiss.h` keyed by TID.
+- [ ] **MESSAGE-INTEGRITY (HMAC-SHA1) + FINGERPRINT (CRC-32).** Compute/verify
+      over the message with the ICE password as key. **REBUILD.** Crypto: prefer
+      a Bolt/own SHA1+HMAC; OpenSSL `HMAC` acceptable as the same justified
+      stopgap as DTLS (§6). CRC-32 — Bolt likely has one (`bolt_hash.h`); else own.
+- [ ] **STUN binding request → server-reflexive candidate.** Send binding
+      request to configured STUN server(s), parse `XOR-MAPPED-ADDRESS`, emit an
+      `srflx` candidate (fills the `gather_srflx_candidates` TODOs at
+      `ice.cpp:203-215`). **REBUILD.** Bolt primitive: SPSC for the async
+      response; `bolt_arena.h`.
+- [ ] **Correctness gate:** unit tests vs canned STUN vectors (RFC 5769 test
+      vectors) for parse/generate + MESSAGE-INTEGRITY + FINGERPRINT; live binding
+      request against a public STUN server (e.g. Google) returns our public IP.
+
+---
+
+## 5. ICE agent (RFC 8445)
+
+> Bolt is always the **controlled** answerer in v1, which simplifies nomination.
+
+- [ ] **Candidate model (ADAPT `ICECandidate`, `ice.h:58-87`).** Keep the struct
+      and `to_string` (`ice.cpp:13-39`). **REBUILD `from_string`** (currently
+      hardcoded, `ice.cpp:50-54`) into a real tokenizing parser
+      (foundation/component/proto/priority/addr/port/typ/raddr/rport).
+      **ADAPT + REBUILD.** Bolt primitive: `bolt_arena.h` for owned strings, or
+      keep `string_view` into the SDP arena.
+- [ ] **Host candidate gathering (REBUILD `gather_host_candidates`,
+      `ice.cpp:181-201`).** Enumerate real interfaces:
+      `GetAdaptersAddresses` on Windows, `getifaddrs` on POSIX (the file's own
+      TODO at `:197-198`). Filter loopback/link-local per policy; assign
+      foundation + RFC 8445 priority. **REBUILD.** Bolt primitive: fixed-capacity
+      candidate array in a `bolt::Arena` (TigerStyle bound on candidate count).
+- [ ] **Server-reflexive gathering** — consume §4's STUN srflx output into the
+      candidate list. **REBUILD.**
+- [ ] **Candidate pairing + priority ordering** (RFC 8445 §6.1.2): form
+      local×remote pairs, compute pair priority, sort, prune redundant.
+      **REBUILD** (FasterAPI had none). Bolt primitive: fixed array +
+      `bolt_branchless.h`-friendly priority compute.
+- [ ] **Connectivity checks (REBUILD `start_connectivity_checks`,
+      `ice.cpp:160-164`).** Triggered + ordinary checks: STUN binding requests
+      with `PRIORITY` + `ICE-CONTROLLED`, role-conflict handling, retransmit with
+      RTO backoff, mark pairs succeeded/failed, learn peer-reflexive candidates.
+      **REBUILD.** Bolt primitive: SPSC for check responses; `bolt_arena.h`;
+      a timer wheel for RTO (own or `bolt_scheduler.h` if it fits).
+- [ ] **Nomination + selected pair (REBUILD `get_selected_pair`,
+      `ice.cpp:166-179`).** As controlled agent, accept the controller's
+      `USE-CANDIDATE`; promote the nominated valid pair to *selected*; expose the
+      4-tuple to the UDP demux (§2) and DTLS (§6). **REBUILD.** Bolt primitive:
+      `join/bolt_swiss.h` 4-tuple → peer.
+- [ ] **ICE-lite option** (document; possibly v1): as a server-side answerer we
+      MAY advertise `a=ice-lite` to skip our own checks. Decide; if taken it
+      shrinks the connectivity-check work above to *responder-only*. **REBUILD**
+      (decision + responder path). No Bolt primitive.
+- [ ] **Correctness gate:** unit test pairing/priority math vs RFC 8445 examples;
+      integration test completes ICE with a browser (host + srflx) end to end.
+
+---
+
+## 6. DTLS (over the ICE-selected path)
+
+> **Bolt-vs-third-party tension:** the project prefers Bolt-native / no
+> third-party libs. **DTLS crypto is the justified stopgap to use OpenSSL.**
+> Reimplementing the X.509/ECDHE/AEAD record stack is out of scope and a
+> security footgun. We treat OpenSSL as a vendored crypto provider behind a thin
+> Bolt-style wrapper; the *transport, demux, framing* around it stay Bolt-native.
+
+- [ ] **Self-signed cert + key generation at startup** (ECDSA P-256). Compute the
+      **SHA-256 fingerprint** for the SDP `a=fingerprint` line (§3). **REBUILD**
+      (wrapper over OpenSSL `EVP`/`X509`). Bolt primitive: none (one-time setup).
+- [ ] **DTLS server endpoint over UDP-via-ICE.** Drive OpenSSL DTLS with a
+      **memory BIO** so we feed it datagrams from the UDP demux (§2) and pull out
+      records to send — never letting OpenSSL own the socket (it must go through
+      the ICE-selected 4-tuple). DTLS **1.2 first**, then enable **1.3**.
+      **REBUILD.** Bolt primitive: `bolt_arena.h` for the per-record scratch;
+      SPSC for the handshake datagram flow.
+- [ ] **Server/client role from SDP `a=setup`.** Browser offers `actpass`; Bolt
+      answers `setup:passive` → Bolt is DTLS **server**. Honor an offer that
+      forces us active if it ever occurs. **REBUILD.**
+- [ ] **Fingerprint verification.** After handshake, verify the peer cert's
+      SHA-256 matches the `a=fingerprint` from the offer (§3). Reject on
+      mismatch. **REBUILD** (this is the actual security check). Bolt primitive:
+      none.
+- [ ] **Export keying material** (`SCTP` needs none; **DTLS-SRTP export is media
+      only**, deferred to §8). For v1 just confirm the handshake completes and
+      the secure record layer is up. **REBUILD.**
+- [ ] **Correctness gate:** standalone test does a full DTLS 1.2 then 1.3
+      handshake against OpenSSL's `openssl s_client -dtls` and against a browser;
+      assert fingerprint match enforced (negative test: wrong fp → rejected).
+
+---
+
+## 7. SCTP over DTLS — the hard part (FasterAPI had none)
+
+> **Bolt-vs-third-party tension (sharpest here).** Browsers speak SCTP-over-DTLS
+> (RFC 8261) for data channels. Two paths:
+>
+> - **Option A — `usrsctp`** (the de-facto third-party userland SCTP). Fast to
+>   correctness, but it's a large C dependency with its own allocator/threading,
+>   directly contradicting the "Bolt-native, no third-party, preallocated"
+>   ethos. If chosen, sandbox it behind a Bolt wrapper and a compile flag.
+> - **Option B — focused Bolt-native minimal SCTP.** Implement *only* the subset
+>   WebRTC data channels need: single stream-multiplexed association, DATA/SACK/
+>   INIT/INIT-ACK/COOKIE/HEARTBEAT/FORWARD-TSN, ordered + unordered, reliable +
+>   partial-reliability (RFC 3758), DCEP. This is real work but bounded, fully
+>   pool-allocated, and aligns with the project's "use our own stack" mandate.
+>
+> **Recommendation: build Option B** (matches `CLAUDE.md`: "use our server here
+> to back the python not whatever libraries you can find"). Keep Option A behind
+> `BOLTAPI_WEBRTC_USRSCTP` as a bring-up/interop oracle only. Items below assume B.
+
+- [ ] **SCTP common header + chunk framing** (RFC 4960 §3) over the DTLS record
+      layer (RFC 8261: each SCTP packet is one DTLS application record).
+      Parse/serialize common header (ports, verification tag, CRC-32c) + TLV
+      chunks. **REBUILD.** Bolt primitive: `bolt::wire` for chunk TLV framing;
+      `bolt_arena.h` per-packet; CRC-32c from `bolt_hash.h` or own.
+- [ ] **Association setup: 4-way handshake.** INIT → INIT-ACK (with state
+      cookie) → COOKIE-ECHO → COOKIE-ACK. As the answerer Bolt is typically the
+      *responder*. **REBUILD.** Bolt primitive: `bolt_arena.h`; SwissTable for
+      association lookup by verification tag.
+- [ ] **DATA chunk + TSN/stream sequencing.** TSN assignment, SSN per stream,
+      `U` (unordered) bit, fragmentation/reassembly across DATA chunks.
+      **REBUILD.** Bolt primitive: `bolt_arena_ring.h` for the reassembly ring;
+      preallocated reorder buffer per stream (no malloc).
+- [ ] **SACK + retransmission + congestion/flow control.** Cumulative + gap-ack
+      SACK, RTO timers, fast retransmit, cwnd/rwnd (RFC 4960 §6-7). **REBUILD.**
+      Bolt primitive: timer wheel (own / `bolt_scheduler.h`); ring buffers for
+      the send/retransmit queue.
+- [ ] **Partial reliability (RFC 3758) + FORWARD-TSN** for
+      `maxRetransmits`/`maxPacketLifetime` (unreliable data channels). Maps to
+      `DataChannelOptions.max_retransmits / max_packet_lifetime_ms`
+      (**ADAPT** the struct from `webrtc/data_channel.h:43-50`). **REBUILD.**
+- [ ] **DCEP — Data Channel Establishment Protocol (RFC 8832).** Parse
+      `DATA_CHANNEL_OPEN` (PPID 50) from the browser's `createDataChannel`, reply
+      `DATA_CHANNEL_ACK`, extract label + protocol + reliability + ordering +
+      stream id. **REBUILD.** Reuse the PPID enum (**ADAPT**
+      `webrtc/data_channel.h:65-73`). Bolt primitive: `bolt::wire` for the DCEP
+      fixed layout.
+- [ ] **Wire SCTP send/recv to the DTLS record layer (§6) and the UDP demux
+      (§2).** Inbound: UDP → DTLS decrypt → SCTP packet → chunks. Outbound:
+      chunks → SCTP packet → DTLS encrypt → UDP send (batched). **REBUILD.**
+      Bolt primitive: SPSC `bolt_channel.h` between layers; `bolt_batch_pool.h`
+      send buffers.
+- [ ] **Correctness gate:** loopback test (two Bolt SCTP endpoints) does INIT→
+      data→SACK→close; then DCEP open/ack/echo against `aiortc` (Python) and a
+      browser. Reliability + ordering verified with reordered/dropped injected
+      packets (`CLAUDE.md`: tests use randomized input, multiple paths).
+
+---
+
+## 8. Data channel surface to App (`IDataChannel`)
+
+- [ ] **Concrete `IDataChannel`** implementing `protocol.h:233-247`
+      (`label()`/`send()`/`close()`), backed by an SCTP stream + DCEP state.
+      **ADAPT** the message shell from `webrtc/data_channel.{h,cpp}` (keep
+      text/binary PPID dispatch `data_channel.cpp:96-143`); **REBUILD** `send`
+      (was `std::cout`, `:145-154`) to emit a real SCTP DATA chunk, and `close`
+      (`:60-76`) to send SCTP stream reset / DCEP close. Bolt primitive:
+      `bolt::wire` framing; SPSC to the worker.
+- [ ] **App-facing registration + callbacks.** `App.on_data_channel(label, cb)`
+      and per-channel `on_message` / `on_open` / `on_close`, mirroring the WS
+      handler registration (`app.h:117-122`). Deliver inbound messages to the
+      `App` worker via SPSC (no handler runs on the I/O thread). **REBUILD.**
+      Bolt primitive: `bolt_channel.h`.
+- [ ] **Backpressure.** Surface SCTP send-window state as a `bufferedAmount`-like
+      signal so `App` handlers can throttle; bound the per-channel send ring.
+      **REBUILD.** Bolt primitive: `bolt_arena_ring.h` bounded send ring.
+- [ ] **Correctness gate:** e2e — browser `RTCDataChannel` ↔ `App`
+      `on_data_channel` echo: text + binary + empty messages + a large message
+      forcing SCTP fragmentation; ordered and unordered channels.
+
+---
+
+## 9. WebRtcProtocol integration into the seam
+
+- [ ] **Replace the `WebRtcProtocol` stub** (`src/proto/webrtc_stub.cpp:36-51`):
+      implement `serve(ITransport&)` to (1) confirm `kind()==Datagram`, (2) start
+      the UDP demux (§2), (3) accept peers driven by signaling (§3). Keep
+      `transport_kind()==Datagram`. **REBUILD.** Bolt primitive: as composed
+      above.
+- [ ] **Keep `register_webrtc(ProtocolRegistry&)`** (`webrtc_stub.cpp:55-61`) —
+      now registering the real factory. No registry change
+      (`protocol.h:141-196`). **ADAPT** (factory body only).
+- [ ] **`App::enable_webrtc` real path.** `init_protocol_seams()` (`app.h:195`)
+      currently logs "not yet implemented" for the stub; switch the ON+compiled
+      path to: build cert (§6), register signaling routes (§3), create
+      `UdpTransport`, `create(ProtocolId::WebRtc)->serve(...)` on the worker pool.
+      Still **never touches H1/H2** and is a no-op when the flag/compile-option is
+      off (per `docs/SEAMS.md` App-hook table). **REBUILD** (additive).
+- [ ] **Lifecycle/teardown.** `WebRtcProtocol::stop()` (was no-op,
+      `webrtc_stub.cpp:50`) closes all peers/channels, drains SPSCs, frees arenas,
+      releases the UDP socket share. Idempotent, `noexcept`. **REBUILD.**
+- [ ] **Correctness gate:** `App` with `enable_webrtc=true` serves H1/H2 *and* a
+      data-channel echo simultaneously; flag OFF build is byte-for-byte unchanged
+      (existing `tests/protocol_seam_test.cpp` still green).
+
+---
+
+## 10. Testing (correctness gates before any perf work)
+
+> Per `CLAUDE.md`: tests are more than hello-world — multiple channels, multiple
+> message types, randomized payloads. **Don't mock — build the real path.**
+
+- [ ] **STUN unit tests** — RFC 5769 vectors: parse/generate, XOR-MAPPED-ADDRESS,
+      MESSAGE-INTEGRITY, FINGERPRINT. **REBUILD.**
+- [ ] **ICE unit tests** — candidate `from_string`/`to_string` round-trip,
+      pairing + priority math vs RFC 8445 examples, role-conflict, nomination.
+- [ ] **DTLS handshake test** — vs `openssl s_client -dtls` and a browser; DTLS
+      1.2 and 1.3; negative fingerprint-mismatch rejection.
+- [ ] **SCTP/DCEP roundtrip** — Bolt↔Bolt loopback (INIT/SACK/retransmit under
+      injected loss + reorder) and DCEP open/ack/echo vs `aiortc`.
+- [ ] **Browser interop** — automated Chrome + Firefox `RTCPeerConnection` +
+      `createDataChannel` against a live `App` (headless via Playwright/Puppeteer):
+      full offer → answer → ICE → DTLS → SCTP → echo. Both browsers, multiple
+      channels, multiple verbs of signaling route (HTTP POST and WS).
+- [ ] **libwebrtc / aiortc interop** — a non-browser native peer (`aiortc`
+      easiest) as a second oracle independent of browser quirks.
+- [ ] **e2e through `App`** — data-channel echo handler registered via
+      `on_data_channel`; randomized text/binary/empty/large payloads; assert
+      ordered vs unordered semantics.
+- [ ] **Concurrency/soak** — N simultaneous peer connections, each multiple
+      channels, sustained for minutes; assert zero leaks (arena/pool accounting)
+      and stable memory. **REBUILD.**
+- [ ] **Negative/fuzz** — malformed STUN/SDP/SCTP/DTLS records must be rejected
+      without crash (feed random bytes into each parser via the per-packet arena).
+
+---
+
+## 11. Performance (only after §10 gates pass)
+
+> Targets are starting points; measure, don't assume (the audit flagged
+> FasterAPI's numbers as arithmetic, not measured — we won't repeat that).
+
+- [ ] **Batched UDP I/O** — `recvmmsg`/`sendmmsg` (IOCP overlapped batches on
+      Windows) for STUN/DTLS/SCTP datagrams. Shared with H3 (`docs/HTTP3_PLAN.md`).
+      Bolt primitive: `bolt_batch_pool.h`.
+- [ ] **Per-packet arena, zero hot-path malloc** — every inbound packet parsed in
+      a reset-per-packet `bolt::Arena`; assert no `new`/`malloc` on the data path
+      (the `CLAUDE.md` mandate). Bolt primitive: `bolt_arena.h`.
+- [ ] **Zero-copy framing** — STUN attributes, SCTP chunks, DCEP, RTP later, all
+      framed/parsed via `bolt::wire` over the receive buffer with no intermediate
+      copies. Bolt primitive: `bolt/wire/bolt_wire.h`, `bolt_wire_stream.h`.
+- [ ] **Lock-free packet→worker** — one SPSC per peer; no locks on the data path;
+      handler runs only on the worker. Bolt primitive: `bolt_channel.h`
+      (SPSC) / `bolt_disruptor.h` (if MP fan-in to a worker is needed).
+- [ ] **SwissTable maps** — 4-tuple→peer, TID→transaction, vtag→association, and
+      (media, later) SSRC→stream — all `bolt::SwissTable`, not `std::unordered_map`.
+      Bolt primitive: `join/bolt_swiss.h`.
+- [ ] **Preallocated send/reassembly rings** — SCTP send queue, retransmit queue,
+      and per-stream reorder buffer are bounded rings sized at association setup.
+      Bolt primitive: `bolt_arena_ring.h`.
+- [ ] **Branchless / vectorizable hot paths** — STUN/SCTP header field extraction
+      and CRC written to vectorize; use `bolt_branchless.h` helpers; verify with
+      the build's existing bench harness. Bolt primitive: `bolt_branchless.h`.
+- [ ] **Benchmarks + targets** (record in `docs/BENCHMARKS.md`):
+      - data-channel echo RTT p50/p99 vs `aiortc` and vs a browser baseline;
+      - max simultaneous peers / channels at fixed CPU;
+      - sustained data-channel throughput (large ordered transfer);
+      - DTLS handshakes/sec; SCTP packets/sec/core.
+      Gate perf changes on no correctness regression (re-run §10).
+
+---
+
+## 12. Media phase (LATER — explicitly out of v1)
+
+> Only the *transport*; codecs (Opus/VP8/H264/AV1) stay out of scope.
+
+- [ ] **RTP/RTCP parse/serialize — PORT `webrtc/rtp.cpp:18-115`** (header codec is
+      correct). Add RTCP (SR/RR/feedback). **PORT + REBUILD (RTCP).** Bolt
+      primitive: `bolt::wire`, `bolt_arena.h`.
+- [ ] **SRTP — REBUILD `webrtc/rtp.cpp:147-205`** (encrypt/decrypt/derive are all
+      TODO; fake auth tag today). DTLS-SRTP keying via the §6 export step
+      (`use_srtp` extension). Crypto via OpenSSL (same justified stopgap as DTLS).
+      **REBUILD.**
+- [ ] **Jitter buffer** for inbound media. **REBUILD.** Bolt primitive:
+      `bolt_arena_ring.h`.
+- [ ] **a=msid/SSRC mapping** — `SwissTable` SSRC→stream. **REBUILD.**
+- [ ] **Codecs explicitly OUT** — Bolt forwards/echoes media; encode/decode is the
+      application's job.
+
+---
+
+## 13. Later / optional (post-v1)
+
+- [ ] **TURN relay candidates** (RFC 8656) for symmetric-NAT peers — allocate,
+      permissions, channel-bind. **REBUILD.**
+- [ ] **Trickle ICE renegotiation** beyond initial gather (WS signaling path §3).
+- [ ] **BUNDLE / multiple m-lines** (needed once media + data coexist).
+- [ ] **SFU / room relay** — re-introduce the `webrtc/signaling.{h,cpp}` room
+      model (**ADAPT**) for multi-peer broadcast.
+- [ ] **Python binding** (`fasterapi/webrtc/*.py` — **DROP & rewrite** via Cython
+      per `CLAUDE.md`) once the C++ path is solid.
+- [ ] **WebTransport** (`http/webtransport_connection.*`) — shares H3's
+      `UdpTransport`; pursue only if requested.
+
+---
+
+## Dependency order (build sequence)
+
+```
+§2 UdpTransport+demux ─┬─► §4 STUN ─► §5 ICE ─┐
+                       │                       ├─► §6 DTLS ─► §7 SCTP/DCEP ─► §8 IDataChannel ─► §9 seam
+§3 Signaling/SDP ──────┘                       │
+                                               └─ (§5 selected pair feeds §6)
+§10 tests gate each box · §11 perf after §10 · §12/§13 later
+```
+
+**One-line summary:** salvage SDP parsing + candidate serialization + the PPID
+enum + (later) the RTP header codec from FasterAPI; **build everything that
+makes a connection** — STUN, ICE, DTLS (OpenSSL stopgap), and a Bolt-native
+minimal SCTP/DCEP — on the shared `UdpTransport`, surfaced to `App` as
+`IDataChannel`, correctness-gated against browsers + `aiortc` before any
+performance tuning, and never touching the HTTP/1.1+HTTP/2 core.
