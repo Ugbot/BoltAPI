@@ -59,7 +59,7 @@ Every WebRTC test/interop MUST be non-hanging:
 - [x] `MediaTrack` (kind/SSRC/codec/PT, bounded `TrackRegistry`/`kMaxTracks`) + `App::on_track(handler)` + `track.write(rtp)`; SRTP-decrypted RTP → RFC5761 demux (by SSRC, PT fallback) → track → app; app `track.write` → outbound interceptors → SRTP-protect → UdpTransport. Wired into `WebRtcPeerHub` (media keying via `make_srtp_sessions` after DTLS; first-byte 128–191 datagrams demuxed `rtcp::is_rtcp` ? SRTCP : SRTP). Mirrors `on_data_channel`. Gate `tests/media_track_test.cpp` (two tracks audio+video distinct SSRCs, 64 seeded randomized rounds byte-exact; sequence-gap → parseable NACK; reporter tick → parseable SR/RR).
 
 ## WM6 — Media example milestones (each a bounded test target)
-- [ ] **echo** (aiortc `server`): receive audio+video + data channel, loop back. Demo server + `testing/web/media.html` (getUserMedia).
+- [x] **echo** (aiortc `server`): receive audio+video + data channel, loop back. `App::enable_media_echo()` installs an on_track handler that `track.write`s every inbound RTP straight back out (re-SRTP, relay, NO transcode) — the media analogue of an on_data_channel echo. Signaling answers the offered audio/video m-lines sendrecv (+ data m-line when present) via `webrtc::build_echo_answer` (combined BUNDLE). Demo server (`examples/demo_server.cpp`: HTTP /health + WS /ws + data echo + media echo + signaling, one App) + `testing/web/media.html` (getUserMedia → echoed `<video>`). PRIMARY GATE `tests/media_echo_test.cpp` (default suite, no aiortc, deadline-bounded): our SrtpSession from a REAL DTLS-SRTP handshake sends audio+video RTP through the production `WebRtcPeerHub` echo path; echoed RTP asserted BYTE-EXACT for BOTH tracks over 40 seeded randomized rounds. Interop `tests/interop/aiortc_media.py` + bounded `AiortcMediaInterop` gtest (WEBRTC=ON, skip-if-absent, tree-kill-bounded) — aiortc synthetic audio+video → server → echo asserted (PASSES against aiortc 1.14). Interop runner `tests/interop/bounded_proc.h` (Job Object / process-group hard timeout + tree-kill; proven it cannot hang/leak).
 - [ ] **play-from-disk** (stream a file: IVF/Ogg/H264 reader → RTP).
 - [ ] **save-to-disk** (record received media to a container).
 - [ ] **broadcast** (1 publisher → N viewers) and **SFU** (per-subscriber RTP forwarding, PLI/NACK via interceptors, no transcode).
@@ -85,10 +85,11 @@ Every WebRTC test/interop MUST be non-hanging:
 - [ ] Batched UDP recv/send (recvmmsg/WSARecvMsg/GSO); zero-copy RTP via `bolt::wire`; per-SSRC `bolt::SwissTable`; per-packet `bolt::Arena`; no malloc on the media path. Bench vs aiortc/Pion.
 
 ## WX — Interop + harness (bounded, no-stall)
-- [ ] `testing/aiortc_media.py` (uv): send synthetic audio+video track, assert echo (hard timeout).
-- [ ] `testing/web/media.html`: browser getUserMedia → Bolt → echo `<video>`.
+- [x] `tests/interop/aiortc_media.py` (uv): send synthetic audio+video track, assert echo (hard timeout). Bounded `AiortcMediaInterop` gtest — PASSES vs aiortc 1.14.
+- [x] `testing/web/media.html`: browser getUserMedia → Bolt → echo `<video>` (static page; not in ctest).
 - [ ] **Pion (Go) peer**: a tiny data+media peer — strongest independent gate.
-- [ ] Demo server: enable media echo + data; one server, all clients point at it.
+- [x] Demo server: enable media echo + data; one server, all clients point at it (`examples/demo_server.cpp`).
+- [x] **No-stall interop runner** `tests/interop/bounded_proc.h`: hard wall-clock cap + WHOLE-tree kill (Windows Job Object `KILL_ON_JOB_CLOSE`; POSIX process group + `killpg`) + fast skip-if-absent. Both aiortc legs use it — proven (tested) they tree-kill on timeout and never hang/leak. (Replaced the bare `std::system` that could hang forever + leak children.)
 - [ ] CI WebRTC leg (BOLTAPI_WITH_WEBRTC=ON) runs unit + loopback + (skip-if-absent, never-hang) interop.
 
 ## Salvage map (media)

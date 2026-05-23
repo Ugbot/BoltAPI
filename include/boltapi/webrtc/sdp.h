@@ -271,5 +271,50 @@ struct MediaAnswerParams {
 // SdpError::MalformedLine if a required field is empty / no media negotiated.
 SdpError build_media_answer(const MediaAnswerParams& p, std::string& out);
 
+// ===========================================================================
+// WM6 — combined media + data-channel answer (the aiortc `server` shape).
+// ===========================================================================
+
+// EchoAnswerParams — inputs to build a COMBINED answer for an offer that may
+// carry audio + video media AND a data channel, all BUNDLEd on one ICE/DTLS
+// transport. Bolt answers as the relay/echo server (setup:passive, ice-lite):
+// negotiated media m-lines (direction from negotiate_media — sendrecv when the
+// offer is sendrecv, so the peer's media is echoed back) plus, when the offer
+// had an m=application section, the data-channel m-line. The m-line ORDER and
+// COUNT mirror what negotiate_media produced followed by the data line; the peer
+// matches by a=mid (BUNDLE), so this is correct for aiortc/browsers. All views
+// are copied at build time and need only outlive the call.
+struct EchoAnswerParams {
+    std::string_view origin_session_id = "4611731400430051336";
+    std::string_view ice_ufrag;            // required
+    std::string_view ice_pwd;              // required
+    std::string_view fingerprint_sha256;   // hex "AB:CD:.." (no algo prefix)
+    std::string_view setup     = "passive";
+    bool             ice_lite  = true;
+    const MediaNegotiation* negotiation = nullptr;  // required, non-empty
+
+    // Data channel: when the offer contained an m=application section, emit a
+    // matching data m-line under the same BUNDLE. `data_mid` is the offer's
+    // application mid (echoed); empty => no data m-line in the answer.
+    std::string_view data_mid;
+    std::uint16_t    sctp_port        = 5000;
+    std::uint32_t    max_message_size = 262144;
+
+    // ICE candidate lines (IceCandidate::to_string form, no leading "a="),
+    // emitted on the FIRST m-line. Views must outlive the build call.
+    const std::string_view* candidates = nullptr;
+    std::size_t             candidate_count = 0;
+};
+
+// build_echo_answer — emit a complete COMBINED audio+video+data answer SDP into
+// `out` (cleared first): BUNDLE + rtcp-mux media m-lines (agreed PTs only,
+// a=rtpmap/a=fmtp echoed, direction from negotiate_media) + an m=application
+// data m-line when `data_mid` is set, all with shared ice-ufrag/pwd/fingerprint/
+// setup. ICE candidates go on the first m-line. Requires ufrag/pwd/fingerprint +
+// a non-empty negotiation. Returns SdpError::Ok, or SdpError::MalformedLine on a
+// missing required field. No throw; allocation is std::string growth (build is
+// not a per-packet hot path).
+SdpError build_echo_answer(const EchoAnswerParams& p, std::string& out);
+
 }  // namespace webrtc
 }  // namespace bolt::api

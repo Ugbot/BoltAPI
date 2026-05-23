@@ -335,6 +335,27 @@ public:
         return *this;
     }
 
+    // WM6 ECHO (aiortc `server` shape). Install an on_track handler that loops
+    // every inbound RTP packet straight back out on the SAME track — re-SRTP,
+    // RELAY, NO transcode. This is the media analogue of an on_data_channel echo:
+    // received audio + video RTP is mirrored to the peer (track.write -> outbound
+    // interceptors -> SRTP-protect -> UDP). The peer hub creates ONE MediaTrack
+    // per inbound SSRC and binds its write sink, so a track that echoes to itself
+    // sends back on that SSRC — exactly what a sendrecv m-line's RTCRtpSender
+    // expects. Idempotent with on_track (the latest registration wins). Returns
+    // *this for chaining. Only meaningful under BOLTAPI_WITH_WEBRTC (the SRTP
+    // transport must be up); in the default build it records the handler harmlessly.
+    App& enable_media_echo() {
+        assert(!started_);
+        media_echo_ = true;
+        track_handler_ = [](webrtc::MediaTrack& track,
+                            const std::uint8_t* rtp_data, std::size_t rtp_len) {
+            App::echo_track(track, rtp_data, rtp_len);
+        };
+        assert(track_handler_ != nullptr && "enable_media_echo: handler set");
+        return *this;
+    }
+
     // -----------------------------------------------------------------------
     // Middleware (global). Folded right-to-left at build time.
     // -----------------------------------------------------------------------
@@ -504,6 +525,26 @@ private:
     // the WebRTC transport isn't up. Defined in app.cpp. Single active peer (v1).
     bool handle_webrtc_offer(std::string_view body, std::string& out_answer);
 
+    // WM6: build the COMBINED media+data echo answer for a parsed offer (when
+    // enable_media_echo() is set and the offer carries audio/video). `cands` are
+    // our host ICE candidate lines. Returns false if no media negotiated (caller
+    // then falls back to the data-only answer). Keeps handle_webrtc_offer small.
+    bool build_echo_answer_for(const webrtc::SdpSession& offer,
+                               const std::string_view* cands, std::size_t ncand,
+                               std::string& out_answer);
+
+    // WM6: build the data-channel-only answer (the original behavior) for a
+    // parsed offer with an m=application section. Returns false if none.
+    bool build_data_answer_for(const webrtc::SdpMedia* app_m,
+                               const std::string_view* cands, std::size_t ncand,
+                               std::string& out_answer);
+
+    // Gather our host ICE candidate lines into `owned` (the backing strings) and
+    // `views` (string_views into them). `views` stays valid only while `owned`
+    // lives. Keeps handle_webrtc_offer small. Defined in app.cpp.
+    void gather_candidate_views(std::vector<std::string>& owned,
+                                std::vector<std::string_view>& views);
+
     // WM5: the C-style deliver trampoline bound as each MediaTrack's deliver
     // sink. `ctx` is &track_handler_ (a stable MediaTrackHandler*); it forwards
     // the inbound RTP to the App's on_track handler. noexcept (the handler must
@@ -513,6 +554,15 @@ private:
                                          const std::uint8_t* data,
                                          std::size_t len) noexcept;
 #endif
+
+    // WM6 echo: loop one inbound RTP packet straight back out on its own track
+    // (re-SRTP, relay, no transcode). Declared unconditionally so the
+    // enable_media_echo() lambda compiles in BOTH build modes; the body is only
+    // meaningful (touches MediaTrack) under BOLTAPI_WITH_WEBRTC. Defined in
+    // app.cpp. noexcept (the exception-free build requires it).
+    static void echo_track(webrtc::MediaTrack& track,
+                           const std::uint8_t* rtp_data,
+                           std::size_t rtp_len) noexcept;
 
     // Run the middleware chain for one matched route, terminal = handler.
     core::coro_task<void> run_chain(std::size_t route_index,
@@ -541,6 +591,9 @@ private:
     std::vector<DcReg>  dc_handlers_;
     // WM5 media: a single on_track handler (tracks demuxed by SSRC in the hub).
     MediaTrackHandler   track_handler_;
+    // WM6: when set via enable_media_echo(), the signaling answer negotiates the
+    // offered audio/video m-lines (sendrecv) so the peer's media is echoed back.
+    bool                media_echo_ = false;
 
 #if defined(BOLTAPI_WITH_WEBRTC)
     // When enable_webrtc is set AND the flag is on, App owns a real UdpTransport

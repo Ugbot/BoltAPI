@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<!--
+  media.html — Bolt API WebRTC MEDIA ECHO test page (WM6).
+
+  getUserMedia(audio+video) -> RTCPeerConnection (sendrecv) -> POST the offer to
+  the Bolt server's /webrtc/offer signaling route -> apply the answer -> the
+  server ECHOES the audio + video RTP straight back (aiortc `server` shape) and
+  this page renders the echoed remote stream in a <video>.
+
+  STATIC page (served by the demo server's static_files("/", "testing/web");
+  NOT run by ctest). Open it against the running demo server:
+      open  http://127.0.0.1:8080/media.html
+
+  No build deps; pure browser APIs. Bounded with a connection watchdog so a
+  failed handshake reports instead of spinning forever.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Bolt API — WebRTC media echo</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem; max-width: 56rem; }
+    h1 { font-size: 1.4rem; }
+    .row { display: flex; gap: 1.5rem; flex-wrap: wrap; }
+    .col { display: flex; flex-direction: column; gap: .4rem; }
+    video { width: 22rem; max-width: 100%; background: #111; border-radius: .4rem; }
+    button { padding: .6rem 1.1rem; font-size: 1rem; cursor: pointer; }
+    #log { white-space: pre-wrap; background: #f4f4f4; padding: .8rem;
+           border-radius: .4rem; font-family: ui-monospace, monospace;
+           font-size: .85rem; min-height: 6rem; margin-top: 1rem; }
+    .ok { color: #137333; } .err { color: #c5221f; }
+  </style>
+</head>
+<body>
+  <h1>Bolt API — WebRTC media echo (audio + video)</h1>
+  <p>
+    Captures your camera + microphone, offers them to the Bolt server
+    (<code>POST /webrtc/offer</code>), and renders the echoed media the server
+    loops back. This is the aiortc <code>server</code> shape: relay, no transcode.
+  </p>
+  <p>
+    <label>signaling path <input id="path" value="/webrtc/offer" size="18" /></label>
+    <button id="go">Start camera &amp; echo</button>
+    <button id="stop" disabled>Stop</button>
+  </p>
+  <div class="row">
+    <div class="col"><strong>Local (sent)</strong><video id="local" autoplay playsinline muted></video></div>
+    <div class="col"><strong>Echoed (received)</strong><video id="remote" autoplay playsinline></video></div>
+  </div>
+  <div id="log"></div>
+
+  <script>
+    "use strict";
+    const $ = (id) => document.getElementById(id);
+    const logEl = $("log");
+    function log(msg, cls) {
+      const line = document.createElement("div");
+      if (cls) line.className = cls;
+      line.textContent = msg;
+      logEl.appendChild(line);
+    }
+
+    // Bounded connection watchdog: if we don't reach "connected" in time, report
+    // and tear down rather than spin forever.
+    const CONNECT_TIMEOUT_MS = 20000;
+
+    let pc = null;
+    let localStream = null;
+
+    async function postOffer(path, sdp) {
+      const resp = await fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/sdp" },
+        body: sdp,
+      });
+      if (!resp.ok) throw new Error("signaling POST returned HTTP " + resp.status);
+      return await resp.text();
+    }
+
+    async function start() {
+      $("go").disabled = true;
+      logEl.textContent = "";
+      try {
+        localStream = await navigator.mediaDevices.getUserMedia({
+          audio: true, video: true,
+        });
+      } catch (e) {
+        log("getUserMedia failed: " + e, "err");
+        $("go").disabled = false;
+        return;
+      }
+      $("local").srcObject = localStream;
+
+      pc = new RTCPeerConnection();
+      // Render the echoed stream the server sends back.
+      pc.ontrack = (ev) => {
+        log("ontrack: " + ev.track.kind + " (echoed)", "ok");
+        $("remote").srcObject = ev.streams[0];
+      };
+      // sendrecv: we send our camera/mic AND expect the echo back.
+      for (const track of localStream.getTracks()) {
+        pc.addTrack(track, localStream);
+      }
+
+      const watchdog = setTimeout(() => {
+        if (pc && pc.connectionState !== "connected") {
+          log("watchdog: not connected after " + (CONNECT_TIMEOUT_MS / 1000) +
+              "s (state=" + pc.connectionState + ")", "err");
+          stop();
+        }
+      }, CONNECT_TIMEOUT_MS);
+
+      pc.onconnectionstatechange = () => {
+        log("connection: " + pc.connectionState);
+        if (pc.connectionState === "connected") {
+          clearTimeout(watchdog);
+          log("CONNECTED — media echo flowing.", "ok");
+          $("stop").disabled = false;
+        } else if (pc.connectionState === "failed" ||
+                   pc.connectionState === "closed") {
+          clearTimeout(watchdog);
+        }
+      };
+
+      try {
+        await pc.setLocalDescription(await pc.createOffer());
+        const answer = await postOffer($("path").value, pc.localDescription.sdp);
+        await pc.setRemoteDescription({ type: "answer", sdp: answer });
+        log("offer/answer exchanged; ICE/DTLS/SRTP negotiating...");
+      } catch (e) {
+        clearTimeout(watchdog);
+        log("signaling failed: " + e, "err");
+        stop();
+      }
+    }
+
+    function stop() {
+      if (pc) { pc.close(); pc = null; }
+      if (localStream) {
+        for (const t of localStream.getTracks()) t.stop();
+        localStream = null;
+      }
+      $("local").srcObject = null;
+      $("remote").srcObject = null;
+      $("go").disabled = false;
+      $("stop").disabled = true;
+      log("stopped.");
+    }
+
+    $("go").addEventListener("click", start);
+    $("stop").addEventListener("click", stop);
+  </script>
+</body>
+</html>
