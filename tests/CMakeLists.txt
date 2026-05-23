@@ -178,6 +178,16 @@ if(WIN32)
     target_link_libraries(boltapi_aiortc_interop_test PRIVATE ws2_32 mswsock iphlpapi)
 endif()
 
+# HTTP/3 (QUIC) PURE PRIMITIVES — dependency-free wire codecs ported from
+# FasterAPI (boltapi/quic/{varint,packet,frames,pn_space,ack}.h). RFC-vector
+# units: RFC 9000 §A.1 varint samples + boundary/random round-trip; RFC 9001
+# §A.1 client Initial public header parse + short/Retry/VN discrimination; ACK
+# multi-range + ECN round-trip, STREAM/CRYPTO framing offsets, CONNECTION_CLOSE
+# (transport+app), PADDING run; RFC 9000 §A.2/A.3 truncated PN encode/decode;
+# AckRangeTracker received-PN -> ranges -> AckFrame (incl. randomized cross-check).
+# No network, no crypto, no OpenSSL — compiles into the default suite.
+boltapi_add_test(boltapi_quic_primitives_test quic_primitives_test.cpp)
+
 # M3: HTTP/3 + WebRTC seam — ProtocolRegistry mechanism (register/has/create),
 # a dummy IProtocol returning NotImplemented, and (when the compile flags are
 # ON) the real H3/WebRTC stub factories registering. Flag-AWARE: passes in the

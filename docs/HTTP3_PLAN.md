@@ -157,27 +157,35 @@ QUIC yet.
 Goal: parse/serialize QUIC packets and frames correctly. Crypto functions exist
 (Phase 3 ports them) but this phase establishes the wire structures.
 
-- [ ] **2.1 Varint codec.** *What:* RFC 9000 §16 variable-length ints.
-      *PORT* `C:\code\FasterAPI\src\cpp\http\quic\quic_varint.h` (already pure,
-      header-only, branchy-but-correct; keep as-is, rename namespace). *Bolt
-      primitive:* none needed; consider a SWAR fast path later (Phase 9). 
-- [ ] **2.2 Long/short header parse + serialize, connection IDs.** *What:* Initial
+- [x] **2.1 Varint codec.** *DONE* (`include/boltapi/quic/varint.h`). RFC 9000
+      §16; ported from `quic_varint.h`, reshaped to Tiger Style. RFC §A.1 vectors
+      + 100k random round-trips pass. *Bolt primitive:* SWAR fast path deferred
+      to Phase 9.
+- [~] **2.2 Long/short header parse + serialize, connection IDs.** *PARTIAL —
+      PARSE done* (`include/boltapi/quic/packet.h`): long (Initial/0-RTT/
+      Handshake/Retry/VN) + short header parse, CID extraction, `PacketForm`
+      discrimination; RFC 9001 §A.1 client-Initial header vector passes. SERIALIZE
+      + `bolt::wire` zero-copy retarget deferred to the send path (Phase 5.7 /
+      Phase 9.2). *What:* Initial
       / 0-RTT / Handshake / Retry / Version-Negotiation (long) and 1-RTT (short)
       headers; DCID/SCID extraction. *PORT*
       `C:\code\FasterAPI\src\cpp\http\quic\quic_packet.{h,cpp}`. *Bolt primitive:*
       parse/write through `bolt::wire` (`extern/bolt/include/bolt/wire/bolt_wire.h`)
       for zero-copy framing; `bolt_port.h` bitops for header-byte flags.
-- [ ] **2.3 Packet number spaces + decoding.** *What:* Initial/Handshake/AppData
-      spaces, largest-acked tracking, truncated PN reconstruction (RFC 9000 §17.1).
-      *PORT* `C:\code\FasterAPI\src\cpp\http\quic\quic_packet_number_space.h`.
-      *Bolt primitive:* n/a (small fixed structs).
-- [ ] **2.4 Frame parse/serialize (all frame types).** *What:* PADDING, PING,
-      ACK(+ECN), RESET_STREAM, STOP_SENDING, CRYPTO, NEW_TOKEN, STREAM, MAX_DATA,
-      MAX_STREAM_DATA, MAX_STREAMS, DATA_BLOCKED, STREAMS_BLOCKED,
-      NEW_CONNECTION_ID, RETIRE_CONNECTION_ID, PATH_CHALLENGE/RESPONSE,
-      CONNECTION_CLOSE, HANDSHAKE_DONE. *PORT*
-      `C:\code\FasterAPI\src\cpp\http\quic\quic_frames.h`. *Bolt primitive:*
-      `bolt::wire` reader/writer; per-packet scratch in `bolt::Arena`.
+- [x] **2.3 Packet number spaces + decoding.** *DONE*
+      (`include/boltapi/quic/pn_space.h`): the 3 spaces, largest-received/acked
+      tracking, truncated-PN encode/decode (RFC 9000 §17.1 + App. A.2/A.3).
+      Crypto/ack/congestion coupling from the source intentionally dropped (later
+      phases). RFC §A.2/§A.3 vectors + 5000-PN round-trip pass.
+- [~] **2.4 Frame parse/serialize.** *PARTIAL — no-crypto frames done*
+      (`include/boltapi/quic/frames.h`): full type-constant table; parse/serialize
+      for PADDING, PING, ACK(+ECN), CONNECTION_CLOSE, and the FRAMING of CRYPTO +
+      STREAM (payload stays a view). Remaining flow-control / connection-mgmt
+      frames (RESET_STREAM, STOP_SENDING, NEW_TOKEN, MAX_*, *_BLOCKED,
+      NEW/RETIRE_CONNECTION_ID, PATH_CHALLENGE/RESPONSE, HANDSHAKE_DONE) carry
+      their type constants but get bodies in Phase 4. `bolt::wire` retarget +
+      arena scratch deferred to Phase 9.2. Plus `ack.h` (AckRangeTracker:
+      received-PN -> ranges) ported here from the §4.2 source ahead of schedule.
 - [ ] **2.5 Version negotiation + Retry.** *What:* respond to unknown versions
       with a VN packet; issue/validate Retry tokens (stateless address validation,
       Retry integrity tag). *PORT*
@@ -529,3 +537,110 @@ green before *any* Phase 9 perf work is merged.
   is gated behind GATE 8.
 - Update `PROJECT_MAP.md` and `docs/SEAMS.md` as items land (not under the
   planning task).
+
+---
+
+## DECISION LOG — first bounded wave (2026-05)
+
+### D0. QUIC-TLS provider — SUPERSEDES the tentative Phase 0.1 "quictls" pick
+
+**Investigation (against the installed OpenSSL):**
+`C:/Program Files/OpenSSL-Win64/include/openssl/opensslv.h` reports
+`OPENSSL_FULL_VERSION_STR "3.6.1"` ("OpenSSL 3.6.1 27 Jan 2026"). Grepping the
+headers for the two competing QUIC-TLS surfaces:
+
+- **BoringSSL / quictls API** that FasterAPI's `quic_tls.h` is written against —
+  `SSL_provide_quic_data`, `SSL_set_quic_method`, `SSL_QUIC_METHOD`,
+  `SSL_quic_read_level`, `SSL_set_quic_transport_params`,
+  `SSL_process_quic_post_handshake`: **NOT PRESENT.** Zero matches in any header.
+- **OpenSSL 3.5+ native QUIC-TLS callback API** — present in
+  `<openssl/ssl.h>`:
+  - `int SSL_set_quic_tls_cbs(SSL *s, const OSSL_DISPATCH *qtdis, void *arg);`
+    (the handshake-bytes callback table — `OSSL_FUNC_SSL_QUIC_TLS_*` dispatch
+    functions: crypto_send / crypto_recv_rcd / crypto_release_rcd /
+    yield_secret / got_transport_params / alert)
+  - `int SSL_set_quic_tls_transport_params(SSL *s, const unsigned char *params, size_t params_len);`
+  - `int SSL_set_quic_tls_early_data_enabled(SSL *s, int enabled);`
+  - plus `<openssl/quic.h>` `OSSL_QUIC_client_method()` /
+    `OSSL_QUIC_server_method()` and the `OSSL_QUIC_ERR_*` transport-error codes.
+
+So the BoringSSL `SSL_QUIC_METHOD` model the FasterAPI port assumes **does not
+exist** on this OpenSSL. The plan's Phase 0.1 justification ("quictls is a
+drop-in, OpenSSL 3.5 would require rewriting the callback wiring") had the
+trade-off right but picked the wrong default for *this* toolchain.
+
+**DECISION: Path (b) — adapt the crypto layer to the OpenSSL 3.5+ QUIC-TLS
+callback API (`SSL_set_quic_tls_cbs` + `OSSL_DISPATCH`).** Rationale:
+1. **Zero new third-party dependency.** OpenSSL 3.6.1 is already linked for
+   H1/H2 TLS and for the live WebRTC DTLS gate (`tests/dtls_test.cpp`,
+   `OpenSSL::SSL`/`OpenSSL::Crypto`). Path (a) is impossible (API absent); path
+   (c) — vendoring quictls — would add a second TLS stack and directly violate
+   `CLAUDE.md`'s "prefer Bolt / import pure algorithms over linking libraries"
+   for no benefit, and risks symbol clashes with the OpenSSL we already link.
+   The TLS-1.3/AEAD dependency exception (Phase 0.2) is satisfied by the OpenSSL
+   we *already have*.
+2. **The adaptation is bounded and well-isolated.** FasterAPI's `quic_tls.h`
+   uses ~6 BoringSSL entry points behind one driver class. The OpenSSL 3.5+ API
+   covers the same four conceptual hooks (provide handshake bytes, emit
+   handshake bytes, install per-level secrets, exchange transport params) — so
+   the port becomes "re-wire one callback struct + the secret/level mapping",
+   confined to a single TU. Keep the `#if OPENSSL_VERSION_NUMBER` shim the plan
+   already recommended so a future BoringSSL/quictls build is a drop-in.
+3. **AEAD / HKDF / header-protection** (RFC 9001 §5, the `quic_packet_protection.h`
+   port) is plain EVP + HKDF and is **identical** across both APIs — it is
+   unaffected by this decision.
+
+**Net effect on the plan:** Phase 3.3 ("TLS 1.3 QUIC method (quictls
+callbacks)") is re-scoped to "TLS 1.3 QUIC method via `SSL_set_quic_tls_cbs`";
+Phase 0.3's `cmake/Findquictls.cmake` is **dropped** — `BOLTAPI_WITH_HTTP3` will
+reuse the existing `find_package(OpenSSL)`. No code under that gate exists yet
+(this wave is crypto-free), so nothing is blocked.
+
+### D1. Pure QUIC primitives PORTED (this wave) — dependency-free, compiled UNCONDITIONALLY
+
+All under `include/boltapi/quic/`, namespace `bolt::api::quic`, Tiger Style
+(>=2 asserts/fn, bounded, noexcept, no alloc, no exceptions), no OpenSSL, no
+`BOLTAPI_WITH_HTTP3` gate — so the default ctest suite covers them.
+
+| File | Source (FasterAPI `src/cpp/http/quic/`) | PORT vs reshape |
+|---|---|---|
+| `varint.h` | `quic_varint.h` | PORT as-is (byte-identical wire logic); reshaped to free functions + named bounds + asserts. |
+| `packet.h` | `quic_packet.{h,cpp}` (header structs + PN helpers) | RESHAPED: parse-only, borrows spans; added `PacketForm` discrimination for Initial/0-RTT/Handshake/Retry/1-RTT/VersionNegotiation; dropped serialize + crypto-coupled bits. |
+| `frames.h` | `quic_frames.h` | RESHAPED: kept full type-constant table; parse/serialize for PADDING/PING/ACK(+ECN)/CONNECTION_CLOSE + STREAM/CRYPTO framing (payload stays a view); bounded `kMaxAckRanges`. |
+| `pn_space.h` | `quic_packet_number_space.h` + PN codec from `quic_packet.cpp` | RESHAPED: pure 3-space sequencing + truncated-PN encode/decode (RFC 9000 §17.1, App. A.2/A.3); dropped crypto/ack/congestion coupling. |
+| `ack.h` | RecvTracker logic from `quic_packet_number_space.h` + `quic_ack_tracker.{h,cpp}` | RESHAPED: fixed-capacity coalescing range set -> `AckFrame` (no `std::vector`/`unordered_map`); dropped loss timers / RTT / congestion (later RFC 9002 phase). |
+
+**Tests:** `tests/quic_primitives_test.cpp` (gtest, registered via
+`boltapi_add_test`, target `boltapi_quic_primitives_test`) — 28 cases.
+RFC vectors exercised + passing:
+- varint: RFC 9000 §A.1 decoded samples (37 / 15293 / 494878333 /
+  151288809941952652) + the exact 8-byte vector `c2 19 7c 5e ff 14 e8 8c` ->
+  151288809941952652 + the 2-byte vector `7b bd` -> 15293; boundary sizes;
+  100k random round-trips; need-more on short buffers.
+- packet: RFC 9001 §A.1 client Initial public header
+  (`c3 00000001 08 8394c8f03e515708 00 00 449e`) — version=1, DCID=
+  `8394c8f03e515708`, empty SCID, token len 0, Length=1182, consumed=18; short
+  header (spin/key-phase/DCID); Version-Negotiation + Retry discrimination
+  (no Length field); need-more / over-long-CID rejection.
+- frames: ACK multi-range + ACK_ECN round-trip; STREAM offsets (incl.
+  no-LEN-extends-to-end); CRYPTO offsets; CONNECTION_CLOSE transport (with
+  frame-type) + application; PADDING run.
+- pn_space: RFC 9000 §A.2 encode length (0xac5c02 / 0xabe8b3 -> 3 bytes) +
+  §A.3 decode (`0x9b32`, largest `0xa82f30ea`, 16-bit -> `0xa82f9b32`);
+  5000-PN truncate->decode round-trip; plain encode-length table; sequencing.
+- ack: contiguous / gapped / out-of-order+duplicate coalescing -> `AckFrame`
+  -> re-parse; 200-trial randomized cross-check vs a brute-force membership set.
+
+**Status:** default `cmake -S . -B build/msvc` build + `ctest -C Release` =
+**150/150 passing** (was 122; +28 QUIC primitives), zero warnings on the new
+TU, H1/H2/WebRTC suites unchanged.
+
+### D2. Next wave (gated on D0; do NOT start crypto in this wave)
+1. Packet protection (AEAD + header protection + HKDF, RFC 9001 §5) — port
+   `quic_packet_protection.h` (EVP, API-agnostic) + RFC 9001 App. A self-test.
+2. TLS 1.3 QUIC handshake via `SSL_set_quic_tls_cbs` / `OSSL_DISPATCH` +
+   transport-params codec (adapts `quic_tls.h` + `quic_handshake.h`).
+3. Secure connection (encrypt/decrypt) -> connection state machine (RFC 9002
+   loss recovery extracted clean) -> streams + flow control.
+4. QPACK (static/dynamic tables, encoder/decoder) -> HTTP/3 frames.
+5. Bridge QUIC streams -> `CoroHttpRequest` -> the existing `App` router.
