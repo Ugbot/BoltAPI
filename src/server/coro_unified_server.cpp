@@ -657,29 +657,43 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
             }
         }
 
-        // Parse successful - convert to CoroHttpRequest
+        // Parse successful - convert to CoroHttpRequest (ZERO-COPY).
+        // All views below point into `buf` (the connection read buffer on this
+        // coroutine frame, or the body arena). That buffer stays alive — the
+        // frame is suspended — across the worker-thread handler co_await and is
+        // only reset AFTER the response is written (end of this loop iteration),
+        // so every view is valid for the whole request, including keep-alive.
         CoroHttpRequest req;
-        req.method = std::string(parsed_req.method_str);
-        req.path = std::string(parsed_req.path);
-        for (size_t i = 0; i < parsed_req.header_count; i++) {
-            req.headers[std::string(parsed_req.headers[i].name)] =
-                std::string(parsed_req.headers[i].value);
+        req.method = std::string_view(parsed_req.method_str);
+        req.path = std::string_view(parsed_req.path);
+        const size_t hdr_n = std::min(parsed_req.header_count,
+                                      CoroHttpRequest::MAX_HEADERS);
+        for (size_t i = 0; i < hdr_n; i++) {
+            req.add_header(std::string_view(parsed_req.headers[i].name),
+                           std::string_view(parsed_req.headers[i].value));
         }
-        req.body = std::string(parsed_req.body);
+        req.body = std::string_view(parsed_req.body);
 
         // Check body size limits
-        auto content_length_it = req.headers.find("Content-Length");
-        if (content_length_it != req.headers.end()) {
-            size_t content_length = std::stoull(content_length_it->second);
-            if (content_length > config_.max_body_size) {
-                // Body too large - send 413 Payload Too Large
-                const char* too_large =
-                    "HTTP/1.1 413 Payload Too Large\r\n"
-                    "Content-Length: 0\r\n"
-                    "Connection: close\r\n"
-                    "\r\n";
-                co_await io.async_write(fd, too_large, strlen(too_large));
-                break;
+        {
+            bool has_cl = false;
+            std::string_view cl_val = req.find_header("Content-Length", &has_cl);
+            if (has_cl) {
+                size_t content_length = 0;
+                for (char c : cl_val) {
+                    if (c < '0' || c > '9') break;
+                    content_length = content_length * 10 + static_cast<size_t>(c - '0');
+                }
+                if (content_length > config_.max_body_size) {
+                    // Body too large - send 413 Payload Too Large
+                    const char* too_large =
+                        "HTTP/1.1 413 Payload Too Large\r\n"
+                        "Content-Length: 0\r\n"
+                        "Connection: close\r\n"
+                        "\r\n";
+                    co_await io.async_write(fd, too_large, strlen(too_large));
+                    break;
+                }
             }
         }
 
@@ -777,23 +791,23 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
         }
 
         // Check for WebSocket upgrade request
-        auto upgrade_it = req.headers.find("Upgrade");
-        auto connection_it = req.headers.find("Connection");
-        auto ws_key_it = req.headers.find("Sec-WebSocket-Key");
-        auto ws_version_it = req.headers.find("Sec-WebSocket-Version");
+        bool has_upgrade = false, has_ws_key = false;
+        std::string_view upgrade_sv  = req.find_header("Upgrade", &has_upgrade);
+        std::string_view ws_key_sv   = req.find_header("Sec-WebSocket-Key", &has_ws_key);
+        std::string_view conn_sv     = req.find_header("Connection");
+        std::string_view ws_ver_sv   = req.find_header("Sec-WebSocket-Version");
 
-        bool is_websocket_upgrade = false;
-        if (upgrade_it != req.headers.end() && ws_key_it != req.headers.end()) {
-            std::string upgrade_val = upgrade_it->second;
-            std::string connection_val = connection_it != req.headers.end() ? connection_it->second : "";
-            std::string ws_version = ws_version_it != req.headers.end() ? ws_version_it->second : "";
-            std::string ws_key = ws_key_it->second;
+        if (has_upgrade && has_ws_key) {
+            std::string upgrade_val(upgrade_sv);
+            std::string connection_val(conn_sv);
+            std::string ws_version(ws_ver_sv);
+            std::string ws_key(ws_key_sv);
 
             if (websocket::HandshakeUtils::validate_upgrade_request(
-                    req.method, upgrade_val, connection_val, ws_version, ws_key)) {
+                    std::string(req.method), upgrade_val, connection_val, ws_version, ws_key)) {
 
                 // Check if we have a handler for this path
-                WebSocketHandler* ws_handler = get_websocket_handler(req.path);
+                WebSocketHandler* ws_handler = get_websocket_handler(std::string(req.path));
                 if (ws_handler) {
                     // Valid WebSocket upgrade - compute accept key and send 101
                     std::string accept_key = websocket::HandshakeUtils::compute_accept_key(ws_key);
@@ -813,7 +827,7 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
                     static std::atomic<uint64_t> ws_connection_id{0};
                     WebSocketConnection ws_conn(++ws_connection_id);
                     ws_conn.set_socket_fd(fd);
-                    ws_conn.set_path(req.path);
+                    ws_conn.set_path(std::string(req.path));
 
                     // Invoke user handler to set up callbacks
                     (*ws_handler)(ws_conn);
@@ -829,24 +843,14 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
             }
         }
 
-        // Check for SSE request (Accept: text/event-stream)
-        // HTTP headers are case-insensitive, so check both common casings
-        std::string accept_value;
-        auto accept_it = req.headers.find("Accept");
-        if (accept_it != req.headers.end()) {
-            accept_value = accept_it->second;
-        } else {
-            // Try lowercase
-            accept_it = req.headers.find("accept");
-            if (accept_it != req.headers.end()) {
-                accept_value = accept_it->second;
-            }
-        }
-        
+        // Check for SSE request (Accept: text/event-stream).
+        // find_header is already case-insensitive, so one lookup suffices.
+        std::string_view accept_value = req.find_header("Accept");
+
         // Match SSE either by Accept header or by registered path (allows curl testing)
-        CoroSSEHandler* sse_handler = get_sse_handler(req.path);
+        CoroSSEHandler* sse_handler = get_sse_handler(std::string(req.path));
         if (sse_handler && (accept_value.empty() ||
-            accept_value.find("text/event-stream") != std::string::npos)) {
+            accept_value.find("text/event-stream") != std::string_view::npos)) {
             {
                 // Send SSE headers (include CORS for cross-origin EventSource)
                 const char* sse_headers =
@@ -1033,23 +1037,31 @@ core::coro_task<void> CoroUnifiedServer::handle_http2_connection(
     h2_conn.set_request_callback([this, &pending_requests](http2::Http2Stream* stream) {
         if (!stream) return;
 
-        // Convert stream request to CoroHttpRequest
+        // Convert stream request to CoroHttpRequest.
+        // HTTP/2 SHIM: unlike H1 (whose views point into the long-lived
+        // connection read buffer), this request is queued and processed in the
+        // I/O loop AFTER subsequent reads, and its source HPACK strings live in
+        // the stream object whose lifetime we don't pin here. So H2 OWNS its
+        // bytes in req.owned_storage_ and points the views there — stable for
+        // the whole request including the handler hop. H1 stays truly zero-copy.
         CoroHttpRequest req;
 
         // Extract method, path, and headers from request_headers()
         for (const auto& [name, value] : stream->request_headers()) {
             if (name == ":method") {
-                req.method = value;
+                req.method = req.own(value);
             } else if (name == ":path") {
-                req.path = value;
+                req.path = req.own(value);
             } else if (!name.empty() && name[0] != ':') {
                 // Regular header (skip other pseudo-headers like :scheme, :authority)
-                req.headers[name] = value;
+                std::string_view nv = req.own(name);
+                std::string_view vv = req.own(value);
+                req.add_header(nv, vv);
             }
         }
 
-        // Get body
-        req.body = stream->request_body();
+        // Get body (owned copy from the stream's body buffer)
+        req.body = req.own(stream->request_body());
 
         // Track request
         requests_total_.fetch_add(1, std::memory_order_relaxed);

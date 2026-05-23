@@ -113,7 +113,7 @@ int main() {
         if (req.method == "POST") {
             // Echo the body back with a known prefix (exercises a 2nd verb +
             // randomized-ish input the caller supplies).
-            resp.body = std::string(kEchoPrefix) + req.body;
+            resp.body = std::string(kEchoPrefix) + std::string(req.body);
         } else {
             resp.body = kPingBody;
         }

@@ -70,39 +70,42 @@ public:
     }
 
     // --- Headers ---
-    const std::unordered_map<std::string, std::string>& headers() const noexcept {
-        return req_.headers;
+    // Number of headers parsed for this request (bounded by CoroHttpRequest::MAX_HEADERS).
+    std::size_t header_count() const noexcept { return req_.header_count; }
+
+    // Zero-copy access to the i-th header name/value (views into the parse buffer).
+    std::string_view header_name(std::size_t i) const noexcept {
+        assert(i < req_.header_count);
+        return req_.headers[i].name;
+    }
+    std::string_view header_value(std::size_t i) const noexcept {
+        assert(i < req_.header_count);
+        return req_.headers[i].value;
     }
 
     // Case-insensitive header lookup. Returns "" when absent. Returns a copy
-    // (owned std::string) so the caller has a stable value.
+    // (owned std::string) so the caller has a stable value. Backed by a
+    // branch-light linear scan over the bounded header views (few headers).
     std::string header(std::string_view name) const {
         assert(!name.empty());
         assert(name.size() < 4096);
-        // Fast path: exact key hit (engine usually lower/canonical-cases).
-        auto it = req_.headers.find(std::string(name));
-        if (it != req_.headers.end()) {
-            return it->second;
-        }
-        // Slow path: case-insensitive linear scan.
-        for (const auto& kv : req_.headers) {
-            if (iequals(kv.first, name)) {
-                return kv.second;
-            }
-        }
-        return std::string{};
+        bool found = false;
+        std::string_view v = req_.find_header(name, &found);
+        return found ? std::string(v) : std::string{};
+    }
+
+    // Zero-copy case-insensitive header lookup for the hot path: returns a view
+    // into the parse buffer (empty when absent). No allocation.
+    std::string_view header_view(std::string_view name) const noexcept {
+        assert(!name.empty());
+        assert(name.size() < 4096);
+        return req_.find_header(name);
     }
 
     bool has_header(std::string_view name) const {
         assert(!name.empty());
         assert(name.size() < 4096);
-        if (req_.headers.find(std::string(name)) != req_.headers.end()) {
-            return true;
-        }
-        for (const auto& kv : req_.headers) {
-            if (iequals(kv.first, name)) return true;
-        }
-        return false;
+        return req_.has_header(name);
     }
 
     // --- Path params (from the router match) ---
@@ -195,18 +198,6 @@ public:
     const CoroHttpRequest& raw() const noexcept { return req_; }
 
 private:
-    // ASCII case-insensitive equality (no allocation).
-    static bool iequals(std::string_view a, std::string_view b) noexcept {
-        if (a.size() != b.size()) return false;
-        for (std::size_t i = 0; i < a.size(); ++i) {
-            char ca = a[i], cb = b[i];
-            if (ca >= 'A' && ca <= 'Z') ca = static_cast<char>(ca - 'A' + 'a');
-            if (cb >= 'A' && cb <= 'Z') cb = static_cast<char>(cb - 'A' + 'a');
-            if (ca != cb) return false;
-        }
-        return true;
-    }
-
     const CoroHttpRequest& req_;
     const RouteParam*      params_;
     uint32_t               param_count_;

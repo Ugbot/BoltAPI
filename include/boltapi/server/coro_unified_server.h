@@ -31,12 +31,15 @@
 #include <atomic>
 #include <condition_variable>
 #include <csignal>
+#include <deque>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
+#include <vector>
 
 namespace bolt::api {
 namespace http {
@@ -67,12 +70,94 @@ using CoroUltraFastCallback = Http1Connection::UltraFastCallback;
  * HTTP Request Handler (coroutine version)
  *
  * Handler receives request details and returns a task that produces the response.
+ *
+ * ZERO-COPY: method/path/body and every header name/value are std::string_view
+ * pointing into the per-request parse buffer (the connection read buffer, which
+ * lives in the connection coroutine frame and stays alive — suspended — across
+ * the worker-thread handler hop and until the response is written). The header
+ * set is a fixed-capacity, allocation-free array (no unordered_map, no per-field
+ * std::string). See coro_unified_server.cpp for the full lifetime argument.
+ *
+ * The HTTP/2 path cannot guarantee that its decoded HPACK strings outlive the
+ * handler the way the H1 read buffer does, so it owns its backing storage in a
+ * small per-request arena (CoroHttpRequest::owned_storage_) and points the views
+ * at that. H1 leaves owned_storage_ empty (truly zero-copy).
  */
+struct CoroHttpHeaderView {
+    std::string_view name;
+    std::string_view value;
+};
+
 struct CoroHttpRequest {
-    std::string method;
-    std::string path;
-    std::unordered_map<std::string, std::string> headers;
-    std::string body;
+    // Matches Http1RequestView::MAX_HEADERS so the H1 fast path and the
+    // dispatch path share the same bound (also caps H2 header fan-out).
+    static constexpr size_t MAX_HEADERS = 64;
+
+    std::string_view method;
+    std::string_view path;
+    std::string_view body;
+
+    CoroHttpHeaderView headers[MAX_HEADERS];
+    size_t header_count = 0;
+
+    // ASCII case-insensitive header lookup (linear scan — few headers, this is
+    // branch-light and cache-friendly vs. an unordered_map probe). Returns a
+    // null/empty view when the header is absent. `found` is set when provided.
+    std::string_view find_header(std::string_view name,
+                                 bool* found = nullptr) const noexcept {
+        for (size_t i = 0; i < header_count; ++i) {
+            if (iequals_ci(headers[i].name, name)) {
+                if (found) *found = true;
+                return headers[i].value;
+            }
+        }
+        if (found) *found = false;
+        return std::string_view{};
+    }
+
+    bool has_header(std::string_view name) const noexcept {
+        bool f = false;
+        (void)find_header(name, &f);
+        return f;
+    }
+
+    // Append a header view; silently drops past MAX_HEADERS (the parser already
+    // bounds at MAX_HEADERS, and the engine's 431 header-size check fires first).
+    void add_header(std::string_view name, std::string_view value) noexcept {
+        if (header_count < MAX_HEADERS) {
+            headers[header_count].name = name;
+            headers[header_count].value = value;
+            ++header_count;
+        }
+    }
+
+    // --- HTTP/2-only owned backing store ---
+    // H1 never touches this (views point into the connection read buffer). H2
+    // copies its decoded header/method/path/body bytes here and points the views
+    // into this stable, request-lifetime storage. Reserved once, never during
+    // the hot H1 path.
+    // NOTE: std::deque guarantees stable element addresses across push_back, so
+    // string_views returned by earlier own() calls stay valid as more are added
+    // (std::vector would reallocate and dangle them). H2-only; never on H1.
+    void own_clear() { owned_storage_.clear(); }
+    std::string_view own(std::string_view s) {
+        owned_storage_.emplace_back(s);
+        return std::string_view(owned_storage_.back());
+    }
+
+private:
+    static bool iequals_ci(std::string_view a, std::string_view b) noexcept {
+        if (a.size() != b.size()) return false;
+        for (size_t i = 0; i < a.size(); ++i) {
+            char ca = a[i], cb = b[i];
+            if (ca >= 'A' && ca <= 'Z') ca = static_cast<char>(ca - 'A' + 'a');
+            if (cb >= 'A' && cb <= 'Z') cb = static_cast<char>(cb - 'A' + 'a');
+            if (ca != cb) return false;
+        }
+        return true;
+    }
+
+    std::deque<std::string> owned_storage_;  // empty on the H1 zero-copy path
 };
 
 struct CoroHttpResponse {
