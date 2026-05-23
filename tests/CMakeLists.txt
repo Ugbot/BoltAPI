@@ -67,3 +67,9 @@ boltapi_add_test(boltapi_compression_test compression_test.cpp)
 if(WIN32)
     target_link_libraries(boltapi_compression_test PRIVATE ws2_32 mswsock)
 endif()
+
+# M3: HTTP/3 + WebRTC seam — ProtocolRegistry mechanism (register/has/create),
+# a dummy IProtocol returning NotImplemented, and (when the compile flags are
+# ON) the real H3/WebRTC stub factories registering. Flag-AWARE: passes in the
+# default flags-OFF build via a dummy protocol; does NOT require the flags on.
+boltapi_add_test(boltapi_protocol_seam_test protocol_seam_test.cpp)

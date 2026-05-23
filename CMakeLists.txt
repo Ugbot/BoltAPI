@@ -168,6 +168,36 @@ if(BOLTAPI_HAVE_GZIP)
 endif()
 
 # ---------------------------------------------------------------------------
+# M3 HTTP/3 + WebRTC extensibility seams (ARCHITECTURE + STUBS ONLY).
+#
+# include/boltapi/transport.h + protocol.h are ALWAYS available (header-only,
+# inert until a factory registers). The seam STUB TUs compile ONLY under their
+# options so the default lib (flags OFF) is byte-for-byte unchanged in behavior:
+#
+#   src/proto/udp_transport.cpp  -> BOLTAPI_WITH_HTTP3 OR BOLTAPI_WITH_WEBRTC
+#   src/proto/http3_stub.cpp     -> BOLTAPI_WITH_HTTP3
+#   src/proto/webrtc_stub.cpp    -> BOLTAPI_WITH_WEBRTC
+#
+# The defines are PUBLIC so app.h / protocol.h consumers and tests see the same
+# flag values the library was built with (the App seam hook + seam test are
+# flag-aware). When ON the stubs return NotImplemented; they pull in NO FasterAPI
+# quic/webrtc source.
+# ---------------------------------------------------------------------------
+if(BOLTAPI_WITH_HTTP3 OR BOLTAPI_WITH_WEBRTC)
+    target_sources(boltapi PRIVATE src/proto/udp_transport.cpp)
+endif()
+if(BOLTAPI_WITH_HTTP3)
+    target_sources(boltapi PRIVATE src/proto/http3_stub.cpp)
+    target_compile_definitions(boltapi PUBLIC BOLTAPI_WITH_HTTP3=1)
+    message(STATUS "Bolt API HTTP/3 seam: ENABLED (scaffold stub — returns NotImplemented)")
+endif()
+if(BOLTAPI_WITH_WEBRTC)
+    target_sources(boltapi PRIVATE src/proto/webrtc_stub.cpp)
+    target_compile_definitions(boltapi PUBLIC BOLTAPI_WITH_WEBRTC=1)
+    message(STATUS "Bolt API WebRTC seam: ENABLED (scaffold stub — returns NotImplemented)")
+endif()
+
+# ---------------------------------------------------------------------------
 # Bolt-native request body arena (risk-gated, opt-in). When ON, the request
 # body buffer is backed by a thread-local bolt::Arena (bump allocator, reset
 # per request) instead of the default slot-pool. PUBLIC so headers compiled in

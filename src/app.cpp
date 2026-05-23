@@ -7,9 +7,17 @@
 #include "boltapi/app.h"
 
 #include "boltapi/compression.h"
+#include "boltapi/core/logger.h"
 
 #include <cassert>
+#include <cstdio>
 #include <utility>
+
+// M3 seam: the protocol registry header is always available (header-only,
+// inert). The stub factories (register_http3/register_webrtc) are only declared
+// + linkable under their compile flags, so calls to them are guarded the same
+// way below.
+#include "boltapi/protocol.h"
 
 namespace bolt::api {
 
@@ -249,6 +257,86 @@ void App::build_dispatch() {
 }
 
 // ---------------------------------------------------------------------------
+// init_protocol_seams — M3 HTTP/3 + WebRTC seam hook.
+//
+// This is the runtime side of the M3 scaffold. It is deliberately conservative:
+// enabling a seam at runtime NEVER affects the H1/H2 server. The four cases:
+//
+//   flag-runtime OFF                      -> nothing (the common path).
+//   runtime ON  + compile option OFF      -> one-time stderr warning; no-op.
+//   runtime ON  + compile option ON       -> register the stub factory, create
+//                                            it, call serve() on a (stub)
+//                                            UdpTransport; serve() returns
+//                                            NotImplemented, which we log. The
+//                                            stub instance is then dropped.
+//                                            H1/H2 keeps serving regardless.
+//
+// No exceptions, no blocking, no crash on any path.
+// ---------------------------------------------------------------------------
+void App::init_protocol_seams() {
+    // Fast exit: neither seam requested. Keep the default path branch-light.
+    if (!config_.enable_http3 && !config_.enable_webrtc) {
+        return;
+    }
+
+#if defined(BOLTAPI_WITH_HTTP3) || defined(BOLTAPI_WITH_WEBRTC)
+    proto::ProtocolRegistry registry;
+#endif
+
+    if (config_.enable_http3) {
+#if defined(BOLTAPI_WITH_HTTP3)
+        const proto::Status reg = proto::register_http3(registry);
+        if (reg.is_ok() && registry.has(proto::ProtocolId::Http3)) {
+            std::unique_ptr<proto::IProtocol> h3 =
+                registry.create(proto::ProtocolId::Http3);
+            assert(h3 != nullptr);
+            const uint16_t udp_port =
+                config_.http3_port != 0 ? config_.http3_port
+                                        : config_.server.http1_port;
+            transport::UdpTransport udp(
+                transport::Endpoint{config_.server.host, udp_port});
+            // Stub serve() returns NotImplemented; log it and move on.
+            const proto::Status served = h3->serve(udp);
+            if (proto::is_not_implemented(served)) {
+                std::fprintf(stderr,
+                    "[boltapi] HTTP/3 enabled but not yet implemented "
+                    "(seam stub on UDP :%u); continuing with HTTP/1.1+HTTP/2.\n",
+                    static_cast<unsigned>(udp_port));
+            }
+        }
+#else
+        std::fprintf(stderr,
+            "[boltapi] Config.enable_http3=true ignored: built without "
+            "BOLTAPI_WITH_HTTP3. Reconfigure with -DBOLTAPI_WITH_HTTP3=ON.\n");
+#endif
+    }
+
+    if (config_.enable_webrtc) {
+#if defined(BOLTAPI_WITH_WEBRTC)
+        const proto::Status reg = proto::register_webrtc(registry);
+        if (reg.is_ok() && registry.has(proto::ProtocolId::WebRtc)) {
+            std::unique_ptr<proto::IProtocol> rtc =
+                registry.create(proto::ProtocolId::WebRtc);
+            assert(rtc != nullptr);
+            transport::UdpTransport udp(
+                transport::Endpoint{config_.server.host,
+                                    config_.server.http1_port});
+            const proto::Status served = rtc->serve(udp);
+            if (proto::is_not_implemented(served)) {
+                std::fprintf(stderr,
+                    "[boltapi] WebRTC enabled but not yet implemented "
+                    "(seam stub); continuing with HTTP/1.1+HTTP/2.\n");
+            }
+        }
+#else
+        std::fprintf(stderr,
+            "[boltapi] Config.enable_webrtc=true ignored: built without "
+            "BOLTAPI_WITH_WEBRTC. Reconfigure with -DBOLTAPI_WITH_WEBRTC=ON.\n");
+#endif
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Lifecycle.
 // ---------------------------------------------------------------------------
 int App::run(std::string_view host, uint16_t port) {
@@ -260,6 +348,7 @@ int App::run(std::string_view host, uint16_t port) {
     server_ = std::make_unique<http::CoroUnifiedServer>(config_.server);
 
     build_dispatch();
+    init_protocol_seams();  // M3: no-op unless a seam flag is set
     started_ = true;
     return server_->start();  // blocking
 }
@@ -273,6 +362,7 @@ int App::start_background(std::string_view host, uint16_t port) {
     server_ = std::make_unique<http::CoroUnifiedServer>(config_.server);
 
     build_dispatch();
+    init_protocol_seams();  // M3: no-op unless a seam flag is set
     started_ = true;
     return server_->start_background();
 }

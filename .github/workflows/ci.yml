@@ -42,6 +42,32 @@ jobs:
         run: ctest --preset ${{ matrix.preset }}
 
   # ---------------------------------------------------------------------------
+  # M3 seam flags-ON build leg. Configures + builds with the HTTP/3 and WebRTC
+  # seams ENABLED so the ON path (stub TUs + the App seam hook + the flag-gated
+  # seam test) can't rot. Build + run the seam test; the stubs return
+  # NotImplemented, so there's nothing more to assert at runtime than the
+  # registry mechanism. MSVC (VS2022) per Windows toolchain policy — never MinGW.
+  # ---------------------------------------------------------------------------
+  seams-on:
+    name: seams-on (windows-msvc, HTTP3+WebRTC)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure (seams ON)
+        run: >
+          cmake -S . -B build/proto -G "Visual Studio 17 2022" -A x64
+          -DBOLTAPI_WITH_HTTP3=ON -DBOLTAPI_WITH_WEBRTC=ON
+
+      - name: Build
+        run: cmake --build build/proto --config Release
+
+      - name: Test (seam test only; full suite covered by build-test)
+        run: ctest --test-dir build/proto -C Release --output-on-failure -R ProtocolSeam
+
+  # ---------------------------------------------------------------------------
   # ASan + UBSan (Linux/clang). Exercises the full suite instrumented; this is
   # where MSVC's local ASan-runtime gap is covered.
   # ---------------------------------------------------------------------------

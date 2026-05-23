@@ -61,6 +61,16 @@ public:
         // M2 hook (declared now so the surface is stable; not wired yet).
         bool        enable_compression = false;
 
+        // M3 seam hooks (additive; default OFF). When a flag is set AND the
+        // matching compile option (BOLTAPI_WITH_HTTP3 / BOLTAPI_WITH_WEBRTC) is
+        // ON, App consults the ProtocolRegistry on start; the registered factory
+        // is a STUB, so App logs "not yet implemented" (NotImplemented) and
+        // CONTINUES serving H1/H2 — it never crashes or blocks. When the compile
+        // option is OFF, setting the runtime flag is a no-op warning.
+        bool        enable_http3  = false;
+        uint16_t    http3_port    = 0;      // 0 = reuse http1_port number over UDP
+        bool        enable_webrtc = false;
+
         Config() noexcept {
             // Facade defaults favor a cleartext HTTP/1.1 dev server. TLS stays
             // available via Config.server.* but is off by default for the App.
@@ -177,6 +187,12 @@ private:
 
     // Build the router + the engine handler. Called once from run/start.
     void build_dispatch();
+
+    // M3 seam hook: if enable_http3/enable_webrtc are set, consult the protocol
+    // registry. Stub factories return NotImplemented, which is logged; H1/H2
+    // serving is unaffected. Safe no-op when no seam flags are set. Called once
+    // from run/start_background after build_dispatch().
+    void init_protocol_seams();
 
     // Run the middleware chain for one matched route, terminal = handler.
     core::coro_task<void> run_chain(std::size_t route_index,
