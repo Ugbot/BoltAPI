@@ -294,6 +294,24 @@ endif()
 # parser. Malformed input -> error (no throw/crash). Pure codec, no engine deps.
 boltapi_add_test(boltapi_media_sdp_test media_sdp_test.cpp)
 
+# WM5: MEDIA TRACK + INTERCEPTOR PIPELINE GATE — in-process, deterministic,
+# deadline-bounded (runs in the DEFAULT suite, no BOLTAPI_WITH_WEBRTC flag).
+# (1) Two srtp::SrtpSessions on a known key model one DTLS-SRTP direction; an
+# audio MediaTrack + a video MediaTrack (distinct SSRCs) in a TrackRegistry; an
+# outbound RTP packet runs the interceptor chain then SRTP-protect, and the
+# protected bytes feed the inbound side (SRTP-unprotect -> RFC5761 demux ->
+# correct track -> on_track-style handler fires with the right SSRC/PT/payload,
+# byte-exact) over 64 randomized (seeded) rounds across both tracks. (2) A
+# deliberate inbound sequence GAP makes the NackGenerator emit a Generic NACK,
+# re-parsed via rtcp.h to assert the missing seqs. (3) The ReportInterceptor
+# tick()/build_now produces a parseable SR/RR compound. Links OpenSSL (SRTP
+# crypto); ws2_32/mswsock/iphlpapi on Windows for parity with the WebRTC TUs.
+boltapi_add_test(boltapi_media_track_test media_track_test.cpp)
+target_link_libraries(boltapi_media_track_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+if(WIN32)
+    target_link_libraries(boltapi_media_track_test PRIVATE ws2_32 mswsock iphlpapi)
+endif()
+
 # M3: HTTP/3 + WebRTC seam — ProtocolRegistry mechanism (register/has/create),
 # a dummy IProtocol returning NotImplemented, and (when the compile flags are
 # ON) the real H3/WebRTC stub factories registering. Flag-AWARE: passes in the

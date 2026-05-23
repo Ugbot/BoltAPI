@@ -462,6 +462,27 @@ void App::init_protocol_seams() {
                             });
                     });
 
+                // WM5 media: declare the outbound media tracks and wire the
+                // on_track handler. The hub pre-registers each declared track per
+                // peer once SRTP keying is ready and, on the first inbound RTP for
+                // an SSRC, surfaces a track via the track-ready callback. We bind
+                // the App's on_track handler as the track's deliver sink so every
+                // inbound RTP packet reaches the App (which may echo via
+                // track.write -> interceptors -> SRTP -> UDP).
+                for (const WebRtcConfig::MediaTrackSpec& ms :
+                         webrtc_config_.media_tracks) {
+                    const webrtc::MediaKind k = ms.kind == 1
+                        ? webrtc::MediaKind::kVideo : webrtc::MediaKind::kAudio;
+                    webrtc_hub_->add_track_spec(k, ms.ssrc, ms.payload_type,
+                                                ms.codec.c_str());
+                }
+                MediaTrackHandler* th = &track_handler_;
+                webrtc_hub_->set_track_ready(
+                    [th](webrtc::MediaTrack& tr) {
+                        if (*th == nullptr) return;
+                        tr.set_deliver_sink(&App::media_deliver_trampoline, th);
+                    });
+
                 webrtc::WebRtcPeerHub* hub = webrtc_hub_.get();
                 webrtc_transport_->set_datagram_handler(
                     [hub](const sockaddr* peer, int plen,
@@ -739,6 +760,20 @@ bool App::handle_webrtc_offer(std::string_view body, std::string& out_answer) {
     }
 
     return webrtc::build_answer(p, out_answer) == webrtc::SdpError::Ok;
+}
+
+// WM5: deliver an inbound RTP packet to the App's on_track handler. `ctx` is the
+// MediaTrackHandler* (&App::track_handler_). noexcept: a handler that throws in
+// an exception-free build is undefined; callers register noexcept handlers.
+void App::media_deliver_trampoline(void* ctx, webrtc::MediaTrack& track,
+                                   const webrtc::rtp::Packet& pkt,
+                                   const std::uint8_t* data,
+                                   std::size_t len) noexcept {
+    assert(ctx != nullptr && "media_deliver: null ctx");
+    assert(data != nullptr && "media_deliver: null data");
+    (void)pkt;  // the App reads identity off `track`; pkt is the parsed view
+    auto* handler = static_cast<MediaTrackHandler*>(ctx);
+    if (*handler != nullptr) (*handler)(track, data, len);
 }
 #endif  // BOLTAPI_WITH_WEBRTC
 

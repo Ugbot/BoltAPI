@@ -55,8 +55,8 @@ Every WebRTC test/interop MUST be non-hanging:
 - [x] Codec intersection with offer → answer (`negotiate_media` + `build_media_answer`): audio **Opus/PCMU/PCMA**, video **VP8/VP9/H264** (relay PTs; no transcode), BUNDLE+rtcp-mux on one transport. Gate `tests/media_sdp_test.cpp` (real Chrome A/V offer, both m-lines, malformed→error).
 
 ## WM5 — Interceptor pipeline + Track API  (Pion-style)
-- [ ] `webrtc/interceptor`: ordered RTP/RTCP middleware chain (mirrors our HTTP onion). Built-ins (each tickable): **NACK responder + generator (RTX)**, **RTCP SR/RR reporter**, **PLI/FIR** keyframe request, **TWCC** feedback + receiver bandwidth estimate.
-- [ ] `MediaTrack` (kind/SSRC/codec/PT) + `App::on_track(handler)` + `track.write(rtp)`; SRTP-decrypted RTP → app; app → interceptors → SRTP → UdpTransport. Mirrors `on_data_channel`.
+- [x] `webrtc/interceptor`: ordered RTP/RTCP middleware chain (mirrors our HTTP onion; bounded `kMaxInterceptors`, inbound in-order + outbound reverse onion, no heap on the packet path). Built-ins (each tickable): **NACK generator** (per-SSRC gap detect → Generic NACK via rtcp.h) **+ NACK responder** (bounded resend ring, re-emits on inbound NACK), **RTCP SR/RR reporter** (per-SSRC counters → SR/RR on tick). PLI/FIR + TWCC are documented TODO stubs (the pipeline + hooks are complete).
+- [x] `MediaTrack` (kind/SSRC/codec/PT, bounded `TrackRegistry`/`kMaxTracks`) + `App::on_track(handler)` + `track.write(rtp)`; SRTP-decrypted RTP → RFC5761 demux (by SSRC, PT fallback) → track → app; app `track.write` → outbound interceptors → SRTP-protect → UdpTransport. Wired into `WebRtcPeerHub` (media keying via `make_srtp_sessions` after DTLS; first-byte 128–191 datagrams demuxed `rtcp::is_rtcp` ? SRTCP : SRTP). Mirrors `on_data_channel`. Gate `tests/media_track_test.cpp` (two tracks audio+video distinct SSRCs, 64 seeded randomized rounds byte-exact; sequence-gap → parseable NACK; reporter tick → parseable SR/RR).
 
 ## WM6 — Media example milestones (each a bounded test target)
 - [ ] **echo** (aiortc `server`): receive audio+video + data channel, loop back. Demo server + `testing/web/media.html` (getUserMedia).

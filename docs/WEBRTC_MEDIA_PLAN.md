@@ -53,10 +53,23 @@
       m-lines onto the one ICE/DTLS transport. Gate `tests/media_sdp_test.cpp`.
 
 ## Phase M5 — Track API + relay/echo
-- [ ] `MediaTrack` (kind audio/video, SSRC, codec) + `App::on_track(handler)` and
-      `track.send(rtp_frame)`; surface incoming SRTP-decrypted RTP as frames.
+- [x] `MediaTrack` (kind audio/video, SSRC, codec, PT; bounded `TrackRegistry`,
+      `kMaxTracks`) + `App::on_track(handler)` and `track.write(rtp_packet)`;
+      surface incoming SRTP-decrypted RTP as packets to the App handler (demux by
+      SSRC, PT fallback). Plus `webrtc/interceptor` — an ordered, bounded
+      RTP/RTCP middleware chain (`kMaxInterceptors`, inbound in-order + outbound
+      reverse onion, no heap on the packet path) with built-ins NackGenerator,
+      NackResponder, ReportInterceptor (SR/RR on tick). Wired into
+      `WebRtcPeerHub`: SRTP keying via `make_srtp_sessions` after DTLS; first-byte
+      128–191 datagrams demuxed (`rtcp::is_rtcp` ? SRTCP-unprotect → RTCP hooks :
+      SRTP-unprotect → demux → track → on_track); outbound `track.write` →
+      interceptors → SRTP-protect → UdpTransport. Gate `tests/media_track_test.cpp`
+      (two tracks audio+video distinct SSRCs, 64 seeded randomized rounds
+      byte-exact; sequence-gap → parseable Generic NACK; reporter tick →
+      parseable SR/RR compound). Deadline-bounded, default suite.
 - [ ] Echo example: receive a track, loop its RTP back out (re-SRTP) — the aiortc
-      `server` shape. Wire into the demo server.
+      `server` shape. Wire into the demo server. (WM6 — the pipeline is ready;
+      `on_track` handlers can already echo via `track.write`.)
 
 ## Phase M6 — Interop + perf
 - [ ] aiortc interop (via `uv run --with aiortc`): the `server`/`videostream`/
