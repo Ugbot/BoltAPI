@@ -438,11 +438,23 @@ TEST(QuicRobustness, FuzzParserAndConnectionInputBounded) {
     }
 
     // (b) Connection-level fuzz: feed garbage + truncated handshake-shaped
-    // datagrams to a live server connection. It must never crash and must not
-    // advance to Established on noise. Bounded by an iteration cap.
-    Pair p;
-    ASSERT_TRUE(p.bind());
-    p.wire();
+    // datagrams to an ISOLATED server connection. It must never crash and must
+    // not advance to Established on noise. Bounded by an iteration cap.
+    //
+    // The server is deliberately STANDALONE — no cross-wired peer, no live UDP
+    // sockets. Its send callback drains to a sink, so nothing the server emits
+    // in reaction to a crafted-but-bogus Initial can ever be answered by a real
+    // peer. That isolation is the point: a cross-wired loopback client (as in the
+    // other gates) would, given a seeded-random datagram that happens to parse as
+    // a valid Initial, reply and bootstrap a genuine TLS handshake — which is
+    // (a) not what this fuzz gate is testing and (b) a source of async-I/O
+    // nondeterminism (the established-by-iter-N count raced with UDP delivery,
+    // and teardown could touch a connection mid-callback -> the historical 1-in-5
+    // flake + occasional AV). With no peer, the only input is our seeded RNG, so
+    // the run is fully deterministic and the "never Established on noise"
+    // invariant is honestly exercised against the connection input path alone.
+    q::QuicConnection iso_server;
+    ASSERT_TRUE(iso_server.init(true, [](const std::uint8_t*, std::size_t) {}));
     std::mt19937 rng2(0x12345678u);
     for (int iter = 0; iter < 4000; ++iter) {
         std::uint8_t buf[1500];
@@ -456,12 +468,10 @@ TEST(QuicRobustness, FuzzParserAndConnectionInputBounded) {
             buf[1] = 0x00; buf[2] = 0x00; buf[3] = 0x00; buf[4] = 0x01;  // v1
             buf[5] = static_cast<std::uint8_t>(rng2() % 25);  // DCID len (may be illegal)
         }
-        std::lock_guard<std::mutex> lk(p.server_mtx);
-        p.server.feed_datagram(buf, n);
-        ASSERT_FALSE(p.server.is_established())
+        iso_server.feed_datagram(buf, n);
+        ASSERT_FALSE(iso_server.is_established())
             << "server reached Established on fuzz at iter " << iter;
     }
-    p.stop();
 }
 
 // ============================================================================

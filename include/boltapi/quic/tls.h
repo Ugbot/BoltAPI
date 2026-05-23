@@ -163,8 +163,10 @@ public:
         std::vector<std::uint8_t> recv_buf;
         std::size_t recv_consumed = 0;  // bytes released back to us by TLS
 
-        std::array<std::uint8_t, kSecretLength> read_secret{};
-        std::array<std::uint8_t, kSecretLength> write_secret{};
+        // Sized for the largest TLS 1.3 hash (SHA-384, 48B) so AES-256-GCM
+        // suites — which aioquic offers FIRST — are not truncated to 32B.
+        std::array<std::uint8_t, kMaxSecretLength> read_secret{};
+        std::array<std::uint8_t, kMaxSecretLength> write_secret{};
         std::size_t read_secret_len = 0;
         std::size_t write_secret_len = 0;
 
@@ -181,13 +183,31 @@ public:
     // in-process self-test (real cert/SNI verification is wave 6). Returns true
     // on success.
     // ------------------------------------------------------------------------
+    // Constrain the SSL_CTX to TLS 1.3 and a DETERMINISTIC cipher-suite order so
+    // both roles (and external peers) converge on the same suite. We prefer
+    // TLS_AES_128_GCM_SHA256 (32B SHA-256 secrets) but still OFFER AES-256-GCM /
+    // ChaCha20 — the suite-aware key schedule (packet_protection.h) derives the
+    // correct hash/length for whichever is negotiated. Returns true on success.
+    bool configure_ctx_common() noexcept {
+        assert(ctx_ != nullptr && "configure_ctx_common: null ctx");
+        assert(owns_ctx_ && "configure_ctx_common: ctx not owned");
+        SSL_CTX_set_min_proto_version(ctx_, TLS1_3_VERSION);
+        SSL_CTX_set_max_proto_version(ctx_, TLS1_3_VERSION);
+        // Honour OUR order (server preference) and put the SHA-256 suite first so
+        // the negotiated suite is stable across OpenSSL default-order changes.
+        SSL_CTX_set_options(ctx_, SSL_OP_CIPHER_SERVER_PREFERENCE);
+        return SSL_CTX_set_ciphersuites(
+                   ctx_,
+                   "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:"
+                   "TLS_CHACHA20_POLY1305_SHA256") == 1;
+    }
+
     bool init_server() noexcept {
         is_server_ = true;
         ctx_ = SSL_CTX_new(TLS_method());
         if (ctx_ == nullptr) return false;
         owns_ctx_ = true;
-        SSL_CTX_set_min_proto_version(ctx_, TLS1_3_VERSION);
-        SSL_CTX_set_max_proto_version(ctx_, TLS1_3_VERSION);
+        if (!configure_ctx_common()) return false;
 
         X509* cert = nullptr;
         EVP_PKEY* key = nullptr;
@@ -208,8 +228,7 @@ public:
         ctx_ = SSL_CTX_new(TLS_method());
         if (ctx_ == nullptr) return false;
         owns_ctx_ = true;
-        SSL_CTX_set_min_proto_version(ctx_, TLS1_3_VERSION);
-        SSL_CTX_set_max_proto_version(ctx_, TLS1_3_VERSION);
+        if (!configure_ctx_common()) return false;
         // Permissive: the self-test server presents a self-signed cert with no
         // CA chain. Real verification (CA store + SNI) lands in wave 6.
         SSL_CTX_set_verify(ctx_, SSL_VERIFY_NONE, nullptr);
@@ -443,9 +462,15 @@ private:
     bool install_protection(LevelState& ls, TlsLevel level, bool is_read,
                             const std::uint8_t* secret,
                             std::size_t secret_len) noexcept {
-        if (secret_len != kSecretLength) return false;  // SHA-256 suites only
+        assert(secret != nullptr && "install_protection: null secret");
+        assert(static_cast<std::size_t>(level) < kNumTlsLevels && "bad level");
+        const AeadAlgorithm algo = aead_for_level(level);
+        // The yielded secret MUST be exactly one hash output long for the suite
+        // (32B SHA-256 / 48B SHA-384). A mismatch means we mis-detected the
+        // cipher; refuse rather than derive keys the peer cannot match.
+        if (secret_len != hash_length(hash_for_aead(algo))) return false;
         PacketProtectionKeys keys;
-        if (!derive_packet_keys(secret, secret_len, aead_for_level(level), keys))
+        if (!derive_packet_keys(secret, secret_len, algo, keys))
             return false;
         PacketProtection& pp = is_read ? ls.read_protection : ls.write_protection;
         if (!pp.initialize(keys)) return false;
@@ -524,7 +549,7 @@ private:
         const std::size_t idx = static_cast<std::size_t>(level);
         LevelState& ls = self->levels_[idx];
         const std::size_t copy =
-            secret_len <= kSecretLength ? secret_len : kSecretLength;
+            secret_len <= kMaxSecretLength ? secret_len : kMaxSecretLength;
         const bool is_read = (direction == kQuicTlsDirRead);
         if (is_read) {
             std::memcpy(ls.read_secret.data(), secret, copy);
@@ -535,8 +560,9 @@ private:
             ls.write_secret_len = copy;
             self->write_level_idx_ = idx;  // we now write at this level
         }
-        // Drive wave-2 packet protection from the secret (best-effort; only
-        // SHA-256 (32-byte) suites are wired — AES-256/SHA-384 is wave 7).
+        // Drive wave-2 packet protection from the secret. Both SHA-256 (32B)
+        // and SHA-384 (48B, TLS_AES_256_GCM_SHA384) suites are wired — the hash
+        // and secret length follow the negotiated cipher (RFC 9001 §5.1).
         self->install_protection(ls, level, is_read, secret, copy);
         return 1;
     }

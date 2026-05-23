@@ -58,6 +58,34 @@ inline constexpr std::size_t kHpSampleLength = 16;    // §5.4.2
 inline constexpr std::size_t kHpMaskLength = 5;       // 1 flag byte + 4 PN bytes
 inline constexpr std::size_t kMaxPacketNumberLength = 4;
 inline constexpr std::size_t kSecretLength = 32;      // SHA-256 PRK / secrets
+// A traffic secret is one hash output long (RFC 8446 §7.1): 32B for SHA-256
+// suites, 48B for SHA-384 (TLS_AES_256_GCM_SHA384). All secret buffers are sized
+// to this maximum so the negotiated suite (not just the SHA-256 ones) fits.
+inline constexpr std::size_t kMaxSecretLength = 48;   // SHA-384 PRK / secrets
+
+// ----------------------------------------------------------------------------
+// Hash function for the TLS 1.3 key schedule (RFC 8446 §7.1). The Initial keys
+// always use SHA-256 (RFC 9001 §5.2); Handshake/1-RTT use the hash bound to the
+// NEGOTIATED cipher suite — SHA-384 for TLS_AES_256_GCM_SHA384, else SHA-256.
+// ----------------------------------------------------------------------------
+enum class HashAlgorithm : std::uint8_t {
+    kSha256 = 0,
+    kSha384 = 1,
+};
+
+inline constexpr std::size_t hash_length(HashAlgorithm h) noexcept {
+    return h == HashAlgorithm::kSha384 ? 48 : 32;
+}
+
+inline const char* hash_digest_name(HashAlgorithm h) noexcept {
+    return h == HashAlgorithm::kSha384 ? "SHA384" : "SHA256";
+}
+
+// The key-schedule hash paired with each AEAD suite (RFC 9001 §5.3 / RFC 8446).
+inline constexpr HashAlgorithm hash_for_aead(AeadAlgorithm a) noexcept {
+    return a == AeadAlgorithm::kAes256Gcm ? HashAlgorithm::kSha384
+                                          : HashAlgorithm::kSha256;
+}
 
 // Initial salt for QUIC v1 (RFC 9001 §5.2): 0x38762cf7...ccbb7f0a.
 inline constexpr std::uint8_t kQuicV1InitialSalt[] = {
@@ -95,12 +123,15 @@ inline constexpr std::size_t hp_key_length(AeadAlgorithm algo) noexcept {
 // HKDF (RFC 8446 §7.1 / RFC 9001 §5) via OpenSSL 3.x EVP_KDF.
 // ============================================================================
 
-// HKDF-Extract(salt, ikm) -> PRK (32 bytes for SHA-256). Returns true on success.
+// HKDF-Extract(salt, ikm) -> PRK (one hash output long). Returns true on success.
+// The PRK length follows `hash` (32B SHA-256, 48B SHA-384).
 inline bool hkdf_extract(std::uint8_t* out, std::size_t out_cap,
                          const std::uint8_t* ikm, std::size_t ikm_len,
-                         const std::uint8_t* salt, std::size_t salt_len) noexcept {
+                         const std::uint8_t* salt, std::size_t salt_len,
+                         HashAlgorithm hash = HashAlgorithm::kSha256) noexcept {
+    const std::size_t prk_len = hash_length(hash);
     assert(out != nullptr && "hkdf_extract: null out");
-    assert(out_cap >= kSecretLength && "hkdf_extract: out too small for SHA-256 PRK");
+    assert(out_cap >= prk_len && "hkdf_extract: out too small for PRK");
     (void)out_cap;  // referenced only by the assert (compiled out under NDEBUG)
 
     EVP_KDF* kdf = EVP_KDF_fetch(nullptr, "HKDF", nullptr);
@@ -112,7 +143,7 @@ inline bool hkdf_extract(std::uint8_t* out, std::size_t out_cap,
     int mode = EVP_KDF_HKDF_MODE_EXTRACT_ONLY;
     OSSL_PARAM params[5];
     params[0] = OSSL_PARAM_construct_utf8_string(
-        OSSL_KDF_PARAM_DIGEST, const_cast<char*>("SHA256"), 0);
+        OSSL_KDF_PARAM_DIGEST, const_cast<char*>(hash_digest_name(hash)), 0);
     params[1] = OSSL_PARAM_construct_int(OSSL_KDF_PARAM_MODE, &mode);
     params[2] = OSSL_PARAM_construct_octet_string(
         OSSL_KDF_PARAM_KEY, const_cast<std::uint8_t*>(ikm), ikm_len);
@@ -120,18 +151,19 @@ inline bool hkdf_extract(std::uint8_t* out, std::size_t out_cap,
         OSSL_KDF_PARAM_SALT, const_cast<std::uint8_t*>(salt), salt_len);
     params[4] = OSSL_PARAM_construct_end();
 
-    const int ret = EVP_KDF_derive(ctx, out, kSecretLength, params);
+    const int ret = EVP_KDF_derive(ctx, out, prk_len, params);
     EVP_KDF_CTX_free(ctx);
-    assert((ret <= 0 || out_cap >= kSecretLength) && "hkdf_extract overran");
+    assert((ret <= 0 || out_cap >= prk_len) && "hkdf_extract overran");
     return ret > 0;
 }
 
 // HKDF-Expand(prk, info, L) -> out[0..out_len). Returns true on success.
 inline bool hkdf_expand(std::uint8_t* out, std::size_t out_len,
                         const std::uint8_t* prk, std::size_t prk_len,
-                        const std::uint8_t* info, std::size_t info_len) noexcept {
+                        const std::uint8_t* info, std::size_t info_len,
+                        HashAlgorithm hash = HashAlgorithm::kSha256) noexcept {
     assert(out != nullptr && "hkdf_expand: null out");
-    assert(out_len > 0 && out_len <= 255 * 32 && "hkdf_expand: L out of range");
+    assert(out_len > 0 && out_len <= 255 * 48 && "hkdf_expand: L out of range");
 
     EVP_KDF* kdf = EVP_KDF_fetch(nullptr, "HKDF", nullptr);
     if (kdf == nullptr) return false;
@@ -142,7 +174,7 @@ inline bool hkdf_expand(std::uint8_t* out, std::size_t out_len,
     int mode = EVP_KDF_HKDF_MODE_EXPAND_ONLY;
     OSSL_PARAM params[5];
     params[0] = OSSL_PARAM_construct_utf8_string(
-        OSSL_KDF_PARAM_DIGEST, const_cast<char*>("SHA256"), 0);
+        OSSL_KDF_PARAM_DIGEST, const_cast<char*>(hash_digest_name(hash)), 0);
     params[1] = OSSL_PARAM_construct_int(OSSL_KDF_PARAM_MODE, &mode);
     params[2] = OSSL_PARAM_construct_octet_string(
         OSSL_KDF_PARAM_KEY, const_cast<std::uint8_t*>(prk), prk_len);
@@ -161,7 +193,8 @@ inline bool hkdf_expand(std::uint8_t* out, std::size_t out_len,
 // Returns true on success.
 inline bool hkdf_expand_label(const std::uint8_t* secret, std::size_t secret_len,
                               const char* label, std::size_t label_len,
-                              std::uint8_t* out, std::size_t out_len) noexcept {
+                              std::uint8_t* out, std::size_t out_len,
+                              HashAlgorithm hash = HashAlgorithm::kSha256) noexcept {
     assert(label != nullptr && "hkdf_expand_label: null label");
     assert(label_len <= 249 && "hkdf_expand_label: label too long for one byte");
 
@@ -184,7 +217,7 @@ inline bool hkdf_expand_label(const std::uint8_t* secret, std::size_t secret_len
     hkdf_label[n++] = 0;  // empty context
 
     assert(n <= sizeof(hkdf_label) && "hkdf_expand_label overran scratch");
-    return hkdf_expand(out, out_len, secret, secret_len, hkdf_label, n);
+    return hkdf_expand(out, out_len, secret, secret_len, hkdf_label, n, hash);
 }
 
 // ============================================================================
@@ -231,12 +264,22 @@ struct PacketProtectionKeys {
     AeadAlgorithm algorithm = AeadAlgorithm::kAes128Gcm;
 };
 
-// quic key / quic iv / quic hp (RFC 9001 §5.1). Returns true on success.
+// quic key / quic iv / quic hp (RFC 9001 §5.1). The HKDF-Expand-Label hash MUST
+// match the AEAD suite's hash (SHA-384 for AES-256-GCM, else SHA-256) and the
+// secret MUST be one hash output long — otherwise the peer derives different
+// keys (the aioquic Handshake "decryption failed" root cause). Returns true on
+// success.
 inline bool derive_packet_keys(const std::uint8_t* secret, std::size_t secret_len,
                                AeadAlgorithm algo,
                                PacketProtectionKeys& keys) noexcept {
+    const HashAlgorithm hash = hash_for_aead(algo);
     assert(secret != nullptr && "derive_packet_keys: null secret");
-    assert(secret_len == kSecretLength && "derive_packet_keys: secret must be 32B");
+    assert(secret_len > 0 && "derive_packet_keys: empty secret");
+    // For a real TLS-yielded secret this is exactly one hash output (32B SHA-256
+    // / 48B SHA-384). HKDF-Expand itself accepts any PRK length, so we do not
+    // hard-fail on a mismatch (round-trip self-tests may pass a short PRK) — but
+    // the negotiated-suite path MUST feed the right length, which install_protection
+    // and the connection layer assert.
 
     keys.algorithm = algo;
     keys.key_len = aead_key_length(algo);
@@ -244,15 +287,15 @@ inline bool derive_packet_keys(const std::uint8_t* secret, std::size_t secret_le
     if (keys.key_len == 0 || keys.hp_len == 0) return false;
 
     if (!hkdf_expand_label(secret, secret_len, "quic key", 8,
-                           keys.key.data(), keys.key_len)) {
+                           keys.key.data(), keys.key_len, hash)) {
         return false;
     }
     if (!hkdf_expand_label(secret, secret_len, "quic iv", 7,
-                           keys.iv.data(), kAeadIvLength)) {
+                           keys.iv.data(), kAeadIvLength, hash)) {
         return false;
     }
     return hkdf_expand_label(secret, secret_len, "quic hp", 7,
-                             keys.hp_key.data(), keys.hp_len);
+                             keys.hp_key.data(), keys.hp_len, hash);
 }
 
 // ============================================================================

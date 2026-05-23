@@ -1234,3 +1234,82 @@ loopback (`http3_app_test`) + bounded interop (`http3_interop_test`,
 skip-if-absent) tests. Default `ctest` is unaffected (HTTP3=OFF → instant skip).
 
 **Public API:** none changed. Test/demo/docs only.
+
+---
+
+## DECISION LOG — QUIC interop crypto + transport-param fix (2026-05)
+
+**Context.** The W5c aioquic gate (`Http3Interop.AioquicPingAndEcho`) SKIPped (exit
+75) with aioquic logging "Payload decryption failed" at the HANDSHAKE level. Our
+in-process handshake passed, so the deviation was self-consistent (both our ends
+agreed) but RFC-wrong (a conformant peer could not match our Handshake/1-RTT
+keys).
+
+**Root cause #1 — hardcoded SHA-256 key schedule.** OpenSSL 3.6 on this box
+negotiates `TLS_AES_256_GCM_SHA384` by default (it honours the client's order and
+aioquic offers AES-256 first). That suite uses **SHA-384 → 48-byte traffic
+secrets**. But (a) `hkdf_extract`/`hkdf_expand`/`hkdf_expand_label` /
+`derive_packet_keys` hardcoded `"SHA256"`, (b) `QuicTls::install_protection`
+rejected any secret != 32B, and (c) `QuicTls::cb_yield_secret` TRUNCATED the
+yielded secret to 32B (`copy = min(secret_len, kSecretLength)`). In-process both
+ends truncated identically so it "worked"; aioquic (correct) derived 48B SHA-384
+keys and could not match our truncated-SHA-256 ones → "decryption failed".
+
+  *Fix.* Made the HKDF layer suite-aware: `HashAlgorithm{kSha256,kSha384}`,
+  `hash_for_aead()`, `hash_length()`, `hash_digest_name()`; every HKDF fn takes a
+  `HashAlgorithm` (defaulting SHA-256 so the Initial path — always AES-128/SHA-256
+  — is unchanged). `derive_packet_keys` now derives key/iv/hp with the suite's
+  hash. Widened the per-level + 1-RTT secret buffers to `kMaxSecretLength` (48B)
+  in `tls.h` LevelState and `connection.h` (app/key-update secrets), tracked the
+  real `ku_secret_len_`, and made `next_generation_secret` (key update) hash- and
+  length-aware. After this, aioquic completed the FULL TLS 1.3 handshake (verified
+  with aioquic DEBUG logs: CLIENT_POST_HANDSHAKE, ALPN h3, all epochs).
+
+**Root cause #2 — missing connection-ID transport params (RFC 9000 §7.3).** With
+the crypto fixed, aioquic then aborted with TRANSPORT_PARAMETER_ERROR (0x8)
+"initial_source_connection_id does not match". `make_local_params()` never set
+`initial_source_connection_id` (must = the SCID we put in our Initial =
+`local_cid_`) nor, for the server, `original_destination_connection_id` (= the
+client's first-Initial DCID = `initial_dcid_`).
+
+  *Fix.* `make_local_params()` now always sets ISCID = `local_cid_` and, when
+  server with `initial_dcid_` known, ODCID = `initial_dcid_`. The server
+  re-publishes its transport params inside `server_on_first_initial()` (after the
+  client's DCID is learned, before TLS advances) so the EncryptedExtensions carry
+  both. After this, aioquic reaches CONNECTED + ALPN h3 (handshake fully
+  interoperable).
+
+**Suite determinism (to keep default `ctest` green + behaviour stable).** `tls.h`
+`init_server`/`init_client` now share `configure_ctx_common()`: TLS 1.3 only,
+`SSL_OP_CIPHER_SERVER_PREFERENCE`, ciphersuite order
+`AES_128_GCM_SHA256 : AES_256_GCM_SHA384 : CHACHA20_POLY1305_SHA256`. This pins a
+stable 32B-secret suite for the in-process self-tests (which assert
+`kSecretLength`) and against aioquic, while still OFFERING the SHA-384 / ChaCha
+suites — the now-suite-aware key schedule derives correctly for whichever is
+negotiated.
+
+**Residual (OUT of the quic/* lane).** The QUIC + TLS handshake is now fully
+interoperable with aioquic, but the gate still SKIPs: at the **HTTP/3** layer our
+response HEADER FIELD NAMES are sent with original casing (e.g. `Content-Type`),
+and RFC 9114 §4.1.1 / RFC 9113 §8.2 mandate **lowercase** — aioquic closes with
+H3_MESSAGE_ERROR (0x10E) "Header b'Content-Type' contains invalid characters".
+The casing originates in `src/app.cpp` (the H3 response-header marshal, ~line 645,
+copying `resp.headers` names verbatim) / `include/boltapi/http3/h3_connection.h`
+`write_headers`. Lowercasing field names there (both files OUTSIDE the quic/*
+lane) is the one remaining change to turn the gate from SKIP → PASS.
+
+**BUG 2 (fuzz flake) — `QuicRobustness.FuzzParserAndConnectionInputBounded`.**
+Part (b) cross-wired a live loopback client+server over real UDP sockets, then fed
+seeded-random datagrams to the server. A datagram that happened to parse as a
+valid Initial made the server respond; the live client replied and bootstrapped a
+GENUINE handshake → the server hit Established "on noise", and the
+async-I/O/teardown race also caused an occasional access violation (~1-in-5). Fix:
+part (b) now feeds the seeded input to an ISOLATED standalone server (no peer, no
+sockets, send → sink), so the run is fully deterministic and the
+"never-Established-on-noise" invariant is honestly exercised against the
+connection input path alone. 20/20 green.
+
+**Files changed:** `include/boltapi/quic/packet_protection.h`,
+`include/boltapi/quic/tls.h`, `include/boltapi/quic/connection.h`,
+`include/boltapi/quic/robustness.h`, `tests/quic_robustness_test.cpp`. Default
+`ctest` 222/222; quic suite 19/19; fuzz 20/20.

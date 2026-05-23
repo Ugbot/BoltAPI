@@ -1351,6 +1351,15 @@ private:
         initial_dcid_.length = hdr.dest_cid.length;
         peer_cid_ = hdr.source_cid;  // reply to the client's SCID
         if (!derive_initial_keys(initial_dcid_)) return false;
+        // Now that we know the client's original DCID (RFC 9000 §7.3), re-publish
+        // our transport parameters so the EncryptedExtensions carry both
+        // initial_source_connection_id (local_cid_) and
+        // original_destination_connection_id (initial_dcid_). This MUST happen
+        // before TLS advances (it runs after this returns), so the values land in
+        // the server's first handshake flight. Without ODCID/ISCID a conformant
+        // client (aioquic) aborts with TRANSPORT_PARAMETER_ERROR.
+        assert(initial_dcid_.length > 0 && "server odcid empty");
+        if (!tls_.set_transport_params(make_local_params())) return false;
         state_ = ConnState::kHandshaking;
         server_initialized_ = true;
         return true;
@@ -1991,16 +2000,20 @@ private:
     // RFC 9001 §6.1: capture the gen-0 1-RTT secrets yielded by TLS so we can
     // derive next-generation AEAD keys for key updates. Idempotent.
     void seed_key_update_keys() noexcept {
+        assert(state_ == ConnState::kEstablished && "seed: not established");
         if (ku_ready_) return;
         std::size_t rl = 0, wl = 0;
         const std::uint8_t* rs = tls_.read_secret(TlsLevel::kApplication, &rl);
         const std::uint8_t* ws = tls_.write_secret(TlsLevel::kApplication, &wl);
-        if (rs == nullptr || ws == nullptr || rl != kSecretLength ||
-            wl != kSecretLength)
-            return;
-        std::memcpy(app_read_secret_, rs, kSecretLength);
-        std::memcpy(app_write_secret_, ws, kSecretLength);
         ku_algo_ = tls_.aead_algorithm();
+        // The 1-RTT secret length follows the negotiated suite's hash, not a
+        // hardcoded 32B (RFC 9001 §5.1) — AES-256-GCM yields 48B SHA-384 secrets.
+        const std::size_t want = hash_length(hash_for_aead(ku_algo_));
+        if (rs == nullptr || ws == nullptr || rl != want || wl != want) return;
+        assert(want <= kMaxSecretLength && "1-RTT secret too long");
+        ku_secret_len_ = want;
+        std::memcpy(app_read_secret_, rs, want);
+        std::memcpy(app_write_secret_, ws, want);
         const bool ok = install_app_protection(app_read_cur_, app_read_secret_,
                                                app_write_cur_, app_write_secret_);
         if (!ok) return;
@@ -2016,10 +2029,12 @@ private:
                                 PacketProtection& write_pp,
                                 const std::uint8_t* write_secret) noexcept {
         assert(read_secret != nullptr && write_secret != nullptr && "iap: null");
+        assert(ku_secret_len_ == hash_length(hash_for_aead(ku_algo_)) &&
+               "iap: secret length must match suite hash");
         PacketProtectionKeys rk, wk;
-        if (!derive_packet_keys(read_secret, kSecretLength, ku_algo_, rk))
+        if (!derive_packet_keys(read_secret, ku_secret_len_, ku_algo_, rk))
             return false;
-        if (!derive_packet_keys(write_secret, kSecretLength, ku_algo_, wk))
+        if (!derive_packet_keys(write_secret, ku_secret_len_, ku_algo_, wk))
             return false;
         read_pp = PacketProtection{};
         write_pp = PacketProtection{};
@@ -2030,10 +2045,17 @@ private:
     // peer-initiated update opens on arrival. The write side is installed only
     // when WE commit the update (so we never seal under keys the peer lacks).
     void derive_next_app_protection() noexcept {
-        if (!next_generation_secret(app_read_secret_, next_read_secret_)) return;
-        if (!next_generation_secret(app_write_secret_, next_write_secret_)) return;
+        assert(ku_secret_len_ == hash_length(hash_for_aead(ku_algo_)) &&
+               "dnap: secret length must match suite hash");
+        const HashAlgorithm h = hash_for_aead(ku_algo_);
+        if (!next_generation_secret(app_read_secret_, next_read_secret_,
+                                    ku_secret_len_, h))
+            return;
+        if (!next_generation_secret(app_write_secret_, next_write_secret_,
+                                    ku_secret_len_, h))
+            return;
         PacketProtectionKeys rk;
-        if (!derive_packet_keys(next_read_secret_, kSecretLength, ku_algo_, rk))
+        if (!derive_packet_keys(next_read_secret_, ku_secret_len_, ku_algo_, rk))
             return;
         app_read_next_ = PacketProtection{};
         app_read_next_.initialize(rk);
@@ -2048,10 +2070,11 @@ private:
         // Promote the pre-derived next read keys to current.
         app_read_cur_ = std::move(app_read_next_);
         // Roll secrets forward and install the new write keys.
-        std::memcpy(app_read_secret_, next_read_secret_, kSecretLength);
-        std::memcpy(app_write_secret_, next_write_secret_, kSecretLength);
+        assert(ku_secret_len_ <= kMaxSecretLength && "rotate: secret too long");
+        std::memcpy(app_read_secret_, next_read_secret_, ku_secret_len_);
+        std::memcpy(app_write_secret_, next_write_secret_, ku_secret_len_);
         PacketProtectionKeys wk;
-        if (!derive_packet_keys(app_write_secret_, kSecretLength, ku_algo_, wk))
+        if (!derive_packet_keys(app_write_secret_, ku_secret_len_, ku_algo_, wk))
             return false;
         app_write_cur_ = PacketProtection{};
         if (!app_write_cur_.initialize(wk)) return false;
@@ -2097,6 +2120,28 @@ private:
         tp.max_idle_timeout_present = true;
         tp.active_connection_id_limit = 4;
         tp.active_connection_id_limit_present = true;
+
+        // RFC 9000 §7.3: both endpoints MUST authenticate the connection IDs they
+        // chose by echoing them in transport parameters. initial_source_connection_id
+        // = the Source CID we put in OUR Initial packets (== local_cid_). A peer
+        // (e.g. aioquic) aborts the handshake with TRANSPORT_PARAMETER_ERROR if
+        // this is missing or mismatched — this was the post-crypto interop blocker.
+        assert(local_cid_.length <= kMaxConnectionIdLength && "iscid too long");
+        std::memcpy(tp.initial_source_connection_id, local_cid_.data,
+                    local_cid_.length);
+        tp.initial_source_connection_id_len = local_cid_.length;
+        tp.initial_source_connection_id_present = true;
+
+        // RFC 9000 §7.3: the SERVER also echoes original_destination_connection_id
+        // = the DCID the client used in its first Initial (== initial_dcid_ once
+        // server_on_first_initial has run). Unknown before that, so only when set.
+        if (is_server_ && initial_dcid_.length > 0) {
+            assert(initial_dcid_.length <= kMaxConnectionIdLength && "odcid too long");
+            std::memcpy(tp.original_destination_connection_id, initial_dcid_.data,
+                        initial_dcid_.length);
+            tp.original_destination_connection_id_len = initial_dcid_.length;
+            tp.original_destination_connection_id_present = true;
+        }
         return tp;
     }
 
@@ -2208,10 +2253,13 @@ private:
     bool ku_ready_ = false;
     std::uint64_t key_gen_ = 0;
     AeadAlgorithm ku_algo_ = AeadAlgorithm::kAes128Gcm;
-    std::uint8_t app_read_secret_[kSecretLength] = {};
-    std::uint8_t app_write_secret_[kSecretLength] = {};
-    std::uint8_t next_read_secret_[kSecretLength] = {};
-    std::uint8_t next_write_secret_[kSecretLength] = {};
+    // 1-RTT traffic secrets are one hash output long (32B SHA-256 / 48B SHA-384),
+    // sized to the maximum so AES-256-GCM-SHA384 key updates work (RFC 9001 §6.1).
+    std::size_t ku_secret_len_ = kSecretLength;
+    std::uint8_t app_read_secret_[kMaxSecretLength] = {};
+    std::uint8_t app_write_secret_[kMaxSecretLength] = {};
+    std::uint8_t next_read_secret_[kMaxSecretLength] = {};
+    std::uint8_t next_write_secret_[kMaxSecretLength] = {};
     PacketProtection app_read_cur_;   // current generation read AEAD
     PacketProtection app_write_cur_;  // current generation write AEAD
     PacketProtection app_read_next_;  // pre-derived next-gen read AEAD

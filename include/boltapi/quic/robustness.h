@@ -369,11 +369,17 @@ inline bool is_stateless_reset(const std::uint8_t* dgram, std::size_t len,
 //   HKDF-Expand-Label(current_secret, "quic ku", "", Hash.length).
 // Returns true on success.
 // ----------------------------------------------------------------------------
-inline bool next_generation_secret(const std::uint8_t* current /*[32]*/,
-                                   std::uint8_t* next /*[32]*/) noexcept {
+// `secret_len` is one hash output (32B SHA-256 / 48B SHA-384) and `hash` is the
+// negotiated suite's key-schedule hash; both default to SHA-256 for callers that
+// only ever use SHA-256 suites.
+inline bool next_generation_secret(
+    const std::uint8_t* current, std::uint8_t* next,
+    std::size_t secret_len = kSecretLength,
+    HashAlgorithm hash = HashAlgorithm::kSha256) noexcept {
     assert(current != nullptr && next != nullptr && "ku: null");
-    return hkdf_expand_label(current, kSecretLength, "quic ku", 7, next,
-                             kSecretLength);
+    assert(secret_len == hash_length(hash) && "ku: secret length vs hash");
+    return hkdf_expand_label(current, secret_len, "quic ku", 7, next, secret_len,
+                             hash);
 }
 
 }  // namespace bolt::api::quic
