@@ -125,6 +125,21 @@ if(WIN32)
     target_link_libraries(boltapi_dtls_test PRIVATE ws2_32 mswsock iphlpapi)
 endif()
 
+# WebRTC DATA CHANNELS — THE DATA-CHANNEL GATE. (1) CRC-32c (RFC 3309) known
+# vectors; (2) the SCTP 4-way association handshake + reliable/ordered DATA+SACK
+# round-trip between two in-process SctpAssociation endpoints; (3) END-TO-END
+# LOOPBACK: our full server stack (UdpTransport + DTLS server + DtlsSessionManager
+# + WebRtcPeerHub with an App-shaped on_data_channel echo handler) against a
+# CLIENT using our own SCTP active side over a real OpenSSL DTLS client —
+# DATA_CHANNEL_OPEN -> handler fires with the right label -> string message
+# echoed -> client receives the echo. Bounded by a deadline so it can't hang.
+# Links OpenSSL + ws2_32/mswsock (Windows) for the live socket + crypto.
+boltapi_add_test(boltapi_datachannel_test datachannel_test.cpp)
+target_link_libraries(boltapi_datachannel_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+if(WIN32)
+    target_link_libraries(boltapi_datachannel_test PRIVATE ws2_32 mswsock iphlpapi)
+endif()
+
 # M3: HTTP/3 + WebRTC seam — ProtocolRegistry mechanism (register/has/create),
 # a dummy IProtocol returning NotImplemented, and (when the compile flags are
 # ON) the real H3/WebRTC stub factories registering. Flag-AWARE: passes in the

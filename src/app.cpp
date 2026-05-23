@@ -365,11 +365,46 @@ void App::init_protocol_seams() {
                     webrtc_dtls_mgr_->set_offer_fingerprint(
                         webrtc_config_.offer_fingerprint);
                 }
-                webrtc::DtlsSessionManager* dm = webrtc_dtls_mgr_.get();
+                // Data-channel hub: bridges DTLS app-data to per-peer SCTP/DCEP
+                // stacks and surfaces established channels to the registered
+                // on_data_channel handlers. The hub IS the datagram handler: it
+                // feeds DTLS, then (once established) drains decrypted SCTP
+                // packets into the per-peer association and routes channel
+                // messages to the App handler that matches the channel's label
+                // (with "" as a wildcard). The handler may echo by sending back
+                // on the channel.
+                webrtc_hub_ = std::make_unique<webrtc::WebRtcPeerHub>(
+                    *webrtc_dtls_mgr_, *webrtc_transport_);
+                // Snapshot the registered handlers for the channel-ready lambda.
+                std::vector<DcReg>* regs = &dc_handlers_;
+                webrtc_hub_->set_channel_ready(
+                    [regs](webrtc::DataChannel& ch) {
+                        // Match by exact label, else fall back to a "" wildcard.
+                        const std::string label(ch.label());
+                        DataChannelHandler matched;
+                        for (const DcReg& r : *regs) {
+                            if (r.label == label) { matched = r.handler; break; }
+                        }
+                        if (!matched) {
+                            for (const DcReg& r : *regs) {
+                                if (r.label.empty()) { matched = r.handler; break; }
+                            }
+                        }
+                        if (!matched) return;  // no handler for this label
+                        webrtc::DataChannel* chp = &ch;
+                        std::string lbl = label;
+                        ch.on_message(
+                            [matched, lbl, chp](const void* data,
+                                                std::size_t len, bool) {
+                                matched(lbl, data, len);
+                            });
+                    });
+
+                webrtc::WebRtcPeerHub* hub = webrtc_hub_.get();
                 webrtc_transport_->set_datagram_handler(
-                    [dm](const sockaddr* peer, int plen,
-                         const std::uint8_t* data, std::size_t len) {
-                        dm->feed(peer, plen, data, len);
+                    [hub](const sockaddr* peer, int plen,
+                          const std::uint8_t* data, std::size_t len) {
+                        hub->feed(peer, plen, data, len);
                     });
             }
 
@@ -399,6 +434,7 @@ void App::init_protocol_seams() {
                 "[boltapi] WebRTC: failed to bind UDP :%u; ICE transport not "
                 "started. H1/H2 unaffected.\n",
                 static_cast<unsigned>(udp_port));
+            webrtc_hub_.reset();
             webrtc_dtls_mgr_.reset();
             webrtc_dtls_ctx_.reset();
             webrtc_transport_.reset();
@@ -461,6 +497,7 @@ void App::stop() {
     if (webrtc_transport_) {
         webrtc_transport_->stop();
     }
+    webrtc_hub_.reset();        // frees per-peer SCTP/DCEP stacks (borrows DTLS)
     webrtc_dtls_mgr_.reset();   // frees all DtlsSessions (SSL/BIO)
     webrtc_dtls_ctx_.reset();   // frees the SSL_CTX
     if (webrtc_transport_) {

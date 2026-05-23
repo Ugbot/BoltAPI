@@ -39,6 +39,8 @@
 #include "boltapi/net/udp_transport.h"
 #include "boltapi/webrtc/ice.h"
 #include "boltapi/webrtc/dtls.h"
+#include "boltapi/webrtc/data_channel.h"
+#include "boltapi/webrtc/peer_hub.h"
 #endif
 
 #include <cassert>
@@ -299,6 +301,11 @@ private:
     // Created in init_protocol_seams(); torn down before the transport in stop().
     std::unique_ptr<webrtc::DtlsContext>        webrtc_dtls_ctx_;
     std::unique_ptr<webrtc::DtlsSessionManager> webrtc_dtls_mgr_;
+    // Data-channel hub: bridges DTLS app-data to per-peer SCTP/DCEP stacks and
+    // surfaces established channels to the registered on_data_channel handlers.
+    // Created in init_protocol_seams() after the DTLS manager; torn down before
+    // the DTLS manager in stop().
+    std::unique_ptr<webrtc::WebRtcPeerHub>      webrtc_hub_;
 #endif
 
     std::unique_ptr<Router>                   router_;

@@ -160,6 +160,13 @@ add_library(boltapi STATIC
     src/net/udp_transport.cpp  # real async UDP transport (own socket + rx thread)
     src/webrtc/ice.cpp         # ICE-lite agent (gather + STUN binding responder)
     src/webrtc/dtls.cpp        # DTLS server (answerer) over UDP via OpenSSL memory BIOs
+    # SCTP / DCEP / data channels — Bolt-native minimal SCTP over DTLS (RFC 4960
+    # subset + RFC 8261 framing), DCEP (RFC 8832), and the App-facing channel
+    # surface. Compiled UNCONDITIONALLY (no engine deps beyond OpenSSL/DTLS
+    # already linked); only the App start wiring stays under BOLTAPI_WITH_WEBRTC.
+    src/webrtc/sctp.cpp         # minimal SCTP association (CRC-32c, handshake, DATA/SACK)
+    src/webrtc/data_channel.cpp # DCEP + IDataChannel + channel routing
+    src/webrtc/peer_hub.cpp     # DTLS<->SCTP bridge + App channel surfacing
     ${BOLTAPI_ENGINE_SOURCES}
 )
 add_library(boltapi::boltapi ALIAS boltapi)
