@@ -39,6 +39,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -460,6 +461,31 @@ TEST(DataChannel, EndToEndLoopbackEcho) {
     EXPECT_EQ(client.received[1], msg2);
     EXPECT_EQ(client.received[2], bin);
     EXPECT_GE(server_msgs.load(), 3);
+
+    // ---- LARGE MESSAGE over the REAL DTLS+UDP path: a 64 KiB binary message is
+    //      fragmented into many SCTP DATA chunks, echoed by the server, and
+    //      reassembled byte-exact on the client. Exercises fragmentation +
+    //      reassembly + SACK/cwnd end-to-end through OpenSSL DTLS records. -------
+    std::string big;
+    big.resize(64 * 1024);
+    {
+        std::mt19937 rng{4242};
+        for (auto& c : big) c = static_cast<char>(rng() & 0xFF);
+    }
+    const std::size_t base_received = client.received.size();
+    ASSERT_TRUE(client.channel->send_binary(big.data(), big.size()));
+    {
+        const auto t_end = std::chrono::steady_clock::now() +
+                           std::chrono::seconds(15);
+        while (std::chrono::steady_clock::now() < t_end &&
+               client.received.size() <= base_received) {
+            client.pump(std::chrono::milliseconds(50));
+        }
+    }
+    ASSERT_GT(client.received.size(), base_received)
+        << "client never received the 64 KiB echo (fragmentation/reassembly)";
+    EXPECT_EQ(client.received.back().size(), big.size());
+    EXPECT_EQ(client.received.back(), big) << "64 KiB echo not byte-exact";
 
     transport.stop();
 }

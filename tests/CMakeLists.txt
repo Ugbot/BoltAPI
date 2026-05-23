@@ -140,6 +140,20 @@ if(WIN32)
     target_link_libraries(boltapi_datachannel_test PRIVATE ws2_32 mswsock iphlpapi)
 endif()
 
+# SCTP ROBUSTNESS GATE — hardened SCTP for real browser data channels, driven
+# between two cross-wired in-process SctpAssociation endpoints (deterministic,
+# no network): (1) 64 KiB + 256 KiB message fragmentation/reassembly both
+# directions, ordered + unordered, byte-exact; (2) unordered delivery is not
+# head-of-line blocked; (3) partial reliability abandons a message via
+# FORWARD-TSN under simulated loss while later messages still arrive; (4) a
+# lossy link (seeded deterministic packet drops) still completes a large
+# reliable transfer via RTO retransmit, with cwnd growth + back-off observed.
+# All bounded by an iteration cap (no hang); deterministic via fixed seeds.
+boltapi_add_test(boltapi_sctp_robust_test sctp_robust_test.cpp)
+if(WIN32)
+    target_link_libraries(boltapi_sctp_robust_test PRIVATE ws2_32)
+endif()
+
 # M3: HTTP/3 + WebRTC seam — ProtocolRegistry mechanism (register/has/create),
 # a dummy IProtocol returning NotImplemented, and (when the compile flags are
 # ON) the real H3/WebRTC stub factories registering. Flag-AWARE: passes in the

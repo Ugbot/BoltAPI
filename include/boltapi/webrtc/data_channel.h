@@ -59,7 +59,8 @@ public:
     using CloseHandler   = std::function<void()>;
 
     DataChannel(DataChannelStack& stack, std::uint16_t stream_id,
-                std::string label, std::string protocol) noexcept;
+                std::string label, std::string protocol,
+                SctpReliability reliability = SctpReliability::reliable()) noexcept;
     ~DataChannel() override = default;
 
     DataChannel(const DataChannel&) = delete;
@@ -77,6 +78,8 @@ public:
     std::uint16_t stream_id() const noexcept { return stream_id_; }
     const std::string& protocol() const noexcept { return protocol_; }
     bool is_open() const noexcept { return open_; }
+    const SctpReliability& reliability() const noexcept { return reliability_; }
+    void set_reliability(const SctpReliability& r) noexcept { reliability_ = r; }
 
     // Callbacks (set by the App wiring when the handler fires).
     void on_message(MessageHandler h) noexcept { on_message_ = std::move(h); }
@@ -93,6 +96,7 @@ private:
     std::uint16_t     stream_id_;
     std::string       label_;
     std::string       protocol_;
+    SctpReliability   reliability_;
     bool              open_ = false;
 
     MessageHandler    on_message_;
@@ -134,19 +138,26 @@ public:
 
     // ACTIVE side: open a new data channel with `label` on the next free stream.
     // Emits DATA_CHANNEL_OPEN once the association is Established. Returns the
-    // channel (owned by the stack) or nullptr on failure.
-    DataChannel* open_channel(std::string label, std::string protocol = "") noexcept;
+    // channel (owned by the stack) or nullptr on failure. `reliability` controls
+    // ordering + partial reliability (mapped to the DCEP channel type byte).
+    DataChannel* open_channel(std::string label, std::string protocol = "",
+                              SctpReliability reliability =
+                                  SctpReliability::reliable()) noexcept;
 
-    // Drive retransmits (passthrough to the association).
-    std::size_t tick_retransmit() noexcept { return assoc_.tick_retransmit(); }
+    // Drive retransmits + RTO + partial-reliability timers (passthrough).
+    std::size_t tick_retransmit() noexcept { return assoc_.tick(0); }
+    std::size_t tick(std::uint64_t now_ms = 0) noexcept { return assoc_.tick(now_ms); }
 
     SctpAssociation& association() noexcept { return assoc_; }
     bool established() const noexcept { return assoc_.established(); }
 
     // Send a user message on a stream (used by DataChannel). is_binary picks the
-    // PPID; empty payloads use the empty-* PPIDs.
+    // PPID; empty payloads use the empty-* PPIDs. `reliability` is the channel's
+    // ordering + partial-reliability policy (plumbed into the SCTP send path).
     bool send_on_stream(std::uint16_t stream_id, const void* data,
-                        std::size_t len, bool is_binary) noexcept;
+                        std::size_t len, bool is_binary,
+                        const SctpReliability& reliability =
+                            SctpReliability::reliable()) noexcept;
 
     // Lookup / count for tests + App introspection.
     DataChannel* channel_for_stream(std::uint16_t stream_id) noexcept;
@@ -165,9 +176,12 @@ private:
     void handle_dcep(std::uint16_t stream_id, const std::uint8_t* data,
                      std::size_t len) noexcept;
     DataChannel* create_channel(std::uint16_t stream_id, std::string label,
-                                std::string protocol) noexcept;
+                                std::string protocol,
+                                SctpReliability reliability =
+                                    SctpReliability::reliable()) noexcept;
     bool send_dcep_open(std::uint16_t stream_id, std::string_view label,
-                        std::string_view protocol) noexcept;
+                        std::string_view protocol,
+                        const SctpReliability& reliability) noexcept;
     bool send_dcep_ack(std::uint16_t stream_id) noexcept;
 
     SctpAssociation     assoc_;
@@ -185,6 +199,7 @@ private:
         std::uint16_t stream_id = 0;
         std::string label;
         std::string protocol;
+        SctpReliability reliability;
     };
     static constexpr std::size_t kMaxPending = 16;
     PendingOpen pending_[kMaxPending];

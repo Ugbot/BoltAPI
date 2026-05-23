@@ -417,22 +417,43 @@ the audit's "mostly REBUILD."
       delivery: in-sequence SSN delivered immediately, future SSN buffered in a
       bounded per-association reorder ring and flushed when the gap fills.
       Preallocated send ring + reorder buffers (no per-message malloc).
-      **DEFERRED:** unordered delivery wiring (U-bit parsed + an immediate-deliver
-      path exists; full unordered channel type) and >1KB fragmentation/reassembly
-      across DATA chunks (single-chunk messages in v1).
+      HARDENING WAVE: **message fragmentation/reassembly** now implemented
+      (RFC 4960 §6.9). Outbound messages > `kSctpMaxChunkData` (1100 B) split
+      into consecutive-TSN DATA chunks with B/M/E flags (same SSN ordered, U-bit
+      unordered); inbound DATA buffered in a bounded per-assoc fragment store
+      (`kSctpMaxFrags`, ABORT on overflow) and reassembled per (stream, SSN/U)
+      into the full message before delivery — handles browser messages up to
+      256 KiB (`kSctpMaxMessage`). **Unordered delivery** is fully wired end to
+      end (U-bit on send + reassemble-and-deliver-immediately, no head-of-line
+      block). Tested: 64K/256K both directions ordered+unordered, byte-exact
+      (`tests/sctp_robust_test.cpp`).
 - [x] **SACK + retransmission.** DONE (SCTP wave): cumulative TSN ack SACK on
-      every received DATA; the SEND side parses gap-ack blocks too. Simple
-      threshold retransmit: in-flight DATA un-acked after a SACK opportunity
-      accrues a miss count, `tick_retransmit()` re-ships the saved framed packet.
-      Preallocated send/retransmit ring. **DEFERRED:** full RTO timer wheel +
-      cwnd congestion control + emitting our own gap-ack blocks (RFC 4960 §6-7;
-      v1 relies on cumulative ack + the peer retransmitting gaps — correctness
-      over perf).
-- [ ] **Partial reliability (RFC 3758) + FORWARD-TSN** for
-      `maxRetransmits`/`maxPacketLifetime` (unreliable data channels). Maps to
-      `DataChannelOptions.max_retransmits / max_packet_lifetime_ms`
-      (**ADAPT** the struct from `webrtc/data_channel.h:43-50`). **REBUILD.**
-      DEFERRED (later wave): v1 is reliable+ordered only.
+      every received DATA; the SEND side parses gap-ack blocks too.
+      HARDENING WAVE: replaced the threshold retransmit with a real **RTO timer**
+      (RFC 6298: SRTT/RTTVAR, RTO min/max, exponential backoff on T3 timeout,
+      Karn's algorithm — RTT sampled only on never-retransmitted chunks) and
+      **congestion control** (RFC 4960 §7: cwnd/ssthresh, slow start +
+      congestion avoidance via partial_bytes_acked, cwnd cut on loss; flight_size
+      tracked; cwnd/rwnd-gated `flush_send`). **Fast retransmit** on 3 dup gap
+      reports, and we now **emit our OWN gap-ack blocks** in SACK so the peer can
+      fast-retransmit. Driven by `tick(now_ms)` (was `tick_retransmit`), pumpable
+      on a timer or per-IO; deterministic via an injectable clock. Tested under
+      seeded packet loss: a large reliable transfer completes via RTO without
+      stall/busy-loop, cwnd grows then backs off (`tests/sctp_robust_test.cpp`).
+- [x] **Partial reliability (RFC 3758) + FORWARD-TSN** for
+      `maxRetransmits`/`maxPacketLifetime` (unreliable data channels).
+      DONE (HARDENING WAVE): `SctpReliability` carries the per-message policy
+      (unordered / rexmit-limited(max_retransmits) / time-limited(max_lifetime_ms)),
+      plumbed from `DATA_CHANNEL_OPEN`'s channel-type byte (reliable / partial-
+      rexmit / partial-timed, ordered+unordered — RFC 8832) through DCEP into the
+      SCTP send path. The sender abandons a message that exceeds its retransmit
+      budget (incl. max_retransmits==0 → abandon on first loss) or lifetime, emits
+      a **FORWARD-TSN** chunk (send + receive) advancing the cumulative TSN past
+      the abandoned fragments + per-stream ordered-SSN skip; the receiver advances
+      and drops orphaned buffered fragments. Tested: a partial-reliable channel
+      under loss abandons a message and later messages still arrive past it
+      (`tests/sctp_robust_test.cpp`). FORWARD-TSN-Supported advertised in
+      INIT/INIT-ACK.
 - [x] **DCEP — Data Channel Establishment Protocol (RFC 8832).** DONE (SCTP
       wave): `src/webrtc/data_channel.cpp` parses `DATA_CHANNEL_OPEN` (PPID 50,
       type/channelType/priority/reliability/labelLen/protocolLen/label/protocol),
@@ -455,8 +476,16 @@ the audit's "mostly REBUILD."
       UNCONDITIONAL) — (1) CRC-32c known vectors; (2) the 4-way handshake +
       reliable/ordered DATA+SACK round-trip between two in-process
       `SctpAssociation` endpoints over two streams, both directions; (3) the e2e
-      loopback below (§8/§10). **DEFERRED:** `aiortc`/browser interop + injected
-      loss/reorder fuzz (later validation wave).
+      loopback below (§8/§10), now incl. a **64 KiB binary message** fragmented +
+      reassembled byte-exact over the real DTLS+UDP path.
+      HARDENING WAVE: added `tests/sctp_robust_test.cpp` (gtest, UNCONDITIONAL) —
+      a cross-wired two-endpoint harness with a VIRTUAL CLOCK + seeded packet-loss
+      relay (deterministic, bounded, no hang): 64K/256K fragmentation/reassembly
+      both directions ordered+unordered (byte-exact); unordered-not-HOL-blocked;
+      partial-reliability-abandons-under-loss (FORWARD-TSN, later msgs arrive);
+      lossy-link-completes-via-RTO (cwnd grows then backs off); multi-stream mixed
+      randomised round-trip. **DEFERRED:** `aiortc`/browser interop (later live
+      validation wave).
 
 ---
 

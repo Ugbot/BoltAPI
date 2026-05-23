@@ -30,9 +30,11 @@ inline void wr32(std::uint8_t* p, std::uint32_t v) noexcept {
 // DataChannel
 // ===========================================================================
 DataChannel::DataChannel(DataChannelStack& stack, std::uint16_t stream_id,
-                         std::string label, std::string protocol) noexcept
+                         std::string label, std::string protocol,
+                         SctpReliability reliability) noexcept
     : stack_(&stack), stream_id_(stream_id),
-      label_(std::move(label)), protocol_(std::move(protocol)) {}
+      label_(std::move(label)), protocol_(std::move(protocol)),
+      reliability_(reliability) {}
 
 proto::Status DataChannel::send(const void* data, std::size_t len) {
     if (!open_) return proto::Status(core::error_code::invalid_state);
@@ -42,12 +44,13 @@ proto::Status DataChannel::send(const void* data, std::size_t len) {
 
 bool DataChannel::send_text(std::string_view text) noexcept {
     if (!open_ || !stack_) return false;
-    return stack_->send_on_stream(stream_id_, text.data(), text.size(), false);
+    return stack_->send_on_stream(stream_id_, text.data(), text.size(), false,
+                                  reliability_);
 }
 
 bool DataChannel::send_binary(const void* data, std::size_t len) noexcept {
     if (!open_ || !stack_) return false;
-    return stack_->send_on_stream(stream_id_, data, len, true);
+    return stack_->send_on_stream(stream_id_, data, len, true, reliability_);
 }
 
 void DataChannel::close() noexcept {
@@ -92,8 +95,8 @@ bool DataChannelStack::feed(const std::uint8_t* data, std::size_t len) noexcept 
         for (std::size_t i = 0; i < kMaxPending; ++i) {
             PendingOpen& p = pending_[i];
             if (p.used) {
-                create_channel(p.stream_id, p.label, p.protocol);
-                send_dcep_open(p.stream_id, p.label, p.protocol);
+                create_channel(p.stream_id, p.label, p.protocol, p.reliability);
+                send_dcep_open(p.stream_id, p.label, p.protocol, p.reliability);
                 p.used = false;
             }
         }
@@ -112,7 +115,8 @@ DataChannel* DataChannelStack::channel_for_stream(std::uint16_t stream_id) noexc
 
 DataChannel* DataChannelStack::create_channel(std::uint16_t stream_id,
                                               std::string label,
-                                              std::string protocol) noexcept {
+                                              std::string protocol,
+                                              SctpReliability reliability) noexcept {
     DataChannel* existing = channel_for_stream(stream_id);
     if (existing) return existing;
     for (std::size_t i = 0; i < kMaxChannels; ++i) {
@@ -122,7 +126,8 @@ DataChannel* DataChannelStack::create_channel(std::uint16_t stream_id,
             s.stream_id = stream_id;
             s.ch = std::make_unique<DataChannel>(*this, stream_id,
                                                  std::move(label),
-                                                 std::move(protocol));
+                                                 std::move(protocol),
+                                                 reliability);
             ++channel_count_;
             return s.ch.get();
         }
@@ -131,7 +136,8 @@ DataChannel* DataChannelStack::create_channel(std::uint16_t stream_id,
 }
 
 DataChannel* DataChannelStack::open_channel(std::string label,
-                                            std::string protocol) noexcept {
+                                            std::string protocol,
+                                            SctpReliability reliability) noexcept {
     // RFC 8832 §6: the side that opens picks a stream id. The DTLS client (which
     // is the SCTP active side here) uses EVEN stream ids; passive uses ODD.
     std::uint16_t sid = next_active_stream_;
@@ -144,8 +150,8 @@ DataChannel* DataChannelStack::open_channel(std::string label,
     }
 
     if (assoc_.established()) {
-        DataChannel* ch = create_channel(sid, label, protocol);
-        if (ch) send_dcep_open(sid, label, protocol);
+        DataChannel* ch = create_channel(sid, label, protocol, reliability);
+        if (ch) send_dcep_open(sid, label, protocol, reliability);
         return ch;
     }
     // Defer until Established.
@@ -155,8 +161,10 @@ DataChannel* DataChannelStack::open_channel(std::string label,
             pending_[i].stream_id = sid;
             pending_[i].label = std::move(label);
             pending_[i].protocol = std::move(protocol);
+            pending_[i].reliability = reliability;
             // Return a channel object now so the caller can wire callbacks.
-            return create_channel(sid, pending_[i].label, pending_[i].protocol);
+            return create_channel(sid, pending_[i].label, pending_[i].protocol,
+                                  reliability);
         }
     }
     return nullptr;
@@ -215,6 +223,11 @@ void DataChannelStack::handle_dcep(std::uint16_t stream_id,
     //   type(1) channelType(1) priority(2) reliability(4) labelLen(2)
     //   protocolLen(2) label(labelLen) protocol(protocolLen)
     if (len < 12) return;
+    const std::uint8_t  channel_type = data[1];
+    const std::uint32_t reliability_param = (static_cast<std::uint32_t>(data[4]) << 24) |
+                                            (static_cast<std::uint32_t>(data[5]) << 16) |
+                                            (static_cast<std::uint32_t>(data[6]) << 8)  |
+                                             static_cast<std::uint32_t>(data[7]);
     const std::uint16_t label_len    = rd16(data + 8);
     const std::uint16_t protocol_len = rd16(data + 10);
     if (12 + static_cast<std::size_t>(label_len) +
@@ -224,9 +237,20 @@ void DataChannelStack::handle_dcep(std::uint16_t stream_id,
     std::string protocol(reinterpret_cast<const char*>(data + 12 + label_len),
                          protocol_len);
 
+    // Map the DCEP channel-type byte to our reliability policy.
+    SctpReliability rel;
+    rel.unordered = (channel_type & 0x80) != 0;
+    const std::uint8_t base = static_cast<std::uint8_t>(channel_type & 0x7F);
+    if (base == kDcepPartialRexmit) {
+        rel.rexmit_limited = true; rel.max_retransmits = reliability_param;
+    } else if (base == kDcepPartialTimed) {
+        rel.time_limited = true; rel.max_lifetime_ms = reliability_param;
+    }
+
     DataChannel* ch = create_channel(stream_id, std::move(label),
-                                     std::move(protocol));
+                                     std::move(protocol), rel);
     if (!ch) return;
+    ch->set_reliability(rel);
     // Reply DATA_CHANNEL_ACK, surface to the App, then mark open.
     send_dcep_ack(stream_id);
     if (on_channel_) on_channel_(*ch);
@@ -235,31 +259,40 @@ void DataChannelStack::handle_dcep(std::uint16_t stream_id,
 
 bool DataChannelStack::send_dcep_open(std::uint16_t stream_id,
                                       std::string_view label,
-                                      std::string_view protocol) noexcept {
+                                      std::string_view protocol,
+                                      const SctpReliability& rel) noexcept {
     std::uint8_t buf[12 + 256];
     const std::size_t llen = label.size() > 200 ? 200 : label.size();
     const std::size_t plen = protocol.size() > 40 ? 40 : protocol.size();
+    // Map our reliability policy back to the DCEP channel-type byte + param.
+    std::uint8_t ctype = kDcepReliable;
+    std::uint32_t rparam = 0;
+    if (rel.rexmit_limited) { ctype = kDcepPartialRexmit; rparam = rel.max_retransmits; }
+    else if (rel.time_limited) { ctype = kDcepPartialTimed; rparam = rel.max_lifetime_ms; }
+    if (rel.unordered) ctype = static_cast<std::uint8_t>(ctype | 0x80);
     buf[0] = kDcepOpen;
-    buf[1] = kDcepReliable;       // channel type: reliable, ordered (v1)
+    buf[1] = ctype;
     wr16(buf + 2, 0);             // priority
-    wr32(buf + 4, 0);             // reliability parameter (n/a for reliable)
+    wr32(buf + 4, rparam);        // reliability parameter
     wr16(buf + 8, static_cast<std::uint16_t>(llen));
     wr16(buf + 10, static_cast<std::uint16_t>(plen));
     std::memcpy(buf + 12, label.data(), llen);
     std::memcpy(buf + 12 + llen, protocol.data(), plen);
     const std::size_t total = 12 + llen + plen;
+    // DCEP control messages are ALWAYS sent reliably + ordered (RFC 8832 §5).
     return assoc_.send(stream_id, static_cast<std::uint32_t>(Ppid::Dcep),
-                       buf, total);
+                       buf, total, SctpReliability::reliable());
 }
 
 bool DataChannelStack::send_dcep_ack(std::uint16_t stream_id) noexcept {
     std::uint8_t ack = kDcepAck;
     return assoc_.send(stream_id, static_cast<std::uint32_t>(Ppid::Dcep),
-                       &ack, 1);
+                       &ack, 1, SctpReliability::reliable());
 }
 
 bool DataChannelStack::send_on_stream(std::uint16_t stream_id, const void* data,
-                                      std::size_t len, bool is_binary) noexcept {
+                                      std::size_t len, bool is_binary,
+                                      const SctpReliability& rel) noexcept {
     std::uint32_t ppid;
     if (is_binary) {
         ppid = static_cast<std::uint32_t>(len == 0 ? Ppid::BinaryEmpty
@@ -272,10 +305,10 @@ bool DataChannelStack::send_on_stream(std::uint16_t stream_id, const void* data,
     // receiver can distinguish it; we send a single 0x00 with the empty PPID.
     if (len == 0) {
         const std::uint8_t z = 0;
-        return assoc_.send(stream_id, ppid, &z, 1);
+        return assoc_.send(stream_id, ppid, &z, 1, rel);
     }
     return assoc_.send(stream_id, ppid,
-                       static_cast<const std::uint8_t*>(data), len);
+                       static_cast<const std::uint8_t*>(data), len, rel);
 }
 
 }  // namespace webrtc
