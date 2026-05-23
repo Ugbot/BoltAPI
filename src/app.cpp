@@ -312,26 +312,32 @@ void App::init_protocol_seams() {
     }
 
     if (config_.enable_webrtc) {
+        // Phase 1: the SDP + STUN codecs and the App data-channel surface are
+        // present and unit-tested, but the ICE/DTLS/SCTP transport is a later
+        // wave. Whether or not the protocol seam is compiled in, enabling WebRTC
+        // is additive and NEVER disturbs H1/H2 serving — we just announce state.
+        const uint16_t udp_port = webrtc_config_.udp_port != 0
+                                      ? webrtc_config_.udp_port
+                                      : config_.server.http1_port;
+        std::fprintf(stderr,
+            "[boltapi] WebRTC: signaling/codecs ready, transport not yet "
+            "implemented (would bind UDP :%u; %zu data-channel handler(s) "
+            "registered); continuing with HTTP/1.1+HTTP/2.\n",
+            static_cast<unsigned>(udp_port), dc_handlers_.size());
+
 #if defined(BOLTAPI_WITH_WEBRTC)
+        // When the seam is compiled in, also exercise the registry path so the
+        // ON build can't rot. The stub serve() returns NotImplemented (logged).
         const proto::Status reg = proto::register_webrtc(registry);
         if (reg.is_ok() && registry.has(proto::ProtocolId::WebRtc)) {
             std::unique_ptr<proto::IProtocol> rtc =
                 registry.create(proto::ProtocolId::WebRtc);
             assert(rtc != nullptr);
             transport::UdpTransport udp(
-                transport::Endpoint{config_.server.host,
-                                    config_.server.http1_port});
+                transport::Endpoint{config_.server.host, udp_port});
             const proto::Status served = rtc->serve(udp);
-            if (proto::is_not_implemented(served)) {
-                std::fprintf(stderr,
-                    "[boltapi] WebRTC enabled but not yet implemented "
-                    "(seam stub); continuing with HTTP/1.1+HTTP/2.\n");
-            }
+            (void)served;  // NotImplemented expected; already announced above.
         }
-#else
-        std::fprintf(stderr,
-            "[boltapi] Config.enable_webrtc=true ignored: built without "
-            "BOLTAPI_WITH_WEBRTC. Reconfigure with -DBOLTAPI_WITH_WEBRTC=ON.\n");
 #endif
     }
 }

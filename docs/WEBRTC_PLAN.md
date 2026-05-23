@@ -100,11 +100,15 @@ the audit's "mostly REBUILD."
 - [ ] **v1 explicitly OUT (later phases):** media (RTP/RTCP/SRTP/jitter/codecs);
       TURN relay candidates; trickle-ICE renegotiation; multi-m-line / BUNDLE of
       media; SFU/room relay; Python binding. Document each as a later phase below.
-- [ ] **Define the public `App` surface** (sketch, to refine): `App::Config`
+- [x] **Define the public `App` surface** (sketch, to refine): `App::Config`
       already has `enable_webrtc` (`include/boltapi/app.h:72`). Add
       `App::enable_webrtc(WebRtcConfig)` returning `*this`, and an
       `on_data_channel(label, handler)` registration mirroring `websocket(...)`
       (`app.h:117`). **REBUILD.** No core edits — additive like the WS/SSE regs.
+      DONE (Wave 1): added `WebRtcConfig` (`app.h`), `enable_webrtc(WebRtcConfig={})`
+      and `on_data_channel(label, handler)` (additive, chainable). Enabling logs
+      "WebRTC: signaling/codecs ready, transport not yet implemented" in
+      `init_protocol_seams()` (`src/app.cpp`); H1/H2 serving untouched.
 
 ---
 
@@ -155,26 +159,43 @@ the audit's "mostly REBUILD."
       `offer`/`answer`/`ice-candidate` — shapes **ADAPT** from
       `fasterapi/webrtc/signaling.py:225-240` and `webrtc/signaling.cpp:68-117`.
       Drop the room/SFU relay logic (out of v1 scope §1). **ADAPT/REBUILD.**
-- [ ] **SDP parser/generator (ADAPT `webrtc/sdp_parser.{h,cpp}`).** Lift the
+- [x] **SDP parser/generator (ADAPT `webrtc/sdp_parser.{h,cpp}`).** Lift the
       line parser; replace `std::unordered_map` attribute store with a small
       fixed-capacity vector of `{key,val}` `string_view`s, replace
       `std::ostringstream generate` with manual buffer append into a
       `bolt::Arena`, and replace `std::stoi` (`sdp_parser.cpp:124`) with a
       noexcept `from_chars`. **ADAPT.** Bolt primitive: `bolt_arena.h` +
       `bolt::wire` byte append.
-- [ ] **SDP answer builder for the data-channel m-line.** Emit
+      DONE (Wave 1): `include/boltapi/webrtc/sdp.h` + `src/webrtc/sdp.cpp`.
+      Fixed-capacity `SdpAttribute[]`/`SdpMedia[]` (no unordered_map), zero-copy
+      `string_view` fields, `std::from_chars` (no stoi), manual `std::string`
+      append (no ostringstream), all noexcept. Compiled unconditionally into
+      `boltapi`. (Used plain `std::string` append rather than `bolt::Arena` —
+      generate is not a per-packet hot path; parse is zero-alloc.)
+- [x] **SDP answer builder for the data-channel m-line.** Emit
       `m=application <port> UDP/DTLS/SCTP webrtc-datachannel`, plus
       `a=setup:passive`, `a=fingerprint:sha-256 <cert fp>`, `a=ice-ufrag`,
       `a=ice-pwd`, `a=sctp-port:5000`, `a=mid:0`, and our host/srflx
       `a=candidate:` lines. **REBUILD** (FasterAPI never produced a real answer).
       Bolt primitive: `bolt_arena.h`.
-- [ ] **Parse the offer's required fields:** remote `ice-ufrag`/`ice-pwd`, remote
+      DONE (Wave 1): `webrtc::build_answer(AnswerParams, std::string&)` emits the
+      full passive answer (BUNDLE, ice-ufrag/pwd, fingerprint:sha-256, setup,
+      mid, sctp-port, max-message-size, optional a=ice-lite). `a=candidate:`
+      lines deferred to the ICE-agent wave (no candidates gathered yet).
+- [x] **Parse the offer's required fields:** remote `ice-ufrag`/`ice-pwd`, remote
       DTLS `fingerprint` + `setup` role, `mid`, `sctp-port`, and the offerer's
       `candidate:` lines (trickle or in-SDP). **REBUILD** the field extraction on
       top of the adapted parser.
-- [ ] **Correctness gate:** unit test parses real Chrome + Firefox offers (fixed
+      DONE (Wave 1): `SdpMedia` accessors `ice_ufrag()/ice_pwd()/fingerprint()/
+      setup()/mid()/sctp_port()/max_message_size()` + generic `attr("candidate")`;
+      `SdpSession::application_media()`.
+- [x] **Correctness gate:** unit test parses real Chrome + Firefox offers (fixed
       fixtures) and round-trips an answer that those browsers accept (validated
       in the interop test §10). No Bolt primitive.
+      DONE (Wave 1): `tests/sdp_test.cpp` — parses a real Chrome + Firefox
+      data-channel offer, asserts the extracted fields, round-trips a built
+      answer, and rejects malformed/empty/overflow input without throwing.
+      Browser-acceptance interop validation still pending (needs the transport).
 
 ---
 
@@ -182,28 +203,45 @@ the audit's "mostly REBUILD."
 
 > RFC 5389/8489. Needed for connectivity checks (mandatory) and srflx gathering.
 
-- [ ] **Full STUN message codec (REBUILD `STUNMessage`, `ice.cpp:63-125`).**
+- [x] **Full STUN message codec (REBUILD `STUNMessage`, `ice.cpp:63-125`).**
       Parse/generate header **and attributes**: `MAPPED-ADDRESS`,
       `XOR-MAPPED-ADDRESS`, `USERNAME`, `MESSAGE-INTEGRITY` (HMAC-SHA1),
       `FINGERPRINT` (CRC-32), `PRIORITY`, `USE-CANDIDATE`, `ICE-CONTROLLING/
       CONTROLLED`, `ERROR-CODE`. Keep the existing magic-cookie check
       (`ice.cpp:79`). **REBUILD.** Bolt primitive: `bolt::wire` for fixed-layout
       attribute TLV framing; `bolt_arena.h` for the message buffer.
+      DONE (Wave 1): `include/boltapi/webrtc/stun.h` + `src/webrtc/stun.cpp`.
+      Header (class/method bit-encode, magic cookie, 96-bit TID) + TLV with
+      4-byte padding; all listed attributes; zero-copy parse into a bounded
+      fixed `Attribute[]` (no heap), `Builder` writes into a caller buffer (no
+      heap). Compiled unconditionally into `boltapi`. (Hand-rolled big-endian
+      read/write helpers rather than `bolt::wire`; codec is self-contained.)
 - [ ] **Transaction-ID generation + matching table.** 96-bit random TID per
       request, matched on response. **REBUILD.** Bolt primitive:
       `join/bolt_swiss.h` keyed by TID.
-- [ ] **MESSAGE-INTEGRITY (HMAC-SHA1) + FINGERPRINT (CRC-32).** Compute/verify
+- [x] **MESSAGE-INTEGRITY (HMAC-SHA1) + FINGERPRINT (CRC-32).** Compute/verify
       over the message with the ICE password as key. **REBUILD.** Crypto: prefer
       a Bolt/own SHA1+HMAC; OpenSSL `HMAC` acceptable as the same justified
       stopgap as DTLS (§6). CRC-32 — Bolt likely has one (`bolt_hash.h`); else own.
+      DONE (Wave 1): `Builder::add_message_integrity` (OpenSSL `HMAC`/`EVP_sha1`,
+      with the RFC 5389 §15.4 header-length fixup) + `add_fingerprint` (own
+      CRC-32, XOR 0x5354554e, §15.5); `verify_message_integrity`/
+      `verify_fingerprint` recompute and compare. Validated byte-exact against
+      RFC 5769 vectors (short-term + long-term MD5 credential).
 - [ ] **STUN binding request → server-reflexive candidate.** Send binding
       request to configured STUN server(s), parse `XOR-MAPPED-ADDRESS`, emit an
       `srflx` candidate (fills the `gather_srflx_candidates` TODOs at
       `ice.cpp:203-215`). **REBUILD.** Bolt primitive: SPSC for the async
       response; `bolt_arena.h`.
-- [ ] **Correctness gate:** unit tests vs canned STUN vectors (RFC 5769 test
+- [~] **Correctness gate:** unit tests vs canned STUN vectors (RFC 5769 test
       vectors) for parse/generate + MESSAGE-INTEGRITY + FINGERPRINT; live binding
       request against a public STUN server (e.g. Google) returns our public IP.
+      DONE (Wave 1): `tests/stun_test.cpp` — RFC 5769 §2.1 request, §2.2 IPv4
+      response, §2.4 long-term-credential request decode + MESSAGE-INTEGRITY +
+      FINGERPRINT verified byte-exact; XOR-MAPPED-ADDRESS decode to 192.0.2.1:
+      32853; builder round-trips for ICE connectivity-check attributes; malformed
+      input rejected without crash. PENDING: live binding request (needs UDP
+      transport, next wave).
 
 ---
 
@@ -393,8 +431,10 @@ the audit's "mostly REBUILD."
 > Per `CLAUDE.md`: tests are more than hello-world — multiple channels, multiple
 > message types, randomized payloads. **Don't mock — build the real path.**
 
-- [ ] **STUN unit tests** — RFC 5769 vectors: parse/generate, XOR-MAPPED-ADDRESS,
+- [x] **STUN unit tests** — RFC 5769 vectors: parse/generate, XOR-MAPPED-ADDRESS,
       MESSAGE-INTEGRITY, FINGERPRINT. **REBUILD.**
+      DONE (Wave 1): `tests/stun_test.cpp` (14 cases), registered as
+      `boltapi_stun_test`. All RFC 5769 vectors pass byte-exact.
 - [ ] **ICE unit tests** — candidate `from_string`/`to_string` round-trip,
       pairing + priority math vs RFC 8445 examples, role-conflict, nomination.
 - [ ] **DTLS handshake test** — vs `openssl s_client -dtls` and a browser; DTLS

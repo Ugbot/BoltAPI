@@ -45,6 +45,30 @@
 
 namespace bolt::api {
 
+// ---------------------------------------------------------------------------
+// WebRtcConfig — minimal additive config for the WebRTC data-channel surface
+// (Phase 1: signaling + codecs ready; transport not yet implemented). All
+// fields have sane defaults so `app.enable_webrtc()` works with no arguments.
+// ---------------------------------------------------------------------------
+struct WebRtcConfig {
+    // UDP port the future ICE/DTLS/SCTP transport will bind. 0 = reuse the
+    // HTTP listen port number over UDP (decided when the transport lands).
+    uint16_t    udp_port = 0;
+
+    // Local ICE credentials policy. When empty, the (future) agent generates
+    // random RFC 8445-conformant ufrag/pwd; supplying them here pins them
+    // (useful for tests / deterministic signaling).
+    std::string ice_ufrag;   // empty => auto-generate
+    std::string ice_pwd;     // empty => auto-generate
+
+    // Advertise a=ice-lite in the answer (server-side answerer optimisation).
+    bool        ice_lite     = false;
+
+    // SCTP association parameters surfaced into the SDP answer.
+    uint16_t    sctp_port        = 5000;
+    uint32_t    max_message_size = 262144;
+};
+
 class App {
 public:
     // Sync handler: fill the Response, return. Wrapped into a ready coro_task.
@@ -52,6 +76,13 @@ public:
     // Async handler: may co_await; fill the Response, co_return.
     using AsyncHandler =
         std::function<core::coro_task<void>(Request&, Response&)>;
+
+    // Data-channel message handler: (label, data, len). Mirrors the WS handler
+    // registration shape. Wired to a real SCTP stream in a later wave; today it
+    // is recorded and the surface logs that transport is not yet implemented.
+    using DataChannelHandler =
+        std::function<void(std::string_view label, const void* data,
+                           std::size_t len)>;
 
     // Forwarding config: wraps a CoroUnifiedServerConfig plus facade-level knobs.
     struct Config {
@@ -125,6 +156,33 @@ public:
         assert(!path.empty());
         assert(handler != nullptr);
         sse_handlers_.push_back({path, std::move(handler)});
+        return *this;
+    }
+
+    // -----------------------------------------------------------------------
+    // WebRTC (additive; Phase 1 — signaling/codecs ready, transport pending).
+    //
+    // enable_webrtc() turns on the WebRTC surface and stores its config. It is
+    // purely additive: it never touches the H1/H2 serving path. Until the
+    // ICE/DTLS/SCTP transport lands, init_protocol_seams() logs a clear
+    // "WebRTC: signaling/codecs ready, transport not yet implemented" message.
+    // Returns *this for chaining, mirroring the rest of the facade.
+    // -----------------------------------------------------------------------
+    App& enable_webrtc(WebRtcConfig cfg = {}) {
+        assert(!started_);
+        config_.enable_webrtc = true;
+        webrtc_config_ = std::move(cfg);
+        return *this;
+    }
+
+    // Register a data-channel message handler for a given label, mirroring the
+    // websocket(...) registration shape. The handler is recorded now and will
+    // be invoked by the data-channel layer once the transport is implemented.
+    App& on_data_channel(std::string label, DataChannelHandler handler) {
+        assert(!label.empty());
+        assert(handler != nullptr);
+        assert(!started_);
+        dc_handlers_.push_back({std::move(label), std::move(handler)});
         return *this;
     }
 
@@ -207,6 +265,11 @@ private:
     struct SseReg { std::string path; http::CoroSSEHandler   handler; };
     std::vector<WsReg>  ws_handlers_;
     std::vector<SseReg> sse_handlers_;
+
+    // WebRTC (additive; Phase 1). Config + per-label data-channel handlers.
+    struct DcReg { std::string label; DataChannelHandler handler; };
+    WebRtcConfig        webrtc_config_{};
+    std::vector<DcReg>  dc_handlers_;
 
     std::unique_ptr<Router>                   router_;
     std::unique_ptr<http::CoroUnifiedServer>  server_;

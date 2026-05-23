@@ -150,6 +150,11 @@ add_library(boltapi STATIC
     src/app.cpp             # M1: App facade + dispatch bridge + middleware fold
     src/compression.cpp     # M2: gzip codec seam (zlib stopgap, BOLTAPI_HAVE_GZIP)
     src/json.cpp            # JSON: thin facade over bolt::parse (fionn)
+    # WebRTC pure codecs (SDP, STUN). Compiled UNCONDITIONALLY: they have no
+    # engine deps and zero runtime cost unless used, so the default test suite
+    # covers them. Only protocol/transport WIRING is gated behind BOLTAPI_WITH_WEBRTC.
+    src/webrtc/sdp.cpp      # SDP parse/generate (ADAPTED from FasterAPI)
+    src/webrtc/stun.cpp     # STUN message codec (REBUILT, RFC 5389/8489)
     ${BOLTAPI_ENGINE_SOURCES}
 )
 add_library(boltapi::boltapi ALIAS boltapi)

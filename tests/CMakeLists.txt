@@ -78,6 +78,16 @@ if(WIN32)
     target_link_libraries(boltapi_json_test PRIVATE ws2_32 mswsock)
 endif()
 
+# WebRTC SDP codec — UNIT: parse a real Chrome data-channel offer (assert
+# ufrag/pwd/fingerprint/setup/mid/sctp-port), generate + round-trip an answer,
+# malformed input -> error (no throw/crash). Pure codec, no engine deps.
+boltapi_add_test(boltapi_sdp_test sdp_test.cpp)
+
+# WebRTC STUN codec — UNIT: RFC 5769 test vectors (sample request, IPv4
+# response, long-term credential) asserting byte-exact encode + correct decode
+# incl. MESSAGE-INTEGRITY (HMAC-SHA1) and FINGERPRINT (CRC-32). Correctness gate.
+boltapi_add_test(boltapi_stun_test stun_test.cpp)
+
 # M3: HTTP/3 + WebRTC seam — ProtocolRegistry mechanism (register/has/create),
 # a dummy IProtocol returning NotImplemented, and (when the compile flags are
 # ON) the real H3/WebRTC stub factories registering. Flag-AWARE: passes in the
