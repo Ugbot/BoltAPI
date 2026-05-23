@@ -475,6 +475,15 @@ public:
     }
 
     /**
+     * Get the server's unified async I/O dispatcher (the event loop that backs
+     * all TCP/HTTP connections). Valid only AFTER start()/start_background()
+     * has created it; returns nullptr before then. Used to run additional
+     * protocols (e.g. WebRTC UDP) on the SAME unified loop instead of a private
+     * thread.
+     */
+    net::IODispatcher* io_dispatcher() noexcept { return io_dispatcher_.get(); }
+
+    /**
      * Track connection open - returns false if draining (reject connection)
      */
     bool track_connection_open() noexcept {

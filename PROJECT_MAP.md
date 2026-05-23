@@ -5,7 +5,7 @@
 
 Legend: ✅ done · 🚧 in progress · ⬜ planned
 
-> **Direction (set 2026-05-23):** goal = the **fastest COMPLETE implementation of all web protocols**. The engine is **not sacred** — refactor `coro_unified_server`/`IODispatcher`/`async_io` when it makes the whole faster/cleaner (correctness-gated, green increments). Near-term consequence: the WebRTC/HTTP3 `UdpTransport` runs on its own rx thread for now (correctness-first); the perf phase should integrate UDP into the unified event loop and unify dispatch via `ProtocolRegistry`.
+> **Direction (set 2026-05-23):** goal = the **fastest COMPLETE implementation of all web protocols**. The engine is **not sacred** — refactor `coro_unified_server`/`IODispatcher`/`async_io` when it makes the whole faster/cleaner (correctness-gated, green increments). ✅ DONE (2026-05-23): UDP datagram I/O is now integrated into the unified async event loop — `async_io` gained `recvfrom_async`/`sendto_async` (IOCP via WSARecvFrom/WSASendTo + OVERLAPPED, tested locally; epoll/kqueue mirror the read/write readiness pattern; io_uring falls back to epoll), `IODispatcher` gained `RecvFromAwaitable`/`SendToAwaitable` + `async_recvfrom`/`async_sendto`, and `UdpTransport` runs its receive loop as a COROUTINE on an IODispatcher (dedicated rx thread REMOVED; clean coroutine-cancellation on stop). 103/103 default ctest green; UDP+ICE live-STUN gate passes over the event loop. Remaining perf phase: unify dispatch via `ProtocolRegistry` and close the single-socket UDP throughput gap (per-packet worker-pool handoff cost; see benchmarks/udp_echo_bench.cpp).
 
 ## Milestones
 - ✅ **M0** — repo skeleton + Bolt submodule + build
@@ -15,7 +15,7 @@ Legend: ✅ done · 🚧 in progress · ⬜ planned
 - 🚧 **M4** — hardening, benchmarks, docs (hardening tests + sanitizers + benches + CI legs landed; remote push pending)
 - ✅ **JSON** — Bolt **fionn** (`bolt::parse`) wired as the canonical parser; `Request::json()`; no simdjson. docs/JSON.md
 - 🚧 **HTTP/3 (full)** — plan in docs/HTTP3_PLAN.md; not started (mostly port: FasterAPI QUIC TLS/packet-protection/QPACK are real)
-- 🚧 **WebRTC (full)** — plan in docs/WEBRTC_PLAN.md. Wave 1: SDP + STUN codecs (RFC 5769 gated). Wave 2: UdpTransport + ICE-lite (live STUN binding over the wire ✅). Next: DTLS, then SCTP/DCEP data channels.
+- 🚧 **WebRTC (full)** — plan in docs/WEBRTC_PLAN.md. Wave 1: SDP + STUN codecs (RFC 5769 gated). Wave 2: UdpTransport + ICE-lite (live STUN binding over the wire ✅; UdpTransport now runs on the unified async event loop — coroutine on IODispatcher via async_recvfrom/async_sendto, no dedicated rx thread ✅). Next: DTLS, then SCTP/DCEP data channels.
 - ⬜ later — Gestalt migration
 
 Current suite: **103/103 ctest green on MSVC** (default build).

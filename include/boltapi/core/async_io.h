@@ -48,7 +48,9 @@ enum class io_op : uint8_t {
     write,     // Write to socket
     connect,   // Connect to remote
     close,     // Close socket
-    timer      // Timer expiration
+    timer,     // Timer expiration
+    recvfrom,  // Datagram receive (UDP) — fills caller's sockaddr out-params
+    sendto     // Datagram send (UDP)
 };
 
 /**
@@ -181,8 +183,69 @@ public:
     ) noexcept = 0;
     
     /**
+     * Submit async datagram receive (UDP recvfrom).
+     *
+     * Waits for the socket to become readable, then performs a single
+     * recvfrom into `buffer`, filling the caller-owned `src`/`srclen`
+     * out-params with the peer address. The callback's io_event.result is
+     * the byte count (>=0) or -1 on error.
+     *
+     * IMPORTANT (lifetime): `buffer`, `src` and `srclen` MUST outlive the
+     * operation (until the callback fires). The awaitable/op owner is
+     * responsible for this — the backend does NOT copy them.
+     *
+     * @param fd      UDP socket FD
+     * @param buffer  Buffer to receive into
+     * @param size    Buffer capacity
+     * @param src     [out] peer address (filled on completion); may be null
+     * @param srclen  [in/out] capacity of src on entry, actual len on exit
+     * @param callback Completion callback
+     * @param user_data User data
+     * @return 0 on success (op submitted), -1 on immediate error
+     */
+    virtual int recvfrom_async(
+        int fd,
+        void* buffer,
+        size_t size,
+        struct sockaddr* src,
+        socklen_t* srclen,
+        io_callback callback,
+        void* user_data = nullptr
+    ) noexcept = 0;
+
+    /**
+     * Submit async datagram send (UDP sendto).
+     *
+     * UDP sendto rarely blocks, so backends may perform the sendto directly
+     * in the submit path and still deliver a completion callback. The
+     * callback's io_event.result is the byte count (>=0) or -1 on error.
+     *
+     * `buffer` and `dst` need only be valid for the duration of the call when
+     * the backend sends synchronously; backends that defer MUST keep them
+     * alive until completion (the awaitable owner guarantees this).
+     *
+     * @param fd      UDP socket FD
+     * @param buffer  Buffer to send from
+     * @param size    Bytes to send
+     * @param dst     Destination address
+     * @param dstlen  Destination address length
+     * @param callback Completion callback
+     * @param user_data User data
+     * @return 0 on success, -1 on immediate error
+     */
+    virtual int sendto_async(
+        int fd,
+        const void* buffer,
+        size_t size,
+        const struct sockaddr* dst,
+        socklen_t dstlen,
+        io_callback callback,
+        void* user_data = nullptr
+    ) noexcept = 0;
+
+    /**
      * Close socket asynchronously
-     * 
+     *
      * @param fd Socket FD
      * @return 0 on success
      */
@@ -278,6 +341,8 @@ public:
     int read_async(int fd, void* buffer, size_t size, io_callback callback, void* user_data) noexcept override;
     int write_async(int fd, const void* buffer, size_t size, io_callback callback, void* user_data) noexcept override;
     int connect_async(int fd, const struct sockaddr* addr, socklen_t addrlen, io_callback callback, void* user_data) noexcept override;
+    int recvfrom_async(int fd, void* buffer, size_t size, struct sockaddr* src, socklen_t* srclen, io_callback callback, void* user_data) noexcept override;
+    int sendto_async(int fd, const void* buffer, size_t size, const struct sockaddr* dst, socklen_t dstlen, io_callback callback, void* user_data) noexcept override;
     int close_async(int fd) noexcept override;
 
     int poll(uint32_t timeout_us) noexcept override;
@@ -314,6 +379,8 @@ public:
     int read_async(int fd, void* buffer, size_t size, io_callback callback, void* user_data) noexcept override;
     int write_async(int fd, const void* buffer, size_t size, io_callback callback, void* user_data) noexcept override;
     int connect_async(int fd, const struct sockaddr* addr, socklen_t addrlen, io_callback callback, void* user_data) noexcept override;
+    int recvfrom_async(int fd, void* buffer, size_t size, struct sockaddr* src, socklen_t* srclen, io_callback callback, void* user_data) noexcept override;
+    int sendto_async(int fd, const void* buffer, size_t size, const struct sockaddr* dst, socklen_t dstlen, io_callback callback, void* user_data) noexcept override;
     int close_async(int fd) noexcept override;
 
     int poll(uint32_t timeout_us) noexcept override;
@@ -349,6 +416,8 @@ public:
     int read_async(int fd, void* buffer, size_t size, io_callback callback, void* user_data) noexcept override;
     int write_async(int fd, const void* buffer, size_t size, io_callback callback, void* user_data) noexcept override;
     int connect_async(int fd, const struct sockaddr* addr, socklen_t addrlen, io_callback callback, void* user_data) noexcept override;
+    int recvfrom_async(int fd, void* buffer, size_t size, struct sockaddr* src, socklen_t* srclen, io_callback callback, void* user_data) noexcept override;
+    int sendto_async(int fd, const void* buffer, size_t size, const struct sockaddr* dst, socklen_t dstlen, io_callback callback, void* user_data) noexcept override;
     int close_async(int fd) noexcept override;
 
     int poll(uint32_t timeout_us) noexcept override;
@@ -385,6 +454,8 @@ public:
     int read_async(int fd, void* buffer, size_t size, io_callback callback, void* user_data) noexcept override;
     int write_async(int fd, const void* buffer, size_t size, io_callback callback, void* user_data) noexcept override;
     int connect_async(int fd, const struct sockaddr* addr, socklen_t addrlen, io_callback callback, void* user_data) noexcept override;
+    int recvfrom_async(int fd, void* buffer, size_t size, struct sockaddr* src, socklen_t* srclen, io_callback callback, void* user_data) noexcept override;
+    int sendto_async(int fd, const void* buffer, size_t size, const struct sockaddr* dst, socklen_t dstlen, io_callback callback, void* user_data) noexcept override;
     int close_async(int fd) noexcept override;
 
     int poll(uint32_t timeout_us) noexcept override;

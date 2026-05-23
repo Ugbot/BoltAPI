@@ -14,6 +14,8 @@
 // not a hello-world single send.
 
 #include "boltapi/net/udp_transport.h"
+#include "boltapi/net/io_dispatcher.h"
+#include "boltapi/core/worker_pool.h"
 
 #include <gtest/gtest.h>
 
@@ -21,13 +23,40 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <thread>
 #include <vector>
 
-namespace net = bolt::api::net;
-namespace sys = bolt::api::net::sys;
+namespace net  = bolt::api::net;
+namespace sys  = bolt::api::net::sys;
+namespace core = bolt::api::core;
 
 namespace {
+
+// Shared event-loop fixture: spins a real IODispatcher (worker pool + async_io
+// backend) so the UdpTransport receive coroutine runs on the unified loop —
+// exactly the production path. One dispatcher is shared across the suite to
+// avoid per-test thread churn; UdpTransport instances attach to it explicitly.
+struct EventLoop {
+    std::unique_ptr<core::WorkerThreadPool> pool;
+    std::unique_ptr<net::IODispatcher>      disp;
+
+    EventLoop() {
+        pool = std::make_unique<core::WorkerThreadPool>(core::WorkerPoolConfig{});
+        pool->start();
+        disp = std::make_unique<net::IODispatcher>(pool.get());
+        disp->start();
+    }
+    ~EventLoop() {
+        disp->stop();
+        pool->stop();
+    }
+};
+
+net::IODispatcher& shared_dispatcher() {
+    static EventLoop loop;
+    return *loop.disp;
+}
 
 // A raw client UDP socket bound to an ephemeral port, with a receive timeout so
 // recvfrom can't hang the test.
@@ -72,14 +101,14 @@ sockaddr_in server_addr(std::uint16_t port) {
 }  // namespace
 
 TEST(UdpTransport, BindEphemeralReportsPort) {
-    net::UdpTransport t;
+    net::UdpTransport t(shared_dispatcher());
     ASSERT_TRUE(t.bind("127.0.0.1", 0));
     EXPECT_NE(t.bound_port(), 0);
     t.stop();
 }
 
 TEST(UdpTransport, RoundTripWithSourceAddressAndDemux) {
-    net::UdpTransport t;
+    net::UdpTransport t(shared_dispatcher());
     ASSERT_TRUE(t.bind("127.0.0.1", 0));
     const std::uint16_t port = t.bound_port();
     ASSERT_NE(port, 0);
@@ -177,7 +206,7 @@ TEST(UdpTransport, RoundTripWithSourceAddressAndDemux) {
 }
 
 TEST(UdpTransport, StopWithoutStartIsClean) {
-    net::UdpTransport t;
+    net::UdpTransport t(shared_dispatcher());
     ASSERT_TRUE(t.bind("127.0.0.1", 0));
     t.stop();  // never started — must not hang or crash
     t.stop();  // idempotent

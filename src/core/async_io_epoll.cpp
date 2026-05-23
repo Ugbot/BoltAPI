@@ -43,7 +43,13 @@ struct pending_op {
     // For connect
     struct sockaddr_storage addr;
     socklen_t addrlen{0};
-    
+
+    // For recvfrom (UDP): caller-owned out-params for the peer address. They
+    // must outlive the op (guaranteed by the awaitable owner); we fill them in
+    // poll() when the socket is readable.
+    struct sockaddr* user_src{nullptr};
+    socklen_t*       user_srclen{nullptr};
+
     // Event flags
     uint32_t events{0};
 };
@@ -247,6 +253,61 @@ int epoll_io::connect_async(
     return impl_->register_op(std::move(op), EPOLLOUT);
 }
 
+int epoll_io::recvfrom_async(
+    int fd,
+    void* buffer,
+    size_t size,
+    struct sockaddr* src,
+    socklen_t* srclen,
+    io_callback callback,
+    void* user_data
+) noexcept {
+    impl_->set_nonblocking(fd);
+
+    auto op = std::make_unique<pending_op>();
+    op->operation = io_op::recvfrom;
+    op->fd = fd;
+    op->buffer = buffer;
+    op->size = size;
+    op->user_src = src;
+    op->user_srclen = srclen;
+    op->callback = std::move(callback);
+    op->user_data = user_data;
+
+    impl_->stat_reads.fetch_add(1, std::memory_order_relaxed);
+    return impl_->register_op(std::move(op), EPOLLIN);
+}
+
+int epoll_io::sendto_async(
+    int fd,
+    const void* buffer,
+    size_t size,
+    const struct sockaddr* dst,
+    socklen_t dstlen,
+    io_callback callback,
+    void* user_data
+) noexcept {
+    impl_->set_nonblocking(fd);
+
+    // UDP sendto rarely blocks: perform it directly in the submit path and
+    // deliver the completion synchronously. `buffer`/`dst` are valid for the
+    // duration of this call (the awaitable owner guarantees it).
+    ssize_t n = ::sendto(fd, buffer, size, 0, dst, dstlen);
+
+    impl_->stat_writes.fetch_add(1, std::memory_order_relaxed);
+
+    if (callback) {
+        io_event event;
+        event.operation = io_op::sendto;
+        event.fd = fd;
+        event.user_data = user_data;
+        event.flags = 0;
+        event.result = n;
+        callback(event);
+    }
+    return 0;
+}
+
 int epoll_io::close_async(int fd) noexcept {
     // Remove from epoll
     epoll_ctl(impl_->epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
@@ -326,13 +387,22 @@ int epoll_io::poll(uint32_t timeout_us) noexcept {
                     event.result = bytes;
                     break;
                 }
-                
+
                 case io_op::write: {
                     ssize_t bytes = write(op->fd, op->buffer, op->size);
                     event.result = bytes;
                     break;
                 }
-                
+
+                case io_op::recvfrom: {
+                    // Socket is readable: do the recvfrom, filling the caller's
+                    // peer-address out-params.
+                    ssize_t bytes = recvfrom(op->fd, op->buffer, op->size, 0,
+                                             op->user_src, op->user_srclen);
+                    event.result = bytes;
+                    break;
+                }
+
                 case io_op::connect: {
                     // Check for connection error
                     int error = 0;

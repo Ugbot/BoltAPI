@@ -30,3 +30,14 @@ if(WIN32)
 endif()
 boltapi_apply_hardening(boltapi_body_throughput_bench)
 boltapi_apply_sanitizers(boltapi_body_throughput_bench)
+
+# UDP echo throughput: NEW event-loop UdpTransport (coroutine on IODispatcher)
+# vs OLD dedicated-thread blocking-recvfrom echo. Confirms the unified-loop path
+# is not slower than the removed dedicated rx thread.
+add_executable(boltapi_udp_echo_bench udp_echo_bench.cpp)
+target_link_libraries(boltapi_udp_echo_bench PRIVATE boltapi::boltapi)
+if(WIN32)
+    target_link_libraries(boltapi_udp_echo_bench PRIVATE ws2_32 mswsock iphlpapi)
+endif()
+boltapi_apply_hardening(boltapi_udp_echo_bench)
+boltapi_apply_sanitizers(boltapi_udp_echo_bench)

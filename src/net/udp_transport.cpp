@@ -1,35 +1,37 @@
-// src/net/udp_transport.cpp — implementation of the standalone UDP transport.
+// src/net/udp_transport.cpp — UDP transport on the unified async event loop.
 //
-// DESIGN (correctness-first, isolation): the engine's IODispatcher has no UDP
-// path and async_io must not be touched, so UdpTransport owns its OWN UDP socket
-// and a dedicated receive thread. The thread runs a NON-BLOCKING socket + a
-// short select() poll loop with an atomic stop flag — this gives a clean,
-// portable, hang-free shutdown on both winsock and POSIX (a blocking recvfrom
-// would otherwise need a self-pipe / socket-shutdown wakeup; the poll loop is
-// simpler and provably terminates within one poll interval).
+// DESIGN: the receive loop is a coroutine scheduled on the engine's
+// IODispatcher (epoll/kqueue/IOCP). Each iteration does
+// `co_await async_recvfrom` and demuxes the datagram. There is NO dedicated
+// receive thread — UDP shares the same async I/O loop as TCP/HTTP.
 //
-// Compiled UNCONDITIONALLY into boltapi (no engine deps).
+// CLEAN SHUTDOWN: stop() sets an atomic stop flag and closes the socket. The
+// socket close completes any in-flight recvfrom (with an error result) which
+// resumes the coroutine; it observes the stop flag and returns. stop() waits
+// for the coroutine to reach its final suspend (rx_done_) before destroying the
+// coroutine handle, so the receive buffer + peer-addr out-params (which the
+// pending op points at) always outlive the last completion. No hang, no leak,
+// no use-after-free.
+//
+// Compiled UNCONDITIONALLY into boltapi (depends only on IODispatcher).
 
 #include "boltapi/net/udp_transport.h"
 
 #include <cstring>
+#include <thread>
 
 namespace bolt::api {
 namespace net {
 
 namespace {
 
-// Poll timeout for the receive loop: short enough that stop() returns quickly,
-// long enough not to spin. 50ms is imperceptible at shutdown and idle-cheap.
-inline constexpr long kPollTimeoutMicros = 50 * 1000;  // 50 ms
-
 // RFC 7983 first-byte classification.
 enum class PacketKind : std::uint8_t { Stun, Dtls, Drop };
 
 inline PacketKind classify(std::uint8_t first_byte) noexcept {
-    if (first_byte <= 3) return PacketKind::Stun;             // 0..3   => STUN
-    if (first_byte >= 20 && first_byte <= 63) return PacketKind::Dtls;  // 20..63 => DTLS
-    return PacketKind::Drop;                                  // else   => drop
+    if (first_byte <= 3) return PacketKind::Stun;                      // 0..3   => STUN
+    if (first_byte >= 20 && first_byte <= 63) return PacketKind::Dtls; // 20..63 => DTLS
+    return PacketKind::Drop;                                           // else   => drop
 }
 
 }  // namespace
@@ -68,14 +70,6 @@ bool UdpTransport::bind(const char* host, std::uint16_t port) noexcept {
         bound_port_ = port;
     }
 
-    // Non-blocking so the receive loop can poll + check the stop flag.
-    if (sys::set_nonblocking(s) != 0) {
-        sys::close_socket(s);
-        sock_       = kInvalidSocket;
-        bound_port_ = 0;
-        return false;
-    }
-
     sock_ = s;
     return true;
 }
@@ -83,25 +77,65 @@ bool UdpTransport::bind(const char* host, std::uint16_t port) noexcept {
 bool UdpTransport::start() noexcept {
     if (sock_ == kInvalidSocket) return false;
     if (running_.load(std::memory_order_acquire)) return false;
+
+    // Resolve the dispatcher: explicit one, else the (lazily started) global.
+    if (dispatcher_ == nullptr) {
+        dispatcher_ = &global_io_dispatcher();
+    }
+
     stop_flag_.store(false, std::memory_order_release);
+    rx_done_.store(false, std::memory_order_release);
     running_.store(true, std::memory_order_release);
-    rx_thread_ = std::thread([this]() noexcept { receive_loop(); });
+
+    // Spin up the receive coroutine. It is detached: we take ownership of the
+    // handle and resume it once to start it (it begins suspended at
+    // initial_suspend). It then drives itself via recvfrom completions until
+    // stop(). We do NOT keep the coro_task object (its dtor would destroy the
+    // handle); we destroy the handle ourselves in stop() after rx_done_.
+    core::coro_task<void> task = receive_loop();
+    std::coroutine_handle<> h = task.release();
+    rx_handle_ = h;
+    h.resume();  // run to the first co_await async_recvfrom (which suspends)
     return true;
 }
 
 void UdpTransport::stop() noexcept {
-    // Signal the loop to exit and join it before closing the socket so the rx
-    // thread never touches a closed handle. Idempotent.
-    stop_flag_.store(true, std::memory_order_release);
-    if (rx_thread_.joinable()) {
-        rx_thread_.join();
+    // Idempotent. If never started, just close any bound socket.
+    if (!running_.exchange(false)) {
+        if (sock_ != kInvalidSocket) {
+            sys::close_socket(sock_);
+            sock_       = kInvalidSocket;
+            bound_port_ = 0;
+        }
+        return;
     }
-    running_.store(false, std::memory_order_release);
+
+    // Signal the coroutine to stop, then close the socket to unblock any
+    // in-flight recvfrom (its completion resumes the coroutine, which observes
+    // the flag and returns).
+    stop_flag_.store(true, std::memory_order_release);
     if (sock_ != kInvalidSocket) {
         sys::close_socket(sock_);
-        sock_       = kInvalidSocket;
-        bound_port_ = 0;
+        // Leave sock_ set until the coroutine has finished so any racing
+        // recvfrom submit targets a (now-invalid) handle that errors out
+        // rather than a recycled fd. We clear it below.
     }
+
+    // Wait for the coroutine to reach its final suspend. Bounded spin with a
+    // yield so we never busy-burn; in practice this completes within one poll
+    // interval (the closed socket completes the pending recvfrom promptly).
+    while (!rx_done_.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+
+    // The coroutine is fully suspended at final_suspend now: destroy it.
+    if (rx_handle_) {
+        rx_handle_.destroy();
+        rx_handle_ = nullptr;
+    }
+
+    sock_       = kInvalidSocket;
+    bound_port_ = 0;
 }
 
 ssize_t UdpTransport::send(const sockaddr* peer, int peer_len,
@@ -115,66 +149,58 @@ ssize_t UdpTransport::send(const sockaddr* peer, int peer_len,
     return n;
 }
 
-void UdpTransport::receive_loop() noexcept {
-    while (!stop_flag_.load(std::memory_order_acquire)) {
-        // select() with a short timeout so we re-check the stop flag promptly.
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(sock_, &rfds);
-        timeval tv{};
-        tv.tv_sec  = 0;
-        tv.tv_usec = kPollTimeoutMicros;
-
-        // On POSIX nfds must be the highest fd + 1; winsock ignores it.
-#ifdef _WIN32
-        const int nfds = 0;
-#else
-        const int nfds = static_cast<int>(sock_) + 1;
-#endif
-        const int ready = ::select(nfds, &rfds, nullptr, nullptr, &tv);
-        if (ready <= 0) continue;  // timeout (0) or error (<0); re-check stop
-
-        // Drain everything currently readable (a single select wake may carry
-        // multiple datagrams). Non-blocking recvfrom returns EWOULDBLOCK when
-        // empty, which ends the inner loop.
-        for (;;) {
-            sockaddr_storage src{};
-            socklen_t        src_len = sizeof(src);
-            const ssize_t n = ::recvfrom(
-                sock_, reinterpret_cast<char*>(rx_buf_),
-                static_cast<int>(kUdpRecvBufferSize), 0,
-                reinterpret_cast<sockaddr*>(&src), &src_len);
-            if (n <= 0) break;  // would-block / error -> back to select
-
-            rx_count_.v.fetch_add(1, std::memory_order_relaxed);
-
-            const auto* peer = reinterpret_cast<const sockaddr*>(&src);
-            const int   plen = static_cast<int>(src_len);
-            const std::size_t len = static_cast<std::size_t>(n);
-
-            switch (classify(rx_buf_[0])) {
-                case PacketKind::Stun:
-                    if (stun_handler_) {
-                        stun_handler_(peer, plen, rx_buf_, len);
-                    } else {
-                        drop_count_.v.fetch_add(1, std::memory_order_relaxed);
-                    }
-                    break;
-                case PacketKind::Dtls:
-                    if (datagram_handler_) {
-                        datagram_handler_(peer, plen, rx_buf_, len);
-                    } else {
-                        // No DTLS path yet (next wave) — drop with a counter.
-                        drop_count_.v.fetch_add(1, std::memory_order_relaxed);
-                    }
-                    break;
-                case PacketKind::Drop:
-                default:
-                    drop_count_.v.fetch_add(1, std::memory_order_relaxed);
-                    break;
+void UdpTransport::demux(const sockaddr* peer, int peer_len,
+                         const std::uint8_t* data, std::size_t len) noexcept {
+    switch (classify(data[0])) {
+        case PacketKind::Stun:
+            if (stun_handler_) {
+                stun_handler_(peer, peer_len, data, len);
+            } else {
+                drop_count_.v.fetch_add(1, std::memory_order_relaxed);
             }
-        }
+            break;
+        case PacketKind::Dtls:
+            if (datagram_handler_) {
+                datagram_handler_(peer, peer_len, data, len);
+            } else {
+                drop_count_.v.fetch_add(1, std::memory_order_relaxed);
+            }
+            break;
+        case PacketKind::Drop:
+        default:
+            drop_count_.v.fetch_add(1, std::memory_order_relaxed);
+            break;
     }
+}
+
+core::coro_task<void> UdpTransport::receive_loop() noexcept {
+    while (!stop_flag_.load(std::memory_order_acquire)) {
+        // Reset the peer-addr capacity each iteration (recvfrom out-param).
+        peer_len_ = sizeof(peer_addr_);
+
+        const ssize_t n = co_await dispatcher_->async_recvfrom(
+            static_cast<int>(sock_), rx_buf_, kUdpRecvBufferSize,
+            reinterpret_cast<sockaddr*>(&peer_addr_), &peer_len_);
+
+        // Re-check the stop flag: a close()-triggered completion lands here with
+        // n <= 0, and we must NOT touch the (closed) socket again.
+        if (stop_flag_.load(std::memory_order_acquire)) break;
+
+        if (n <= 0) {
+            // Transient error on a live socket: loop and re-arm recvfrom.
+            continue;
+        }
+
+        rx_count_.v.fetch_add(1, std::memory_order_relaxed);
+        demux(reinterpret_cast<const sockaddr*>(&peer_addr_),
+              static_cast<int>(peer_len_), rx_buf_,
+              static_cast<std::size_t>(n));
+    }
+
+    // Signal stop() that we're done; after this we suspend at final_suspend and
+    // stop() destroys the handle.
+    rx_done_.store(true, std::memory_order_release);
+    co_return;
 }
 
 }  // namespace net

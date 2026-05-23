@@ -62,6 +62,52 @@ void WriteAwaitable::await_suspend(std::coroutine_handle<> handle) noexcept {
     }
 }
 
+void RecvFromAwaitable::await_suspend(std::coroutine_handle<> handle) noexcept {
+    dispatcher_->reads_started_.fetch_add(1, std::memory_order_relaxed);
+
+    RecvFromAwaitable* self = this;
+
+    // Forward the caller-owned peer-address out-params straight to the backend.
+    // They (and `buf_`) must outlive the op — the awaitable temporary lives
+    // across the suspension point, and the caller guarantees `src_`/`srclen_`
+    // storage outlives the co_await.
+    int rc = dispatcher_->io_->recvfrom_async(
+        fd_, buf_, len_, src_, srclen_,
+        [self, handle](const core::io_event& event) {
+            self->result_ = event.result;
+            self->dispatcher_->reads_completed_.fetch_add(1, std::memory_order_relaxed);
+            self->dispatcher_->resume_on_worker(handle);
+        },
+        nullptr
+    );
+
+    if (rc != 0) {
+        result_ = -1;
+        dispatcher_->resume_on_worker(handle);
+    }
+}
+
+void SendToAwaitable::await_suspend(std::coroutine_handle<> handle) noexcept {
+    dispatcher_->writes_started_.fetch_add(1, std::memory_order_relaxed);
+
+    SendToAwaitable* self = this;
+
+    int rc = dispatcher_->io_->sendto_async(
+        fd_, buf_, len_, dst_, dstlen_,
+        [self, handle](const core::io_event& event) {
+            self->result_ = event.result;
+            self->dispatcher_->writes_completed_.fetch_add(1, std::memory_order_relaxed);
+            self->dispatcher_->resume_on_worker(handle);
+        },
+        nullptr
+    );
+
+    if (rc != 0) {
+        result_ = -1;
+        dispatcher_->resume_on_worker(handle);
+    }
+}
+
 void AcceptAwaitable::await_suspend(std::coroutine_handle<> handle) noexcept {
     dispatcher_->accepts_started_.fetch_add(1, std::memory_order_relaxed);
 

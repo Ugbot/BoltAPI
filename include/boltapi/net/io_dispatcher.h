@@ -69,6 +69,58 @@ private:
     ssize_t result_ = 0;
 };
 
+/// Awaitable for async datagram receive (UDP recvfrom).
+///
+/// The awaitable OWNS the peer-address out-params it forwards to the backend:
+/// `src`/`srclen` point at caller storage that MUST outlive the co_await (the
+/// awaitable is a temporary that lives across the suspension point, so passing
+/// pointers to caller-stack/long-lived storage is correct). On resume, the
+/// caller reads the filled-in src/srclen plus the byte count.
+class RecvFromAwaitable {
+public:
+    RecvFromAwaitable(IODispatcher* dispatcher, int fd, void* buf, size_t len,
+                      struct sockaddr* src, socklen_t* srclen) noexcept
+        : dispatcher_(dispatcher), fd_(fd), buf_(buf), len_(len),
+          src_(src), srclen_(srclen) {}
+
+    bool await_ready() const noexcept { return false; }
+    void await_suspend(std::coroutine_handle<> handle) noexcept;
+    ssize_t await_resume() const noexcept { return result_; }
+
+private:
+    friend class IODispatcher;
+    IODispatcher* dispatcher_;
+    int fd_;
+    void* buf_;
+    size_t len_;
+    struct sockaddr* src_;
+    socklen_t* srclen_;
+    ssize_t result_ = 0;
+};
+
+/// Awaitable for async datagram send (UDP sendto).
+class SendToAwaitable {
+public:
+    SendToAwaitable(IODispatcher* dispatcher, int fd, const void* buf, size_t len,
+                    const struct sockaddr* dst, socklen_t dstlen) noexcept
+        : dispatcher_(dispatcher), fd_(fd), buf_(buf), len_(len),
+          dst_(dst), dstlen_(dstlen) {}
+
+    bool await_ready() const noexcept { return false; }
+    void await_suspend(std::coroutine_handle<> handle) noexcept;
+    ssize_t await_resume() const noexcept { return result_; }
+
+private:
+    friend class IODispatcher;
+    IODispatcher* dispatcher_;
+    int fd_;
+    const void* buf_;
+    size_t len_;
+    const struct sockaddr* dst_;
+    socklen_t dstlen_;
+    ssize_t result_ = 0;
+};
+
 /// Awaitable for async accept operations
 class AcceptAwaitable {
 public:
@@ -181,6 +233,30 @@ public:
         return ConnectAwaitable(this, fd, addr, addrlen);
     }
 
+    /// Async datagram receive (UDP) - returns awaitable.
+    /// @param fd Datagram socket file descriptor
+    /// @param buf Buffer to receive into
+    /// @param len Buffer capacity
+    /// @param src [out] peer address (filled on completion); must outlive co_await
+    /// @param srclen [in/out] capacity on entry, actual peer-addr length on exit
+    /// @return Awaitable that yields bytes received, or -1 on error
+    RecvFromAwaitable async_recvfrom(int fd, void* buf, size_t len,
+                                     struct sockaddr* src, socklen_t* srclen) noexcept {
+        return RecvFromAwaitable(this, fd, buf, len, src, srclen);
+    }
+
+    /// Async datagram send (UDP) - returns awaitable.
+    /// @param fd Datagram socket file descriptor
+    /// @param buf Buffer to send from
+    /// @param len Bytes to send
+    /// @param dst Destination address
+    /// @param dstlen Destination address length
+    /// @return Awaitable that yields bytes sent, or -1 on error
+    SendToAwaitable async_sendto(int fd, const void* buf, size_t len,
+                                 const struct sockaddr* dst, socklen_t dstlen) noexcept {
+        return SendToAwaitable(this, fd, buf, len, dst, dstlen);
+    }
+
     /// Close a file descriptor asynchronously
     void async_close(int fd) noexcept;
 
@@ -235,6 +311,8 @@ private:
     friend class WriteAwaitable;
     friend class AcceptAwaitable;
     friend class ConnectAwaitable;
+    friend class RecvFromAwaitable;
+    friend class SendToAwaitable;
 
     void io_thread_loop(size_t thread_id);
 

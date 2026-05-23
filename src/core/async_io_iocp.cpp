@@ -48,9 +48,19 @@ struct iocp_op {
     // For connect
     struct sockaddr_storage addr;
     int addrlen{0};
-    
+
+    // For recvfrom (UDP): WSARecvFrom fills `from_addr`/`from_len` (which must
+    // outlive the async op — they live in this heap-allocated op). On
+    // completion we copy them back into the caller's out-params below.
+    struct sockaddr_storage from_addr;
+    int                     from_len{0};
+    struct sockaddr*        user_src{nullptr};   // caller out: peer address
+    socklen_t*              user_srclen{nullptr}; // caller in/out: capacity/len
+
     iocp_op() {
         ZeroMemory(&overlapped, sizeof(overlapped));
+        ZeroMemory(&from_addr, sizeof(from_addr));
+        from_len = sizeof(from_addr);
     }
 };
 
@@ -307,6 +317,103 @@ int iocp_io::connect_async(
     return 0;
 }
 
+int iocp_io::recvfrom_async(
+    int fd,
+    void* buffer,
+    size_t size,
+    struct sockaddr* src,
+    socklen_t* srclen,
+    io_callback callback,
+    void* user_data
+) noexcept {
+    SOCKET sock = (SOCKET)fd;
+    impl_->associate_socket(sock);
+
+    auto* op = new iocp_op();
+    op->operation = io_op::recvfrom;
+    op->sock = sock;
+    op->buffer = static_cast<char*>(buffer);
+    op->callback = std::move(callback);
+    op->user_data = user_data;
+    op->user_src = src;
+    op->user_srclen = srclen;
+
+    op->wsabuf.buf = op->buffer;
+    op->wsabuf.len = static_cast<ULONG>(size);
+
+    // WSARecvFrom: the OVERLAPPED, the WSABUF, AND the from-addr/from-len
+    // out-params must all stay valid until the completion is dequeued — they
+    // live inside `op`, which we only delete in poll() after the completion.
+    DWORD flags = 0;
+    int result = WSARecvFrom(
+        sock,
+        &op->wsabuf, 1,
+        &op->bytes_transferred,
+        &flags,
+        reinterpret_cast<sockaddr*>(&op->from_addr),
+        &op->from_len,
+        &op->overlapped,
+        NULL);
+
+    if (result != 0 && WSAGetLastError() != WSA_IO_PENDING) {
+        delete op;
+        impl_->stat_errors.fetch_add(1, std::memory_order_relaxed);
+        return -1;
+    }
+
+    impl_->stat_reads.fetch_add(1, std::memory_order_relaxed);
+    return 0;
+}
+
+int iocp_io::sendto_async(
+    int fd,
+    const void* buffer,
+    size_t size,
+    const struct sockaddr* dst,
+    socklen_t dstlen,
+    io_callback callback,
+    void* user_data
+) noexcept {
+    SOCKET sock = (SOCKET)fd;
+    impl_->associate_socket(sock);
+
+    auto* op = new iocp_op();
+    op->operation = io_op::sendto;
+    op->sock = sock;
+    op->buffer = const_cast<char*>(static_cast<const char*>(buffer));
+    op->callback = std::move(callback);
+    op->user_data = user_data;
+
+    op->wsabuf.buf = op->buffer;
+    op->wsabuf.len = static_cast<ULONG>(size);
+
+    // Destination address must outlive the op; copy it into the op storage.
+    if (dst != nullptr && dstlen > 0 &&
+        dstlen <= static_cast<socklen_t>(sizeof(op->addr))) {
+        memcpy(&op->addr, dst, dstlen);
+        op->addrlen = dstlen;
+    }
+
+    int result = WSASendTo(
+        sock,
+        &op->wsabuf, 1,
+        &op->bytes_transferred,
+        0,
+        reinterpret_cast<sockaddr*>(&op->addr),
+        op->addrlen,
+        &op->overlapped,
+        NULL);
+
+    if (result != 0 && WSAGetLastError() != WSA_IO_PENDING) {
+        delete op;
+        impl_->stat_errors.fetch_add(1, std::memory_order_relaxed);
+        return -1;
+    }
+
+    impl_->stat_writes.fetch_add(1, std::memory_order_relaxed);
+    return 0;
+}
+
 int iocp_io::close_async(int fd) noexcept {
     impl_->stat_closes.fetch_add(1, std::memory_order_relaxed);
     return closesocket((SOCKET)fd);
@@ -373,9 +480,27 @@ int iocp_io::poll(uint32_t timeout_us) noexcept {
                 
             case io_op::read:
             case io_op::write:
+            case io_op::sendto:
                 event.result = bytes_transferred;
                 break;
-                
+
+            case io_op::recvfrom:
+                event.result = bytes_transferred;
+                // Copy the peer address WSARecvFrom captured back into the
+                // caller's out-params (truncating to their capacity).
+                if (op->user_src != nullptr && op->user_srclen != nullptr) {
+                    socklen_t cap = *op->user_srclen;
+                    socklen_t got = static_cast<socklen_t>(op->from_len);
+                    socklen_t copy = (got < cap) ? got : cap;
+                    if (copy > 0) {
+                        memcpy(op->user_src, &op->from_addr, copy);
+                    }
+                    *op->user_srclen = got;
+                } else if (op->user_srclen != nullptr) {
+                    *op->user_srclen = static_cast<socklen_t>(op->from_len);
+                }
+                break;
+
             case io_op::connect:
                 event.result = 0;  // Success
                 break;

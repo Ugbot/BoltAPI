@@ -321,8 +321,11 @@ void App::init_protocol_seams() {
         // IceAgent. Gather host candidates, bind the UDP port, route inbound
         // STUN to the agent's binding responder, and log candidates + creds. A
         // signaling route (POST /webrtc/offer producing build_answer) is a TODO
-        // hook for the next wave. This is fully isolated from the H1/H2 server:
-        // it owns its own socket + receive thread and shuts down with the App.
+        // hook for the next wave. The UdpTransport runs its receive loop as a
+        // coroutine on the engine's UNIFIED async event loop (the global
+        // IODispatcher — the same async_io backend that drives TCP/HTTP), NOT a
+        // private receive thread. It owns only its UDP socket and shuts down
+        // with the App. H1/H2 are unaffected.
         webrtc_agent_ = std::make_unique<webrtc::IceAgent>();
         if (!webrtc_config_.ice_ufrag.empty() &&
             !webrtc_config_.ice_pwd.empty()) {

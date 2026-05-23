@@ -16,6 +16,8 @@
 // and candidate to_string/from_string round-trips.
 
 #include "boltapi/net/udp_transport.h"
+#include "boltapi/net/io_dispatcher.h"
+#include "boltapi/core/worker_pool.h"
 #include "boltapi/webrtc/ice.h"
 #include "boltapi/webrtc/stun.h"
 
@@ -24,15 +26,36 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <thread>
 
 namespace net  = bolt::api::net;
 namespace sys  = bolt::api::net::sys;
+namespace core = bolt::api::core;
 namespace ice  = bolt::api::webrtc;
 namespace stun = bolt::api::webrtc::stun;
 
 namespace {
+
+// Shared event-loop fixture so the UdpTransport receive coroutine runs on the
+// unified IODispatcher (worker pool + async_io) — the production path.
+struct EventLoop {
+    std::unique_ptr<core::WorkerThreadPool> pool;
+    std::unique_ptr<net::IODispatcher>      disp;
+    EventLoop() {
+        pool = std::make_unique<core::WorkerThreadPool>(core::WorkerPoolConfig{});
+        pool->start();
+        disp = std::make_unique<net::IODispatcher>(pool.get());
+        disp->start();
+    }
+    ~EventLoop() { disp->stop(); pool->stop(); }
+};
+
+net::IODispatcher& shared_dispatcher() {
+    static EventLoop loop;
+    return *loop.disp;
+}
 
 constexpr char kOurUfrag[]  = "SVRufrag";              // our (server) ufrag, >=4
 constexpr char kOurPwd[]    = "serverpassword01234567";// our pwd, >=22
@@ -163,7 +186,7 @@ TEST(IceAgent, CredentialGeneration) {
 // THE LIVE STUN GATE — real binding request over the wire, success response.
 // ===========================================================================
 TEST(IceAgent, LiveStunBindingOverTheWire) {
-    net::UdpTransport transport;
+    net::UdpTransport transport(shared_dispatcher());
     ASSERT_TRUE(transport.bind("127.0.0.1", 0));
     const std::uint16_t port = transport.bound_port();
     ASSERT_NE(port, 0);
@@ -254,7 +277,7 @@ TEST(IceAgent, LiveStunBindingOverTheWire) {
 // Negative: WRONG MESSAGE-INTEGRITY -> rejected (not a success), no crash.
 // ===========================================================================
 TEST(IceAgent, WrongIntegrityRejected) {
-    net::UdpTransport transport;
+    net::UdpTransport transport(shared_dispatcher());
     ASSERT_TRUE(transport.bind("127.0.0.1", 0));
     const std::uint16_t port = transport.bound_port();
     ASSERT_NE(port, 0);
@@ -310,7 +333,7 @@ TEST(IceAgent, WrongIntegrityRejected) {
 // Robustness: random / malformed datagrams to the STUN handler don't crash.
 // ===========================================================================
 TEST(IceAgent, MalformedStunIgnored) {
-    net::UdpTransport transport;
+    net::UdpTransport transport(shared_dispatcher());
     ASSERT_TRUE(transport.bind("127.0.0.1", 0));
     ice::IceAgent agent;
     agent.set_credentials(kOurUfrag, kOurPwd);

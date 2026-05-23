@@ -45,6 +45,11 @@ struct pending_op {
     // For connect
     struct sockaddr_storage addr;
     socklen_t addrlen{0};
+
+    // For recvfrom (UDP): caller-owned peer-address out-params. Must outlive
+    // the op (guaranteed by the awaitable owner); filled in poll() on read.
+    struct sockaddr* user_src{nullptr};
+    socklen_t*       user_srclen{nullptr};
 };
 
 /**
@@ -237,6 +242,69 @@ int kqueue_io::connect_async(
     return 0;
 }
 
+int kqueue_io::recvfrom_async(
+    int fd,
+    void* buffer,
+    size_t size,
+    struct sockaddr* src,
+    socklen_t* srclen,
+    io_callback callback,
+    void* user_data
+) noexcept {
+    impl_->set_nonblocking(fd);
+
+    pending_op* op = new pending_op();
+    op->operation = io_op::recvfrom;
+    op->fd = fd;
+    op->buffer = buffer;
+    op->size = size;
+    op->user_src = src;
+    op->user_srclen = srclen;
+    op->callback = std::move(callback);
+    op->user_data = user_data;
+
+    struct kevent kev;
+    EV_SET(&kev, fd, EVFILT_READ, EV_ADD | EV_ENABLE | EV_ONESHOT, 0, 0, op);
+
+    if (kevent(impl_->kq_fd, &kev, 1, nullptr, 0, nullptr) < 0) {
+        delete op;
+        impl_->stat_errors.fetch_add(1, std::memory_order_relaxed);
+        return -1;
+    }
+
+    impl_->stat_reads.fetch_add(1, std::memory_order_relaxed);
+    return 0;
+}
+
+int kqueue_io::sendto_async(
+    int fd,
+    const void* buffer,
+    size_t size,
+    const struct sockaddr* dst,
+    socklen_t dstlen,
+    io_callback callback,
+    void* user_data
+) noexcept {
+    impl_->set_nonblocking(fd);
+
+    // UDP sendto rarely blocks: send directly in the submit path and deliver
+    // the completion synchronously. `buffer`/`dst` are valid for this call.
+    ssize_t n = ::sendto(fd, buffer, size, 0, dst, dstlen);
+
+    impl_->stat_writes.fetch_add(1, std::memory_order_relaxed);
+
+    if (callback) {
+        io_event event;
+        event.operation = io_op::sendto;
+        event.fd = fd;
+        event.user_data = user_data;
+        event.flags = 0;
+        event.result = n;
+        callback(event);
+    }
+    return 0;
+}
+
 int kqueue_io::close_async(int fd) noexcept {
     impl_->stat_closes.fetch_add(1, std::memory_order_relaxed);
     return close(fd);
@@ -306,6 +374,15 @@ int kqueue_io::poll(uint32_t timeout_us) noexcept {
 
             case io_op::write: {
                 ssize_t bytes = write(op->fd, op->buffer, op->size);
+                event.result = bytes;
+                break;
+            }
+
+            case io_op::recvfrom: {
+                // Socket is readable: recvfrom into the buffer, filling the
+                // caller's peer-address out-params.
+                ssize_t bytes = recvfrom(op->fd, op->buffer, op->size, 0,
+                                         op->user_src, op->user_srclen);
                 event.result = bytes;
                 break;
             }
