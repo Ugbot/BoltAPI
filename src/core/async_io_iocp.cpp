@@ -57,10 +57,28 @@ struct iocp_op {
     struct sockaddr*        user_src{nullptr};   // caller out: peer address
     socklen_t*              user_srclen{nullptr}; // caller in/out: capacity/len
 
-    iocp_op() {
+    iocp_op() { reset(); }
+
+    // Re-initialize for reuse from the pool. Clears the OVERLAPPED (required —
+    // the kernel reads it), the recvfrom out-param scratch, and the per-op
+    // fields a fresh submit sets. `callback` is reset by the pool on free.
+    void reset() noexcept {
         ZeroMemory(&overlapped, sizeof(overlapped));
+        operation = io_op::read;
+        sock = INVALID_SOCKET;
+        user_data = nullptr;
+        wsabuf.buf = nullptr;
+        wsabuf.len = 0;
+        buffer = nullptr;
+        bytes_transferred = 0;
+        flags = 0;
+        accept_socket = INVALID_SOCKET;
+        ZeroMemory(&addr, sizeof(addr));
+        addrlen = 0;
         ZeroMemory(&from_addr, sizeof(from_addr));
         from_len = sizeof(from_addr);
+        user_src = nullptr;
+        user_srclen = nullptr;
     }
 };
 
@@ -115,6 +133,12 @@ struct iocp_io::impl {
         if (iocp_handle != INVALID_HANDLE_VALUE) {
             CloseHandle(iocp_handle);
         }
+        // Drain the op free list (these are recycled, not in-flight, ops).
+        {
+            std::lock_guard<std::mutex> lock(pool_mutex);
+            for (iocp_op* op : pool_free) delete op;
+            pool_free.clear();
+        }
         WSACleanup();
     }
     
@@ -141,9 +165,68 @@ struct iocp_io::impl {
         closesocket(temp_socket);
     }
     
+    // Sockets already associated with this IOCP. CreateIoCompletionPort is a
+    // syscall and only needs to run ONCE per handle; re-associating on every
+    // submit (e.g. per-datagram recvfrom on a long-lived UDP socket) is pure
+    // overhead and fails with ERROR_INVALID_PARAMETER anyway. Cache the set so
+    // the hot path skips the syscall after the first association.
+    std::mutex          assoc_mutex;
+    std::unordered_map<SOCKET, char> associated;
+
     int associate_socket(SOCKET sock) {
+        {
+            std::lock_guard<std::mutex> lock(assoc_mutex);
+            if (associated.find(sock) != associated.end()) {
+                return 0;  // already associated — skip the CreateIoCompletionPort syscall
+            }
+        }
         HANDLE h = CreateIoCompletionPort((HANDLE)sock, iocp_handle, (ULONG_PTR)sock, 0);
-        return (h == iocp_handle) ? 0 : -1;
+        const bool ok = (h == iocp_handle);
+        if (ok) {
+            std::lock_guard<std::mutex> lock(assoc_mutex);
+            associated.emplace(sock, char{1});
+        }
+        return ok ? 0 : -1;
+    }
+
+    void forget_socket(SOCKET sock) {
+        std::lock_guard<std::mutex> lock(assoc_mutex);
+        associated.erase(sock);
+    }
+
+    // ---- iocp_op free-list pool ------------------------------------------
+    // new/delete on the per-datagram hot path is expensive (CLAUDE.md). Recycle
+    // completed iocp_op objects through a lock-guarded free list. The lock is
+    // only contended between the I/O thread (which frees on completion and may
+    // alloc on re-arm) and submit threads; it is far cheaper than malloc/free.
+    std::mutex             pool_mutex;
+    std::vector<iocp_op*>  pool_free;
+    static constexpr std::size_t kPoolCap = 256;  // bounded retained free slots
+
+    iocp_op* alloc_op() {
+        {
+            std::lock_guard<std::mutex> lock(pool_mutex);
+            if (!pool_free.empty()) {
+                iocp_op* op = pool_free.back();
+                pool_free.pop_back();
+                op->reset();
+                return op;
+            }
+        }
+        return new (std::nothrow) iocp_op();
+    }
+
+    void free_op(iocp_op* op) {
+        if (op == nullptr) return;
+        op->callback = nullptr;  // release any captured state promptly
+        {
+            std::lock_guard<std::mutex> lock(pool_mutex);
+            if (pool_free.size() < kPoolCap) {
+                pool_free.push_back(op);
+                return;
+            }
+        }
+        delete op;
     }
 };
 
@@ -165,16 +248,17 @@ int iocp_io::accept_async(
     // Associate with IOCP
     impl_->associate_socket(listen_socket);
     
-    auto* op = new iocp_op();
+    auto* op = impl_->alloc_op();
+    if (op == nullptr) { impl_->stat_errors.fetch_add(1, std::memory_order_relaxed); return -1; }
     op->operation = io_op::accept;
     op->sock = listen_socket;
     op->callback = std::move(callback);
     op->user_data = user_data;
-    
+
     // Create accept socket
     op->accept_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (op->accept_socket == INVALID_SOCKET) {
-        delete op;
+        impl_->free_op(op);
         impl_->stat_errors.fetch_add(1, std::memory_order_relaxed);
         return -1;
     }
@@ -194,11 +278,11 @@ int iocp_io::accept_async(
     
     if (!result && WSAGetLastError() != ERROR_IO_PENDING) {
         closesocket(op->accept_socket);
-        delete op;
+        impl_->free_op(op);
         impl_->stat_errors.fetch_add(1, std::memory_order_relaxed);
         return -1;
     }
-    
+
     impl_->stat_accepts.fetch_add(1, std::memory_order_relaxed);
     return 0;
 }
@@ -213,22 +297,23 @@ int iocp_io::read_async(
     SOCKET sock = (SOCKET)fd;
     impl_->associate_socket(sock);
     
-    auto* op = new iocp_op();
+    auto* op = impl_->alloc_op();
+    if (op == nullptr) { impl_->stat_errors.fetch_add(1, std::memory_order_relaxed); return -1; }
     op->operation = io_op::read;
     op->sock = sock;
     op->buffer = static_cast<char*>(buffer);
     op->callback = std::move(callback);
     op->user_data = user_data;
-    
+
     op->wsabuf.buf = op->buffer;
     op->wsabuf.len = static_cast<ULONG>(size);
-    
+
     // Start receive operation
     DWORD flags = 0;
     int result = WSARecv(sock, &op->wsabuf, 1, &op->bytes_transferred, &flags, &op->overlapped, NULL);
-    
+
     if (result != 0 && WSAGetLastError() != WSA_IO_PENDING) {
-        delete op;
+        impl_->free_op(op);
         impl_->stat_errors.fetch_add(1, std::memory_order_relaxed);
         return -1;
     }
@@ -247,21 +332,22 @@ int iocp_io::write_async(
     SOCKET sock = (SOCKET)fd;
     impl_->associate_socket(sock);
     
-    auto* op = new iocp_op();
+    auto* op = impl_->alloc_op();
+    if (op == nullptr) { impl_->stat_errors.fetch_add(1, std::memory_order_relaxed); return -1; }
     op->operation = io_op::write;
     op->sock = sock;
     op->buffer = const_cast<char*>(static_cast<const char*>(buffer));
     op->callback = std::move(callback);
     op->user_data = user_data;
-    
+
     op->wsabuf.buf = op->buffer;
     op->wsabuf.len = static_cast<ULONG>(size);
-    
+
     // Start send operation
     int result = WSASend(sock, &op->wsabuf, 1, &op->bytes_transferred, 0, &op->overlapped, NULL);
-    
+
     if (result != 0 && WSAGetLastError() != WSA_IO_PENDING) {
-        delete op;
+        impl_->free_op(op);
         impl_->stat_errors.fetch_add(1, std::memory_order_relaxed);
         return -1;
     }
@@ -280,7 +366,8 @@ int iocp_io::connect_async(
     SOCKET sock = (SOCKET)fd;
     impl_->associate_socket(sock);
     
-    auto* op = new iocp_op();
+    auto* op = impl_->alloc_op();
+    if (op == nullptr) { impl_->stat_errors.fetch_add(1, std::memory_order_relaxed); return -1; }
     op->operation = io_op::connect;
     op->sock = sock;
     op->callback = std::move(callback);
@@ -308,11 +395,11 @@ int iocp_io::connect_async(
     );
     
     if (!result && WSAGetLastError() != ERROR_IO_PENDING) {
-        delete op;
+        impl_->free_op(op);
         impl_->stat_errors.fetch_add(1, std::memory_order_relaxed);
         return -1;
     }
-    
+
     impl_->stat_connects.fetch_add(1, std::memory_order_relaxed);
     return 0;
 }
@@ -329,7 +416,8 @@ int iocp_io::recvfrom_async(
     SOCKET sock = (SOCKET)fd;
     impl_->associate_socket(sock);
 
-    auto* op = new iocp_op();
+    auto* op = impl_->alloc_op();
+    if (op == nullptr) { impl_->stat_errors.fetch_add(1, std::memory_order_relaxed); return -1; }
     op->operation = io_op::recvfrom;
     op->sock = sock;
     op->buffer = static_cast<char*>(buffer);
@@ -356,7 +444,7 @@ int iocp_io::recvfrom_async(
         NULL);
 
     if (result != 0 && WSAGetLastError() != WSA_IO_PENDING) {
-        delete op;
+        impl_->free_op(op);
         impl_->stat_errors.fetch_add(1, std::memory_order_relaxed);
         return -1;
     }
@@ -377,7 +465,8 @@ int iocp_io::sendto_async(
     SOCKET sock = (SOCKET)fd;
     impl_->associate_socket(sock);
 
-    auto* op = new iocp_op();
+    auto* op = impl_->alloc_op();
+    if (op == nullptr) { impl_->stat_errors.fetch_add(1, std::memory_order_relaxed); return -1; }
     op->operation = io_op::sendto;
     op->sock = sock;
     op->buffer = const_cast<char*>(static_cast<const char*>(buffer));
@@ -405,7 +494,7 @@ int iocp_io::sendto_async(
         NULL);
 
     if (result != 0 && WSAGetLastError() != WSA_IO_PENDING) {
-        delete op;
+        impl_->free_op(op);
         impl_->stat_errors.fetch_add(1, std::memory_order_relaxed);
         return -1;
     }
@@ -416,6 +505,9 @@ int iocp_io::sendto_async(
 
 int iocp_io::close_async(int fd) noexcept {
     impl_->stat_closes.fetch_add(1, std::memory_order_relaxed);
+    // Drop the association cache entry: the SOCKET value may be recycled by the
+    // OS for a future socket, which must be (re-)associated on its first op.
+    impl_->forget_socket((SOCKET)fd);
     return closesocket((SOCKET)fd);
 }
 
@@ -456,10 +548,12 @@ int iocp_io::poll(uint32_t timeout_us) noexcept {
         return (completion_key == WAKE_KEY) ? 1 : 0;
     }
 
-    // Get operation from OVERLAPPED
+    // Get operation from OVERLAPPED. We recycle it back to the pool AFTER the
+    // callback returns (the callback may itself submit a new op, which draws a
+    // DIFFERENT op from the pool — safe, since this one is still in use until it
+    // returns).
     iocp_op* op = CONTAINING_RECORD(overlapped, iocp_op, overlapped);
-    std::unique_ptr<iocp_op> op_guard(op);
-    
+
     impl_->stat_events.fetch_add(1, std::memory_order_relaxed);
     
     // Create event
@@ -511,11 +605,12 @@ int iocp_io::poll(uint32_t timeout_us) noexcept {
         }
     }
     
-    // Invoke callback
+    // Invoke callback (inline on the I/O thread), then recycle the op.
     if (op->callback) {
         op->callback(event);
     }
-    
+    impl_->free_op(op);
+
     return 1;
 }
 

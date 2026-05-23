@@ -1,17 +1,25 @@
 // src/net/udp_transport.cpp — UDP transport on the unified async event loop.
 //
-// DESIGN: the receive loop is a coroutine scheduled on the engine's
-// IODispatcher (epoll/kqueue/IOCP). Each iteration does
-// `co_await async_recvfrom` and demuxes the datagram. There is NO dedicated
-// receive thread — UDP shares the same async I/O loop as TCP/HTTP.
+// DESIGN: the receive path uses the RAW async_io callback model directly. We
+// submit recvfrom_async(fd, slot.buf, &slot.peer_addr, &slot.peer_len, cb,
+// &slot); the callback `cb` runs INLINE on the I/O thread inside poll(). It
+// demuxes the datagram, handles STUN/control inline (compute + sendto), then
+// re-arms another recvfrom_async on the same slot. There is NO coroutine and NO
+// per-packet worker handoff. UDP shares the same async I/O loop as TCP/HTTP.
+//
+// PIPELINING: on a completion backend (IOCP) we keep kUdpRecvInFlight ops
+// posted at once so the kernel can deliver the next datagram while we demux the
+// previous; each op has its own slot. On a readiness backend (epoll/kqueue) the
+// callback drains the socket in a loop per wakeup (batching) and a single armed
+// op suffices, but the accounting is uniform across backends.
 //
 // CLEAN SHUTDOWN: stop() sets an atomic stop flag and closes the socket. The
-// socket close completes any in-flight recvfrom (with an error result) which
-// resumes the coroutine; it observes the stop flag and returns. stop() waits
-// for the coroutine to reach its final suspend (rx_done_) before destroying the
-// coroutine handle, so the receive buffer + peer-addr out-params (which the
-// pending op points at) always outlive the last completion. No hang, no leak,
-// no use-after-free.
+// close completes every in-flight recvfrom (with an error result); each
+// completion runs the callback, which observes the stop flag, does NOT re-arm,
+// and decrements in_flight_. stop() waits for in_flight_ to reach zero before
+// returning, so the per-slot buffers + peer-addr out-params (which the kernel
+// may write) always outlive every in-flight op. No hang, no leak, no
+// use-after-free.
 //
 // Compiled UNCONDITIONALLY into boltapi (depends only on IODispatcher).
 
@@ -82,20 +90,33 @@ bool UdpTransport::start() noexcept {
     if (dispatcher_ == nullptr) {
         dispatcher_ = &global_io_dispatcher();
     }
+    io_ = dispatcher_->io_engine();
+    if (io_ == nullptr) return false;
 
     stop_flag_.store(false, std::memory_order_release);
-    rx_done_.store(false, std::memory_order_release);
+    in_flight_.store(0, std::memory_order_release);
     running_.store(true, std::memory_order_release);
 
-    // Spin up the receive coroutine. It is detached: we take ownership of the
-    // handle and resume it once to start it (it begins suspended at
-    // initial_suspend). It then drives itself via recvfrom completions until
-    // stop(). We do NOT keep the coro_task object (its dtor would destroy the
-    // handle); we destroy the handle ourselves in stop() after rx_done_.
-    core::coro_task<void> task = receive_loop();
-    std::coroutine_handle<> h = task.release();
-    rx_handle_ = h;
-    h.resume();  // run to the first co_await async_recvfrom (which suspends)
+    // Arm the receive path. On a completion backend (IOCP) we post
+    // kUdpRecvInFlight concurrent recvfrom ops to pipeline completions; on a
+    // readiness backend (epoll/kqueue) the callback drains per wakeup, so a
+    // single armed op is enough. The initial arm here may run on a thread other
+    // than the I/O thread — recvfrom_async is safe to submit from any thread.
+#ifdef _WIN32
+    const std::size_t to_arm = kUdpRecvInFlight;
+#else
+    const std::size_t to_arm = 1;
+#endif
+    bool any = false;
+    for (std::size_t i = 0; i < to_arm; ++i) {
+        slots_[i].owner = this;
+        if (arm_recv(slots_[i])) any = true;
+    }
+    if (!any) {
+        // Nothing armed (submit failure): unwind cleanly.
+        running_.store(false, std::memory_order_release);
+        return false;
+    }
     return true;
 }
 
@@ -110,32 +131,117 @@ void UdpTransport::stop() noexcept {
         return;
     }
 
-    // Signal the coroutine to stop, then close the socket to unblock any
-    // in-flight recvfrom (its completion resumes the coroutine, which observes
-    // the flag and returns).
+    // Signal the callback to stop re-arming, then close the socket to complete
+    // any in-flight recvfrom (each completion runs the callback, which observes
+    // the flag and does NOT re-arm). We leave sock_ set until every op has
+    // drained so a racing submit targets a (now-invalid) handle that errors out
+    // rather than a recycled fd.
     stop_flag_.store(true, std::memory_order_release);
     if (sock_ != kInvalidSocket) {
-        sys::close_socket(sock_);
-        // Leave sock_ set until the coroutine has finished so any racing
-        // recvfrom submit targets a (now-invalid) handle that errors out
-        // rather than a recycled fd. We clear it below.
+        // Close THROUGH the engine so any backend per-socket state (e.g. the
+        // IOCP association cache) is dropped along with the handle — otherwise a
+        // recycled SOCKET value could skip (re-)association. close_async closes
+        // the handle, which completes every in-flight recvfrom and unblocks the
+        // drain below.
+        if (io_ != nullptr) {
+            io_->close_async(static_cast<int>(sock_));
+        } else {
+            sys::close_socket(sock_);
+        }
     }
 
-    // Wait for the coroutine to reach its final suspend. Bounded spin with a
-    // yield so we never busy-burn; in practice this completes within one poll
-    // interval (the closed socket completes the pending recvfrom promptly).
-    while (!rx_done_.load(std::memory_order_acquire)) {
+    // Wait for every in-flight recvfrom op to complete and run its callback.
+    // The closed socket completes pending ops promptly; bounded spin with a
+    // yield so we never busy-burn. After this the per-slot buffers are no longer
+    // referenced by any kernel/backend op.
+    while (in_flight_.load(std::memory_order_acquire) != 0) {
         std::this_thread::yield();
-    }
-
-    // The coroutine is fully suspended at final_suspend now: destroy it.
-    if (rx_handle_) {
-        rx_handle_.destroy();
-        rx_handle_ = nullptr;
     }
 
     sock_       = kInvalidSocket;
     bound_port_ = 0;
+}
+
+bool UdpTransport::arm_recv(RecvSlot& slot) noexcept {
+    if (io_ == nullptr || sock_ == kInvalidSocket) return false;
+    if (stop_flag_.load(std::memory_order_acquire)) return false;
+
+    // Reset the peer-addr capacity for this op (recvfrom out-param).
+    slot.peer_len = sizeof(slot.peer_addr);
+
+    // Count the op as in-flight BEFORE submitting so a synchronous-inline
+    // completion (which decrements) cannot underflow.
+    in_flight_.fetch_add(1, std::memory_order_acq_rel);
+
+    const int rc = io_->recvfrom_async(
+        static_cast<int>(sock_), slot.buf, kUdpRecvBufferSize,
+        reinterpret_cast<sockaddr*>(&slot.peer_addr), &slot.peer_len,
+        [](const core::io_event& ev) noexcept {
+            auto* s = static_cast<RecvSlot*>(ev.user_data);
+            s->owner->on_recv(*s, ev.result);
+        },
+        &slot);
+
+    if (rc != 0) {
+        // Submit failed outright: this op never reaches a completion, so undo
+        // the in-flight bump here.
+        in_flight_.fetch_sub(1, std::memory_order_acq_rel);
+        return false;
+    }
+    return true;
+}
+
+void UdpTransport::on_recv(RecvSlot& slot, ssize_t n) noexcept {
+    // This runs INLINE on the I/O thread inside poll(). On stop, the socket
+    // close completes the op with n <= 0; we must NOT touch the (closed) socket
+    // and must NOT re-arm — just retire the op.
+    if (stop_flag_.load(std::memory_order_acquire)) {
+        in_flight_.fetch_sub(1, std::memory_order_acq_rel);
+        return;
+    }
+
+    if (n > 0) {
+        rx_count_.v.fetch_add(1, std::memory_order_relaxed);
+        demux(reinterpret_cast<const sockaddr*>(&slot.peer_addr),
+              static_cast<int>(slot.peer_len), slot.buf,
+              static_cast<std::size_t>(n));
+    }
+
+#ifndef _WIN32
+    // POSIX readiness backend: the socket is non-blocking and was just readable.
+    // Drain it — keep recvfrom'ing until EWOULDBLOCK/EAGAIN — to amortize the
+    // epoll/kqueue wakeup over every queued datagram (batching).
+    if (n > 0) {
+        for (;;) {
+            if (stop_flag_.load(std::memory_order_acquire)) {
+                in_flight_.fetch_sub(1, std::memory_order_acq_rel);
+                return;
+            }
+            slot.peer_len = sizeof(slot.peer_addr);
+            const ssize_t m = ::recvfrom(
+                static_cast<int>(sock_),
+                reinterpret_cast<char*>(slot.buf), kUdpRecvBufferSize, 0,
+                reinterpret_cast<sockaddr*>(&slot.peer_addr), &slot.peer_len);
+            if (m <= 0) break;  // EWOULDBLOCK/EAGAIN (or error) -> re-arm below
+            rx_count_.v.fetch_add(1, std::memory_order_relaxed);
+            demux(reinterpret_cast<const sockaddr*>(&slot.peer_addr),
+                  static_cast<int>(slot.peer_len), slot.buf,
+                  static_cast<std::size_t>(m));
+        }
+    }
+#endif
+
+    // Re-arm another recvfrom on this slot. CRITICAL ordering for clean stop:
+    // arm the NEW op first (it bumps in_flight_), THEN drop THIS op's reference.
+    // This keeps in_flight_ from transiently hitting zero while we still touch
+    // `this` — otherwise stop() could observe zero and return, racing the very
+    // code re-arming on the (about-to-be-destroyed) transport. If the re-arm
+    // fails or stop was requested, we simply drop our reference and let stop()
+    // proceed once the count settles to zero.
+    if (!stop_flag_.load(std::memory_order_acquire)) {
+        arm_recv(slot);  // bumps in_flight_ on success
+    }
+    in_flight_.fetch_sub(1, std::memory_order_acq_rel);  // retire THIS op last
 }
 
 ssize_t UdpTransport::send(const sockaddr* peer, int peer_len,
@@ -171,36 +277,6 @@ void UdpTransport::demux(const sockaddr* peer, int peer_len,
             drop_count_.v.fetch_add(1, std::memory_order_relaxed);
             break;
     }
-}
-
-core::coro_task<void> UdpTransport::receive_loop() noexcept {
-    while (!stop_flag_.load(std::memory_order_acquire)) {
-        // Reset the peer-addr capacity each iteration (recvfrom out-param).
-        peer_len_ = sizeof(peer_addr_);
-
-        const ssize_t n = co_await dispatcher_->async_recvfrom(
-            static_cast<int>(sock_), rx_buf_, kUdpRecvBufferSize,
-            reinterpret_cast<sockaddr*>(&peer_addr_), &peer_len_);
-
-        // Re-check the stop flag: a close()-triggered completion lands here with
-        // n <= 0, and we must NOT touch the (closed) socket again.
-        if (stop_flag_.load(std::memory_order_acquire)) break;
-
-        if (n <= 0) {
-            // Transient error on a live socket: loop and re-arm recvfrom.
-            continue;
-        }
-
-        rx_count_.v.fetch_add(1, std::memory_order_relaxed);
-        demux(reinterpret_cast<const sockaddr*>(&peer_addr_),
-              static_cast<int>(peer_len_), rx_buf_,
-              static_cast<std::size_t>(n));
-    }
-
-    // Signal stop() that we're done; after this we suspend at final_suspend and
-    // stop() destroys the handle.
-    rx_done_.store(true, std::memory_order_release);
-    co_return;
 }
 
 }  // namespace net
