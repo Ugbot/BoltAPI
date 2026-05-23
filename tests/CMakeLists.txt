@@ -188,6 +188,15 @@ endif()
 # No network, no crypto, no OpenSSL — compiles into the default suite.
 boltapi_add_test(boltapi_quic_primitives_test quic_primitives_test.cpp)
 
+# Wave 2: QUIC packet protection (RFC 9001 §5) — AEAD seal/open (AES-128/256-GCM,
+# ChaCha20-Poly1305), header protection, HKDF-Expand-Label, Initial-secret
+# derivation. GATE: RFC 9001 Appendix A worked examples (§A.1 keys, §A.2 client
+# Initial, §A.3 server Initial, §A.5 ChaCha20) verified BYTE-EXACT, plus negative
+# auth-fail tests and randomized AEAD round-trips. OpenSSL is always linked into
+# boltapi, so this runs in the default suite. No TLS handshake (that is wave 3).
+boltapi_add_test(boltapi_quic_protection_test quic_protection_test.cpp)
+target_link_libraries(boltapi_quic_protection_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+
 # M3: HTTP/3 + WebRTC seam — ProtocolRegistry mechanism (register/has/create),
 # a dummy IProtocol returning NotImplemented, and (when the compile flags are
 # ON) the real H3/WebRTC stub factories registering. Flag-AWARE: passes in the

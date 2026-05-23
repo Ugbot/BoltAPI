@@ -212,12 +212,18 @@ production-grade**, but the *base* `quic_connection.cpp` never invoked it
       reassembly of handshake bytes per encryption level. *PORT*
       `C:\code\FasterAPI\src\cpp\http\quic\quic_crypto_buffer.h`. *Bolt primitive:*
       `bolt::Arena` for the reassembly scratch; ring buffer for ordered bytes.
-- [ ] **3.2 Packet protection: AEAD + header protection + HKDF.** *What:* real
-      AES-128/256-GCM + ChaCha20-Poly1305 via OpenSSL EVP, HKDF-Expand-Label,
-      header protection mask (RFC 9001 §5). *PORT*
-      `C:\code\FasterAPI\src\cpp\http\quic\quic_packet_protection.h` — audit
-      confirms this is **real OpenSSL EVP** crypto, port as-is. *Bolt primitive:*
-      arena scratch for nonce/mask; avoid per-op allocation (reuse `EVP_CIPHER_CTX`).
+- [x] **3.2 Packet protection: AEAD + header protection + HKDF.** *DONE (wave 2)*
+      (`include/boltapi/quic/packet_protection.h`). Real AES-128/256-GCM +
+      ChaCha20-Poly1305 via OpenSSL EVP, HKDF-Extract/Expand/Expand-Label,
+      Initial-secret derivation (v1 salt), per-direction quic key/iv/hp, AEAD
+      seal/open, AES-ECB / ChaCha20 header protection (RFC 9001 §5). PORTED from
+      `quic_packet_protection.h`; reshaped to Tiger Style (namespace
+      `bolt::api::quic`, ≥2 asserts/fn, fixed buffers, noexcept, bool returns) and
+      **FIXED** the FasterAPI ChaCha20 HP mask bug (it ignored the counter; per
+      RFC 9001 §5.4.4 the 16-byte sample is the EVP_chacha20 IV = [counter:4 LE]
+      [nonce:12]). `EVP_CIPHER_CTX` reused per ctx; no per-op alloc. Compiled
+      UNCONDITIONALLY (OpenSSL always linked) so the default suite covers it.
+      *Bolt primitive:* fixed stack buffers for nonce/mask.
 - [ ] **3.3 TLS 1.3 QUIC method (quictls callbacks).** *What:* `SSL_QUIC_METHOD`
       with set_encryption_secrets / add_handshake_data / flush_flight /
       send_alert; `SSL_provide_quic_data` + `SSL_do_handshake` driver; ALPN `h3`;
@@ -237,10 +243,17 @@ production-grade**, but the *base* `quic_connection.cpp` never invoked it
       encrypt/decrypt per audit). **This replaces the stubbed base
       `quic_connection.cpp` path** — see salvage map. *Bolt primitive:*
       `bolt::Arena` per-packet; `bolt::SwissTable` for streams (Phase 5).
-- [ ] **3.6 Self-test the AEAD/HP against RFC 9001 Appendix A test vectors.**
-      *What:* the published Initial-packet sample (keys, nonce, sample, protected
-      bytes) must reproduce exactly. *PORT* FasterAPI's protection gtests if
-      present; otherwise add vectors. *Bolt primitive:* n/a.
+- [x] **3.6 Self-test the AEAD/HP against RFC 9001 Appendix A test vectors.**
+      *DONE (wave 2)* (`tests/quic_protection_test.cpp`, target
+      `boltapi_quic_protection_test`, default suite). BYTE-EXACT against RFC 9001
+      Appendix A: §A.1 initial/client/server secrets + client & server quic
+      key/iv/hp; §A.2 client Initial (AEAD ciphertext+tag, HP mask 437b9aec36,
+      protected header `c0…449e7b9aec34`, full-packet prefix, round-trip); §A.3
+      server Initial (HP mask 2ec0d8356a, protected header `cf…4075c0d9`,
+      round-trip); §A.5 ChaCha20 short header (key/iv/hp, payload ciphertext
+      `655e…5bfb`, protected header `4cfe4189`, full 21-byte packet). Plus
+      negative auth-fail tests (tampered tag/body, wrong key, wrong AAD) and
+      randomized AEAD round-trips across all three suites. *Bolt primitive:* n/a.
 
 **GATE 3:** RFC 9001 Appendix A vectors pass; a unit test drives a *real* TLS 1.3
 handshake between two in-process `QUICSecureConnection`s to ESTABLISHED (the
@@ -412,8 +425,10 @@ behavior is byte-for-byte the current build.
 
 - [ ] **8.1 Unit: varint** — exhaustive boundaries + random round-trip. *PORT*
       FasterAPI gtests where useful.
-- [ ] **8.2 Unit: packet protection** — RFC 9001 Appendix A vectors + random
-      AEAD round-trip. *PORT* from FasterAPI's protection tests.
+- [x] **8.2 Unit: packet protection** — *DONE (wave 2)*
+      (`tests/quic_protection_test.cpp`): RFC 9001 Appendix A vectors (§A.1/A.2/
+      A.3/A.5) byte-exact + random AEAD round-trip across all three suites +
+      negative auth-fail tests. See item 3.6.
 - [ ] **8.3 Unit: packet/frame round-trip** — *PORT*
       `C:\code\FasterAPI\src\cpp\http\quic\test_quic_packet.cpp`.
 - [ ] **8.4 Unit: ACK tracker** — *PORT*
@@ -635,12 +650,38 @@ RFC vectors exercised + passing:
 **150/150 passing** (was 122; +28 QUIC primitives), zero warnings on the new
 TU, H1/H2/WebRTC suites unchanged.
 
-### D2. Next wave (gated on D0; do NOT start crypto in this wave)
-1. Packet protection (AEAD + header protection + HKDF, RFC 9001 §5) — port
-   `quic_packet_protection.h` (EVP, API-agnostic) + RFC 9001 App. A self-test.
-2. TLS 1.3 QUIC handshake via `SSL_set_quic_tls_cbs` / `OSSL_DISPATCH` +
+### D2. Packet protection PORTED (wave 2) — RFC 9001 §5, compiled UNCONDITIONALLY
+
+`include/boltapi/quic/packet_protection.h` (+ `tests/quic_protection_test.cpp`),
+namespace `bolt::api::quic`, Tiger Style (≥2 asserts/fn, fixed buffers, noexcept,
+bool/enum returns, no exceptions). EVP/HKDF crypto is API-agnostic (RFC 9001 §5 is
+identical across the BoringSSL and OpenSSL-3.5 QUIC-TLS surfaces per D0), and
+OpenSSL is always linked into boltapi, so NO `BOLTAPI_WITH_HTTP3` gate — the
+default ctest suite covers it. **NO TLS handshake** (that is wave 3).
+
+| Item | Source (`quic_packet_protection.h`) | PORT vs reshape |
+|---|---|---|
+| `hkdf_extract/expand/expand_label` | same | PORT (byte-identical HkdfLabel); reshaped to bool returns + bounded scratch + asserts. |
+| `derive_initial_secret/secrets` + `derive_packet_keys` | same | PORT (v1 salt `0x38762cf7…ccbb7f0a`; "client in"/"server in"; quic key/iv/hp). |
+| `PacketProtection` (AEAD seal/open, HP protect/unprotect) | same | RESHAPED: bool returns, asserts on lengths/pn_len, cached `EVP_CIPHER_CTX`. |
+| ChaCha20 header-protection mask | `generate_hp_mask` | **FIXED**: FasterAPI ignored the counter and mis-sliced the nonce; per RFC 9001 §5.4.4 the 16-byte sample is the EVP_chacha20 IV `[counter:4 LE][nonce:12]`. |
+| `derive_initial(DCID, is_server)` convenience | `derive_initial_packet_protection` | RESHAPED to one direction + AES-128-GCM (Initial), zeroizes secrets. |
+
+**Tests:** `boltapi_quic_protection_test` (gtest, 6 cases). RFC 9001 Appendix A,
+BYTE-EXACT and passing: §A.1 secrets + client/server quic key/iv/hp; §A.2 client
+Initial (ciphertext+tag, HP mask `437b9aec36`, protected header
+`c0…449e7b9aec34`, round-trip); §A.3 server Initial (HP mask `2ec0d8356a`,
+protected header `cf…4075c0d9`, round-trip); §A.5 ChaCha20 (key/iv/hp, ciphertext
+`655e…5bfb`, protected header `4cfe4189`, full 21-byte packet); negative
+auth-fail (tampered tag/body, wrong key, wrong AAD); randomized AEAD round-trip ×
+all three suites. **Status:** default `cmake --preset msvc` + `ctest -C Release`
+= **156/156** (was 150; +6), zero warnings on the new TU, H1/H2/WebRTC untouched.
+
+### D3. Next wave (wave 3 — TLS 1.3 handshake; gated on D0)
+1. TLS 1.3 QUIC handshake via `SSL_set_quic_tls_cbs` / `OSSL_DISPATCH` +
    transport-params codec (adapts `quic_tls.h` + `quic_handshake.h`).
-3. Secure connection (encrypt/decrypt) -> connection state machine (RFC 9002
-   loss recovery extracted clean) -> streams + flow control.
-4. QPACK (static/dynamic tables, encoder/decoder) -> HTTP/3 frames.
-5. Bridge QUIC streams -> `CoroHttpRequest` -> the existing `App` router.
+2. Secure connection (encrypt/decrypt, drives wave-2 `PacketProtection`) ->
+   connection state machine (RFC 9002 loss recovery extracted clean) -> streams
+   + flow control.
+3. QPACK (static/dynamic tables, encoder/decoder) -> HTTP/3 frames.
+4. Bridge QUIC streams -> `CoroHttpRequest` -> the existing `App` router.
