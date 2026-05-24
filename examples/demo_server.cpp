@@ -46,6 +46,10 @@ int main(int argc, char** argv) {
     bolt::api::WebRtcConfig wcfg;          // signaling_path defaults to /webrtc/offer
     wcfg.ice_lite         = true;          // Bolt is the ICE-lite controlled peer
     wcfg.max_message_size = 262144;
+    // WebRTC gets its OWN UDP port so it never collides with the HTTP/3 (QUIC)
+    // endpoint, which binds the H1 port number over UDP. Sharing one UDP port
+    // would mux QUIC Initials and WebRTC STUN/DTLS onto the same socket.
+    wcfg.udp_port         = static_cast<std::uint16_t>(port + 1);
     app.enable_webrtc(wcfg);
 
     // HTTP/3 (W5c): serve H3 alongside H1/H2 on the SAME port number over UDP
@@ -104,6 +108,26 @@ int main(int argc, char** argv) {
     app.get("/health", [](bolt::api::Request&, bolt::api::Response& res) {
         res.status(200).content_type("text/plain; charset=utf-8").send("ok");
     });
+#if defined(BOLTAPI_WITH_HTTP3)
+    // WebTransport cert pin: SHA-256 of the QUIC server cert (DER) as lowercase
+    // hex. The browser passes it as a Uint8Array in
+    //   new WebTransport(url, {serverCertificateHashes:[{algorithm,value}]})
+    // so a self-signed QUIC cert is accepted (#45 Chrome handshake verification).
+    app.get("/wt/cert-hash", [](bolt::api::Request&, bolt::api::Response& res) {
+        std::uint8_t h[32];
+        if (!bolt::api::quic::server_cert_sha256(h)) {
+            res.status(500).content_type("text/plain").send("no quic cert");
+            return;
+        }
+        static const char hx[] = "0123456789abcdef";
+        char hex[64];
+        for (int i = 0; i < 32; ++i) {
+            hex[2 * i]     = hx[(h[i] >> 4) & 0xF];
+            hex[2 * i + 1] = hx[h[i] & 0xF];
+        }
+        res.ok().content_type("text/plain").send(std::string_view(hex, 64));
+    });
+#endif
     app.websocket("/ws", [](bolt::api::http::WebSocketConnection& ws) {
         ws.on_text_message = [&ws](const std::string& msg) {
             ws.send_text(msg);  // echo

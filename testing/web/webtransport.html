@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<!--
+  webtransport.html — Bolt API WebTransport / HTTP/3 handshake test page (#45).
+
+  Loaded over http://localhost:8080 (a secure context for localhost), it pins the
+  Bolt QUIC server's self-signed cert hash (GET /wt/cert-hash) and opens a
+  WebTransport session to the QUIC endpoint on UDP :8080. `wt.ready` resolving
+  proves Chrome completed the QUIC handshake to Established (the #45 gate). It
+  then tries a datagram echo (works once RFC 9221 datagrams land).
+
+  Drive it with the chrome-devtools MCP against a running demo server:
+      boltapi_demo_server.exe 8080 testing/web
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Bolt API — WebTransport / HTTP/3</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem; max-width: 52rem; }
+    #log { white-space: pre-wrap; background: #f4f4f4; padding: .8rem;
+           border-radius: .4rem; font-family: ui-monospace, monospace;
+           font-size: .85rem; min-height: 8rem; }
+    .ok { color: #137333; } .err { color: #c5221f; }
+    button { padding: .5rem 1rem; font-size: 1rem; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <h1>Bolt API — WebTransport (HTTP/3)</h1>
+  <p>Pins the QUIC server cert hash and opens a WebTransport session. The session
+     becoming <code>READY</code> means the QUIC handshake completed (#45).</p>
+  <p><button id="go">Connect</button> &nbsp; url
+     <input id="url" value="https://localhost:8080/wt" size="32" /></p>
+  <div id="log"></div>
+
+  <script>
+    "use strict";
+    const logEl = document.getElementById("log");
+    function log(m, cls) {
+      const d = document.createElement("div");
+      if (cls) d.className = cls;
+      d.textContent = m; logEl.appendChild(d);
+      // Mirror to a global the MCP can read.
+      (window.__wtlog = window.__wtlog || []).push(m);
+    }
+
+    function hexToBytes(hex) {
+      const out = new Uint8Array(hex.length / 2);
+      for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i*2, 2), 16);
+      return out;
+    }
+
+    async function connect() {
+      window.__wtState = "starting";
+      document.getElementById("go").disabled = true;
+      logEl.textContent = "";
+      if (typeof WebTransport === "undefined") {
+        log("WebTransport API not available in this browser", "err");
+        window.__wtState = "no-api"; return;
+      }
+      let hashHex;
+      try {
+        const r = await fetch("/wt/cert-hash");
+        hashHex = (await r.text()).trim();
+        log("cert-hash: " + hashHex);
+      } catch (e) { log("cert-hash fetch failed: " + e, "err");
+        window.__wtState = "no-cert"; return; }
+
+      const url = document.getElementById("url").value;
+      let wt;
+      try {
+        // value MUST be a Uint8Array (an ArrayBuffer is silently ignored).
+        wt = new WebTransport(url, { serverCertificateHashes: [
+          { algorithm: "sha-256", value: hexToBytes(hashHex) } ] });
+      } catch (e) { log("WebTransport ctor threw: " + e, "err");
+        window.__wtState = "ctor-threw"; return; }
+
+      // Bounded watchdog so a stuck handshake reports instead of hanging.
+      const watchdog = setTimeout(() => {
+        if (window.__wtState !== "ready") {
+          log("watchdog: not ready after 15s (state=" + window.__wtState + ")", "err");
+        }
+      }, 15000);
+
+      try {
+        await wt.ready;
+        clearTimeout(watchdog);
+        window.__wtState = "ready";
+        log("READY — QUIC handshake complete, WebTransport session open.", "ok");
+      } catch (e) {
+        clearTimeout(watchdog);
+        window.__wtState = "ready-rejected";
+        log("wt.ready rejected: " + e, "err");
+        return;
+      }
+
+      // Try a datagram echo (works once RFC 9221 datagrams are wired).
+      try {
+        const w = wt.datagrams.writable.getWriter();
+        await w.write(new TextEncoder().encode("bolt-wt-ping"));
+        log("sent datagram 'bolt-wt-ping'");
+        const reader = wt.datagrams.readable.getReader();
+        const to = setTimeout(() => reader.cancel(), 3000);
+        const { value, done } = await reader.read();
+        clearTimeout(to);
+        if (!done && value) {
+          log("echo datagram: " + new TextDecoder().decode(value), "ok");
+          window.__wtDatagram = true;
+        } else { log("no echo datagram (datagrams not wired yet)"); }
+      } catch (e) { log("datagram phase: " + e); }
+
+      wt.closed.then(() => log("session closed")).catch(() => {});
+    }
+    document.getElementById("go").addEventListener("click", connect);
+  </script>
+</body>
+</html>
