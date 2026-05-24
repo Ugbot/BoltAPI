@@ -369,6 +369,21 @@ public:
         return *this;
     }
 
+    // P2 — SFU relay: forward every peer's audio+video to every OTHER peer in the
+    // session (selective forwarding, no transcode), instead of echoing to the
+    // sender. Enables MULTI-PEER signaling (shared ICE-lite creds; per-peer DTLS
+    // by source address — no single-peer fingerprint pin) and puts the peer hub
+    // in relay mode. With two browsers connected, each sees the other's video.
+    // Mutually exclusive with enable_media_echo() (relay wins). Returns *this.
+    App& enable_media_relay() {
+        assert(!started_);
+        media_relay_ = true;
+        media_echo_  = false;          // relay supersedes echo (no self-loopback)
+        track_handler_ = nullptr;      // forwarding happens inline in the hub
+        assert(media_relay_ && "enable_media_relay: flag set");
+        return *this;
+    }
+
     // -----------------------------------------------------------------------
     // Middleware (global). Folded right-to-left at build time.
     // -----------------------------------------------------------------------
@@ -629,6 +644,9 @@ private:
     // WM6: when set via enable_media_echo(), the signaling answer negotiates the
     // offered audio/video m-lines (sendrecv) so the peer's media is echoed back.
     bool                media_echo_ = false;
+    // P2: when set via enable_media_relay(), the hub runs in SFU relay mode
+    // (forward to other peers) and signaling accepts multiple concurrent peers.
+    bool                media_relay_ = false;
 
 #if defined(BOLTAPI_WITH_WEBRTC)
     // When enable_webrtc is set AND the flag is on, App owns a real UdpTransport

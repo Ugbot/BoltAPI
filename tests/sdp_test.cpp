@@ -258,12 +258,17 @@ TEST(Sdp, TruncatedMediaLineIsError) {
               sdp::SdpError::BadMediaLine);
 }
 
-TEST(Sdp, TooManyMediaSectionsOverflows) {
+TEST(Sdp, TooManyMediaSectionsAreToleratedAndCapped) {
+    // #44 — the parser is overflow-TOLERANT: a fat offer (more m= sections than
+    // the cap) parses successfully, keeping the first kSdpMaxMediaSections and
+    // silently dropping the rest, rather than rejecting the whole offer (a real
+    // Chrome offer can exceed the per-section attr/format/media caps).
     std::string big = "v=0\r\n";
     for (int i = 0; i < (int)sdp::kSdpMaxMediaSections + 2; ++i)
         big += "m=application 9 UDP/DTLS/SCTP x\r\n";
     sdp::SdpSession s;
-    EXPECT_EQ(sdp::parse(big, s), sdp::SdpError::Overflow);
+    EXPECT_EQ(sdp::parse(big, s), sdp::SdpError::Ok);
+    EXPECT_EQ(s.media_count, sdp::kSdpMaxMediaSections);  // capped, not rejected
 }
 
 TEST(Sdp, RandomGarbageDoesNotCrash) {

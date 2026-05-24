@@ -253,6 +253,7 @@ SdpError parse(std::string_view sdp, SdpSession& out) noexcept {
     if (sdp.empty()) return SdpError::Empty;
 
     SdpMedia* current = nullptr;  // null while in session scope
+    SdpMedia  discard;            // sink for m= sections past the section cap (#44)
 
     std::size_t line_start = 0;
     const std::size_t n = sdp.size();
@@ -281,8 +282,15 @@ SdpError parse(std::string_view sdp, SdpSession& out) noexcept {
                     break;
 
                 case 'm': {
-                    if (out.media_count >= kSdpMaxMediaSections)
-                        return SdpError::Overflow;
+                    // Overflow-tolerant (#44): past the section cap, drop further
+                    // m= sections (and their a= lines) rather than rejecting the
+                    // whole offer. `current=nullptr` would misroute attrs to the
+                    // session scope, so point at a discard sink instead.
+                    if (out.media_count >= kSdpMaxMediaSections) {
+                        current = &discard;
+                        discard = SdpMedia{};
+                        break;
+                    }
                     SdpMedia& m = out.media[out.media_count];
                     m = SdpMedia{};
 
@@ -308,10 +316,9 @@ SdpError parse(std::string_view sdp, SdpSession& out) noexcept {
                             std::string_view tok = (sp == std::string_view::npos)
                                 ? trim(fmts.substr(fp))
                                 : trim(fmts.substr(fp, sp - fp));
-                            if (!tok.empty()) {
-                                if (m.format_count >= kSdpMaxFormatsPerMedia)
-                                    return SdpError::Overflow;
-                                m.formats[m.format_count++] = tok;
+                            if (!tok.empty() &&
+                                m.format_count < kSdpMaxFormatsPerMedia) {
+                                m.formats[m.format_count++] = tok;  // else skip (#44)
                             }
                             if (sp == std::string_view::npos) break;
                             fp = sp + 1;
@@ -325,14 +332,14 @@ SdpError parse(std::string_view sdp, SdpSession& out) noexcept {
 
                 case 'a': {
                     const SdpAttribute a = split_attr(value);
+                    // Overflow-tolerant (#44): skip a= lines past the cap rather
+                    // than rejecting; the cap (256) clears a real Chrome offer.
                     if (current) {
-                        if (current->attr_count >= kSdpMaxAttrsPerSection)
-                            return SdpError::Overflow;
-                        current->attrs[current->attr_count++] = a;
+                        if (current->attr_count < kSdpMaxAttrsPerSection)
+                            current->attrs[current->attr_count++] = a;
                     } else {
-                        if (out.session_attr_count >= kSdpMaxAttrsPerSection)
-                            return SdpError::Overflow;
-                        out.session_attrs[out.session_attr_count++] = a;
+                        if (out.session_attr_count < kSdpMaxAttrsPerSection)
+                            out.session_attrs[out.session_attr_count++] = a;
                     }
                     break;
                 }
@@ -515,6 +522,111 @@ std::string_view answer_direction(std::string_view offer_dir) noexcept {
     return std::string_view{"sendrecv"};
 }
 
+// First whitespace-separated token of `v`; advances `v` past it. Bounded.
+std::string_view next_token(std::string_view& v) noexcept {
+    [[maybe_unused]] const std::size_t in_size = v.size();
+    assert(in_size <= 4096 && "next_token: span bound");      // bounded input
+    std::size_t b = 0;
+    while (b < v.size() && (v[b] == ' ' || v[b] == '\t')) ++b;
+    std::size_t e = b;
+    while (e < v.size() && v[e] != ' ' && v[e] != '\t') ++e;
+    const std::string_view tok = v.substr(b, e - b);
+    v = v.substr(e);
+    assert(tok.size() <= in_size && "next_token: token overran input");  // postcond
+    assert(v.size() <= in_size && "next_token: remainder grew");          // postcond
+    return tok;
+}
+
+// #37 — read the offer's a=rtcp-fb lines for `pt` and set the flags for the
+// feedback types Bolt supports (so the answer advertises ONLY offered feedback).
+// "*" applies to every PT. Bounded scan; no allocation.
+void parse_rtcp_fb_for_pt(const SdpMedia& m, std::uint8_t pt,
+                          RtcpFeedback& fb) noexcept {
+    assert(m.attr_count <= kSdpMaxAttrsPerSection && "rtcp-fb: attr overflow");
+    assert(m.media_type == "audio" || m.media_type == "video");  // RTP media only
+    for (std::size_t i = 0; i < m.attr_count; ++i) {
+        if (m.attrs[i].key != "rtcp-fb") continue;
+        std::string_view v = m.attrs[i].value;          // "<pt> <type> [param]"
+        const std::string_view pt_tok = next_token(v);
+        bool applies = (pt_tok == "*");
+        if (!applies) {
+            std::uint8_t fb_pt = 0;
+            if (parse_uint(pt_tok, &fb_pt) && fb_pt == pt) applies = true;
+        }
+        if (!applies) continue;
+        const std::string_view type = next_token(v);
+        const std::string_view param = next_token(v);
+        if (type == "nack") {
+            if (param == "pli") fb.nack_pli = true;
+            else                fb.nack = true;
+        } else if (type == "ccm" && param == "fir") {
+            fb.ccm_fir = true;
+        } else if (type == "transport-cc") {
+            fb.transport_cc = true;
+        } else if (type == "goog-remb") {
+            fb.goog_remb = true;
+        }
+    }
+}
+
+// #37 — find the RTX (RFC 4588) PT in this m-line whose fmtp "apt=<media_pt>"
+// references `media_pt`. Fills *rtx_pt + *rtx_rtpmap and returns true if found.
+bool find_rtx_for_pt(const SdpMedia& m, std::uint8_t media_pt,
+                     std::uint8_t* rtx_pt, std::string_view* rtx_rtpmap) noexcept {
+    assert(rtx_pt != nullptr && rtx_rtpmap != nullptr && "find_rtx: null out");
+    assert(m.format_count <= kSdpMaxFormatsPerMedia && "find_rtx: fmt overflow");
+    std::uint8_t pts[kSdpMaxFormatsPerMedia];
+    const std::size_t n = m.payload_types(pts, kSdpMaxFormatsPerMedia);
+    assert(n <= kSdpMaxFormatsPerMedia && "find_rtx: pt count bound");
+    for (std::size_t i = 0; i < n; ++i) {
+        const std::string_view rm = m.rtpmap_for(pts[i]);
+        if (!ieq(encoding_name(rm), "rtx")) continue;
+        const std::string_view fp = m.fmtp_for(pts[i]);     // "apt=<pt>"
+        const std::size_t apt = fp.find("apt=");
+        if (apt == std::string_view::npos) continue;
+        std::uint8_t ap = 0;
+        if (!parse_uint(fp.substr(apt + 4), &ap)) continue;
+        if (ap != media_pt) continue;
+        *rtx_pt = pts[i];
+        *rtx_rtpmap = rm;
+        return true;
+    }
+    return false;
+}
+
+// #37 — is this extmap URI one Bolt echoes back? (mid/rid for BUNDLE+simulcast
+// demux; transport-cc for TWCC; abs-send-time for BWE.)
+bool is_supported_extmap(std::string_view uri) noexcept {
+    return uri == kMidExtUri || uri == kRidExtUri ||
+           uri == kTransportCcExtUri || uri == kAbsSendTimeExtUri;
+}
+
+// #37 — collect the offer's a=extmap lines for supported extensions into `out`
+// (capacity `cap`), keeping each at the OFFER's id. Returns the count written.
+std::size_t collect_supported_extmaps(const SdpMedia& m, NegotiatedExtmap* out,
+                                      std::size_t cap) noexcept {
+    assert(out != nullptr && "extmap: null out");
+    assert(cap > 0 && cap <= kMaxExtmaps && "extmap: bad cap");
+    assert(m.attr_count <= kSdpMaxAttrsPerSection && "extmap: attr overflow");
+    std::size_t n = 0;
+    for (std::size_t i = 0; i < m.attr_count && n < cap; ++i) {
+        if (m.attrs[i].key != "extmap") continue;
+        std::string_view v = m.attrs[i].value;     // "<id>[/dir] <uri> [attr]"
+        std::string_view id_tok = next_token(v);
+        const std::size_t slash = id_tok.find('/');
+        if (slash != std::string_view::npos) id_tok = id_tok.substr(0, slash);
+        std::uint8_t id = 0;
+        if (!parse_uint(id_tok, &id) || id < 1 || id > 14) continue;
+        const std::string_view uri = next_token(v);
+        if (!is_supported_extmap(uri)) continue;
+        out[n].id = id;
+        out[n].uri = uri;
+        ++n;
+    }
+    assert(n <= cap && "extmap: wrote past cap");  // postcondition
+    return n;
+}
+
 }  // namespace
 
 SdpError negotiate_media(const SdpSession& offer,
@@ -547,7 +659,16 @@ SdpError negotiate_media(const SdpSession& offer,
             c.pt = pts[i];
             c.rtpmap = rm;
             c.fmtp = m.fmtp_for(pts[i]);
+            // #37 — advertise the offered RTCP feedback + RTX for this codec so a
+            // browser actually turns NACK/PLI/FIR/REMB/TWCC + RTX retransmission
+            // ON. The hub already generates/consumes these (WA live-wiring).
+            parse_rtcp_fb_for_pt(m, c.pt, c.fb);
+            find_rtx_for_pt(m, c.pt, &c.rtx_pt, &c.rtx_rtpmap);
         }
+        // #37 — echo the offer's supported header extensions (mid/rid/
+        // transport-cc/abs-send-time) so they are active on the wire.
+        nm.extmap_count =
+            collect_supported_extmaps(m, nm.extmaps, kMaxExtmaps);
         // WA — simulcast: if the offer m-line has a=simulcast + a=rid lines,
         // echo the rids (bounded) and the RID header-extension id so the answer
         // can mirror the simulcast (RFC 8851/8852). Bounded by kMaxRids.
@@ -565,12 +686,34 @@ SdpError negotiate_media(const SdpSession& offer,
     return SdpError::Ok;
 }
 
+// #37 — emit the a=rtcp-fb:<pt> <type> lines for the feedback flags set on a
+// codec (only those the offer listed, so we never over-promise). Bounded.
+static void append_rtcp_fb(std::string& out, std::uint8_t pt,
+                           const RtcpFeedback& fb) {
+    assert(pt <= 127 && "append_rtcp_fb: pt out of range");      // RTP PT is 7-bit
+    [[maybe_unused]] const std::size_t out_before = out.size();
+    const auto line = [&](std::string_view type) {
+        std::string v;
+        append_uint(v, pt);
+        v.push_back(' ');
+        v.append(type.data(), type.size());
+        append_attr(out, "rtcp-fb", v);
+    };
+    if (fb.nack)         line("nack");
+    if (fb.nack_pli)     line("nack pli");
+    if (fb.ccm_fir)      line("ccm fir");
+    if (fb.transport_cc) line("transport-cc");
+    if (fb.goog_remb)    line("goog-remb");
+    assert((out.size() >= out_before) && "append_rtcp_fb: output shrank");
+    assert((fb.any() || out.size() == out_before) && "append_rtcp_fb: spurious line");
+}
+
 // Emit one m= media section into `out` for a negotiated audio/video line.
 static void append_media_section(std::string& out, const NegotiatedMedia& nm) {
     assert(nm.codec_count > 0 && "append_media_section: empty");
     assert(nm.codec_count <= kMaxCodecsPerSection && "append_media_section: overflow");
 
-    // m=<kind> 9 UDP/TLS/RTP/SAVPF <pt>...
+    // m=<kind> 9 UDP/TLS/RTP/SAVPF <media pt>... <rtx pt>...
     out.append("m=", 2);
     out.append(nm.kind == MediaKind::kAudio ? "audio" : "video");
     out.append(" 9 UDP/TLS/RTP/SAVPF", 20);
@@ -578,11 +721,28 @@ static void append_media_section(std::string& out, const NegotiatedMedia& nm) {
         out.push_back(' ');
         append_uint(out, nm.codecs[i].pt);
     }
+    for (std::size_t i = 0; i < nm.codec_count; ++i) {  // #37 — RTX PTs
+        if (nm.codecs[i].rtx_pt != 0) {
+            out.push_back(' ');
+            append_uint(out, nm.codecs[i].rtx_pt);
+        }
+    }
     out.append("\r\n", 2);
     append_line(out, 'c', "IN IP4 0.0.0.0");
     append_attr(out, "rtcp-mux", std::string_view{});
     if (!nm.mid.empty()) append_attr(out, "mid", nm.mid);
     append_attr(out, nm.direction, std::string_view{});
+
+    // #37 — a=extmap lines (mid/rid/transport-cc/abs-send-time), each at the
+    // offer's id, so the corresponding header extensions are active on the wire.
+    assert(nm.extmap_count <= kMaxExtmaps && "append_media_section: extmap overflow");
+    for (std::size_t e = 0; e < nm.extmap_count; ++e) {
+        std::string v;
+        append_uint(v, nm.extmaps[e].id);
+        v.push_back(' ');
+        v.append(nm.extmaps[e].uri.data(), nm.extmaps[e].uri.size());
+        append_attr(out, "extmap", v);
+    }
 
     for (std::size_t i = 0; i < nm.codec_count; ++i) {
         const NegotiatedCodec& c = nm.codecs[i];
@@ -593,6 +753,8 @@ static void append_media_section(std::string& out, const NegotiatedMedia& nm) {
             v.append(c.rtpmap.data(), c.rtpmap.size());
             append_attr(out, "rtpmap", v);
         }
+        // #37 — a=rtcp-fb:<pt> <type> for each feedback the offer listed.
+        append_rtcp_fb(out, c.pt, c.fb);
         if (!c.fmtp.empty()) {  // a=fmtp:<pt> <params>
             std::string v;
             append_uint(v, c.pt);
@@ -600,19 +762,26 @@ static void append_media_section(std::string& out, const NegotiatedMedia& nm) {
             v.append(c.fmtp.data(), c.fmtp.size());
             append_attr(out, "fmtp", v);
         }
+        // #37 — the paired RTX codec: a=rtpmap:<rtx> rtx/<clock> + a=fmtp apt=<pt>.
+        if (c.rtx_pt != 0) {
+            std::string v;
+            append_uint(v, c.rtx_pt);
+            v.push_back(' ');
+            v.append(c.rtx_rtpmap.data(), c.rtx_rtpmap.size());
+            append_attr(out, "rtpmap", v);
+            std::string f;
+            append_uint(f, c.rtx_pt);
+            f.append(" apt=", 5);
+            append_uint(f, c.pt);
+            append_attr(out, "fmtp", f);
+        }
     }
 
-    // WA — simulcast answer (RFC 8851/8852): echo the RID header-extension map,
-    // one a=rid:<id> recv line per offered layer, then a=simulcast:recv <list>.
+    // WA — simulcast answer (RFC 8851/8852): one a=rid:<id> recv line per offered
+    // layer, then a=simulcast:recv <list>. (The RID a=extmap is emitted above as
+    // part of the #37 extmap set.)
     assert(nm.rid_count <= kMaxRids && "append_media_section: rid overflow");
     if (nm.rid_count > 0) {
-        if (nm.rid_ext_id != 0) {  // a=extmap:<id> <RID uri>
-            std::string v;
-            append_uint(v, nm.rid_ext_id);
-            v.push_back(' ');
-            v.append(kRidExtUri.data(), kRidExtUri.size());
-            append_attr(out, "extmap", v);
-        }
         for (std::size_t r = 0; r < nm.rid_count; ++r) {  // a=rid:<id> recv
             std::string v;
             v.append(nm.rids[r].data(), nm.rids[r].size());

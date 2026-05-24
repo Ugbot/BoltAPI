@@ -260,6 +260,10 @@ bool WebRtcPeerHub::ensure_media(Peer& p) noexcept {
         m.self_ssrc = media_cfg_.media_ssrc;
         if (m.self_ssrc == 0 && track_spec_count_ > 0)
             m.self_ssrc = track_specs_[0].ssrc;
+        // SFU relay (P2) has no declared outbound track/SSRC; use a fixed non-zero
+        // local id so PLI/TWCC we generate carry a valid sender SSRC.
+        constexpr std::uint32_t kRelaySenderSsrc = 0x42'4F'4C'54u;  // "BOLT"
+        if (m.self_ssrc == 0 && relay_) m.self_ssrc = kRelaySenderSsrc;
         m.chain.add(&m.nack_gen);
         const bool use_rtx = media_cfg_.rtx_pt != 0 &&
                              media_cfg_.rtx_ssrc != media_cfg_.media_ssrc;
@@ -308,7 +312,10 @@ void WebRtcPeerHub::feed_media(Peer& p, const std::uint8_t* data,
             srtp::Error::kOk) return;
         rtcp::Compound c;
         if (rtcp::parse_compound(plain, plain_len, c) != rtcp::RtcpError::Ok) return;
-        m.chain.inbound_rtcp(c, sink);
+        m.chain.inbound_rtcp(c, sink);  // local: NACK->RTX from this leg's cache
+        // SFU (P2): relay a subscriber's PLI/FIR upstream to the publisher so it
+        // emits a keyframe (NACK stays local — served from the per-leg RTX cache).
+        if (relay_) relay_rtcp_feedback(p, c);
         return;
     }
     // SRTP -> plain RTP.
@@ -335,7 +342,10 @@ void WebRtcPeerHub::feed_media(Peer& p, const std::uint8_t* data,
         t->set_write_sink(&MediaTrack_write_trampoline, &m.access);
         if (on_track_ready_) on_track_ready_(*t);
     }
-    t->deliver(pkt, plain, plain_len);
+    t->deliver(pkt, plain, plain_len);  // local on_track (echo/app); noop in relay
+    // SFU (P2): forward this packet to every OTHER peer (selective forwarding,
+    // per-subscriber SRTP, no transcode). This is the relay fan-out.
+    if (relay_) forward_rtp_to_others(p, plain, plain_len);
 }
 
 bool WebRtcPeerHub::send_rtp(Peer& p, const std::uint8_t* data,
@@ -410,6 +420,65 @@ bool WebRtcPeerHub::send_rtcp(Peer& p, const std::uint8_t* data,
         srtp::Error::kOk) return false;
     return transport_->send(reinterpret_cast<const sockaddr*>(&p.addr),
                             p.addr_len, prot, prot_len) >= 0;
+}
+
+// SFU (P2) — forward one plaintext RTP packet from `src` to every OTHER keyed
+// peer via that peer's outbound chain (RTX cache) + SRTP + transport. Verbatim
+// forwarding (same SSRC/seq/ts) — correct for one-source-per-SSRC relay; the
+// subscriber browser latches the new SSRC onto its recv transceiver. Bounded.
+std::size_t WebRtcPeerHub::forward_rtp_to_others(Peer& src,
+                                                 const std::uint8_t* plain,
+                                                 std::size_t len) noexcept {
+    assert(plain != nullptr && "forward: null");
+    assert(len >= rtp::kFixedHeaderSize && "forward: short rtp");
+    assert(relay_ && "forward: not in relay mode");
+    std::size_t fanned = 0;
+    for (std::size_t i = 0; i < kMaxPeers; ++i) {
+        Peer& q = peers_[i];
+        if (&q == &src) continue;                       // never echo to the source
+        if (!q.used || !q.media || !q.media->keyed) continue;
+        if (send_rtp(q, plain, len)) ++fanned;
+    }
+    assert(fanned < kMaxPeers && "forward: fanout exceeded peer table");
+    return fanned;
+}
+
+// SFU (P2) — the peer publishing `ssrc` (it created an inbound track for it), or
+// nullptr. Bounded scan over the peer table; no allocation.
+WebRtcPeerHub::Peer* WebRtcPeerHub::publisher_of_ssrc(std::uint32_t ssrc) noexcept {
+    assert(ssrc != 0 && "publisher_of_ssrc: zero ssrc");
+    assert(relay_ && "publisher_of_ssrc: not in relay mode");
+    for (std::size_t i = 0; i < kMaxPeers; ++i) {
+        Peer& p = peers_[i];
+        if (!p.used || !p.media || !p.media->keyed) continue;
+        if (p.media->tracks.by_ssrc(ssrc) != nullptr) return &p;
+    }
+    return nullptr;
+}
+
+// SFU (P2) — relay PLI/FIR keyframe requests upstream. For each PSFB PLI/FIR in
+// the compound, find the publisher of the targeted media SSRC and send it a PLI
+// (its encoder produces a fresh keyframe, which the relay forwards downstream).
+void WebRtcPeerHub::relay_rtcp_feedback(Peer& from,
+                                        const rtcp::Compound& c) noexcept {
+    assert(relay_ && "relay_rtcp: not in relay mode");
+    assert(c.count <= rtcp::kMaxPackets && "relay_rtcp: count overflow");
+    for (std::size_t i = 0; i < c.count; ++i) {
+        const rtcp::Packet& pk = c.packets[i];
+        if (pk.type != rtcp::Type::PSFB) continue;
+        const bool is_pli = pk.count == static_cast<std::uint8_t>(rtcp::PsfbFmt::Pli);
+        const bool is_fir = pk.count == static_cast<std::uint8_t>(rtcp::PsfbFmt::Fir);
+        if (!is_pli && !is_fir) continue;
+        std::uint32_t target = pk.media_ssrc;             // PLI carries it here
+        if (target == 0 && pk.fir_count > 0) target = pk.fir[0].ssrc;  // FIR FCI
+        if (target == 0) continue;
+        Peer* pub = publisher_of_ssrc(target);
+        if (pub == nullptr || pub == &from) continue;     // unknown / self
+        std::uint8_t buf[64];
+        rtcp::Builder b(buf, sizeof(buf));
+        if (b.add_pli(pub->media->self_ssrc, target) != rtcp::RtcpError::Ok) continue;
+        (void)send_rtcp(*pub, buf, b.size());
+    }
 }
 
 std::size_t WebRtcPeerHub::tick_media(std::uint64_t now_ms) noexcept {

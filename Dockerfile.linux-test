@@ -1,0 +1,60 @@
+# Bolt API — Linux WebRTC test lane (parity with the Windows/MSVC build).
+#
+# Builds the WebRTC stack + the full test suite on Linux (epoll async-I/O backend)
+# against the SYSTEM OpenSSL (3.0 on Ubuntu 24.04 — fine for DTLS/SRTP; HTTP/3 is
+# OFF here so we don't need the 3.5+ QUIC-TLS API or a from-source OpenSSL), then
+# RUNS the WebRTC ctest suite (incl. the SFU relay gate) so the image only builds
+# if Linux parity holds.
+#
+#   docker build -f Dockerfile.linux-test -t boltapi-linux-test .
+# ---------------------------------------------------------------------------
+FROM ubuntu:24.04 AS test
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake ninja-build git ca-certificates pkg-config \
+        libssl-dev zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+# Source only (extern/bolt submodule must be checked out in the build context).
+COPY . .
+
+# Configure: WebRTC ON, HTTP/3 OFF (system OpenSSL 3.0 has no QUIC-TLS API),
+# tests + examples ON. Linux uses the epoll/io_uring async backend.
+RUN cmake -S . -B build/linux -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBOLTAPI_WITH_HTTP3=OFF \
+        -DBOLTAPI_WITH_WEBRTC=ON \
+        -DBOLTAPI_BUILD_EXAMPLES=ON \
+        -DBOLTAPI_BUILD_TESTS=ON \
+        -DBOLTAPI_WARNINGS_AS_ERRORS=OFF
+# NOTE: -Werror is OFF for this Linux lane. The suite is MSVC-primary (Windows
+# enforces /WX); these tests were never built on GCC, so they trip some GCC-only
+# style warnings (-Wdangling-else / -Wmisleading-indentation in GoogleTest macro
+# uses, etc.) that are not relevant to RUNNING the WebRTC suite on Linux — the
+# point of this lane. Cleaning those for GCC -Werror is separate hygiene.
+
+# Build the WebRTC lib + the WebRTC/relay test targets + the relay demo server
+# (the relay App must LINK on Linux too). We scope to the WebRTC suite — the
+# non-WebRTC tests (e.g. the exceptions-on no_alloc gate, H1/H2 web tests) have
+# their own Linux lanes and are out of scope for the relay goal.
+RUN cmake --build build/linux -j"$(nproc)" --target \
+        boltapi boltapi_demo_server \
+        boltapi_sdp_test boltapi_signaling_test boltapi_stun_test \
+        boltapi_udp_transport_test boltapi_ice_test boltapi_ice_full_test \
+        boltapi_turn_test boltapi_dtls_test boltapi_datachannel_test \
+        boltapi_sctp_robust_test boltapi_rtp_test boltapi_srtp_test \
+        boltapi_dtls_srtp_test boltapi_media_sdp_test boltapi_media_track_test \
+        boltapi_media_echo_test boltapi_media_pipeline_test \
+        boltapi_simulcast_test boltapi_rtx_fec_test boltapi_bwe_test
+
+# Gate: run the WebRTC + media + SFU-relay suite on Linux (the epoll async-I/O
+# backend). The MediaRelay + MediaEcho cases live in boltapi_media_echo_test;
+# ctest case names are CamelCase, so match those. Each ctest has a hard 180s
+# ceiling; the image fails to build if any WebRTC test fails. This is also the
+# container's default command, so `docker run --rm boltapi-linux-test` re-runs it.
+WORKDIR /src/build/linux
+RUN ctest --output-on-failure -j"$(nproc)" \
+        -R "Media|Srtp|Rtp|Rtcp|Dtls|Ice|Turn|DataChannel|Sctp|Stun|Sdp|Signaling|Simulcast|Svc|Rtx|Fec|Bwe|Twcc|Udp"
+CMD ["ctest", "--output-on-failure", \
+     "-R", "Media|Srtp|Rtp|Rtcp|Dtls|Ice|Turn|DataChannel|Sctp|Stun|Sdp|Signaling|Simulcast|Svc|Rtx|Fec|Bwe|Twcc|Udp"]

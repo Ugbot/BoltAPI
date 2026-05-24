@@ -287,6 +287,35 @@ inline void srtcp_gcm_iv(const std::uint8_t salt[kGcmSaltLen], std::uint32_t ssr
 // ============================================================================
 // Primitive crypto helpers (OpenSSL EVP).
 // ============================================================================
+// #38 — per-packet SRTP protect/unprotect ran on the media hot path used to
+// EVP_MAC_fetch("HMAC") (a provider lookup) + EVP_CIPHER_CTX_new/free EVERY
+// packet — protect measured ~25x slower than it needs to be. Cache the fetched
+// HMAC algorithm ONCE (process lifetime) and reuse per-thread cipher/MAC
+// contexts (re-init with the new key/iv each call — far cheaper than new/free).
+// thread_local so the single I/O thread keeps hot, reusable contexts; the
+// destructor frees them at thread exit (TigerStyle: explicit teardown).
+inline EVP_MAC* srtp_hmac_algo() noexcept {
+    static EVP_MAC* mac = EVP_MAC_fetch(nullptr, "HMAC", nullptr);  // once
+    return mac;
+}
+struct SrtpCryptoCtx {
+    EVP_CIPHER_CTX* ctr = nullptr;  // AES-128-CTR (CM profile)
+    EVP_CIPHER_CTX* gcm = nullptr;  // AES-128-GCM (GCM profile)
+    EVP_MAC_CTX*    mac = nullptr;  // HMAC-SHA1 (CM auth tag)
+    SrtpCryptoCtx() = default;
+    SrtpCryptoCtx(const SrtpCryptoCtx&) = delete;
+    SrtpCryptoCtx& operator=(const SrtpCryptoCtx&) = delete;
+    ~SrtpCryptoCtx() noexcept {
+        if (ctr != nullptr) EVP_CIPHER_CTX_free(ctr);
+        if (gcm != nullptr) EVP_CIPHER_CTX_free(gcm);
+        if (mac != nullptr) EVP_MAC_CTX_free(mac);
+    }
+};
+inline SrtpCryptoCtx& srtp_crypto_ctx() noexcept {
+    thread_local SrtpCryptoCtx c;  // per-thread reusable contexts
+    return c;
+}
+
 // AES-128-CTR encrypt/decrypt in place (CTR is symmetric). `n` may be 0.
 inline bool aes_ctr_xcrypt(const std::uint8_t key[kSessionKeyLen],
                            const std::uint8_t iv[16], std::uint8_t* buf,
@@ -294,15 +323,14 @@ inline bool aes_ctr_xcrypt(const std::uint8_t key[kSessionKeyLen],
     assert(key != nullptr && iv != nullptr && "aes_ctr: null key/iv");
     assert((buf != nullptr || n == 0) && "aes_ctr: null buf");
     if (n == 0) return true;
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-    if (ctx == nullptr) return false;
+    EVP_CIPHER_CTX*& ctx = srtp_crypto_ctx().ctr;  // #38 — reused per thread
+    if (ctx == nullptr) { ctx = EVP_CIPHER_CTX_new(); if (ctx == nullptr) return false; }
     bool ok = EVP_EncryptInit_ex(ctx, EVP_aes_128_ctr(), nullptr, key, iv) == 1;
     if (ok) {
         int len = 0;
         ok = EVP_EncryptUpdate(ctx, buf, &len, buf, static_cast<int>(n)) == 1 &&
              static_cast<std::size_t>(len) == n;
     }
-    EVP_CIPHER_CTX_free(ctx);
     return ok;
 }
 
@@ -315,11 +343,10 @@ inline bool hmac_sha1_two(const std::uint8_t key[kAuthKeyLen],
                           std::uint8_t* tag, std::size_t tag_len) noexcept {
     assert(key != nullptr && tag != nullptr && "hmac: null");
     assert(tag_len <= 20 && (a != nullptr || alen == 0) && "hmac: bad arg");
-    EVP_MAC* mac = EVP_MAC_fetch(nullptr, "HMAC", nullptr);
+    EVP_MAC* mac = srtp_hmac_algo();           // #38 — fetched once, cached
     if (mac == nullptr) return false;
-    EVP_MAC_CTX* ctx = EVP_MAC_CTX_new(mac);
-    EVP_MAC_free(mac);
-    if (ctx == nullptr) return false;
+    EVP_MAC_CTX*& ctx = srtp_crypto_ctx().mac;  // #38 — reused per thread
+    if (ctx == nullptr) { ctx = EVP_MAC_CTX_new(mac); if (ctx == nullptr) return false; }
     char digest[] = "SHA1";
     OSSL_PARAM params[2];
     params[0] = OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST, digest, 0);
@@ -330,7 +357,6 @@ inline bool hmac_sha1_two(const std::uint8_t key[kAuthKeyLen],
               (alen == 0 || EVP_MAC_update(ctx, a, alen) == 1) &&
               (blen == 0 || EVP_MAC_update(ctx, b, blen) == 1) &&
               EVP_MAC_final(ctx, full, &out_len, sizeof(full)) == 1 && out_len == 20;
-    EVP_MAC_CTX_free(ctx);
     if (ok) std::memcpy(tag, full, tag_len);
     return ok;
 }
@@ -362,8 +388,8 @@ inline bool aes_gcm_seal(const std::uint8_t key[kSessionKeyLen],
                          std::uint8_t tag[kGcmTagLen]) noexcept {
     assert(key != nullptr && iv != nullptr && tag != nullptr && "gcm seal: null");
     assert((text != nullptr || n == 0) && (aad != nullptr || aad_len == 0) && "gcm seal arg");
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-    if (ctx == nullptr) return false;
+    EVP_CIPHER_CTX*& ctx = srtp_crypto_ctx().gcm;  // #38 — reused per thread
+    if (ctx == nullptr) { ctx = EVP_CIPHER_CTX_new(); if (ctx == nullptr) return false; }
     int len = 0;
     bool ok = EVP_EncryptInit_ex(ctx, EVP_aes_128_gcm(), nullptr, nullptr, nullptr) == 1 &&
               EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, kGcmSaltLen, nullptr) == 1 &&
@@ -374,7 +400,6 @@ inline bool aes_gcm_seal(const std::uint8_t key[kSessionKeyLen],
                EVP_EncryptUpdate(ctx, text, &len, text, static_cast<int>(n)) == 1) &&
               EVP_EncryptFinal_ex(ctx, text, &len) == 1 &&
               EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, kGcmTagLen, tag) == 1;
-    EVP_CIPHER_CTX_free(ctx);
     return ok;
 }
 
@@ -388,8 +413,8 @@ inline bool aes_gcm_open(const std::uint8_t key[kSessionKeyLen],
                          const std::uint8_t tag[kGcmTagLen]) noexcept {
     assert(key != nullptr && iv != nullptr && tag != nullptr && "gcm open: null");
     assert((text != nullptr || n == 0) && (aad != nullptr || aad_len == 0) && "gcm open arg");
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-    if (ctx == nullptr) return false;
+    EVP_CIPHER_CTX*& ctx = srtp_crypto_ctx().gcm;  // #38 — reused per thread
+    if (ctx == nullptr) { ctx = EVP_CIPHER_CTX_new(); if (ctx == nullptr) return false; }
     int len = 0;
     bool ok = EVP_DecryptInit_ex(ctx, EVP_aes_128_gcm(), nullptr, nullptr, nullptr) == 1 &&
               EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, kGcmSaltLen, nullptr) == 1 &&
@@ -401,7 +426,6 @@ inline bool aes_gcm_open(const std::uint8_t key[kSessionKeyLen],
               EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, kGcmTagLen,
                                   const_cast<std::uint8_t*>(tag)) == 1 &&
               EVP_DecryptFinal_ex(ctx, text, &len) == 1;
-    EVP_CIPHER_CTX_free(ctx);
     return ok;
 }
 

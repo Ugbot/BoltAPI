@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<!--
+  room.html — Bolt API WebRTC SFU room test page (P2 relay).
+
+  Each browser tab joins a room via the Bolt server (POST /webrtc/offer) sending
+  audio+video. The Bolt SFU forwards every publisher's media to every other peer
+  (selective forwarding, no transcode). So with two tabs open, each tab renders
+  the OTHER tab's live video — the headline relay gate.
+
+  STATIC page (served by the demo server's static_files("/", "testing/web");
+  NOT run by ctest). Open it in two tabs against the running relay demo server:
+      http://127.0.0.1:8080/room.html
+
+  Uses getUserMedia when a camera is available, else SYNTHETIC media (an animated
+  canvas + a WebAudio tone) so it works headlessly / without a camera (e.g. when
+  driven by the chrome-devtools MCP). No build deps; pure browser APIs.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Bolt API — WebRTC SFU room</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 1.5rem; max-width: 60rem; }
+    h1 { font-size: 1.3rem; }
+    .row { display: flex; gap: 1rem; flex-wrap: wrap; }
+    .col { display: flex; flex-direction: column; gap: .3rem; }
+    video { width: 18rem; max-width: 100%; background: #111; border-radius: .4rem; }
+    #remotes { display: flex; gap: 1rem; flex-wrap: wrap; }
+    button { padding: .5rem 1rem; font-size: 1rem; cursor: pointer; }
+    #log { white-space: pre-wrap; background: #f4f4f4; padding: .6rem;
+           border-radius: .4rem; font-family: ui-monospace, monospace;
+           font-size: .8rem; min-height: 4rem; margin-top: 1rem; }
+    .ok { color: #137333; } .err { color: #c5221f; }
+    label.tag { font-weight: 600; }
+  </style>
+</head>
+<body>
+  <h1>Bolt API — WebRTC SFU room</h1>
+  <p>Open this page in <strong>two tabs</strong>. Each publishes audio+video to
+     the Bolt SFU; each should see the other's video below.</p>
+  <p>
+    <label class="tag">name <input id="name" value="" size="10" /></label>
+    <button id="go">Join room</button>
+    <button id="stop" disabled>Leave</button>
+  </p>
+  <div class="row">
+    <div class="col"><strong>Local (published)</strong>
+      <video id="local" autoplay playsinline muted></video></div>
+  </div>
+  <h3>Remote peers (forwarded by the SFU)</h3>
+  <div id="remotes"></div>
+  <div id="log"></div>
+
+  <script>
+    "use strict";
+    const $ = (id) => document.getElementById(id);
+    const logEl = $("log");
+    function log(msg, cls) {
+      const line = document.createElement("div");
+      if (cls) line.className = cls;
+      line.textContent = msg;
+      logEl.appendChild(line);
+    }
+    $("name").value = "tab-" + Math.floor(Math.random() * 1000);
+
+    let pc = null, localStream = null, raf = 0, audioCtx = null;
+
+    // Synthetic media: animated canvas video + a WebAudio tone. Used when no
+    // camera is present (headless / MCP). Returns a MediaStream(audio+video).
+    function syntheticStream() {
+      const canvas = document.createElement("canvas");
+      canvas.width = 320; canvas.height = 240;
+      const ctx = canvas.getContext("2d");
+      const hueBase = Math.floor(Math.random() * 360);
+      let frame = 0;
+      const draw = () => {
+        ctx.fillStyle = `hsl(${(hueBase + frame) % 360},80%,45%)`;
+        ctx.fillRect(0, 0, 320, 240);
+        ctx.fillStyle = "#fff"; ctx.font = "28px sans-serif";
+        ctx.fillText($("name").value + " " + frame, 12, 130);
+        frame++; raf = requestAnimationFrame(draw);
+      };
+      draw();
+      const v = canvas.captureStream(30).getVideoTracks()[0];
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const osc = audioCtx.createOscillator();
+      const dst = audioCtx.createMediaStreamDestination();
+      osc.frequency.value = 200 + Math.random() * 300;
+      osc.connect(dst); osc.start();
+      const a = dst.stream.getAudioTracks()[0];
+      return new MediaStream([v, a]);
+    }
+
+    async function getMedia() {
+      try {
+        const s = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+        log("using camera + mic");
+        return s;
+      } catch (e) {
+        log("no camera (" + e.name + "); using synthetic media");
+        return syntheticStream();
+      }
+    }
+
+    async function join() {
+      $("go").disabled = true;
+      logEl.textContent = "";
+      localStream = await getMedia();
+      $("local").srcObject = localStream;
+
+      pc = new RTCPeerConnection();
+      pc.ontrack = (ev) => {
+        // Render each forwarded remote stream in its own <video>.
+        const stream = ev.streams[0] || new MediaStream([ev.track]);
+        let el = document.getElementById("r-" + stream.id);
+        if (!el) {
+          const col = document.createElement("div"); col.className = "col";
+          const lbl = document.createElement("strong"); lbl.textContent = "peer";
+          el = document.createElement("video");
+          el.id = "r-" + stream.id; el.autoplay = true; el.playsInline = true;
+          col.appendChild(lbl); col.appendChild(el);
+          $("remotes").appendChild(col);
+        }
+        el.srcObject = stream;
+        log("ontrack " + ev.track.kind + " from a remote peer", "ok");
+      };
+      pc.onconnectionstatechange = () => {
+        log("connection: " + pc.connectionState);
+        if (pc.connectionState === "connected") $("stop").disabled = false;
+      };
+      for (const t of localStream.getTracks()) pc.addTrack(t, localStream);
+
+      await pc.setLocalDescription(await pc.createOffer());
+      await new Promise((res) => {
+        if (pc.iceGatheringState === "complete") return res();
+        const t = setTimeout(res, 3000);
+        pc.onicegatheringstatechange = () => {
+          if (pc.iceGatheringState === "complete") { clearTimeout(t); res(); }
+        };
+      });
+      const resp = await fetch("/webrtc/offer", {
+        method: "POST", headers: { "Content-Type": "application/sdp" },
+        body: pc.localDescription.sdp,
+      });
+      if (!resp.ok) { log("signaling HTTP " + resp.status, "err"); return; }
+      await pc.setRemoteDescription({ type: "answer", sdp: await resp.text() });
+      log("joined; ICE/DTLS/SRTP negotiating…");
+    }
+
+    function leave() {
+      if (raf) cancelAnimationFrame(raf);
+      if (pc) { pc.close(); pc = null; }
+      if (localStream) { for (const t of localStream.getTracks()) t.stop(); localStream = null; }
+      if (audioCtx) { audioCtx.close(); audioCtx = null; }
+      $("local").srcObject = null;
+      $("remotes").innerHTML = "";
+      $("go").disabled = false; $("stop").disabled = true;
+      log("left.");
+    }
+
+    $("go").addEventListener("click", join);
+    $("stop").addEventListener("click", leave);
+  </script>
+</body>
+</html>

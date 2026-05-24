@@ -55,12 +55,15 @@ namespace webrtc {
 // Bounds (TigerStyle: explicit, asserted). A data-channel SDP is small; these
 // caps are generous for a single m=application section plus typical attributes.
 // ----------------------------------------------------------------------------
-inline constexpr std::size_t kSdpMaxMediaSections   = 4;    // BUNDLE of a few m-lines
-// A real Chrome audio+video offer carries ~10 codecs * (rtpmap+fmtp+rtcp-fb*4)
-// plus extmap/ssrc per m-line, so the per-section attribute cap must be generous
-// (still fixed/bounded — TigerStyle, no growth). 128 covers Chrome/Firefox.
-inline constexpr std::size_t kSdpMaxAttrsPerSection = 128;  // a= lines per scope
-inline constexpr std::size_t kSdpMaxFormatsPerMedia = 32;   // m= PT tokens (audio lists many)
+inline constexpr std::size_t kSdpMaxMediaSections   = 8;    // BUNDLE of a few m-lines (rooms/renegotiation)
+// A real Chrome audio+video offer carries ~25 video codecs * (rtpmap+fmtp+
+// rtcp-fb*5) plus 11 extmap + ssrc-group/ssrc per m-line — measured ~147 a=lines
+// on one video m-line alone. The per-section cap must clear that with headroom
+// (still fixed/bounded — TigerStyle, no growth). Overflow is TOLERATED (extra
+// a=/format/m= lines past the cap are skipped, never a parse failure) so an
+// unexpectedly fat offer degrades gracefully instead of being rejected (#44).
+inline constexpr std::size_t kSdpMaxAttrsPerSection = 256;  // a= lines per scope
+inline constexpr std::size_t kSdpMaxFormatsPerMedia = 48;   // m= PT tokens (Chrome video lists ~27)
 inline constexpr std::size_t kSdpMaxCandidates      = 16;   // a=candidate lines / media
 
 // Media (audio/video) negotiation bounds (WM4). kMaxMediaSections = audio +
@@ -68,6 +71,9 @@ inline constexpr std::size_t kSdpMaxCandidates      = 16;   // a=candidate lines
 // codec set we emit per m-line. Both fixed — no unbounded vectors.
 inline constexpr std::size_t kMaxMediaSections    = kSdpMaxMediaSections;
 inline constexpr std::size_t kMaxCodecsPerSection = 16;
+// #37 — header extensions (a=extmap) we echo per m-line: mid, rtp-stream-id,
+// transport-cc, abs-send-time, video-orientation. Bounded, fixed capacity.
+inline constexpr std::size_t kMaxExtmaps          = 8;
 
 // WA — simulcast (RFC 8851 a=simulcast + RFC 8852 a=rid). A simulcast track
 // offers up to kMaxRids alternative encodings keyed by a short restriction id
@@ -239,13 +245,41 @@ SdpError build_answer(const AnswerParams& p, std::string& out);
 // Media kinds we negotiate (relay/echo, no transcode — WEBRTC_MEDIA_PLAN §M4).
 enum class MediaKind : std::uint8_t { kAudio = 0, kVideo = 1 };
 
+// RTCP feedback (#37) we will advertise back for a codec — but ONLY the subset
+// the offer itself listed for that PT (so we never promise feedback the peer did
+// not offer). Each flag maps to one a=rtcp-fb line in the answer. The hub already
+// generates/consumes these (NACK/PLI/FIR/REMB/transport-cc — WA live-wiring); the
+// answer must advertise them so a browser actually turns RTX/FEC/TWCC ON.
+struct RtcpFeedback {
+    bool nack         = false;  // a=rtcp-fb:<pt> nack          (generic NACK)
+    bool nack_pli     = false;  // a=rtcp-fb:<pt> nack pli      (picture loss)
+    bool ccm_fir      = false;  // a=rtcp-fb:<pt> ccm fir       (full intra req)
+    bool transport_cc = false;  // a=rtcp-fb:<pt> transport-cc  (TWCC)
+    bool goog_remb    = false;  // a=rtcp-fb:<pt> goog-remb     (REMB)
+    bool any() const noexcept {
+        return nack || nack_pli || ccm_fir || transport_cc || goog_remb;
+    }
+};
+
 // One negotiated codec kept in the answer: the offer's payload type plus the
 // rtpmap encoding string and (optional) fmtp params, all zero-copy views into
-// the offer buffer (which must outlive the answer build).
+// the offer buffer (which must outlive the answer build). #37 adds the RTCP
+// feedback to advertise and the associated RTX (RFC 4588) retransmission PT.
 struct NegotiatedCodec {
     std::uint8_t     pt = 0;        // payload type (echoed from the offer)
     std::string_view rtpmap;        // "opus/48000/2", "VP8/90000", ...
     std::string_view fmtp;          // fmtp params (may be empty)
+    RtcpFeedback     fb;            // #37 — advertised feedback (offer-intersected)
+    std::uint8_t     rtx_pt = 0;    // #37 — associated RTX PT (0 = none offered)
+    std::string_view rtx_rtpmap;    // "rtx/90000" for rtx_pt (when rtx_pt != 0)
+};
+
+// One header extension (a=extmap) we echo back in the answer (#37). We only keep
+// extensions we support (mid/rid for BUNDLE+simulcast demux, transport-cc for
+// TWCC, abs-send-time for BWE), each at the id the OFFER assigned it.
+struct NegotiatedExtmap {
+    std::uint8_t     id = 0;        // 1..14 (one-byte header-ext id range)
+    std::string_view uri;           // the extension URI (view into the offer)
 };
 
 // One negotiated media section (audio or video): the common codecs kept, the
@@ -264,6 +298,11 @@ struct NegotiatedMedia {
     std::string_view rids[kMaxRids]{};
     std::size_t      rid_count = 0;
     std::uint8_t     rid_ext_id = 0;            // a=extmap id for the RID ext (0=absent)
+
+    // #37 — header extensions echoed back (a=extmap), each at the offer's id, for
+    // the extensions we support (mid/rid/transport-cc/abs-send-time). Bounded.
+    NegotiatedExtmap extmaps[kMaxExtmaps]{};
+    std::size_t      extmap_count = 0;
 };
 
 // The result of intersecting an offer against Bolt's supported codec set: the
@@ -278,6 +317,8 @@ struct MediaNegotiation {
 // both the SDP layer and the RTP-extension demux agree on one spelling.
 inline constexpr std::string_view kRidExtUri =
     "urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id";
+inline constexpr std::string_view kMidExtUri =
+    "urn:ietf:params:rtp-hdrext:sdes:mid";
 inline constexpr std::string_view kTransportCcExtUri =
     "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01";
 inline constexpr std::string_view kAbsSendTimeExtUri =

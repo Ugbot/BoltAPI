@@ -35,6 +35,11 @@ int main(int argc, char** argv) {
     const std::uint16_t port =
         argc > 1 ? static_cast<std::uint16_t>(std::atoi(argv[1])) : 8080;
     const std::string web_root = argc > 2 ? argv[2] : "testing/web";
+    // Media mode: "echo" (default, aiortc `server` shape — loop media back to the
+    // sender) or "relay" (P2 SFU — forward each peer's media to every OTHER peer
+    // in the room). Pass as the 3rd arg: demo_server [port] [web_root] [mode].
+    const std::string mode = argc > 3 ? argv[3] : "echo";
+    const bool relay = (mode == "relay" || mode == "sfu");
 
     bolt::api::App app;
 
@@ -68,11 +73,16 @@ int main(int argc, char** argv) {
         });
     }
 
-    // WM6: MEDIA ECHO (aiortc `server` shape). Loop received audio + video RTP
-    // straight back out (re-SRTP, relay, no transcode). The signaling answer
-    // negotiates the offered audio/video m-lines sendrecv so the peer's media
-    // returns to it. H1/H2 + data channels are untouched.
-    app.enable_media_echo();
+    // Media: either ECHO (WM6, aiortc `server` shape — loop received audio+video
+    // back to the sender) or RELAY (P2 SFU — forward each peer's media to every
+    // OTHER peer in the room; with two browsers, each sees the other's video).
+    // The signaling answer negotiates the offered audio/video m-lines sendrecv in
+    // both modes. H1/H2 + data channels are untouched.
+    if (relay) {
+        app.enable_media_relay();
+    } else {
+        app.enable_media_echo();
+    }
 
 #if defined(BOLTAPI_WITH_WEBRTC)
     // "chat" data channel: echo each message straight back, preserving type.
@@ -104,13 +114,15 @@ int main(int argc, char** argv) {
     app.static_files("/", web_root);
 
     std::fprintf(stderr,
-        "Bolt API demo server on http://127.0.0.1:%u\n"
+        "Bolt API demo server on http://127.0.0.1:%u  (media mode: %s)\n"
         "  open  http://127.0.0.1:%u/webrtc.html  (browser data-channel test)\n"
         "  open  http://127.0.0.1:%u/media.html   (browser audio+video echo)\n"
+        "  open  http://127.0.0.1:%u/room.html    (SFU room — two tabs see each other)\n"
         "  GET   /health   WS /ws                 (HTTP/WS surfaces)\n"
         "  POST  /webrtc/offer                    (signaling: data + media)\n"
         "  HTTP/3 (QUIC) on UDP :%u (ALPN h3); H1/H2 advertise alt-svc h3=\":%u\"\n"
         "  static root: %s\n",
+        port, relay ? "relay (SFU)" : "echo",
         port, port, port, port, port, web_root.c_str());
 
     return app.run("127.0.0.1", port);

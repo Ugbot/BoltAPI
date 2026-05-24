@@ -26,17 +26,27 @@ Status: `[x]` done · `[~]` partial/unit-gated · `[ ]` todo.
 - [~] WP: RTX/SVC/pacer + interceptors live-wired into peer_hub; inline-I/O SRTP confirmed.
 
 ## P0 — Real two-way media in a browser
-- [ ] **#37 — negotiate, don't just echo.** Emit `a=rtpmap`/`a=fmtp`/`a=rtcp-fb`
-      (nack, nack pli, ccm fir, transport-cc, goog-remb)/`a=rtx (apt)`/`a=ulpfec`/
-      `a=extmap` (transport-cc, abs-send-time, rtp-stream-id) in the SDP **answer** so a
-      browser actually turns on RTX/FEC/TWCC. Today the answer mostly echoes the offer.
-- [ ] **Browser getUserMedia echo** verified in real Chrome via the chrome-devtools MCP
-      (camera+mic → Bolt → echoed `<video>`), not just aiortc. (`testing/web/media.html`.)
-- [ ] **#38 — fix SRTP `protect` ~25× slower than `unprotect`** (cache EVP_CIPHER_CTX /
-      EVP_MAC_CTX, precompute session state). Must be fixed before relay scale.
+- [x] **#44 — parse a real Chrome offer.** The bounded SDP parser rejected real
+      Chrome offers (a video m-line has ~147 a=lines > the 128 cap → Overflow → HTTP
+      400). Raised the caps (attrs 256, media 8, formats 48) AND made the parser
+      **overflow-tolerant** (skip extras past a cap instead of failing). Chrome now
+      connects + echoes through Bolt (verified via the chrome-devtools MCP).
+- [x] **#37 — negotiate, don't just echo.** The SDP **answer** now emits `a=rtcp-fb`
+      (nack, nack pli, ccm fir, transport-cc, goog-remb — offer-intersected per codec) +
+      `a=rtx (apt)` + `a=extmap` (mid, rtp-stream-id, transport-cc, abs-send-time, each at
+      the offer's id). `negotiate_media`/`append_media_section` in webrtc/sdp.{h,cpp};
+      gated by `media_sdp_test`; **verified in real Chrome** (answer carries all lines,
+      Chrome accepts + connects). (`a=ulpfec` deferred — RED/ULPFEC relay is unit-gated.)
+- [x] **Browser getUserMedia echo** verified in real Chrome via the chrome-devtools MCP
+      (synthetic canvas+oscillator media, since the MCP Chrome has no camera/fake-device
+      flag): connected, 2 echoed tracks, 422 inbound packets. (`testing/web/media.html`.)
+- [x] **#38 — fix SRTP `protect`** per-packet `EVP_MAC_fetch` + `EVP_CIPHER_CTX_new/free`.
+      Cached the fetched HMAC algorithm once + thread_local reusable cipher/MAC contexts
+      (re-init per packet). srtp.h; byte-exact correctness gated (`srtp_test`, `media_echo`).
 - [ ] Renegotiation: add/remove a track mid-session (new offer/answer) without dropping
       the connection.
-- [ ] Gate: Chrome ↔ Bolt sendrecv audio+video echo, stable for 60 s, no leak.
+- [~] Gate: Chrome ↔ Bolt sendrecv audio+video echo (connected + echo flowing verified
+      via MCP; a formal 60 s no-leak soak is a follow-up — multi-tab MCP throttles bg tabs).
 
 ## P1 — Pion-parity peer features
 - [ ] Codec set negotiated + relayed (no transcode): audio **Opus/PCMU/PCMA**, video
@@ -53,25 +63,37 @@ Status: `[x]` done · `[~]` partial/unit-gated · `[ ]` todo.
       independent signal; bounded, skip-if-absent via `bounded_proc.h`).
 
 ## P2 — Relay / SFU  (the headline: N peers, selective forwarding, no transcode)
-- [ ] **Rooms / multi-peer session manager**: key peers by ICE ufrag; a room holds N
-      `WebRtcPeerHub`s; bounded peer/room pools. (Today: single active peer in places.)
-- [ ] **Selective Forwarding Unit**: forward each publisher's RTP to each subscriber
-      with **per-subscriber SSRC + PT rewrite** and seq/timestamp continuity; no decode.
-- [ ] **RTCP termination + per-leg generation**: do NOT forward raw RTCP; generate
-      SR/RR/NACK/PLI per leg; map feedback between publisher and subscribers.
-- [ ] **Keyframe management**: on a new subscriber or layer switch, send PLI/FIR upstream;
-      buffer/forward the next keyframe.
+- [x] **Multi-peer session manager**: the `WebRtcPeerHub` already keys peers by source
+      address (≤64). The single-peer limit was in signaling — fixed: in relay mode peers
+      SHARE Bolt's ICE-lite creds (STUN validated by MESSAGE-INTEGRITY, routed by address)
+      and DTLS is per-peer by address (no single fingerprint pin). `App::enable_media_relay()`
+      + `hub.set_relay()`. (Single implicit room = all peers on the server; NAMED multi-room
+      keyed by ufrag is the follow-up.)
+- [x] **Selective Forwarding Unit**: `WebRtcPeerHub::forward_rtp_to_others` forwards each
+      publisher's RTP to every other keyed peer via that peer's outbound chain + SRTP, no
+      decode. Verbatim SSRC/seq/ts (correct for one-source-per-SSRC; the browser latches the
+      new SSRC). Per-subscriber SSRC/PT **rewrite** is the follow-up (needed for simulcast
+      layer-switch / SSRC-collision hardening, not for basic forwarding).
+- [~] **RTCP termination + per-leg generation**: PLI/FIR are relayed upstream to the
+      publisher (`relay_rtcp_feedback`); NACK is served LOCALLY per leg from the chain's
+      RTX/resend cache (not forwarded). Full per-leg SR/RR regeneration is partial (the
+      reporter runs per peer).
+- [x] **Keyframe management**: a subscriber's PLI/FIR is routed to the publisher of that
+      SSRC (`publisher_of_ssrc` → `add_pli`) so it emits a keyframe the relay forwards.
 - [ ] **Simulcast layer selection**: ingest multiple RID encodings from a publisher;
       pick the layer per subscriber by their estimated bandwidth (TWCC/REMB); switch
       layers with keyframe requests. (SVC: forward the target spatial/temporal layers.)
-- [ ] **Per-subscriber NACK/RTX** + a bounded retransmit cache (recent packets per SSRC).
+- [~] **Per-subscriber NACK/RTX** + a bounded retransmit cache: the per-leg interceptor
+      chain (NackResponder/RtxInterceptor) caches each forwarded SSRC per subscriber and
+      answers that subscriber's NACK. (Default NACK-by-resend; true RTX wiring per leg TBD.)
 - [ ] **Bandwidth estimation per subscriber** (TWCC receiver estimate / REMB) → drive
       layer selection + the pacer.
-- [ ] Bidirectional: every peer both publishes and subscribes; full mesh handled by the
-      SFU (1 up + N down per peer).
-- [ ] Gate: **2 browsers** join a room via Bolt → each sees the other's live video
-      (SFU forwarding). Then **N peers**. Then simulcast layer-switch under bandwidth
-      change (verified via the MCP + Pion).
+- [x] Bidirectional: every peer both publishes and subscribes (1 up + N down per peer).
+- [x] Gate: **2 browsers** join a room via Bolt → each sees the other (SFU forwarding) —
+      verified via the chrome-devtools MCP (both connected, `ontrack` audio+video forwarded,
+      real RTP packets) + a deterministic loopback gate `MediaRelay.ForwardsAudioVideoBetween
+      PeersByteExact` (two real DTLS-SRTP peers, A↔B audio+video forwarded BYTE-EXACT, 16
+      rounds each way). **N peers** (hub ≤64) + simulcast layer-switch are follow-ups.
 
 ## P3 — "Fun things" (example milestones, each a test target)
 - [ ] **play-from-disk**: IVF (VP8/VP9) / Ogg (Opus) / H264 Annex-B reader → RTP → peer.

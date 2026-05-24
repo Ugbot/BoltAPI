@@ -311,7 +311,28 @@ int epoll_io::sendto_async(
 int epoll_io::close_async(int fd) noexcept {
     // Remove from epoll
     epoll_ctl(impl_->epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
-    
+
+    // Complete any STILL-PENDING op for this fd with an error result so its
+    // callback runs (mirrors IOCP, where closing the handle completes in-flight
+    // operations). Without this a readiness backend would silently drop the op:
+    // UdpTransport::stop() closes the socket and then SPINS waiting for its
+    // recvfrom completion to decrement in_flight_ — if the callback never fires
+    // it hangs forever. Firing it (the callback observes the transport's stop
+    // flag, decrements, and does NOT re-arm) unblocks the drain.
+    pending_op* op = impl_->find_and_remove_op(fd);
+    if (op != nullptr) {
+        std::unique_ptr<pending_op> op_guard(op);
+        if (op->callback) {
+            io_event event;
+            event.operation = op->operation;
+            event.fd        = op->fd;
+            event.user_data = op->user_data;
+            event.flags     = 0;
+            event.result    = -1;  // closed / cancelled
+            op->callback(event);
+        }
+    }
+
     impl_->stat_closes.fetch_add(1, std::memory_order_relaxed);
     return close(fd);
 }

@@ -100,7 +100,8 @@ public:
         for (std::size_t i = 0; i < count_; ++i) {
             std::int64_t d = window_[i].arrival_us - prev;
             prev = window_[i].arrival_us;
-            if (d > 32767) d = 32767; if (d < -32768) d = -32768;
+            if (d > 32767) d = 32767;
+            if (d < -32768) d = -32768;
             const std::int16_t s = static_cast<std::int16_t>(d);
             out[8 + i * 2] = static_cast<std::uint8_t>((s >> 8) & 0xFF);
             out[8 + i * 2 + 1] = static_cast<std::uint8_t>(s & 0xFF);

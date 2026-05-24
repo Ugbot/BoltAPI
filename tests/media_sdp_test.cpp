@@ -154,6 +154,21 @@ TEST(MediaSdp, NegotiateKeepsCommonCodecsOnly) {
     EXPECT_EQ(nv.codecs[0].rtpmap, std::string_view("VP8/90000"));
     EXPECT_EQ(nv.codecs[1].pt, 102);
     EXPECT_EQ(nv.codecs[1].rtpmap, std::string_view("H264/90000"));
+
+    // #37 — VP8(96) carries an RTX mapping (97 apt=96) + NACK/PLI feedback; H264
+    // (102) in this offer has neither. Audio Opus(111) advertises transport-cc.
+    EXPECT_EQ(nv.codecs[0].rtx_pt, 97);
+    EXPECT_EQ(nv.codecs[0].rtx_rtpmap, std::string_view("rtx/90000"));
+    EXPECT_TRUE(nv.codecs[0].fb.nack);
+    EXPECT_TRUE(nv.codecs[0].fb.nack_pli);
+    EXPECT_EQ(nv.codecs[1].rtx_pt, 0);
+    EXPECT_FALSE(nv.codecs[1].fb.any());
+    EXPECT_TRUE(na.codecs[0].fb.transport_cc);
+    // #37 — abs-send-time extmap kept on video; ssrc-audio-level dropped on audio.
+    ASSERT_EQ(nv.extmap_count, 1u);
+    EXPECT_EQ(nv.extmaps[0].id, 2);
+    EXPECT_EQ(nv.extmaps[0].uri, sdp::kAbsSendTimeExtUri);
+    EXPECT_EQ(na.extmap_count, 0u);
 }
 
 TEST(MediaSdp, BuildAnswerWellFormedAndRoundTrips) {
@@ -180,13 +195,28 @@ TEST(MediaSdp, BuildAnswerWellFormedAndRoundTrips) {
     EXPECT_NE(answer.find("a=setup:passive"), std::string::npos);
     EXPECT_NE(answer.find("a=rtcp-mux"), std::string::npos);
     EXPECT_NE(answer.find("m=audio 9 UDP/TLS/RTP/SAVPF 111"), std::string::npos);
-    EXPECT_NE(answer.find("m=video 9 UDP/TLS/RTP/SAVPF 96 102"),
+    // #37 — RTX PT (97, apt=96) is now appended to the video m-line after the
+    // media PTs (96 102), so a browser turns on retransmission.
+    EXPECT_NE(answer.find("m=video 9 UDP/TLS/RTP/SAVPF 96 102 97"),
               std::string::npos);
     EXPECT_NE(answer.find("a=rtpmap:111 opus/48000/2"), std::string::npos);
     EXPECT_NE(answer.find("a=rtpmap:102 H264/90000"), std::string::npos);
-    // The dropped codecs must NOT appear in the answer.
+    // The unsupported codec must NOT appear in the answer.
     EXPECT_EQ(answer.find("telephone-event"), std::string::npos);
-    EXPECT_EQ(answer.find("rtx/90000"), std::string::npos);
+
+    // #37 — RTCP feedback the offer listed is now advertised back.
+    EXPECT_NE(answer.find("a=rtcp-fb:96 nack"), std::string::npos);
+    EXPECT_NE(answer.find("a=rtcp-fb:96 nack pli"), std::string::npos);
+    EXPECT_NE(answer.find("a=rtcp-fb:111 transport-cc"), std::string::npos);
+    // #37 — RTX codec advertised (rtpmap + apt fmtp) so retransmission negotiates.
+    EXPECT_NE(answer.find("a=rtpmap:97 rtx/90000"), std::string::npos);
+    EXPECT_NE(answer.find("a=fmtp:97 apt=96"), std::string::npos);
+    // #37 — supported header extensions echoed at the offer's id (abs-send-time
+    // on video). The unsupported ssrc-audio-level extension is dropped.
+    EXPECT_NE(answer.find(
+        "a=extmap:2 http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time"),
+        std::string::npos);
+    EXPECT_EQ(answer.find("ssrc-audio-level"), std::string::npos);
 
     // Round-trip: parse our own answer back; assert both negotiated m-lines.
     sdp::SdpSession parsed;

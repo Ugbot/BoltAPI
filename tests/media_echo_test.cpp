@@ -441,3 +441,168 @@ TEST(MediaEcho, AudioAndVideoRtpEchoByteExact) {
 
     transport.stop();
 }
+
+namespace {
+
+// Receive ONE forwarded media datagram on a client and SRTP-unprotect it into
+// `out` (RTP plaintext). Skips late DTLS records (first byte 20..63); media is
+// 128..191. Bounded by the socket RCVTIMEO + the deadline (never hangs).
+bool recv_media(DtlsSrtpClient& c, srtp::SrtpSession& in, std::uint8_t* out,
+                std::size_t cap, std::size_t* out_len,
+                std::chrono::steady_clock::time_point deadline) {
+    assert(out != nullptr && out_len != nullptr && "recv_media: null out");
+    assert(cap >= 64 && "recv_media: tiny cap");
+    while (std::chrono::steady_clock::now() < deadline) {
+        std::uint8_t buf[800];
+        const int n = c.recv_raw(buf, sizeof(buf));
+        if (n <= 0) continue;                          // RCVTIMEO tick: retry
+        if (buf[0] < 128 || buf[0] > 191) continue;    // skip non-media
+        if (in.unprotect_rtp(buf, static_cast<std::size_t>(n), out, cap,
+                             out_len) == srtp::Error::kOk)
+            return true;
+    }
+    return false;
+}
+
+}  // namespace
+
+// ===========================================================================
+// THE SFU RELAY GATE (P2) — two REAL DTLS-SRTP peers join one hub in relay mode;
+// each one's audio+video RTP is FORWARDED to the OTHER (selective forwarding, no
+// transcode, no self-echo), byte-exact, over real loopback UDP. This is the
+// in-process deterministic analogue of "two browsers see each other through the
+// Bolt SFU". Bounded by an iteration cap + a wall-clock deadline (never hangs).
+// ===========================================================================
+TEST(MediaRelay, ForwardsAudioVideoBetweenPeersByteExact) {
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(30);
+
+    // ---- Server: UdpTransport + DTLS server + peer hub in SFU RELAY mode. ----
+    net::UdpTransport transport(shared_dispatcher());
+    ASSERT_TRUE(transport.bind("127.0.0.1", 0));
+    const std::uint16_t port = transport.bound_port();
+    ASSERT_NE(port, 0);
+
+    auto dctx = wrtc::DtlsContext::create();
+    ASSERT_NE(dctx, nullptr);
+    ASSERT_TRUE(dctx->is_valid());
+    wrtc::DtlsSessionManager mgr(*dctx, transport);
+    mgr.set_offer_fingerprint("");  // multi-peer: accept any peer cert (relay)
+
+    wrtc::WebRtcPeerHub hub(mgr, transport);
+    hub.set_relay(true);            // forward each peer's media to the OTHERS
+    transport.set_datagram_handler(
+        [&hub](const sockaddr* peer, int plen, const std::uint8_t* data,
+               std::size_t len) { hub.feed(peer, plen, data, len); });
+    ASSERT_TRUE(transport.start());
+
+    // ---- Two real OpenSSL DTLS-SRTP peers (A and B). ----
+    DtlsSrtpClient a, b;
+    ASSERT_TRUE(a.open(port));
+    ASSERT_TRUE(b.open(port));
+    sockaddr_in aa{}, bb{};
+    socklen_t aal = sizeof(aa), bbl = sizeof(bb);
+    ASSERT_EQ(::getsockname(a.fd, reinterpret_cast<sockaddr*>(&aa), &aal), 0);
+    ASSERT_EQ(::getsockname(b.fd, reinterpret_cast<sockaddr*>(&bb), &bbl), 0);
+
+    std::atomic<bool> a_ok{false}, b_ok{false};
+    std::thread ta([&] { a_ok.store(a.handshake(deadline)); });
+    std::thread tb([&] { b_ok.store(b.handshake(deadline)); });
+    wrtc::DtlsSession* sa = wait_session(
+        mgr, reinterpret_cast<sockaddr*>(&aa), static_cast<int>(aal), deadline);
+    wrtc::DtlsSession* sb = wait_session(
+        mgr, reinterpret_cast<sockaddr*>(&bb), static_cast<int>(bbl), deadline);
+    ta.join();
+    tb.join();
+    ASSERT_TRUE(a_ok.load() && b_ok.load()) << "a/b handshake incomplete";
+    ASSERT_NE(sa, nullptr);
+    ASSERT_NE(sb, nullptr);
+    ASSERT_EQ(sa->state(), wrtc::DtlsSession::State::Established);
+    ASSERT_EQ(sb->state(), wrtc::DtlsSession::State::Established);
+
+    srtp::SrtpSession a_in, a_out, b_in, b_out;
+    ASSERT_TRUE(a.make_srtp(a_in, a_out));
+    ASSERT_TRUE(b.make_srtp(b_in, b_out));
+
+    // Distinct SSRCs per peer so the forwarded streams never collide.
+    constexpr std::uint32_t kAaudio = 0xA0A0'0001u, kAvideo = 0xA0A0'0002u;
+    constexpr std::uint32_t kBaudio = 0xB0B0'0001u, kBvideo = 0xB0B0'0002u;
+
+    // Warmup: each peer sends one packet so the hub OBTAINS + keys BOTH peers'
+    // media (a peer is keyed on its first post-handshake datagram). Drain any
+    // forward that results so the assertion rounds start from a clean socket.
+    auto protect_send = [&](DtlsSrtpClient& c, srtp::SrtpSession& out,
+                            std::uint8_t pt, std::uint16_t seq,
+                            std::uint32_t ssrc, const std::uint8_t* pl,
+                            std::size_t pl_len, std::uint8_t* raw,
+                            std::size_t* raw_len) {
+        *raw_len = build_rtp(raw, 512, pt, seq, ssrc, 1000u + seq, pl, pl_len);
+        std::uint8_t prot[640]; std::size_t prot_len = 0;
+        ASSERT_EQ(out.protect_rtp(raw, *raw_len, prot, sizeof(prot), &prot_len),
+                  srtp::Error::kOk);
+        ASSERT_GT(c.send_raw(prot, prot_len), 0);
+    };
+    {
+        const std::uint8_t warm[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+        std::uint8_t raw[512]; std::size_t rl = 0;
+        protect_send(a, a_out, kAudioPt, 1, kAaudio, warm, sizeof(warm), raw, &rl);
+        protect_send(b, b_out, kAudioPt, 1, kBaudio, warm, sizeof(warm), raw, &rl);
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        std::uint8_t scratch[800]; std::size_t sl = 0;
+        // Drain whatever each side already received (bounded, non-fatal).
+        for (int k = 0; k < 4; ++k) {
+            (void)recv_media(a, a_in, scratch, sizeof(scratch), &sl,
+                             std::chrono::steady_clock::now() +
+                                 std::chrono::milliseconds(50));
+            (void)recv_media(b, b_in, scratch, sizeof(scratch), &sl,
+                             std::chrono::steady_clock::now() +
+                                 std::chrono::milliseconds(50));
+        }
+    }
+
+    std::mt19937 rng(0x5F0'2026u);
+    std::uniform_int_distribution<int> len_d(16, 200);
+    std::uniform_int_distribution<int> byte_d(0, 255);
+
+    constexpr int kRounds = 16;        // bounded (no hang)
+    int a_to_b = 0, b_to_a = 0;
+    for (int i = 0; i < kRounds; ++i) {
+        ASSERT_LT(std::chrono::steady_clock::now(), deadline) << "deadline";
+        const bool video = (i % 2) == 1;
+        const std::uint8_t pt = video ? kVideoPt : kAudioPt;
+        const std::uint16_t seq = static_cast<std::uint16_t>(5000 + i);
+
+        std::vector<std::uint8_t> pl(static_cast<std::size_t>(len_d(rng)));
+        for (auto& x : pl) x = static_cast<std::uint8_t>(byte_d(rng));
+
+        // A -> SFU -> B (forwarded, byte-exact).
+        std::uint8_t a_raw[512]; std::size_t a_raw_len = 0;
+        protect_send(a, a_out, pt, seq, video ? kAvideo : kAaudio,
+                     pl.data(), pl.size(), a_raw, &a_raw_len);
+        std::uint8_t got[800]; std::size_t got_len = 0;
+        ASSERT_TRUE(recv_media(b, b_in, got, sizeof(got), &got_len, deadline))
+            << "B did not receive A's forwarded packet (round " << i << ")";
+        ASSERT_EQ(got_len, a_raw_len) << "A->B forwarded length differs";
+        EXPECT_EQ(std::memcmp(got, a_raw, a_raw_len), 0)
+            << "A->B not byte-exact (round " << i << ")";
+        ++a_to_b;
+
+        // B -> SFU -> A (forwarded, byte-exact).
+        std::uint8_t b_raw[512]; std::size_t b_raw_len = 0;
+        protect_send(b, b_out, pt, seq, video ? kBvideo : kBaudio,
+                     pl.data(), pl.size(), b_raw, &b_raw_len);
+        std::uint8_t got2[800]; std::size_t got2_len = 0;
+        ASSERT_TRUE(recv_media(a, a_in, got2, sizeof(got2), &got2_len, deadline))
+            << "A did not receive B's forwarded packet (round " << i << ")";
+        ASSERT_EQ(got2_len, b_raw_len) << "B->A forwarded length differs";
+        EXPECT_EQ(std::memcmp(got2, b_raw, b_raw_len), 0)
+            << "B->A not byte-exact (round " << i << ")";
+        ++b_to_a;
+    }
+
+    EXPECT_EQ(a_to_b, kRounds);
+    EXPECT_EQ(b_to_a, kRounds);
+    EXPECT_EQ(hub.peer_count(), 2u) << "hub should hold exactly the two peers";
+
+    transport.stop();
+}

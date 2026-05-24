@@ -485,6 +485,9 @@ void App::init_protocol_seams() {
                 // on the channel.
                 webrtc_hub_ = std::make_unique<webrtc::WebRtcPeerHub>(
                     *webrtc_dtls_mgr_, *webrtc_transport_);
+                // P2 — SFU relay mode: forward each peer's media to every other
+                // peer (set via App::enable_media_relay()).
+                webrtc_hub_->set_relay(media_relay_);
                 // Snapshot the registered handlers for the channel-ready lambda.
                 std::vector<DcReg>* regs = &dc_handlers_;
                 webrtc_hub_->set_channel_ready(
@@ -815,11 +818,18 @@ bool App::handle_webrtc_offer(std::string_view body, std::string& out_answer) {
     if (offer_fp.empty()) return false;
 
     // ----- Configure the live stack for this peer. -----
-    // Pin the expected remote ICE credentials so the IceAgent validates inbound
-    // STUN Binding Requests carrying USERNAME "ourUfrag:peerUfrag".
-    webrtc_agent_->set_expected_remote(peer_ufrag, peer_pwd);
-    if (webrtc_dtls_mgr_) {
-        webrtc_dtls_mgr_->set_offer_fingerprint(offer_fp);
+    // SINGLE-PEER mode: pin the expected remote ICE credentials so the IceAgent
+    // validates inbound STUN Binding Requests carrying USERNAME "ourUfrag:peerUfrag"
+    // and bind the peer DTLS cert to the offered fingerprint.
+    // MULTI-PEER relay mode (P2): peers share Bolt's ICE-lite creds and are routed
+    // by source address — pinning ONE peer's ufrag/fingerprint would reject the
+    // others, so we DON'T pin. STUN is still validated by MESSAGE-INTEGRITY (our
+    // pwd) and each peer's DTLS handshake establishes its own session per address.
+    if (!media_relay_) {
+        webrtc_agent_->set_expected_remote(peer_ufrag, peer_pwd);
+        if (webrtc_dtls_mgr_) {
+            webrtc_dtls_mgr_->set_offer_fingerprint(offer_fp);
+        }
     }
 
     // WI — Full ICE: pin the peer credentials on the full agent and register OUR
@@ -848,10 +858,12 @@ bool App::handle_webrtc_offer(std::string_view body, std::string& out_answer) {
         cand_views.empty() ? nullptr : cand_views.data();
     const std::size_t cvn = cand_views.size();
 
-    // WM6: when media echo is enabled AND the offer carries audio/video,
-    // negotiate the media (+ data) m-lines into ONE BUNDLEd echo answer. Else
-    // fall back to the data-channel-only answer (the original behavior).
-    if (media_echo_ && build_echo_answer_for(offer, cv, cvn, out_answer)) {
+    // WM6/P2: when media echo OR SFU relay is enabled AND the offer carries
+    // audio/video, negotiate the media (+ data) m-lines into ONE BUNDLEd answer
+    // (sendrecv, so the peer both sends and receives). Else fall back to the
+    // data-channel-only answer (the original behavior).
+    if ((media_echo_ || media_relay_) &&
+        build_echo_answer_for(offer, cv, cvn, out_answer)) {
         return true;
     }
     return build_data_answer_for(app_m, cv, cvn, out_answer);
@@ -992,7 +1004,10 @@ bool App::build_echo_answer_for(const webrtc::SdpSession& offer,
     // video m-line and configure the live peer hub's interceptor chain. (The
     // answer SDP itself only echoes what the read-only sdp.* builder emits; this
     // wiring makes the inbound NACK->RTX and TWCC-arrival paths run for real.)
-    if (webrtc_hub_ != nullptr) {
+    // SKIPPED in relay mode: configure_media assumes ONE declared echo track/SSRC,
+    // but relay forwards many arbitrary SSRCs. The hub's default per-leg
+    // NACK-by-resend (keyed on each forwarded SSRC) is correct for the SFU.
+    if (webrtc_hub_ != nullptr && !media_relay_) {
         webrtc::WebRtcPeerHub::MediaConfig mc;
         for (std::size_t i = 0; i < offer.media_count; ++i) {
             const webrtc::SdpMedia& m = offer.media[i];

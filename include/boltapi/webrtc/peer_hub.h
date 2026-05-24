@@ -117,6 +117,14 @@ public:
     // media is built AFTER this call (call right after negotiating the answer).
     void configure_media(const MediaConfig& cfg) noexcept;
 
+    // SFU relay mode (P2): when ON, each inbound RTP packet from one peer is
+    // FORWARDED to every OTHER keyed peer (per-subscriber SRTP, no transcode), and
+    // a subscriber's PLI/FIR is relayed upstream to the publisher of that SSRC so
+    // keyframes flow. OFF (default) keeps the single-peer echo/track behavior.
+    // Idempotent; safe to toggle before traffic flows.
+    void set_relay(bool on) noexcept { relay_ = on; }
+    bool relay() const noexcept { return relay_; }
+
     // The transport datagram handler: feed DTLS, then drive SCTP. noexcept,
     // safe on malformed input.
     void feed(const sockaddr* peer, int peer_len, const std::uint8_t* data,
@@ -227,6 +235,19 @@ private:
     // Build + emit one TWCC feedback compound from the recorded window (if any).
     std::size_t emit_twcc_feedback(Media& m) noexcept;
 
+    // SFU (P2) — forward one plaintext RTP packet from `src` to every OTHER keyed
+    // peer (per-subscriber SRTP-protect + send via their outbound chain). Returns
+    // the number of subscribers the packet was forwarded to. Bounded by kMaxPeers.
+    std::size_t forward_rtp_to_others(Peer& src, const std::uint8_t* plain,
+                                      std::size_t len) noexcept;
+    // SFU (P2) — relay a subscriber's PLI/FIR upstream: for each PSFB PLI/FIR in
+    // the compound, find the peer publishing that media SSRC and send it a PLI so
+    // it emits a keyframe. NACK is served locally (per-leg RTX cache), not relayed.
+    void relay_rtcp_feedback(Peer& from, const rtcp::Compound& c) noexcept;
+    // SFU (P2) — the peer currently publishing `ssrc` (a track in its registry),
+    // or nullptr. Used to route PLI/FIR upstream. Bounded scan over kMaxPeers.
+    Peer* publisher_of_ssrc(std::uint32_t ssrc) noexcept;
+
     DtlsSessionManager* dtls_      = nullptr;  // borrowed
     net::UdpTransport*  transport_ = nullptr;  // borrowed
     ChannelReadyCallback on_channel_ready_;
@@ -239,6 +260,9 @@ private:
     // Negotiated media options (RTX/TWCC/abs-send-time/pacer). Applied per peer
     // when its media chain is built. Defaults => off (legacy echo behavior).
     MediaConfig    media_cfg_{};
+
+    // SFU relay mode (P2). false => single-peer echo/track (legacy). See set_relay.
+    bool           relay_ = false;
 
     Peer        peers_[kMaxPeers];
     std::size_t count_ = 0;
