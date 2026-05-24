@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Bolt API — all-protocols test</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.5 system-ui, sans-serif; max-width: 960px; margin: 24px auto;
+         padding: 0 16px; }
+  h1 { margin: 0 0 2px; } .sub { color: #888; margin: 0 0 16px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  section { border: 1px solid #8884; border-radius: 10px; padding: 12px 14px; }
+  section h2 { margin: 0 0 8px; font-size: 15px; display: flex; align-items: center;
+               gap: 8px; }
+  .pill { font-size: 11px; padding: 1px 7px; border-radius: 999px; background: #8883; }
+  .pill.ok { background: #15803d; color: #fff; } .pill.err { background: #b91c1c; color:#fff; }
+  .pill.wait { background: #b45309; color: #fff; }
+  button { font: inherit; padding: 5px 10px; border: 1px solid #8886; border-radius: 7px;
+           background: #8881; cursor: pointer; margin: 0 4px 4px 0; }
+  button:hover { background: #8883; } button:disabled { opacity: .5; cursor: default; }
+  input { font: inherit; padding: 4px 7px; border: 1px solid #8886; border-radius: 7px; }
+  pre { background: #8881; border-radius: 7px; padding: 8px; max-height: 150px;
+        overflow: auto; margin: 8px 0 0; font-size: 12px; white-space: pre-wrap; }
+  video { width: 100%; max-width: 240px; background: #000; border-radius: 7px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  code { background: #8882; padding: 1px 5px; border-radius: 4px; }
+  a { color: inherit; }
+</style>
+</head>
+<body>
+<h1>Bolt API — all-protocols test</h1>
+<p class="sub" id="origin">loading…</p>
+
+<div class="grid">
+
+  <section id="s-http">
+    <h2>HTTP <span class="pill" id="p-http">idle</span></h2>
+    <div class="row">
+      <button onclick="httpGet()">GET /ping</button>
+      <button onclick="httpEcho()">POST /echo (random)</button>
+      <button onclick="httpInfo()">GET /api/info</button>
+    </div>
+    <pre id="log-http"></pre>
+  </section>
+
+  <section id="s-ws">
+    <h2>WebSocket <span class="pill" id="p-ws">idle</span></h2>
+    <div class="row">
+      <button id="ws-conn" onclick="wsConnect()">connect</button>
+      <input id="ws-msg" value="hello bolt" size="16" />
+      <button onclick="wsSend()">send</button>
+      <button onclick="wsClose()">close</button>
+    </div>
+    <pre id="log-ws"></pre>
+  </section>
+
+  <section id="s-sse">
+    <h2>SSE <span class="pill" id="p-sse">idle</span></h2>
+    <div class="row">
+      <button onclick="sseStart()">connect /events</button>
+      <button onclick="sseStop()">close</button>
+    </div>
+    <pre id="log-sse"></pre>
+  </section>
+
+  <section id="s-wt">
+    <h2>WebTransport <span class="pill" id="p-wt">idle</span></h2>
+    <div class="row"><button onclick="wtConnect()">connect (HTTP/3)</button></div>
+    <pre id="log-wt"></pre>
+  </section>
+
+  <section id="s-dc">
+    <h2>WebRTC data channel <span class="pill" id="p-dc">idle</span></h2>
+    <div class="row">
+      <button onclick="dcConnect()">connect + echo (text + 64KiB)</button>
+      <button onclick="dcClose()">close</button>
+    </div>
+    <pre id="log-dc"></pre>
+  </section>
+
+  <section id="s-media">
+    <h2>WebRTC audio/video <span class="pill" id="p-media">idle</span></h2>
+    <div class="row">
+      <button onclick="mediaConnect()">start camera + echo</button>
+      <button onclick="mediaClose()">stop</button>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <div>local<br><video id="vid-local" autoplay muted playsinline></video></div>
+      <div>echoed<br><video id="vid-remote" autoplay playsinline></video></div>
+    </div>
+    <pre id="log-media"></pre>
+  </section>
+
+</div>
+
+<script>
+const ORIGIN = location.origin;
+const WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
+const log = (id, m, cls) => { const e = document.getElementById('log-'+id);
+  e.textContent += m + '\n'; e.scrollTop = e.scrollHeight;
+  if (cls) e.style.color = cls === 'err' ? '#b91c1c' : ''; };
+const pill = (id, txt, cls) => { const e = document.getElementById('p-'+id);
+  e.textContent = txt; e.className = 'pill' + (cls ? ' '+cls : ''); };
+
+// ---- status / protocol ----
+(async () => {
+  const nav = performance.getEntriesByType('navigation')[0];
+  const proto = nav && nav.nextHopProtocol ? nav.nextHopProtocol : '(unknown)';
+  document.getElementById('origin').textContent =
+    'served from ' + ORIGIN + '  ·  this page loaded over ' + proto +
+    '  ·  ' + (window.isSecureContext ? 'secure context (WebRTC/getUserMedia ok)'
+                                      : 'NOT a secure context');
+})();
+
+// ---- HTTP ----
+async function httpGet() { pill('http','…','wait'); try {
+  const r = await fetch('/ping', {cache:'no-store'});
+  log('http', 'GET /ping → ' + r.status + ' "' + (await r.text()) + '"');
+  pill('http','ok','ok'); } catch(e){ log('http','ERR '+e,'err'); pill('http','err','err'); } }
+async function httpEcho() { pill('http','…','wait'); try {
+  const body = 'rnd-' + Math.random().toString(36).slice(2);
+  const r = await fetch('/echo', {method:'POST', body});
+  const back = await r.text();
+  log('http', 'POST /echo → ' + r.status + (back===body ? ' byte-exact ✓' : ' MISMATCH'));
+  pill('http', back===body?'ok':'err', back===body?'ok':'err'); }
+  catch(e){ log('http','ERR '+e,'err'); pill('http','err','err'); } }
+async function httpInfo() { pill('http','…','wait'); try {
+  const r = await fetch('/api/info', {cache:'no-store'});
+  log('http', 'GET /api/info → ' + await r.text()); pill('http','ok','ok'); }
+  catch(e){ log('http','ERR '+e,'err'); pill('http','err','err'); } }
+
+// ---- WebSocket ----
+let ws = null;
+function wsConnect() { try {
+  pill('ws','…','wait'); log('ws','connecting ' + WS_URL);
+  ws = new WebSocket(WS_URL);
+  ws.onopen = () => { log('ws','open'); pill('ws','open','ok'); };
+  ws.onmessage = (e) => log('ws','recv: ' + e.data);
+  ws.onclose = () => { log('ws','closed'); pill('ws','closed'); };
+  ws.onerror = () => { log('ws','error','err'); pill('ws','err','err'); };
+} catch(e){ log('ws','ERR '+e,'err'); pill('ws','err','err'); } }
+function wsSend() { if (!ws || ws.readyState!==1) { log('ws','not open','err'); return; }
+  const m = document.getElementById('ws-msg').value; ws.send(m); log('ws','sent: '+m); }
+function wsClose() { if (ws) ws.close(); }
+
+// ---- SSE ----
+let es = null;
+function sseStart() { pill('sse','…','wait'); log('sse','connecting /events');
+  es = new EventSource('/events');
+  es.onopen = () => pill('sse','open','ok');
+  es.addEventListener('tick', e => log('sse','tick: '+e.data));
+  es.addEventListener('done', e => { log('sse','done: '+e.data); pill('sse','done','ok'); es.close(); });
+  es.onerror = () => { log('sse','error/closed'); pill('sse','closed'); }; }
+function sseStop() { if (es) es.close(); pill('sse','closed'); }
+
+// ---- WebTransport (HTTP/3) ----
+async function wtConnect() {
+  pill('wt','…','wait');
+  if (typeof WebTransport === 'undefined') {
+    log('wt','WebTransport API not available in this browser','err'); pill('wt','n/a','err'); return; }
+  const url = 'https://' + location.hostname + ':8443/wt';
+  log('wt','new WebTransport(' + url + ')');
+  try {
+    const wt = new WebTransport(url);
+    await wt.ready;
+    log('wt','READY — session established'); pill('wt','ok','ok');
+  } catch (e) {
+    log('wt','failed: ' + e + '  (server WebTransport endpoint pending — RFC 9297)','err');
+    pill('wt','pending','err');
+  }
+}
+
+// ---- WebRTC signaling helper (non-trickle: wait for ICE gathering) ----
+async function signal(pc) {
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  await new Promise(res => {
+    if (pc.iceGatheringState === 'complete') return res();
+    const c = () => { if (pc.iceGatheringState === 'complete') {
+      pc.removeEventListener('icegatheringstatechange', c); res(); } };
+    pc.addEventListener('icegatheringstatechange', c);
+    setTimeout(res, 2000); // fallback
+  });
+  const r = await fetch('/webrtc/offer', { method:'POST', body: pc.localDescription.sdp });
+  const answer = await r.text();
+  await pc.setRemoteDescription({ type:'answer', sdp: answer });
+}
+
+// ---- WebRTC data channel ----
+let dcPc = null;
+async function dcConnect() { pill('dc','…','wait'); try {
+  dcPc = new RTCPeerConnection();
+  dcPc.oniceconnectionstatechange = () => log('dc','ice: '+dcPc.iceConnectionState);
+  const dc = dcPc.createDataChannel('chat');
+  dc.binaryType = 'arraybuffer';
+  dc.onopen = () => { log('dc','channel open — sending'); pill('dc','open','ok');
+    dc.send('hello over webrtc');
+    dc.send(new Uint8Array(65536).fill(7)); };
+  let got = 0;
+  dc.onmessage = (e) => {
+    if (typeof e.data === 'string') log('dc','recv text: '+e.data);
+    else log('dc','recv binary: '+e.data.byteLength+' bytes ✓');
+    if (++got >= 2) pill('dc','echoed','ok'); };
+  await signal(dcPc); log('dc','offer/answer exchanged; negotiating…');
+} catch(e){ log('dc','ERR '+e,'err'); pill('dc','err','err'); } }
+function dcClose() { if (dcPc) dcPc.close(); pill('dc','closed'); }
+
+// ---- WebRTC media (camera/mic echo) ----
+let mPc = null, mStream = null;
+async function mediaConnect() { pill('media','…','wait'); try {
+  mStream = await navigator.mediaDevices.getUserMedia({ audio:true, video:true });
+  document.getElementById('vid-local').srcObject = mStream;
+  mPc = new RTCPeerConnection();
+  mPc.oniceconnectionstatechange = () => log('media','ice: '+mPc.iceConnectionState);
+  mStream.getTracks().forEach(t => mPc.addTrack(t, mStream));
+  const remote = new MediaStream();
+  document.getElementById('vid-remote').srcObject = remote;
+  mPc.ontrack = (e) => { remote.addTrack(e.track); log('media','echoed track: '+e.track.kind);
+    pill('media','echoing','ok'); };
+  await signal(mPc); log('media','offer/answer exchanged; media negotiating…');
+} catch(e){ log('media','ERR '+e,'err'); pill('media','err','err'); } }
+function mediaClose() { if (mPc) mPc.close(); if (mStream) mStream.getTracks().forEach(t=>t.stop());
+  pill('media','stopped'); }
+</script>
+</body>
+</html>

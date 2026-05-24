@@ -112,6 +112,20 @@ int main() {
         ws.on_text_message = [&ws](const std::string& m) { ws.send_text(m); };
     });
 
+    // SSE: stream a short burst of numbered events then a "done" event.
+    app.sse_coro("/events",
+        [](api::net::IODispatcher& io, int fd, const api::http::CoroHttpRequest&)
+            -> api::core::coro_task<void> {
+            api::http::SSEWriter sse(io, fd);
+            for (int i = 0; i < 20; ++i) {
+                const bool ok = co_await sse.send_event(
+                    "tick", "{\"n\":" + std::to_string(i) + "}");
+                if (!ok) break;  // client disconnected
+            }
+            co_await sse.send_event("done", "bye");
+            co_return;
+        });
+
     app.static_files("/", web_root);
 
     std::printf(
