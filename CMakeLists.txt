@@ -276,6 +276,22 @@ if(BOLTAPI_BUILD_EXAMPLES)
     endif()
     boltapi_apply_hardening(boltapi_sse_stream)
 
+    # START HERE: a small REST API (routing, params, JSON, middleware).
+    add_executable(boltapi_rest_api examples/rest_api.cpp)
+    target_link_libraries(boltapi_rest_api PRIVATE boltapi::boltapi)
+    if(WIN32)
+        target_link_libraries(boltapi_rest_api PRIVATE ws2_32 mswsock)
+    endif()
+    boltapi_apply_hardening(boltapi_rest_api)
+
+    # HTTP/1.1 + HTTP/3 on one App (QUIC over UDP; serves H3 under WITH_HTTP3).
+    add_executable(boltapi_http3_server examples/http3_server.cpp)
+    target_link_libraries(boltapi_http3_server PRIVATE boltapi::boltapi)
+    if(WIN32)
+        target_link_libraries(boltapi_http3_server PRIVATE ws2_32 mswsock iphlpapi)
+    endif()
+    boltapi_apply_hardening(boltapi_http3_server)
+
     # WebRTC data-channel echo server (debug/example; meaningful under WEBRTC=ON).
     add_executable(boltapi_webrtc_echo examples/webrtc_echo.cpp)
     target_link_libraries(boltapi_webrtc_echo PRIVATE boltapi::boltapi)
