@@ -1,0 +1,58 @@
+# Bolt API — Linux HTTP/3 + WebTransport test lane (parity with Windows/MSVC).
+#
+# HTTP/3 needs OpenSSL's 3.5+ QUIC-TLS callback API (SSL_set_quic_tls_cbs);
+# Ubuntu 24.04 ships 3.0, so build OpenSSL 3.6 from source into /opt/openssl
+# (same as the main Dockerfile). Then configure HTTP3=ON + WEBRTC=ON + TESTS=ON
+# against it and RUN the QUIC/HTTP3 ctest suite (epoll async-I/O backend) so the
+# image only builds if Linux parity holds.
+#
+#   docker build -f Dockerfile.linux-h3-test -t boltapi-linux-h3-test .
+# ---------------------------------------------------------------------------
+FROM ubuntu:24.04 AS test
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake ninja-build git ca-certificates pkg-config \
+        perl curl wget zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# OpenSSL 3.6 from source (the 3.5+ QUIC-TLS API HTTP/3 needs).
+ARG OPENSSL_VERSION=3.6.1
+RUN curl -fsSL "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz" -o /tmp/openssl.tar.gz \
+    && tar -xzf /tmp/openssl.tar.gz -C /tmp \
+    && cd "/tmp/openssl-${OPENSSL_VERSION}" \
+    && ./Configure --prefix=/opt/openssl --openssldir=/opt/openssl \
+                   --libdir=lib linux-x86_64 \
+    && make -j"$(nproc)" && make install_sw \
+    && rm -rf /tmp/openssl*
+ENV LD_LIBRARY_PATH=/opt/openssl/lib
+
+WORKDIR /src
+COPY . .
+
+# Configure: HTTP/3 + WebRTC + tests ON, against the from-source OpenSSL.
+# -Werror OFF for this new GCC lane (the suite is MSVC-primary; Windows enforces
+# /WX). Linux uses the epoll async backend.
+RUN cmake -S . -B build/linux-h3 -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DOPENSSL_ROOT_DIR=/opt/openssl \
+        -DBOLTAPI_WITH_HTTP3=ON \
+        -DBOLTAPI_WITH_WEBRTC=ON \
+        -DBOLTAPI_BUILD_EXAMPLES=ON \
+        -DBOLTAPI_BUILD_TESTS=ON \
+        -DBOLTAPI_WARNINGS_AS_ERRORS=OFF
+
+# Build the QUIC/HTTP3 test targets + lib + demo (the relay app must link too).
+RUN cmake --build build/linux-h3 -j"$(nproc)" --target \
+        boltapi boltapi_demo_server \
+        boltapi_quic_primitives_test boltapi_quic_protection_test \
+        boltapi_quic_tls_test boltapi_quic_connection_test \
+        boltapi_quic_stream_test boltapi_quic_robustness_test \
+        boltapi_qpack_test boltapi_http3_app_test
+
+# Gate: run the QUIC + HTTP/3 + QPACK suite on Linux. ctest case names are
+# CamelCase; the image fails to build if any test fails.
+WORKDIR /src/build/linux-h3
+RUN ctest --output-on-failure -j"$(nproc)" \
+        -R "Quic|Http3|Qpack|QuicStream|QuicDatagram"
+CMD ["ctest", "--output-on-failure", \
+     "-R", "Quic|Http3|Qpack|QuicStream|QuicDatagram"]
