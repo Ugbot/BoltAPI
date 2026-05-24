@@ -1371,9 +1371,30 @@ private:
     void flush() noexcept {
         if (state_ == ConnState::kClosed || state_ == ConnState::kDraining)
             return;
+        // #45 — COALESCE the first flight: Initial(ServerHello) +
+        // Handshake(Cert/CertVerify/Finished) (+ a trailing 1-RTT packet) into ONE
+        // UDP datagram (RFC 9000 §12.2). The accumulator (`coalescing_`) collects
+        // each sealed packet; seal_and_send appends instead of sending, and
+        // flush_datagram() emits the datagram. Without coalescing Chrome stays at
+        // Initial (it expects the ServerHello+Cert coalesced); aioquic tolerates
+        // both. Long-header packets (Initial/Handshake) coalesce freely; a
+        // short-header (1-RTT) packet has no length field so it MUST end the
+        // datagram (seal_and_send flushes after a short packet).
+        //
+        // SCOPED to the handshake (pre-Established): the first flight is the only
+        // place coalescing matters — the server's Initial(ServerHello)+Handshake
+        // (Cert/Fin) must share one datagram so Chrome advances past Initial. Once
+        // Established the traffic is all 1-RTT short-header packets, which cannot
+        // coalesce with each other anyway, so we keep the EXACT prior per-packet
+        // send path there.
+        coalescing_ = (state_ != ConnState::kEstablished);
+        dgram_len_ = 0;
+        dgram_has_initial_ = false;
         flush_level(TlsLevel::kInitial, PacketForm::kLongInitial);
         flush_level(TlsLevel::kHandshake, PacketForm::kLongHandshake);
         flush_app_level();
+        if (coalescing_) flush_datagram();   // emit whatever remains coalesced
+        coalescing_ = false;
     }
 
     // Build + send long-header (Initial/Handshake) packets at `level`. Pulls all
@@ -1649,7 +1670,7 @@ private:
         write_pn(dgram + pn_offset, pn, pn_len);
         const std::size_t wire =
             seal_and_send(dgram, pn_offset, pn_len, payload, payload_len, pn, pp,
-                          pp, level == TlsLevel::kInitial);
+                          pp, level == TlsLevel::kInitial, /*short_header=*/false);
         record_sent(space_for(level), pn, wire, ack_eliciting, ranges,
                     range_count);
     }
@@ -1678,7 +1699,9 @@ private:
         const std::size_t pn_offset = pos;
         write_pn(dgram + pn_offset, pn, pn_len);
         const std::size_t wire = seal_and_send(dgram, pn_offset, pn_len, payload,
-                                               payload_len, pn, aead, hp, false);
+                                               payload_len, pn, aead, hp,
+                                               /*pad_initial=*/false,
+                                               /*short_header=*/true);
         record_sent(PacketNumberSpace::kApplication, pn, wire, ack_eliciting,
                     ranges, range_count);
         return true;
@@ -1707,17 +1730,21 @@ private:
                               std::uint8_t pn_len, const std::uint8_t* payload,
                               std::size_t payload_len, std::uint64_t pn,
                               PacketProtection* aead, PacketProtection* hp,
-                              bool pad_initial) noexcept {
+                              bool pad_initial, bool short_header) noexcept {
         assert(aead != nullptr && hp != nullptr && "seal_and_send: null pp");
         // RFC 9000 §8.1: respect the 3x anti-amplification budget. A padded
         // Initial may exceed budget but is permitted (the client's Initial is at
         // least 1200B, giving 3600B headroom for the server's first flight).
-        const std::size_t projected =
-            (pad_initial && payload_len + pn_offset + pn_len + kAeadTagLength <
-             kInitialMinDatagram)
-                ? kInitialMinDatagram
-                : pn_offset + pn_len + payload_len + kAeadTagLength;
-        if (!amp_allows(projected)) return 0;
+        // While coalescing (#45) the amp gate + Initial padding move to
+        // flush_datagram() so they apply to the WHOLE datagram, not per packet.
+        if (!coalescing_) {
+            const std::size_t projected =
+                (pad_initial && payload_len + pn_offset + pn_len + kAeadTagLength <
+                 kInitialMinDatagram)
+                    ? kInitialMinDatagram
+                    : pn_offset + pn_len + payload_len + kAeadTagLength;
+            if (!amp_allows(projected)) return 0;
+        }
         const std::size_t aad_len = pn_offset + pn_len;
         std::uint8_t sealed[kMaxDatagramSize];
         std::size_t sealed_len = 0;
@@ -1731,6 +1758,11 @@ private:
         assert(sample_off + kHpSampleLength <= total && "HP sample past packet");
         hp->protect_header(dgram, pn_offset, pn_len, dgram + sample_off);
 
+        if (coalescing_) {
+            coalesce_append(dgram, total, pad_initial, short_header);
+            return total;  // per-packet on-wire size (loss/cwnd accounting)
+        }
+
         if (pad_initial && total < kInitialMinDatagram) {
             std::memset(dgram + total, 0, kInitialMinDatagram - total);
             total = kInitialMinDatagram;
@@ -1738,6 +1770,45 @@ private:
         assert(total <= kMaxDatagramSize && "datagram overflow");
         send_raw(dgram, total);
         return total;
+    }
+
+    // #45 — append one sealed packet to the coalesced-datagram accumulator. Long
+    // packets (Initial/Handshake carry a Length field) coalesce freely; a
+    // short-header (1-RTT) packet has NO length so it MUST be the last packet in
+    // the datagram (RFC 9000 §12.2) — we flush right after appending one. If the
+    // packet would overflow the path MTU, flush the current datagram first.
+    void coalesce_append(const std::uint8_t* pkt, std::size_t len,
+                         bool is_initial, bool short_header) noexcept {
+        assert(pkt != nullptr && "coalesce_append: null");
+        assert(len > 0 && len <= kMaxDatagramSize && "coalesce_append: bad len");
+        if (dgram_len_ + len > kMaxDatagramSize) flush_datagram();
+        assert(dgram_len_ + len <= kMaxDatagramSize && "coalesce: still overflow");
+        std::memcpy(dgram_buf_ + dgram_len_, pkt, len);
+        dgram_len_ += len;
+        if (is_initial) dgram_has_initial_ = true;
+        if (short_header) flush_datagram();  // 1-RTT must end the datagram
+    }
+
+    // #45 — emit the accumulated coalesced datagram (padding to >=1200B when it
+    // contains an Initial, RFC 9000 §14.1; one anti-amp check for the whole
+    // datagram). Resets the accumulator. No-op when empty.
+    void flush_datagram() noexcept {
+        if (dgram_len_ == 0) return;
+        std::size_t out_len = dgram_len_;
+        const bool pad = dgram_has_initial_ && out_len < kInitialMinDatagram;
+        const std::size_t projected = pad ? kInitialMinDatagram : out_len;
+        if (!amp_allows(projected)) {            // whole datagram over 3x budget
+            dgram_len_ = 0; dgram_has_initial_ = false; return;
+        }
+        if (pad) {
+            assert(kInitialMinDatagram <= kMaxDatagramSize && "pad past MTU");
+            std::memset(dgram_buf_ + out_len, 0, kInitialMinDatagram - out_len);
+            out_len = kInitialMinDatagram;
+        }
+        assert(out_len <= kMaxDatagramSize && "coalesced datagram overflow");
+        send_raw(dgram_buf_, out_len);
+        dgram_len_ = 0;
+        dgram_has_initial_ = false;
     }
 
     // Write a long header up to (excluding) the packet number. *out_len receives
@@ -2174,6 +2245,13 @@ private:
     PacketNumberSpaceManager spaces_;
     AckRangeTracker acks_[kPacketNumberSpaceCount];
     bool ack_pending_[kPacketNumberSpaceCount] = {false, false, false};
+
+    // #45 — coalesced-datagram accumulator (active only inside flush()). Sealed
+    // packets are appended here and emitted as ONE UDP datagram (RFC 9000 §12.2).
+    bool         coalescing_        = false;
+    bool         dgram_has_initial_ = false;
+    std::size_t  dgram_len_         = 0;
+    std::uint8_t dgram_buf_[kMaxDatagramSize]{};
     CryptoReassembly crypto_rx_[kNumTlsLevels];
 
     // Outbound CRYPTO bytes per level + the running send offset + acked flag.
