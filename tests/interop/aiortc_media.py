@@ -23,6 +23,7 @@
 
 import asyncio
 import fractions
+import os
 import sys
 import urllib.request
 
@@ -165,7 +166,11 @@ async def run(port: int, signaling_path: str) -> int:
 
     for d in drains:
         d.cancel()
-    await pc.close()
+    # Best-effort close, bounded so teardown can't hang the harness.
+    try:
+        await asyncio.wait_for(pc.close(), timeout=2.0)
+    except Exception:  # noqa: BLE001 — close is best-effort
+        pass
     return rc
 
 
@@ -183,4 +188,12 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    rc = main()
+    # HARD EXIT (same aiortc 1.14 teardown-hang fix as aiortc_datachannel.py):
+    # aiortc/aioice leave non-daemon background threads that don't join on
+    # interpreter shutdown, so sys.exit hangs the python process AFTER the media
+    # echo already round-tripped, making the bounded gtest SKIP a PASSING run.
+    # os._exit gives an immediate, bounded exit with the real result code.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(rc)

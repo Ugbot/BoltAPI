@@ -455,3 +455,22 @@ boltapi_add_test(boltapi_bwe_test bwe_test.cpp)
 # ON) the real H3/WebRTC stub factories registering. Flag-AWARE: passes in the
 # default flags-OFF build via a dummy protocol; does NOT require the flags on.
 boltapi_add_test(boltapi_protocol_seam_test protocol_seam_test.cpp)
+
+# WebRTC manual/debug demo server (NOT a ctest gate — no add_test). Starts the
+# full App with the WebRTC surface + on_data_channel("chat") echo + media echo on
+# a fixed port and blocks, so the python interop harnesses / a browser / a
+# step-through debugger (cdb) can drive the SCTP/DCEP handlers with full output.
+# Built only when the WebRTC seam is on; serves the testing/web/ pages by hand.
+if(BOLTAPI_WITH_WEBRTC)
+    add_executable(boltapi_webrtc_debug_server
+                   ${CMAKE_SOURCE_DIR}/testing/webrtc_debug_server.cpp)
+    target_link_libraries(boltapi_webrtc_debug_server PRIVATE boltapi::boltapi)
+    target_link_libraries(boltapi_webrtc_debug_server
+                          PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    if(WIN32)
+        target_link_libraries(boltapi_webrtc_debug_server
+                              PRIVATE ws2_32 mswsock iphlpapi)
+    endif()
+    boltapi_apply_hardening(boltapi_webrtc_debug_server)
+    boltapi_apply_sanitizers(boltapi_webrtc_debug_server)
+endif()

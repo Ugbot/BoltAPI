@@ -6,7 +6,7 @@
 # Opens a data channel to a running Bolt API demo server, POSTs the offer SDP to
 # the signaling route, applies the answer, sends a text + a 64KiB binary message,
 # and asserts both echo back. Exit 0 on success, nonzero on failure/timeout.
-import asyncio, sys, urllib.request
+import asyncio, os, sys, urllib.request
 
 from aiortc import RTCPeerConnection, RTCSessionDescription
 
@@ -52,9 +52,18 @@ async def main() -> int:
     except asyncio.TimeoutError:
         print(f"INTEROP FAIL: timed out (text={got['text']} bin={got['bin']})")
         rc = 1
-    await pc.close()
+    try:
+        await asyncio.wait_for(pc.close(), timeout=2.0)
+    except Exception:
+        pass
     return rc
 
 
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main()))
+    rc = asyncio.run(main())
+    # Hard exit: aiortc 1.14 leaves non-daemon threads that hang interpreter
+    # shutdown after the round-trip succeeds. os._exit gives a prompt, bounded
+    # exit with the real code (matches tests/interop/aiortc_datachannel.py).
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(rc)

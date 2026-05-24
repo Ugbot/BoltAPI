@@ -103,7 +103,11 @@ async def run(port: int, signaling_path: str) -> int:
         rc = 3
         print(f"INTEROP FAIL: {exc!r}", file=sys.stderr, flush=True)
 
-    await pc.close()
+    # Best-effort close, bounded so teardown can't hang the harness.
+    try:
+        await asyncio.wait_for(pc.close(), timeout=2.0)
+    except Exception:  # noqa: BLE001 — close is best-effort
+        pass
     return rc
 
 
@@ -122,4 +126,14 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    rc = main()
+    # HARD EXIT (the interop regression fix): aiortc 1.14 leaves non-daemon
+    # background threads (aioice datagram transports / event-loop executors) that
+    # do NOT join on interpreter shutdown, so a normal `sys.exit(rc)` hangs the
+    # python process AFTER the round-trip already succeeded — which made the
+    # bounded gtest wait the full wall-clock cap and SKIP a PASSING interop run.
+    # os._exit bypasses interpreter/atexit teardown for an immediate, bounded
+    # exit with the real result code. Flush first so no output is lost.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(rc)
