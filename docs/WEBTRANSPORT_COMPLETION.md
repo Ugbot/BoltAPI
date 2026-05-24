@@ -33,11 +33,17 @@ Status: `[x]` done · `[~]` partial · `[ ]` todo.
       session open". The full path works end-to-end with real Chrome:
       QUIC+TLS handshake → H3 SETTINGS → Extended CONNECT → 200 → wt.ready.
 
-## P1 — Datagrams  (needs QUIC DATAGRAM, RFC 9221 + H3 DATAGRAM, RFC 9297)
-- [ ] H3 datagram framing: quarter-stream-id prefix mapping a QUIC DATAGRAM to the WT
-      session's CONNECT stream (RFC 9297 §2.1 / WT-over-H3 draft).
-- [ ] App API: `session.send_datagram(bytes)` / `on_datagram(cb)`; bounded queues.
-- [ ] Gate: aioquic + Chrome (MCP) datagram echo round-trip.
+## P1 — Datagrams  ✅ DONE (committed c37baf2) — Chrome datagram echo round-trips
+- [x] QUIC DATAGRAM frames (RFC 9221): parse 0x30/0x31 + `send_datagram()` honoring
+      the peer's `max_datagram_frame_size` (quic/connection.h; frame types were declared
+      but unimplemented).
+- [x] H3 datagram framing (RFC 9297): quarter-stream-id prefix (= session CONNECT
+      stream id / 4) maps a QUIC DATAGRAM to the WT session; server echoes it back to
+      that session (demo shape).
+- [~] App API: not yet exposed — the demo echoes inside h3_connection.h. A proper
+      `session.send_datagram`/`on_datagram` App callback is the follow-up.
+- [x] Gate: loopback `QuicDatagram.RoundTripEcho` (deterministic) + **Chrome (MCP)
+      datagram echo round-trip** (webtransport.html sends 'bolt-wt-ping' → echo received).
 
 ## P2 — Streams (session-associated bidi/uni)
 - [ ] Uni-stream type `0x54` (WT uni) + bidi signal value `0x41` with the session id

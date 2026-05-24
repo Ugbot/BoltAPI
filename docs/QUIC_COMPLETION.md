@@ -56,11 +56,13 @@ source 4-tuple** (`App::Http3Peer` pool + `http3_lookup_`/`http3_obtain_`/`http3
       routing (for migration / multiple connections from one address) is the follow-up.
 - [x] Gate: H3 loopback + aioquic interop green; Chrome handshake reaches Established.
 
-## P1 — QUIC DATAGRAM frames (RFC 9221)  (enables WebTransport datagrams)
-- [ ] Parse + emit DATAGRAM frames (0x30 no-length / 0x31 length-prefixed); deliver to
-      the app; respect `max_datagram_frame_size` both ways; bounded recv queue.
-- [ ] App/connection API: `send_datagram()` / `on_datagram()`. No per-packet malloc.
-- [ ] Gate: aioquic + Chrome datagram echo round-trip.
+## P1 — QUIC DATAGRAM frames (RFC 9221)  ✅ DONE (committed c37baf2)
+- [x] Parse 0x30 (no-length) / 0x31 (length-prefixed) DATAGRAM frames → on_datagram_;
+      emit via `send_datagram()` respecting the peer's `max_datagram_frame_size`. No
+      per-packet malloc (stack scratch into a 1-RTT packet).
+- [x] Connection API: `set_datagram_handler()` / `send_datagram()`.
+- [x] Gate: loopback `QuicDatagram.RoundTripEcho` + Chrome WebTransport datagram echo
+      (MCP). (A dedicated aioquic *datagram* leg is a follow-up; H3 GET/POST aioquic green.)
 
 ## P2 — Advanced transport
 - [ ] 0-RTT / session resumption (RFC 9001 §4.6): session tickets, early data, remembered
