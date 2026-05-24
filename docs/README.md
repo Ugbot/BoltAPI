@@ -18,6 +18,16 @@ deeper references and the living design/decision logs.
 - [`../PROJECT_MAP.md`](../PROJECT_MAP.md) — what exists and its status (the index of record)
 - [`ROADMAP.md`](ROADMAP.md) — **known performance bugs, untried/unverified items, and planned infrastructure (Docker, long-running integration tests)**
 
+## Completion roadmaps (ordered punch-cards)
+- [`QUIC_COMPLETION.md`](QUIC_COMPLETION.md) — finish QUIC to browser/relay grade
+  (Chrome handshake ACK/coalesce, multi-connection demux, DATAGRAM, 0-RTT/migration, perf)
+- [`WEBTRANSPORT_COMPLETION.md`](WEBTRANSPORT_COMPLETION.md) — full WebTransport
+  (browser `wt.ready`, datagrams, streams, sessions) — mostly rides QUIC completion
+- [`WEBRTC_RELAY_PLAN.md`](WEBRTC_RELAY_PLAN.md) — two-way browser media → Pion parity →
+  **SFU/relay** (rooms, selective forwarding, simulcast selection) + fun examples
+- [`WEBTRANSPORT_CERT_PLAN.md`](WEBTRANSPORT_CERT_PLAN.md) — serverCertificateHashes (done) +
+  the precise remaining QUIC↔Chrome handshake blocker
+
 ## Conventions
 - **Tiger Style** throughout (assert ≥2/fn, bounded/static allocation, no hidden
   control flow, functions < 70 lines, zero warnings, no exceptions). See `CLAUDE.md`.
