@@ -16,17 +16,27 @@ load generator (`benchmarks/loadgen/http_client.{h,cpp}`). Phase 0 promotes it.
 
 ---
 
-## Phase 0 — Upstream HTTP client (the enabling primitive)
-- [ ] Promote `benchmarks/loadgen/http_client.{h,cpp}` → `include/boltapi/http/client.h`
-      + `src/http/client.cpp` (`boltapi::http::Client`): request serializer +
-      incremental response parser + pooled keep-alive `ClientConn`, on the engine's
-      `IODispatcher` async I/O.
-- [ ] Connection pool keyed by upstream (`bolt::SwissTable`), bounded
-      `max_conns_per_upstream`, keep-alive reuse, idle reaping.
-- [ ] `coro_task<ClientResponse> Client::send(target, ClientRequest)`.
-- **Gate:** a loopback gtest — Client GETs/POSTs a second in-process `App` and gets
-      byte-exact responses; pool reuses connections across N requests; ASan clean.
-- **Reference:** `mcp/proxy/{proxy_core,upstream_connection}.h` (shape only).
+## Phase 0 — Upstream HTTP client (the enabling primitive) ✅ DONE
+- [x] Promoted the load-gen client core → `include/boltapi/http/client.h` +
+      `src/http/client.cpp` (`bolt::api::http::Client`): `serialize_request` +
+      incremental `ResponseParser` (status + headers + Content-Length body framing)
+      + `ClientConn`, on the engine's `IODispatcher` async I/O. `benchmarks/loadgen/`
+      now reuses this same core (one source of truth — the duplicate is deleted).
+- [x] Bounded keep-alive connection pool keyed by host:port (`max_targets`,
+      `max_conns_per_target`), reuse on keep-alive responses, `close_idle()`.
+      *(v1 pool uses a short-critical-section mutex; a sharded/lock-free pool keyed
+      via interned `bolt::SwissTable` is the documented perf-pass follow-up —
+      ARCHITECTURE §7.)*
+- [x] `core::coro_task<ClientResponse> Client::send(host, port, ClientRequest)`.
+- **Gate MET:** `tests/http_client_test.cpp` — 7 cases: byte-exact GET / POST / PUT
+      (incl. a 40 KiB body spanning many recv chunks → multi-read reassembly),
+      path-param + JSON routes + response-header extraction, 404, and keep-alive
+      connection **reuse** across a 50-request burst (`idle_total() > 0`). Green on
+      **MSVC** (full suite 248/248) and **Linux/Clang** (`Dockerfile.linux-gateway`).
+- **Reference used:** `mcp/proxy/{proxy_core,upstream_connection}.h` (shape only).
+- **Follow-ups carried to later phases:** TLS-to-upstream (HTTPS origins), streaming
+      bodies (v1 buffers, bounded by a resp ceiling), chunked-response decode (v1
+      requires Content-Length), per-request timeouts (Phase 3).
 
 ## Phase 1 — Reverse-proxy MVP (the headline gate)
 - [ ] `Upstream`/`Target` model + `App::proxy(route, upstream)` (code-first config).

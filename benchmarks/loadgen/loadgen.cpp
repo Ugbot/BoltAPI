@@ -59,7 +59,7 @@ api::core::coro_task<void> LoadGen::connection_loop(std::uint32_t index) {
         bool complete = false;
         while (!complete) {
             const ssize_t n = co_await dispatcher_->async_read(
-                c.fd, c.rbuf, http::kRecvChunk);
+                c.fd, c.rbuf, sizeof(c.rbuf));
             if (n <= 0) { broken = true; break; }
             bytes_in_.fetch_add(static_cast<std::uint64_t>(n), std::memory_order_relaxed);
             const auto st = c.parser.consume(c.rbuf, static_cast<std::size_t>(n));
@@ -96,7 +96,7 @@ LoadGenResult LoadGen::run() {
 
     // Build the shared request wire bytes once; copy into each connection buffer.
     std::string wire;
-    http::serialize_request(req_, wire);
+    http::serialize_request(req_, cfg_.host, wire);
     for (auto& c : conns_) c.wbuf = wire;
 
     // Worker pool + dispatcher (private, not the noisy global).

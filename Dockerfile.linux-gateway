@@ -1,0 +1,39 @@
+# Bolt API — Linux gateway test lane (Clang/lld), parity with Windows/MSVC.
+#
+# Builds + runs the gateway data-path tests with LLVM/Clang + lld (project policy:
+# Clang on Linux, never GCC), against system OpenSSL (HTTP3/WebRTC OFF — the
+# gateway client path is cleartext HTTP/1.1). Currently gates Phase 0: the
+# outbound HTTP client (`boltapi::http::Client`). Future gateway phases (proxy,
+# plugins, LB, …) add their ctest cases here.
+#
+#   docker build -f Dockerfile.linux-gateway -t boltapi-linux-gateway .
+# ---------------------------------------------------------------------------
+FROM ubuntu:24.04 AS gateway
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        clang lld llvm cmake ninja-build make libstdc++-14-dev \
+        git ca-certificates pkg-config libssl-dev zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+ENV CC=clang CXX=clang++
+
+WORKDIR /src
+COPY . .
+
+# Clang pinned explicitly (never auto-detect -> never GCC) + lld; tests ON.
+RUN cmake -S . -B build/linux-gw -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_COMPILER=clang \
+        -DCMAKE_CXX_COMPILER=clang++ \
+        -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld" \
+        -DBOLTAPI_WITH_HTTP3=OFF \
+        -DBOLTAPI_WITH_WEBRTC=OFF \
+        -DBOLTAPI_BUILD_TESTS=ON \
+        -DBOLTAPI_WARNINGS_AS_ERRORS=OFF
+
+RUN cmake --build build/linux-gw -j"$(nproc)" --target boltapi_http_client_test
+
+# Gate: the outbound HTTP client over the epoll async backend. CamelCase case
+# names; the image fails to build if any test fails (hard ctest TIMEOUT ceiling).
+WORKDIR /src/build/linux-gw
+RUN ctest --output-on-failure -j"$(nproc)" -R "HttpClient"
+CMD ["ctest", "--output-on-failure", "-R", "HttpClient"]

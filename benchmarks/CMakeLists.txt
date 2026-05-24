@@ -80,12 +80,12 @@ boltapi_apply_sanitizers(boltapi_bench_server)
 
 # In-tree async HTTP/1.1 load generator: a real socket load driver built on
 # BoltAPI's own outbound primitives (IODispatcher async_connect/read/write +
-# WorkerThreadPool). ZERO third-party deps. Its http_client.{h,cpp} core is the
-# seed of the future API-gateway upstream HTTP client (see docs/gateway/).
+# WorkerThreadPool). ZERO third-party deps. Reuses the promoted client core now
+# living in the library (include/boltapi/http/client.h + src/http/client.cpp) —
+# the same code path the API gateway uses for upstream forwarding (docs/gateway/).
 add_executable(boltapi_loadgen
     loadgen/loadgen_main.cpp
-    loadgen/loadgen.cpp
-    loadgen/http_client.cpp)
+    loadgen/loadgen.cpp)
 target_include_directories(boltapi_loadgen PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/loadgen)
 target_link_libraries(boltapi_loadgen PRIVATE boltapi::boltapi)
 if(WIN32)

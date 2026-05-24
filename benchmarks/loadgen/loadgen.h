@@ -16,10 +16,10 @@
 
 #include "boltapi/core/coro_task.h"
 #include "boltapi/core/worker_pool.h"
+#include "boltapi/http/client.h"        // promoted client core (serializer/parser/ClientConn)
 #include "boltapi/net/io_dispatcher.h"
 #include "boltapi/net/sys_compat.h"
 
-#include "http_client.h"
 #include "latency_histogram.h"
 
 #include <cstdint>
@@ -29,7 +29,8 @@
 
 namespace bolt::bench {
 
-namespace api = ::bolt::api;  // engine primitives live under bolt::api::{core,net}
+namespace api  = ::bolt::api;        // engine primitives live under bolt::api::{core,net}
+namespace http = ::bolt::api::http;  // outbound HTTP/1.1 client core
 
 struct LoadGenConfig {
     std::string   host        = "127.0.0.1";

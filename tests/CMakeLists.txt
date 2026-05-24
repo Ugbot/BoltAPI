@@ -28,6 +28,14 @@ if(WIN32)
     target_link_libraries(boltapi_app_integration_test PRIVATE ws2_32 mswsock)
 endif()
 
+# Gateway Phase 0: outbound HTTP/1.1 client (bolt::api::http::Client) — drives a
+# real in-process App with the Client over the async dispatcher; byte-exact GET/
+# POST/PUT, path-param/JSON routes, 404, and keep-alive connection reuse.
+boltapi_add_test(boltapi_http_client_test http_client_test.cpp)
+if(WIN32)
+    target_link_libraries(boltapi_http_client_test PRIVATE ws2_32 mswsock)
+endif()
+
 # M1: middleware onion — chain order, short-circuit (401), sync+async mix.
 boltapi_add_test(boltapi_middleware_test middleware_test.cpp)
 if(WIN32)

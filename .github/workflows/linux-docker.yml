@@ -24,6 +24,12 @@ jobs:
           # WebRTC + SFU relay: system OpenSSL (DTLS/SRTP; HTTP3 OFF), epoll backend.
           # Gate inside the image: ctest -R "Media|Srtp|Dtls|Ice|Turn|..." -> 96/96.
           - { name: "linux-clang-webrtc", dockerfile: "Dockerfile.linux-test",    tag: "boltapi-linux-test" }
+          # Benchmark tooling: builds bench_server + the in-tree loadgen, runs a
+          # bounded smoke gate (failed=0, ok>0) over /plaintext + /json.
+          - { name: "linux-clang-bench",  dockerfile: "Dockerfile.linux-bench",   tag: "boltapi-linux-bench" }
+          # Gateway data path: builds + runs the outbound HTTP client tests
+          # (Phase 0). Future gateway phases add their ctest cases to this lane.
+          - { name: "linux-clang-gateway", dockerfile: "Dockerfile.linux-gateway", tag: "boltapi-linux-gateway" }
     steps:
       - uses: actions/checkout@v4
         with:
