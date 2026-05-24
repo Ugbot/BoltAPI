@@ -55,14 +55,33 @@ but Chrome **rejects the self-signed cert** and CONNECTION_CLOSEs (→ Draining)
       CONNECT->200 OK (cert change did not regress the proven path).
 - [ ] D5. Commit + push (serverCertificateHashes done; handshake-completion open).
 
-## REMAINING (the actual blocker, #45)
-Chrome's QUIC handshake doesn't complete: server sends ServerHello+Handshake flight,
-Chrome stays at the Initial level and times out. A stuck Chrome handshake also wedges
-the single-peer endpoint (the reset only fires for connections PAST handshake, not
-ones stuck in Handshaking). Next: trace why Chrome doesn't advance after the server's
-flight (coalescing? anti-amplification? Handshake-key/packet-number? cert message
-size?), and make the single-peer reset also recover stale Handshaking connections so
-one bad attempt doesn't wedge the server.
+## REMAINING (the actual blockers, #45) — verified via chrome-devtools MCP + QUIC trace
+The cert/pin side is DONE and correct (diagnostic confirmed: ECDSA P-256,
+validity_days=13, hash == /wt/cert-hash). Two deeper QUIC↔Chrome interop bugs remain:
+
+1. **`serverCertificateHashes` value type** — RESOLVED in the page: Chrome SILENTLY
+   IGNORES the pin when `value` is an ArrayBuffer (→ falls back to CA verify →
+   `CERTIFICATE_UNKNOWN`/alert 46). Passing the **Uint8Array** makes Chrome honor it
+   (no more cert reject). Page now uses `value: bytes` (Uint8Array).
+
+2. **OpenSSL rejects Chrome's ClientHello: `error:0A00006E: bad extension`** (the
+   dominant failure now; `failed=1`). Chrome sends a TLS extension our OpenSSL
+   QUIC-TLS server rejects (aioquic's minimal ClientHello does not trigger it). Need
+   to identify WHICH extension (SSL_CTX_set_msg_callback / keylog / pcap) and
+   configure OpenSSL to accept/ignore it — likely Chrome's PSK/early-data, ALPS
+   (application_settings), compress_certificate, or a GREASE/ECH extension. This is
+   the QUIC-Interop-Runner class of work.
+
+3. **Single-peer endpoint wedges under Chrome's retries (#42)** — Chrome keeps one
+   persistent QUIC connection and retransmits aggressively (pn climbs into the
+   hundreds); the single QuicConnection + reset-on-Initial heuristic can't cleanly
+   handle this and wedges, making behaviour inconsistent run-to-run. Proper fix:
+   per-DCID multi-connection demux (#42), so each browser connection is isolated.
+
+Net: WebTransport server logic + cert pinning are correct; the browser pill needs
+(2) the OpenSSL ClientHello-extension fix and (3) multi-connection demux — both
+focused QUIC interop efforts. A publicly/locally-trusted cert (e.g. mkcert) would
+also let normal Chrome connect without pinning, but does not bypass (2)/(3).
 - [ ] D6. Update RUNNING.md (WebTransport in-browser works, no flags) + tick #45.
 
 ## Notes / non-goals

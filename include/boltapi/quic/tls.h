@@ -176,6 +176,31 @@ inline bool server_cert_sha256(std::uint8_t out[32]) noexcept {
     return ok == 1 && mdlen == 32;
 }
 
+// Diagnostic: log the shared server cert's hash, validity window, and key type, so
+// we can confirm it meets Chrome's serverCertificateHashes rules (ECDSA P-256,
+// validity <= 14 days). Only meaningful with BOLTAPI_QUIC_TRACE; safe no-op without.
+inline void trace_server_cert_info() noexcept {
+#ifdef BOLTAPI_QUIC_TRACE
+    X509* cert = nullptr;
+    EVP_PKEY* key = nullptr;
+    if (!shared_server_identity(&cert, &key)) {
+        std::fprintf(stderr, "[quic-cert] no shared identity\n");
+        return;
+    }
+    std::uint8_t h[32];
+    const bool hok = server_cert_sha256(h);
+    char hex[65];
+    static const char hx[] = "0123456789abcdef";
+    for (int i = 0; i < 32; ++i) { hex[2*i] = hx[(h[i]>>4)&0xF]; hex[2*i+1] = hx[h[i]&0xF]; }
+    hex[64] = 0;
+    int days = 0, secs = 0;
+    ASN1_TIME_diff(&days, &secs, X509_get0_notBefore(cert), X509_get0_notAfter(cert));
+    std::fprintf(stderr,
+        "[quic-cert] sha256=%s hashok=%d validity_days=%d secs=%d keytype=%d (EC=%d)\n",
+        hex, (int)hok, days, secs, EVP_PKEY_base_id(key), EVP_PKEY_EC);
+#endif
+}
+
 // ============================================================================
 // QuicTls — drives one side (client or server) of the TLS 1.3 QUIC handshake
 // via the OpenSSL QUIC-TLS callbacks, buffering CRYPTO data per level and

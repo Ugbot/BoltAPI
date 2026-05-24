@@ -169,7 +169,7 @@ async function wtConnect() {
     for (let i = 0; i < 32; i++) bytes[i] = parseInt(hex.substr(i*2, 2), 16);
     const url = 'https://' + location.hostname + ':8443/wt';
     log('wt','new WebTransport(' + url + ', serverCertificateHashes)');
-    const wt = new WebTransport(url, { serverCertificateHashes: [{ algorithm: 'sha-256', value: bytes.buffer }] });
+    const wt = new WebTransport(url, { serverCertificateHashes: [{ algorithm: 'sha-256', value: bytes }] });
     await wt.ready;
     log('wt','READY — WebTransport session established ✓'); pill('wt','ok','ok');
   } catch (e) {

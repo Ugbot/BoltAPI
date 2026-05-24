@@ -158,5 +158,9 @@ int main() {
         h1_port, tls ? "https" : "http", tls_port, tls ? "on" : "off",
         tls_port, rtc_port, web_root.c_str());
 
+#if defined(BOLTAPI_WITH_HTTP3)
+    api::quic::trace_server_cert_info();  // diagnostic (no-op without BOLTAPI_QUIC_TRACE)
+#endif
+
     return app.run("0.0.0.0", h1_port);  // blocking
 }
