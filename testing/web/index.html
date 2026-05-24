@@ -166,8 +166,10 @@ async function wtConnect() {
     await wt.ready;
     log('wt','READY — session established'); pill('wt','ok','ok');
   } catch (e) {
-    log('wt','failed: ' + e + '  (server WebTransport endpoint pending — RFC 9297)','err');
-    pill('wt','pending','err');
+    log('wt','failed: ' + e + '  (if this persists, load this page over '
+        + 'http://localhost:8080 so the WebTransport QUIC connection is the only '
+        + 'one — single-peer endpoint, task #42)','err');
+    pill('wt','err','err');
   }
 }
 

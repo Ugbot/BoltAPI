@@ -614,45 +614,43 @@ void App::start_http3() {
         return;
     }
 
-    http3_quic_ = std::make_unique<quic::QuicConnection>();
-    http3_conn_ = std::make_unique<http3::H3Connection>();
-
-    // The server's outbound send fn targets the last peer that reached us. The
-    // peer address is captured by the datagram handler before feed_datagram.
+    // Peer address of the last datagram (the server's send fn targets it). Shared
+    // so a recreated connection's send fn keeps using the same updated address.
     auto peer = std::make_shared<sockaddr_storage>();
     auto peer_len = std::make_shared<int>(0);
     net::UdpTransport* tp = http3_transport_.get();
-    auto send_fn = [tp, peer, peer_len](const std::uint8_t* d, std::size_t n) {
-        if (*peer_len <= 0) return;
-        tp->send(reinterpret_cast<const sockaddr*>(peer.get()), *peer_len, d, n);
-    };
-    if (!http3_quic_->init(/*is_server=*/true, send_fn)) {
-        std::fprintf(stderr, "[boltapi] HTTP/3: QUIC init failed; H3 not started.\n");
-        http3_conn_.reset(); http3_quic_.reset(); http3_transport_.reset();
+
+    http3_new_connection_(tp, peer, peer_len);
+    if (!http3_quic_) {  // QUIC init failed
+        http3_conn_.reset();
+        http3_transport_.reset();
         return;
     }
 
-    http3_conn_->attach(*http3_quic_, /*is_server=*/true);
     App* self = this;
-    http3::H3Connection* h3 = http3_conn_.get();
-    http3_conn_->set_request_handler([self, h3](const http3::H3Request& r) {
-        self->serve_http3_request(*h3, r);
-    });
-
-    quic::QuicConnection* qc = http3_quic_.get();
-    http3::H3Connection* hc = http3_conn_.get();
     std::mutex* mtx = &http3_mtx_;
     http3_transport_->set_datagram_handler(
-        [qc, hc, peer, peer_len, mtx](const sockaddr* p, int plen,
-                                      const std::uint8_t* d, std::size_t n) {
+        [self, peer, peer_len, mtx, tp](const sockaddr* p, int plen,
+                                        const std::uint8_t* d, std::size_t n) {
             std::lock_guard<std::mutex> lk(*mtx);
             if (p != nullptr && plen > 0 &&
                 plen <= static_cast<int>(sizeof(sockaddr_storage))) {
                 std::memcpy(peer.get(), p, static_cast<std::size_t>(plen));
                 *peer_len = plen;
             }
-            qc->feed_datagram(d, n);
-            if (qc->one_rtt_keys_ready()) hc->send_settings();
+            // A long-header (Initial) packet arriving after the current connection
+            // already finished its handshake means a NEW QUIC connection — e.g. the
+            // browser opening a WebTransport session after the page loaded. The
+            // single-peer endpoint (v1) starts a fresh connection for it so
+            // sequential connections both work (multi-concurrent is task #42).
+            if (n > 0 && quic::is_long_header(d[0]) && self->http3_quic_ &&
+                self->http3_quic_->state() != quic::ConnState::kNew &&
+                self->http3_quic_->state() != quic::ConnState::kHandshaking) {
+                self->http3_new_connection_(tp, peer, peer_len);
+            }
+            if (self->http3_quic_) self->http3_quic_->feed_datagram(d, n);
+            if (self->http3_quic_ && self->http3_quic_->one_rtt_keys_ready())
+                self->http3_conn_->send_settings();
         });
     http3_transport_->start();
 
@@ -660,6 +658,37 @@ void App::start_http3() {
         "[boltapi] HTTP/3: QUIC server up on UDP :%u (ALPN h3); requests bridge "
         "to the shared App dispatch path. H1/H2 unaffected.\n",
         static_cast<unsigned>(http3_transport_->bound_port()));
+}
+
+// ---------------------------------------------------------------------------
+// http3_new_connection_ — (re)create the server QuicConnection + H3Connection and
+// wire its send fn (to the shared peer address) + request handler. Called once at
+// start and again when a new connection's Initial arrives after the current one is
+// established (single-peer v1). Sets http3_quic_ to null on init failure.
+// ---------------------------------------------------------------------------
+void App::http3_new_connection_(net::UdpTransport* tp,
+                                std::shared_ptr<sockaddr_storage> peer,
+                                std::shared_ptr<int> peer_len) {
+    assert(tp != nullptr && "http3_new_connection_: null transport");
+    assert(peer && peer_len && "http3_new_connection_: null peer state");
+    http3_quic_ = std::make_unique<quic::QuicConnection>();
+    http3_conn_ = std::make_unique<http3::H3Connection>();
+    auto send_fn = [tp, peer, peer_len](const std::uint8_t* d, std::size_t n) {
+        if (*peer_len <= 0) return;
+        tp->send(reinterpret_cast<const sockaddr*>(peer.get()), *peer_len, d, n);
+    };
+    if (!http3_quic_->init(/*is_server=*/true, send_fn)) {
+        std::fprintf(stderr, "[boltapi] HTTP/3: QUIC init failed.\n");
+        http3_conn_.reset();
+        http3_quic_.reset();
+        return;
+    }
+    http3_conn_->attach(*http3_quic_, /*is_server=*/true);
+    App* self = this;
+    http3::H3Connection* h3 = http3_conn_.get();
+    http3_conn_->set_request_handler([self, h3](const http3::H3Request& r) {
+        self->serve_http3_request(*h3, r);
+    });
 }
 
 // ---------------------------------------------------------------------------

@@ -524,6 +524,15 @@ private:
     // seams() under BOLTAPI_WITH_HTTP3. Never touches the H1/H2 server.
     void start_http3();
 
+    // (Re)create the single server QuicConnection + H3Connection and wire its
+    // send fn + request handler. Called once from start_http3 and again from the
+    // datagram handler when a NEW connection's Initial arrives after the current
+    // one finished its handshake (single-peer endpoint v1 — lets sequential QUIC
+    // connections, e.g. an H3 page load then a WebTransport session, both work).
+    void http3_new_connection_(net::UdpTransport* tp,
+                               std::shared_ptr<sockaddr_storage> peer,
+                               std::shared_ptr<int> peer_len);
+
     // Build a CoroHttpRequest from a decoded H3Request, route it through
     // dispatch_http3(), and send the response back over the H3 stream.
     void serve_http3_request(http3::H3Connection& h3, const http3::H3Request& r);
