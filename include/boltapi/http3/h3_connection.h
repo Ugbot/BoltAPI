@@ -30,6 +30,8 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <string>
@@ -285,7 +287,17 @@ private:
         if (fv.type != static_cast<std::uint64_t>(FrameType::kHeaders)) return 0;
         H3Request req{};
         req.stream_id = s.id;
-        if (!decode_headers(fv.payload, fv.length, req)) return 0;
+        const bool dec = decode_headers(fv.payload, fv.length, req);
+        if (std::getenv("BOLTAPI_QUIC_TRACE") != nullptr) {
+            std::fprintf(stderr,
+                "[h3] WT-CONNECT? decode=%d method='%.*s' protocol='%.*s' "
+                "path='%.*s' hdr_len=%llu\n", (int)dec,
+                (int)req.method.size(), req.method.data(),
+                (int)req.protocol.size(), req.protocol.data(),
+                (int)req.path.size(), req.path.data(),
+                (unsigned long long)fv.length);
+        }
+        if (!dec) return 0;
         if (req.method != "CONNECT" || req.protocol != "webtransport") return 0;
         (void)write_headers(s.id, /*is_response=*/true, 200, {}, {}, {}, {},
                             nullptr, 0, /*fin=*/false);
@@ -486,6 +498,12 @@ private:
         }
         std::uint8_t payload[kSettingsMaxBytes];
         const std::size_t pn = sf.encode_payload(payload, sizeof(payload));
+        if (std::getenv("BOLTAPI_QUIC_TRACE") != nullptr) {
+            std::fprintf(stderr, "[h3] SETTINGS payload (%zu B):", pn);
+            for (std::size_t i = 0; i < pn; ++i)
+                std::fprintf(stderr, " %02x", payload[i]);
+            std::fprintf(stderr, "\n");
+        }
         (void)frame_and_send(control_id_, FrameType::kSettings, payload, pn,
                              /*fin=*/false);
     }

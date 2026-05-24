@@ -1506,6 +1506,8 @@ private:
         plen += maybe_append_ack(PacketNumberSpace::kApplication, payload + plen,
                                  sizeof(payload) - plen);
         if (plen == 0) return;
+        QTRACE("flush_app_control send plen=%zu hsdone_now=%d", plen,
+               (int)(handshake_done_sent_ && ack_eliciting));
         FrameRange ranges[kMaxFrameRangesPerPacket];
         std::size_t rc = 0;
         send_app_packet(payload, plen, ack_eliciting, ranges, rc);
@@ -1528,6 +1530,7 @@ private:
             if (plen > before) ++rc;
         }
         if (plen == 0) return false;
+        QTRACE("flush_app_stream send plen=%zu streams=%zu", plen, rc);
         send_app_packet(payload, plen, /*ack_eliciting=*/true, ranges, rc);
         return true;
     }

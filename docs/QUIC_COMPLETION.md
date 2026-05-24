@@ -23,34 +23,38 @@ Status: `[x]` done · `[~]` partial · `[ ]` todo.
 - [x] Cert: process-stable ECDSA P-256, ≤14-day server identity (`shared_server_identity`),
       `server_cert_sha256()` for WebTransport pinning.
 
-## P0 — Chrome handshake completion  (THE current blocker; #45)
-Diagnosed via the chrome-devtools MCP + QUIC trace: with a fresh connection + the
-Uint8Array cert pin, TLS advances cleanly (`failed=0`, cert accepted), but **Chrome
-stays at the Initial level** — it re-sends Initials and never processes the server's
-ServerHello, so 1-RTT is never reached. aioquic advances on the same flight; Chrome
-does not.
-- [ ] **ACK the peer's Initial/Handshake packets in the server's own first flight.**
-      The server's ServerHello Initial (99 B) currently has no room for an ACK frame.
-      Emit ACK frames per PN space so Chrome stops retransmitting and advances. Audit
-      `flush()`/ACK-eliciting logic: an ACK must ride the Initial that carries the
-      ServerHello (and the Handshake packet that carries Cert/Finished).
-- [ ] **Coalesce** Initial(ServerHello) + Handshake(Cert/CertVerify/Finished) (+ 1-RTT
-      when ready) into a single UDP datagram (RFC 9000 §12.2). The server currently
-      sends them as separate datagrams; Chrome prefers/▸expects coalescing.
-- [ ] Re-check anti-amplification (3×) and PN spaces don't stall the first flight.
-- [ ] Gate: Chrome (chrome-devtools MCP) completes the QUIC handshake to `Established`
-      and `wt.ready` resolves; aioquic stays green.
+## P0 — Chrome handshake completion  ✅ DONE (#45) — Chrome reaches Established
+Diagnosed + fixed via the chrome-devtools MCP + QUIC packet trace. THREE real bugs,
+each surfaced only by a real Chrome handshake (aioquic masked all three by sending
+in-order, single-cert, and tolerant); aioquic interop + all QUIC/H3 gates stay green:
+- [x] **Coalesce the first flight** (#45): Initial(ServerHello)+Handshake(Cert/
+      CertVerify/Finished) into ONE UDP datagram (RFC 9000 §12.2) so Chrome advances
+      past Initial. (ACK-on-first-flight already worked.) `flush()` + a coalesced-
+      datagram accumulator, scoped to the handshake. Committed bddcec4.
+- [x] **Out-of-order CRYPTO reassembly**: `CryptoReassembly` tracked a SINGLE pending
+      extent; Chrome fragments its ClientHello heavily out of order, so the contiguous
+      cursor jumped over still-empty gaps → corrupt ClientHello → `failed=1`. Replaced
+      with a bounded sorted/merged interval set. Committed c105857.
+- [x] **WebTransport-compliant leaf cert**: the QUIC cert had NO X.509v3 extensions
+      (aioquic accepted it; Chrome rejected with certificate_unknown). Added
+      basicConstraints/keyUsage/EKU serverAuth/SAN + ~7-day validity. Committed c105857.
+- [x] Gate: Chrome (MCP) now completes the QUIC+TLS handshake to **Established**
+      (`complete=1 failed=0 1rtt=1`); aioquic stays green. `wt.ready` still pending —
+      see WEBTRANSPORT_COMPLETION (Chrome returns ERR_METHOD_NOT_SUPPORTED: it does
+      not open the WebTransport CONNECT despite the server advertising correct H3
+      SETTINGS — a WebTransport-layer / Chrome-WT-draft issue, NOT the QUIC transport).
 
-## P0 — Multi-connection server demux  (#42; blocks ANY multi-client / relay use)
-Today the H3/WebTransport endpoint drives ONE `QuicConnection` with a reset-on-Initial
-heuristic; it wedges under a real browser's retransmits and can't serve >1 peer.
-- [ ] Per-DCID **connection table** (bounded, `bolt::SwissTable` DCID→slot; fixed pool).
-- [ ] On inbound: parse DCID, route to the owning connection; an Initial with an unknown
-      DCID + valid form **creates** a new connection (subject to Retry/anti-amp).
-- [ ] Retire connections on close/idle; bounded count; per-connection peer address.
-- [ ] Remove the single-peer reset hack in `App::start_http3` / `http3_new_connection_`.
-- [ ] Gate: 2+ concurrent QUIC clients (aioquic ×N) served simultaneously; Chrome retries
-      don't wedge; sequential + concurrent both clean.
+## P0 — Multi-connection server demux  ✅ DONE (#42; committed c105857)
+Replaced the single `QuicConnection` + reset-on-Initial heuristic (which wedged under
+a browser's Initial retransmits) with a bounded **per-peer connection pool keyed by
+source 4-tuple** (`App::Http3Peer` pool + `http3_lookup_`/`http3_obtain_`/`http3_feed_`).
+- [x] Bounded pool (kMaxHttp3Peers=16); inbound routes by source address; an Initial
+      from a NEW peer creates a slot; closed/draining slots reclaimed.
+- [x] Removed the single-peer reset hack; per-connection peer address + send fn.
+- [x] Chrome's Initial retransmits from one address all hit one connection (no wedge).
+- [~] Routing by source 4-tuple (sufficient for distinct clients + no-wedge). Per-DCID
+      routing (for migration / multiple connections from one address) is the follow-up.
+- [x] Gate: H3 loopback + aioquic interop green; Chrome handshake reaches Established.
 
 ## P1 — QUIC DATAGRAM frames (RFC 9221)  (enables WebTransport datagrams)
 - [ ] Parse + emit DATAGRAM frames (0x30 no-length / 0x31 length-prefixed); deliver to

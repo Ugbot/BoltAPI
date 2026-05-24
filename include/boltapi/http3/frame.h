@@ -62,7 +62,8 @@ enum class SettingId : std::uint64_t {
     kQpackBlockedStreams   = 0x07,  // RFC 9204 §5
     kEnableConnectProtocol = 0x08,        // RFC 9220 — extended CONNECT (:protocol)
     kH3Datagram            = 0x33,        // RFC 9297 — HTTP/3 datagrams
-    kWtMaxSessions         = 0x14e9cd29,  // WebTransport-over-HTTP/3 (SETTINGS_WT_MAX_SESSIONS)
+    kWtMaxSessions         = 0x14e9cd29,  // WebTransport-over-HTTP/3 (SETTINGS_WT_MAX_SESSIONS, draft-07+)
+    kEnableWebtransport    = 0x2b603742,  // SETTINGS_ENABLE_WEBTRANSPORT (draft-02; sent for cross-draft compat)
 };
 
 // ----------------------------------------------------------------------------
@@ -177,9 +178,13 @@ struct SettingsFrame {
             pos += put_setting(SettingId::kEnableConnectProtocol, 1, out, cap, pos);
         if (h3_datagram)
             pos += put_setting(SettingId::kH3Datagram, 1, out, cap, pos);
-        if (wt_max_sessions > 0)
+        if (wt_max_sessions > 0) {
             pos += put_setting(SettingId::kWtMaxSessions, wt_max_sessions,
                                out, cap, pos);
+            // Cross-draft compat: also advertise the older draft-02
+            // SETTINGS_ENABLE_WEBTRANSPORT=1 so browsers on either draft enable WT.
+            pos += put_setting(SettingId::kEnableWebtransport, 1, out, cap, pos);
+        }
         assert(pos <= cap && "settings encode overran buffer");
         return pos;
     }

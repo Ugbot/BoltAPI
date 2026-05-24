@@ -17,14 +17,21 @@ Status: `[x]` done · `[~]` partial · `[ ]` todo.
       page pins it (must pass a **Uint8Array** — ArrayBuffer is silently ignored).
       Verified via the MCP: Chrome **honors the pin** (no cert reject).
 
-## P0 — Browser session establishment  (blocked on QUIC P0)
-- [ ] Depends on `QUIC_COMPLETION` P0 (Chrome handshake completion: ACK + coalesce).
-      Once Chrome reaches `Established`, `wt.ready` should resolve (cert pin already
-      works). **This turns the test-page WebTransport pill green.**
-- [ ] Depends on `QUIC_COMPLETION` P0 multi-connection demux (#42) so Chrome's retries
-      don't wedge the endpoint.
-- [ ] Gate: chrome-devtools MCP — `new WebTransport(url,{serverCertificateHashes})` →
-      `READY`.
+## P0 — Browser session establishment  ✅ DONE — Chrome wt.ready RESOLVES
+- [x] QUIC_COMPLETION P0 done: Chrome completes the QUIC+TLS handshake to
+      **Established** (coalesce #45 + out-of-order CRYPTO reassembly + WT-compliant
+      leaf cert; cert pin verified). #42 multi-connection done.
+- [x] **The missing setting**: Chrome 148 needs the draft-02
+      `SETTINGS_ENABLE_WEBTRANSPORT` (0x2b603742)=1 IN ADDITION to the draft-07+
+      `SETTINGS_WT_MAX_SESSIONS` (0x14e9cd29). With only the latter, Chrome returned
+      `ERR_METHOD_NOT_SUPPORTED` and never sent CONNECT. Emitting BOTH (cross-draft)
+      makes Chrome open the WebTransport session. (enable_connect_protocol 0x08 +
+      h3_datagram 0x33 + QUIC max_datagram_frame_size were already correct.)
+- [x] Gate MET: chrome-devtools MCP — `new WebTransport(url,{serverCertificateHashes})`
+      → **READY**. Server trace: `WT-CONNECT? decode=1 method='CONNECT'
+      protocol='webtransport' path='/wt'` → 200; page logs "READY — WebTransport
+      session open". The full path works end-to-end with real Chrome:
+      QUIC+TLS handshake → H3 SETTINGS → Extended CONNECT → 200 → wt.ready.
 
 ## P1 — Datagrams  (needs QUIC DATAGRAM, RFC 9221 + H3 DATAGRAM, RFC 9297)
 - [ ] H3 datagram framing: quarter-stream-id prefix mapping a QUIC DATAGRAM to the WT
