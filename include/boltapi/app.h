@@ -539,14 +539,22 @@ private:
     // seams() under BOLTAPI_WITH_HTTP3. Never touches the H1/H2 server.
     void start_http3();
 
-    // (Re)create the single server QuicConnection + H3Connection and wire its
-    // send fn + request handler. Called once from start_http3 and again from the
-    // datagram handler when a NEW connection's Initial arrives after the current
-    // one finished its handshake (single-peer endpoint v1 — lets sequential QUIC
-    // connections, e.g. an H3 page load then a WebTransport session, both work).
-    void http3_new_connection_(net::UdpTransport* tp,
-                               std::shared_ptr<sockaddr_storage> peer,
-                               std::shared_ptr<int> peer_len);
+    // #42 — multi-connection demux. Route one inbound QUIC datagram to the per-
+    // peer connection (keyed by source address); an Initial from a NEW peer
+    // creates a connection slot. Called from the transport datagram handler under
+    // http3_mtx_. Chrome's Initial retransmits from one address all hit the one
+    // connection, so the endpoint never wedges and many clients are served at once.
+    void http3_feed_(net::UdpTransport* tp, const sockaddr* peer, int peer_len,
+                     const std::uint8_t* data, std::size_t len);
+    // Find the connection slot for `peer` (nullptr if none). Bounded scan.
+    struct Http3Peer;  // defined below
+    Http3Peer* http3_lookup_(const sockaddr* peer, int peer_len) noexcept;
+    // Find-or-create + init a connection slot for `peer` (its QuicConnection +
+    // H3Connection + per-peer send fn + request handler). nullptr if the bounded
+    // pool is full of live connections (the new Initial is shed). Reclaims closed/
+    // draining slots first.
+    Http3Peer* http3_obtain_(net::UdpTransport* tp, const sockaddr* peer,
+                             int peer_len);
 
     // Build a CoroHttpRequest from a decoded H3Request, route it through
     // dispatch_http3(), and send the response back over the H3 stream.
@@ -682,9 +690,21 @@ private:
     // H3Connection bridges decoded requests to dispatch_http3(). Single-peer (v1),
     // serialized by h3_mtx_. Torn down before the transport in stop().
     std::unique_ptr<net::UdpTransport>     http3_transport_;
-    std::unique_ptr<quic::QuicConnection>  http3_quic_;
-    std::unique_ptr<http3::H3Connection>   http3_conn_;
-    std::mutex                             http3_mtx_;
+    // #42 — bounded pool of per-peer QUIC connections (keyed by source address),
+    // replacing the single-connection + reset-on-Initial heuristic that wedged
+    // under a browser's Initial retransmits. Each slot owns its QuicConnection +
+    // H3Connection + peer address; its send fn targets that address.
+    struct Http3Peer {
+        std::unique_ptr<quic::QuicConnection> quic;
+        std::unique_ptr<http3::H3Connection>  h3;
+        sockaddr_storage addr{};
+        int              addr_len = 0;
+        bool             used = false;
+    };
+    static constexpr std::size_t kMaxHttp3Peers = 16;
+    Http3Peer    http3_peers_[kMaxHttp3Peers];
+    std::size_t  http3_peer_count_ = 0;
+    std::mutex   http3_mtx_;
 #endif
 
     std::unique_ptr<Router>                   router_;

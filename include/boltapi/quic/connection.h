@@ -56,7 +56,10 @@
 #include "bolt/bolt_arena.h"
 #include "bolt/join/bolt_swiss.h"
 
-#ifdef BOLTAPI_QUIC_TRACE
+// Tracing is ALWAYS compiled in but RUNTIME-gated by the BOLTAPI_QUIC_TRACE env
+// var (checked once via a function-local static), so it costs nothing unless the
+// env var is set. (Was #ifdef-gated, which needed a special trace build; making
+// it runtime-only lets any build emit a packet trace for diagnosis.)
 #include <cstdio>
 #include <cstdlib>
 #define QTRACE(...)                                                    \
@@ -68,9 +71,6 @@
             std::fprintf(stderr, "\n");                                \
         }                                                              \
     } while (0)
-#else
-#define QTRACE(...) ((void)0)
-#endif
 
 namespace bolt::api::quic {
 
@@ -173,35 +173,72 @@ public:
     }
 
 private:
-    // Mark [start, start+n) present and extend the contiguous cursor if it now
-    // reaches/passes recv_cursor_. With a single in-order stream (loopback) the
-    // common path simply advances the cursor.
-    void mark_filled(std::size_t start, std::size_t n) noexcept {
-        assert(start + n <= kMaxCryptoBuffer && "mark_filled overflow");
-        if (start <= recv_cursor_ && start + n > recv_cursor_) {
-            recv_cursor_ = start + n;
-        } else if (start > recv_cursor_) {
-            // Out-of-order: remember the furthest filled extent so a later
-            // gap-filling frame can re-trigger the advance below.
-            if (start + n > pending_end_) pending_end_ = start + n;
-            if (pending_start_ == 0 || start < pending_start_)
-                pending_start_ = start;
+    // Bounded set of filled byte ranges (kept SORTED + MERGED, no overlaps/
+    // adjacency). A real ClientHello arrives as a handful of CRYPTO fragments in
+    // ARBITRARY order (Chrome fragments heavily out-of-order); tracking each
+    // filled interval — rather than one pending extent — is required to advance
+    // the contiguous cursor ONLY over bytes that are actually present (the old
+    // single-region tracker jumped the cursor across still-empty gaps, handing
+    // TLS a corrupt ClientHello). 64 ranges is ample: merging keeps the count at
+    // the number of disjoint gaps, which a handshake never approaches.
+    static constexpr std::size_t kMaxRanges = 64;
+
+    // Insert [s,e) into the sorted/merged range set; coalesce overlaps + adjacency.
+    // Returns false if the set is full and the range can't be merged (protocol
+    // error — far more fragments than any real handshake).
+    bool add_range(std::size_t s, std::size_t e) noexcept {
+        assert(s < e && e <= kMaxCryptoBuffer && "add_range: bad [s,e)");
+        // Find the first range whose end >= s (candidate to merge/precede).
+        std::size_t i = 0;
+        while (i < range_count_ && ranges_[i].end < s) ++i;
+        // Merge all subsequent ranges that overlap/touch [s,e).
+        std::size_t ns = s, ne = e;
+        std::size_t j = i;
+        while (j < range_count_ && ranges_[j].start <= ne) {
+            if (ranges_[j].start < ns) ns = ranges_[j].start;
+            if (ranges_[j].end   > ne) ne = ranges_[j].end;
+            ++j;
         }
-        // If a buffered out-of-order region is now contiguous, absorb it.
-        if (pending_end_ > recv_cursor_ && pending_start_ <= recv_cursor_) {
-            recv_cursor_ = pending_end_;
-            pending_start_ = 0;
-            pending_end_ = 0;
+        // Replace ranges_[i, j) with the single merged [ns, ne).
+        if (i == j) {  // pure insertion — make room
+            if (range_count_ >= kMaxRanges) return false;
+            for (std::size_t k = range_count_; k > i; --k) ranges_[k] = ranges_[k - 1];
+            ++range_count_;
+        } else if (j - i > 1) {  // collapse j-i ranges into one
+            const std::size_t removed = (j - i) - 1;
+            for (std::size_t k = i + 1; k + removed < range_count_; ++k)
+                ranges_[k] = ranges_[k + removed];
+            range_count_ -= removed;
         }
-        assert(recv_cursor_ <= highest_ && "cursor past highest");
+        ranges_[i].start = ns;
+        ranges_[i].end   = ne;
+        assert(range_count_ <= kMaxRanges && "range_count overflow");
+        return true;
     }
 
+    // Advance recv_cursor_ over the merged range anchored at byte 0 (the
+    // contiguous prefix). Ranges are sorted, so it's ranges_[0] iff it starts at 0.
+    void recompute_contiguous() noexcept {
+        recv_cursor_ = (range_count_ > 0 && ranges_[0].start == 0)
+                           ? ranges_[0].end : 0;
+        assert(recv_cursor_ <= highest_ && "cursor past highest");
+        assert(read_cursor_ <= recv_cursor_ && "read cursor past contiguous");
+    }
+
+    void mark_filled(std::size_t start, std::size_t n) noexcept {
+        assert(start + n <= kMaxCryptoBuffer && "mark_filled overflow");
+        if (n == 0) return;
+        (void)add_range(start, start + n);  // bounded; drop on overflow (no jump)
+        recompute_contiguous();
+    }
+
+    struct Range { std::size_t start = 0; std::size_t end = 0; };
     std::uint8_t buffer_[kMaxCryptoBuffer]{};
+    Range       ranges_[kMaxRanges]{};
+    std::size_t range_count_ = 0;
     std::size_t read_cursor_ = 0;    // next byte handed to TLS
-    std::size_t recv_cursor_ = 0;    // highest contiguous byte received
+    std::size_t recv_cursor_ = 0;    // highest contiguous-from-0 byte received
     std::size_t highest_ = 0;        // highest byte ever written
-    std::size_t pending_start_ = 0;  // buffered out-of-order region [start,end)
-    std::size_t pending_end_ = 0;
 };
 
 // Callbacks the connection raises (the connection layer is transport-agnostic;
@@ -1318,6 +1355,11 @@ private:
         ConnectionCloseFrame cc;
         std::size_t c = 0;
         if (cc.parse(data + 1, len - 1, is_app, c) != kFrameOk) return false;
+        QTRACE("  CONNECTION_CLOSE app=%d error=0x%llx frame_type=0x%llx reason='%.*s'",
+               (int)is_app, (unsigned long long)cc.error_code,
+               (unsigned long long)cc.frame_type,
+               (int)cc.reason_length,
+               cc.reason_phrase ? cc.reason_phrase : "");
         state_ = ConnState::kDraining;
         out_consumed = 1 + c;
         return true;
@@ -1798,8 +1840,11 @@ private:
         const bool pad = dgram_has_initial_ && out_len < kInitialMinDatagram;
         const std::size_t projected = pad ? kInitialMinDatagram : out_len;
         if (!amp_allows(projected)) {            // whole datagram over 3x budget
+            QTRACE("flush_datagram AMP-BLOCKED projected=%zu", projected);
             dgram_len_ = 0; dgram_has_initial_ = false; return;
         }
+        QTRACE("flush_datagram emit len=%zu (initial=%d pad=%d)", out_len,
+               (int)dgram_has_initial_, (int)pad);
         if (pad) {
             assert(kInitialMinDatagram <= kMaxDatagramSize && "pad past MTU");
             std::memset(dgram_buf_ + out_len, 0, kInitialMinDatagram - out_len);

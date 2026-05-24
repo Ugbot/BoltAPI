@@ -24,6 +24,12 @@
 // static-files root ("testing/web") resolves; pass an alternate web root and/or
 // port on the command line: demo_server [port] [web_root].
 #include "boltapi/app.h"
+#if defined(BOLTAPI_WITH_HTTP3)
+#include "boltapi/quic/tls.h"   // quic::shared_server_identity (cert-pem route)
+#include <openssl/pem.h>
+#include <openssl/x509.h>
+#include <openssl/bio.h>
+#endif
 
 #include <cstdint>
 #include <cstdio>
@@ -126,6 +132,22 @@ int main(int argc, char** argv) {
             hex[2 * i + 1] = hx[h[i] & 0xF];
         }
         res.ok().content_type("text/plain").send(std::string_view(hex, 64));
+    });
+    // Diagnostic: the QUIC server cert as PEM (to openssl-inspect its structure +
+    // independently verify its SHA-256 matches /wt/cert-hash).
+    app.get("/wt/cert-pem", [](bolt::api::Request&, bolt::api::Response& res) {
+        X509* cert = nullptr; EVP_PKEY* key = nullptr;
+        if (!bolt::api::quic::shared_server_identity(&cert, &key) || cert == nullptr) {
+            res.status(500).content_type("text/plain").send("no cert"); return;
+        }
+        BIO* bio = BIO_new(BIO_s_mem());
+        if (bio == nullptr) { res.status(500).send("bio"); return; }
+        PEM_write_bio_X509(bio, cert);
+        char* data = nullptr;
+        const long n = BIO_get_mem_data(bio, &data);
+        std::string pem(data, data + (n > 0 ? n : 0));
+        BIO_free(bio);
+        res.ok().content_type("text/plain").send(pem);
     });
 #endif
     app.websocket("/ws", [](bolt::api::http::WebSocketConnection& ws) {

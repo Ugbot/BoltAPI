@@ -617,43 +617,15 @@ void App::start_http3() {
         return;
     }
 
-    // Peer address of the last datagram (the server's send fn targets it). Shared
-    // so a recreated connection's send fn keeps using the same updated address.
-    auto peer = std::make_shared<sockaddr_storage>();
-    auto peer_len = std::make_shared<int>(0);
-    net::UdpTransport* tp = http3_transport_.get();
-
-    http3_new_connection_(tp, peer, peer_len);
-    if (!http3_quic_) {  // QUIC init failed
-        http3_conn_.reset();
-        http3_transport_.reset();
-        return;
-    }
-
+    // #42 — connections are created on demand per peer (no pre-created singleton).
     App* self = this;
     std::mutex* mtx = &http3_mtx_;
+    net::UdpTransport* tp = http3_transport_.get();
     http3_transport_->set_datagram_handler(
-        [self, peer, peer_len, mtx, tp](const sockaddr* p, int plen,
-                                        const std::uint8_t* d, std::size_t n) {
+        [self, mtx, tp](const sockaddr* p, int plen,
+                        const std::uint8_t* d, std::size_t n) {
             std::lock_guard<std::mutex> lk(*mtx);
-            if (p != nullptr && plen > 0 &&
-                plen <= static_cast<int>(sizeof(sockaddr_storage))) {
-                std::memcpy(peer.get(), p, static_cast<std::size_t>(plen));
-                *peer_len = plen;
-            }
-            // A long-header (Initial) packet arriving after the current connection
-            // already finished its handshake means a NEW QUIC connection — e.g. the
-            // browser opening a WebTransport session after the page loaded. The
-            // single-peer endpoint (v1) starts a fresh connection for it so
-            // sequential connections both work (multi-concurrent is task #42).
-            if (n > 0 && quic::is_long_header(d[0]) && self->http3_quic_ &&
-                self->http3_quic_->state() != quic::ConnState::kNew &&
-                self->http3_quic_->state() != quic::ConnState::kHandshaking) {
-                self->http3_new_connection_(tp, peer, peer_len);
-            }
-            if (self->http3_quic_) self->http3_quic_->feed_datagram(d, n);
-            if (self->http3_quic_ && self->http3_quic_->one_rtt_keys_ready())
-                self->http3_conn_->send_settings();
+            self->http3_feed_(tp, p, plen, d, n);
         });
     http3_transport_->start();
 
@@ -669,29 +641,101 @@ void App::start_http3() {
 // start and again when a new connection's Initial arrives after the current one is
 // established (single-peer v1). Sets http3_quic_ to null on init failure.
 // ---------------------------------------------------------------------------
-void App::http3_new_connection_(net::UdpTransport* tp,
-                                std::shared_ptr<sockaddr_storage> peer,
-                                std::shared_ptr<int> peer_len) {
-    assert(tp != nullptr && "http3_new_connection_: null transport");
-    assert(peer && peer_len && "http3_new_connection_: null peer state");
-    http3_quic_ = std::make_unique<quic::QuicConnection>();
-    http3_conn_ = std::make_unique<http3::H3Connection>();
-    auto send_fn = [tp, peer, peer_len](const std::uint8_t* d, std::size_t n) {
-        if (*peer_len <= 0) return;
-        tp->send(reinterpret_cast<const sockaddr*>(peer.get()), *peer_len, d, n);
-    };
-    if (!http3_quic_->init(/*is_server=*/true, send_fn)) {
-        std::fprintf(stderr, "[boltapi] HTTP/3: QUIC init failed.\n");
-        http3_conn_.reset();
-        http3_quic_.reset();
-        return;
+namespace {
+// 4-tuple equality for QUIC peer routing (IPv4/IPv6, address + port).
+bool h3_addr_eq(const sockaddr_storage& a, int alen,
+                const sockaddr* b, int blen) noexcept {
+    if (alen != blen || b == nullptr) return false;
+    if (a.ss_family != b->sa_family) return false;
+    if (a.ss_family == AF_INET) {
+        const auto* x = reinterpret_cast<const sockaddr_in*>(&a);
+        const auto* y = reinterpret_cast<const sockaddr_in*>(b);
+        return x->sin_port == y->sin_port &&
+               x->sin_addr.s_addr == y->sin_addr.s_addr;
     }
-    http3_conn_->attach(*http3_quic_, /*is_server=*/true);
+    if (a.ss_family == AF_INET6) {
+        const auto* x = reinterpret_cast<const sockaddr_in6*>(&a);
+        const auto* y = reinterpret_cast<const sockaddr_in6*>(b);
+        return x->sin6_port == y->sin6_port &&
+               std::memcmp(&x->sin6_addr, &y->sin6_addr,
+                           sizeof(x->sin6_addr)) == 0;
+    }
+    return false;
+}
+}  // namespace
+
+App::Http3Peer* App::http3_lookup_(const sockaddr* peer, int peer_len) noexcept {
+    assert(peer != nullptr && peer_len > 0 && "http3_lookup_: bad peer");
+    for (std::size_t i = 0; i < kMaxHttp3Peers; ++i) {
+        Http3Peer& s = http3_peers_[i];
+        if (s.used && h3_addr_eq(s.addr, s.addr_len, peer, peer_len)) return &s;
+    }
+    return nullptr;
+}
+
+App::Http3Peer* App::http3_obtain_(net::UdpTransport* tp, const sockaddr* peer,
+                                   int peer_len) {
+    assert(tp != nullptr && "http3_obtain_: null transport");
+    assert(peer != nullptr && "http3_obtain_: null peer");
+    assert(peer_len > 0 &&
+           peer_len <= static_cast<int>(sizeof(sockaddr_storage)) &&
+           "http3_obtain_: bad peer_len");
+    if (Http3Peer* existing = http3_lookup_(peer, peer_len)) return existing;
+
+    // Find a free slot, reclaiming any closed/draining connection first.
+    Http3Peer* slot = nullptr;
+    for (std::size_t i = 0; i < kMaxHttp3Peers; ++i) {
+        Http3Peer& s = http3_peers_[i];
+        if (!s.used) { slot = &s; break; }
+        if (s.quic && (s.quic->is_closed() || s.quic->is_draining())) {
+            s.h3.reset(); s.quic.reset(); s.used = false; slot = &s; break;
+        }
+    }
+    if (slot == nullptr) return nullptr;  // pool full of live conns: shed
+
+    slot->quic = std::make_unique<quic::QuicConnection>();
+    slot->h3   = std::make_unique<http3::H3Connection>();
+    std::memcpy(&slot->addr, peer, static_cast<std::size_t>(peer_len));
+    slot->addr_len = peer_len;
+    // The send fn targets THIS slot's fixed address (the slot lives in the pool
+    // array, so the pointer is stable for the connection's lifetime).
+    Http3Peer* sp = slot;
+    auto send_fn = [tp, sp](const std::uint8_t* d, std::size_t n) {
+        if (sp->addr_len <= 0) return;
+        tp->send(reinterpret_cast<const sockaddr*>(&sp->addr), sp->addr_len, d, n);
+    };
+    if (!slot->quic->init(/*is_server=*/true, send_fn)) {
+        std::fprintf(stderr, "[boltapi] HTTP/3: QUIC init failed.\n");
+        slot->h3.reset(); slot->quic.reset(); slot->addr_len = 0;
+        return nullptr;
+    }
+    slot->h3->attach(*slot->quic, /*is_server=*/true);
     App* self = this;
-    http3::H3Connection* h3 = http3_conn_.get();
-    http3_conn_->set_request_handler([self, h3](const http3::H3Request& r) {
+    http3::H3Connection* h3 = slot->h3.get();
+    slot->h3->set_request_handler([self, h3](const http3::H3Request& r) {
         self->serve_http3_request(*h3, r);
     });
+    slot->used = true;
+    ++http3_peer_count_;
+    assert(http3_peer_count_ <= kMaxHttp3Peers && "http3 peer count overflow");
+    return slot;
+}
+
+void App::http3_feed_(net::UdpTransport* tp, const sockaddr* peer, int peer_len,
+                      const std::uint8_t* data, std::size_t len) {
+    assert(tp != nullptr && "http3_feed_: null transport");
+    if (peer == nullptr || peer_len <= 0 || data == nullptr || len == 0) return;
+    Http3Peer* s = http3_lookup_(peer, peer_len);
+    if (s == nullptr) {
+        // Only a long-header Initial from an unknown peer starts a connection;
+        // stray short-header / non-Initial datagrams are dropped (no wedge).
+        if (!quic::is_long_header(data[0])) return;
+        s = http3_obtain_(tp, peer, peer_len);
+        if (s == nullptr) return;  // pool full: shed
+    }
+    assert(s->quic && s->h3 && "http3_feed_: slot half-built");
+    s->quic->feed_datagram(data, len);
+    if (s->quic->one_rtt_keys_ready()) s->h3->send_settings();
 }
 
 // ---------------------------------------------------------------------------
@@ -1135,8 +1179,15 @@ void App::stop() {
     if (http3_transport_) {
         http3_transport_->stop();
     }
-    http3_conn_.reset();   // bridge (borrows the QuicConnection)
-    http3_quic_.reset();   // QUIC endpoint (TLS/keys)
+    // #42 — tear down every per-peer connection (bridge borrows the QUIC conn, so
+    // reset h3 before quic) before freeing the transport their send fns target.
+    for (std::size_t i = 0; i < kMaxHttp3Peers; ++i) {
+        http3_peers_[i].h3.reset();
+        http3_peers_[i].quic.reset();
+        http3_peers_[i].used = false;
+        http3_peers_[i].addr_len = 0;
+    }
+    http3_peer_count_ = 0;
     http3_transport_.reset();
 #endif
 #if defined(BOLTAPI_WITH_WEBRTC)

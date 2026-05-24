@@ -114,11 +114,14 @@ inline bool generate_self_signed_p256(X509** out_cert, EVP_PKEY** out_key,
     }
     X509_set_version(x, 2);  // v3
     ASN1_INTEGER_set(X509_get_serialNumber(x), 1);
-    // Validity <= 14 days so a WebTransport client may pin this cert via
-    // serverCertificateHashes (Chrome rejects longer-lived pinned certs).
-    // notBefore backdated 1h for clock-skew tolerance.
-    X509_gmtime_adj(X509_get_notBefore(x), -3600);
-    X509_gmtime_adj(X509_get_notAfter(x), 13L * 24 * 3600);
+    // Validity well under 14 days so a WebTransport client may pin this cert via
+    // serverCertificateHashes (Chrome rejects pinned certs whose validity period
+    // exceeds the limit). Use ~7 days with a small (5 min) clock-skew backdate so
+    // the TOTAL validity (notAfter - notBefore) stays comfortably under any limit
+    // — a 13-day window left almost no margin and Chrome rejected with
+    // certificate_unknown / CERTIFICATE_VERIFY_FAILED.
+    X509_gmtime_adj(X509_get_notBefore(x), -300);
+    X509_gmtime_adj(X509_get_notAfter(x), 7L * 24 * 3600);
     X509_set_pubkey(x, pkey);
 
     X509_NAME* name = X509_get_subject_name(x);
@@ -126,6 +129,29 @@ inline bool generate_self_signed_p256(X509** out_cert, EVP_PKEY** out_key,
                                reinterpret_cast<const unsigned char*>(cn), -1, -1,
                                0);
     X509_set_issuer_name(x, name);  // self-signed
+
+    // Standard leaf-certificate extensions (added BEFORE signing). A bare cert
+    // with NO extensions is accepted by aioquic but REJECTED by Chrome's
+    // WebTransport verifier (certificate_unknown), which expects a well-formed TLS
+    // leaf: not a CA, usable for digital signatures + server auth, with a SAN.
+    {
+        const auto add_ext = [&](int nid, const char* value) noexcept -> bool {
+            X509_EXTENSION* ext =
+                X509V3_EXT_conf_nid(nullptr, nullptr, nid, value);
+            if (ext == nullptr) return false;
+            const int rc = X509_add_ext(x, ext, -1);
+            X509_EXTENSION_free(ext);
+            return rc == 1;
+        };
+        if (!add_ext(NID_basic_constraints, "critical,CA:FALSE") ||
+            !add_ext(NID_key_usage, "critical,digitalSignature") ||
+            !add_ext(NID_ext_key_usage, "serverAuth") ||
+            !add_ext(NID_subject_alt_name, "DNS:localhost,IP:127.0.0.1,IP:0:0:0:0:0:0:0:1")) {
+            X509_free(x);
+            EVP_PKEY_free(pkey);
+            return false;
+        }
+    }
 
     if (X509_sign(x, pkey, EVP_sha256()) == 0) {
         X509_free(x);
