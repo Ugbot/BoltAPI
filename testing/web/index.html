@@ -159,16 +159,21 @@ async function wtConnect() {
   pill('wt','…','wait');
   if (typeof WebTransport === 'undefined') {
     log('wt','WebTransport API not available in this browser','err'); pill('wt','n/a','err'); return; }
-  const url = 'https://' + location.hostname + ':8443/wt';
-  log('wt','new WebTransport(' + url + ')');
   try {
-    const wt = new WebTransport(url);
+    // Chrome rejects self-signed certs for WebTransport (and ignores
+    // --ignore-certificate-errors). Pin the server cert by SHA-256 instead.
+    const hex = (await (await fetch('/wt/cert-hash', {cache:'no-store'})).text()).trim();
+    if (!/^[0-9a-f]{64}$/.test(hex)) { log('wt','no cert hash from /wt/cert-hash (build with HTTP/3?)','err'); pill('wt','err','err'); return; }
+    log('wt','pinning cert sha-256 ' + hex.slice(0,16) + '…');
+    const bytes = new Uint8Array(32);
+    for (let i = 0; i < 32; i++) bytes[i] = parseInt(hex.substr(i*2, 2), 16);
+    const url = 'https://' + location.hostname + ':8443/wt';
+    log('wt','new WebTransport(' + url + ', serverCertificateHashes)');
+    const wt = new WebTransport(url, { serverCertificateHashes: [{ algorithm: 'sha-256', value: bytes.buffer }] });
     await wt.ready;
-    log('wt','READY — session established'); pill('wt','ok','ok');
+    log('wt','READY — WebTransport session established ✓'); pill('wt','ok','ok');
   } catch (e) {
-    log('wt','failed: ' + e + '  (if this persists, load this page over '
-        + 'http://localhost:8080 so the WebTransport QUIC connection is the only '
-        + 'one — single-peer endpoint, task #42)','err');
+    log('wt','failed: ' + (e && e.message ? e.message : e),'err');
     pill('wt','err','err');
   }
 }

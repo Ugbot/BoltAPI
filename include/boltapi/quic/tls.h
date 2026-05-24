@@ -114,8 +114,11 @@ inline bool generate_self_signed_p256(X509** out_cert, EVP_PKEY** out_key,
     }
     X509_set_version(x, 2);  // v3
     ASN1_INTEGER_set(X509_get_serialNumber(x), 1);
-    X509_gmtime_adj(X509_get_notBefore(x), 0);
-    X509_gmtime_adj(X509_get_notAfter(x), 365L * 24 * 3600);
+    // Validity <= 14 days so a WebTransport client may pin this cert via
+    // serverCertificateHashes (Chrome rejects longer-lived pinned certs).
+    // notBefore backdated 1h for clock-skew tolerance.
+    X509_gmtime_adj(X509_get_notBefore(x), -3600);
+    X509_gmtime_adj(X509_get_notAfter(x), 13L * 24 * 3600);
     X509_set_pubkey(x, pkey);
 
     X509_NAME* name = X509_get_subject_name(x);
@@ -132,6 +135,45 @@ inline bool generate_self_signed_p256(X509** out_cert, EVP_PKEY** out_key,
     *out_cert = x;
     *out_key = pkey;
     return true;
+}
+
+// ----------------------------------------------------------------------------
+// shared_server_identity — a PROCESS-STABLE self-signed P-256 cert/key, generated
+// ONCE (thread-safe static init) and reused by every server handshake so a
+// WebTransport client can pin the cert via serverCertificateHashes. Returns
+// BORROWED pointers (the statics own them for the process lifetime; do NOT free).
+// ----------------------------------------------------------------------------
+inline bool shared_server_identity(X509** out_cert, EVP_PKEY** out_key) noexcept {
+    assert(out_cert != nullptr && out_key != nullptr &&
+           "shared_server_identity: null out");
+    static X509*      s_cert = nullptr;
+    static EVP_PKEY*  s_key  = nullptr;
+    static const bool s_ok   = generate_self_signed_p256(&s_cert, &s_key);
+    if (!s_ok) return false;
+    *out_cert = s_cert;
+    *out_key  = s_key;
+    return true;
+}
+
+// ----------------------------------------------------------------------------
+// server_cert_sha256 — SHA-256 of the DER encoding of the shared server cert (32
+// bytes): exactly the hash a browser passes in WebTransport serverCertificateHashes.
+// Generates the shared identity on demand. noexcept; returns false on any failure.
+// ----------------------------------------------------------------------------
+inline bool server_cert_sha256(std::uint8_t out[32]) noexcept {
+    assert(out != nullptr && "server_cert_sha256: null out");
+    X509* cert = nullptr;
+    EVP_PKEY* key = nullptr;
+    if (!shared_server_identity(&cert, &key)) return false;
+    assert(cert != nullptr && "server_cert_sha256: null cert");
+    unsigned char* der = nullptr;
+    const int n = i2d_X509(cert, &der);
+    if (n <= 0 || der == nullptr) return false;
+    unsigned int mdlen = 0;
+    const int ok = EVP_Digest(der, static_cast<std::size_t>(n), out, &mdlen,
+                              EVP_sha256(), nullptr);
+    OPENSSL_free(der);
+    return ok == 1 && mdlen == 32;
 }
 
 // ============================================================================
@@ -209,14 +251,15 @@ public:
         owns_ctx_ = true;
         if (!configure_ctx_common()) return false;
 
+        // Use the PROCESS-STABLE identity so every connection presents the same
+        // cert (a WebTransport client pins its hash via serverCertificateHashes).
+        // Borrowed pointers — SSL_CTX_use_* take their own refs; do NOT free here.
         X509* cert = nullptr;
         EVP_PKEY* key = nullptr;
-        if (!generate_self_signed_p256(&cert, &key)) return false;
+        if (!shared_server_identity(&cert, &key)) return false;
         const bool loaded = SSL_CTX_use_certificate(ctx_, cert) == 1 &&
                             SSL_CTX_use_PrivateKey(ctx_, key) == 1 &&
                             SSL_CTX_check_private_key(ctx_) == 1;
-        X509_free(cert);
-        EVP_PKEY_free(key);
         if (!loaded) return false;
 
         SSL_CTX_set_alpn_select_cb(ctx_, &QuicTls::alpn_select_cb, this);
@@ -343,6 +386,18 @@ public:
             return true;  // need more peer CRYPTO; not an error
         }
         failed_ = true;
+#ifdef BOLTAPI_QUIC_TRACE
+        {
+            unsigned long e;
+            char ebuf[256];
+            std::fprintf(stderr, "[quic-tls] SSL_do_handshake rc=%d err=%d\n",
+                         rc, err);
+            while ((e = ERR_get_error()) != 0) {
+                ERR_error_string_n(e, ebuf, sizeof(ebuf));
+                std::fprintf(stderr, "[quic-tls] handshake error: %s\n", ebuf);
+            }
+        }
+#endif
         ERR_clear_error();
         return false;
     }

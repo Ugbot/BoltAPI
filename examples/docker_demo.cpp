@@ -98,6 +98,26 @@ int main() {
 
     // Plain HTTP surfaces (reachable over H1, H2, and H3).
     app.get("/ping", [](api::Request&, api::Response& res) { res.ok().text("pong"); });
+#if defined(BOLTAPI_WITH_HTTP3)
+    // WebTransport cert pin: SHA-256 of the QUIC server cert (DER) as lowercase hex.
+    // The browser uses this in new WebTransport(url, {serverCertificateHashes:[...]})
+    // so a self-signed cert is accepted (Chrome's WebTransport rejects untrusted
+    // certs and ignores --ignore-certificate-errors; pinning the hash is the path).
+    app.get("/wt/cert-hash", [](api::Request&, api::Response& res) {
+        std::uint8_t h[32];
+        if (!api::quic::server_cert_sha256(h)) {
+            res.status(500).content_type("text/plain").send("no quic cert");
+            return;
+        }
+        static const char hx[] = "0123456789abcdef";
+        char hex[64];
+        for (int i = 0; i < 32; ++i) {
+            hex[2 * i]     = hx[(h[i] >> 4) & 0xF];
+            hex[2 * i + 1] = hx[h[i] & 0xF];
+        }
+        res.ok().content_type("text/plain").send(std::string_view(hex, 64));
+    });
+#endif
     app.post("/echo", [](api::Request& req, api::Response& res) { res.ok().send(req.body()); });
     app.get("/api/info", [tls, h1_port, tls_port, rtc_port]
                          (api::Request&, api::Response& res) {
