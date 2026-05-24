@@ -1,0 +1,39 @@
+name: linux-docker
+
+# Linux container parity lanes, both built with LLVM/Clang + lld (project policy:
+# Clang on Linux, never GCC — closest parity to the MSVC primary). Each lane's
+# Dockerfile RUNs its ctest gate as a build step, so a green `docker build` IS a
+# green test run; the image only builds if Linux parity holds.
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  docker-lane:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # HTTP/3 + WebTransport: builds OpenSSL 3.6 from source (linux-x86_64-clang;
+          # the 3.5+ QUIC-TLS API, vs Ubuntu's 3.0) then the QUIC/H3/QPACK suite.
+          # Gate inside the image: ctest -R "Quic|Http3|Qpack" -> 75/75.
+          - { name: "linux-clang-http3",  dockerfile: "Dockerfile.linux-h3-test", tag: "boltapi-linux-h3-test" }
+          # WebRTC + SFU relay: system OpenSSL (DTLS/SRTP; HTTP3 OFF), epoll backend.
+          # Gate inside the image: ctest -R "Media|Srtp|Dtls|Ice|Turn|..." -> 96/96.
+          - { name: "linux-clang-webrtc", dockerfile: "Dockerfile.linux-test",    tag: "boltapi-linux-test" }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # extern/bolt must be present in the build context (Dockerfile COPY . .).
+          submodules: recursive
+
+      # The Dockerfiles pin Clang/lld + the explicit cmake compiler flags
+      # themselves; building the image runs the full configure -> build -> ctest
+      # gate. BuildKit caches layers between runs on the same runner image.
+      - name: Build + test (${{ matrix.dockerfile }})
+        env:
+          DOCKER_BUILDKIT: "1"
+        run: docker build -f ${{ matrix.dockerfile }} -t ${{ matrix.tag }} .
