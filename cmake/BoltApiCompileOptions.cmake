@@ -39,7 +39,11 @@ function(boltapi_apply_hardening tgt)
             -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wno-unused-parameter
         )
         if(NOT scope STREQUAL "INTERFACE")
-            target_compile_options(${tgt} PRIVATE -fno-exceptions -fno-rtti)
+            # RTTI off (matches the MSVC /GR- branch). Exceptions stay ON:
+            # the POSIX backends (event_loop_epoll/kqueue) use `throw`, and the
+            # MSVC branch keeps /EHsc — so -fno-exceptions here was a Linux-only
+            # inconsistency that broke the GCC/Clang build.
+            target_compile_options(${tgt} PRIVATE -fno-rtti)
         endif()
     endif()
 
