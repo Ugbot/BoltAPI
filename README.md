@@ -1,5 +1,8 @@
 # Bolt API
 
+[![ci](https://github.com/Ugbot/BoltAPI/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Ugbot/BoltAPI/actions/workflows/ci.yml)
+[![linux-docker](https://github.com/Ugbot/BoltAPI/actions/workflows/linux-docker.yml/badge.svg?branch=main)](https://github.com/Ugbot/BoltAPI/actions/workflows/linux-docker.yml)
+
 A high-performance, **complete** C++20 web framework — HTTP/1.1, HTTP/2, **HTTP/3
 (QUIC)**, WebSocket, Server-Sent Events, and **WebRTC (data + audio + video)** —
 behind one ergonomic, FastAPI-style facade.
