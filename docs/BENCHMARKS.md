@@ -100,6 +100,101 @@ across `co_await`), which offsets the tiny win. The Arena path is kept as a
 zero-copy `req.body()` view + zero-copy response (eliminating the string copies)
 — a separate, larger change.
 
+## Load generator + endpoint suite (real sockets)
+
+The micro/throughput benches above run the client *in-process*. To measure under
+a real socket load driver — and to produce headline req/s + tail-latency numbers
+the way TechEmpower/1MRC do — there is a standardized pair:
+
+- **`bench_server`** (`benchmarks/bench_server.cpp`) — a long-lived server over the
+  real `App` facade with TechEmpower-aligned routes: `/plaintext`, `/json`,
+  `/db`, `/queries?n=K`, `/route/{id}`. **Honest deviation:** BoltAPI dropped the
+  PostgreSQL dependency, so `/db` and `/queries` are a **synthetic CPU proxy** (a
+  bounded xorshift row generator), *not* a real database round-trip — the numbers
+  measure framework + serialization cost, not DB throughput.
+- **`boltapi_loadgen`** (`benchmarks/loadgen/`) — an **in-tree async HTTP/1.1 load
+  generator with ZERO third-party deps**, built on BoltAPI's own outbound
+  primitives (`IODispatcher` `async_connect`/`async_read`/`async_write` +
+  `WorkerThreadPool`). N keep-alive connections each run a serial request/response
+  loop as a coroutine until a wall-clock deadline; per-request latency goes into a
+  per-connection log-linear histogram (no cross-connection sharing → no atomics on
+  the hot path), merged at the end for p50/p90/p99/p99.9.
+  - **Why in-tree:** it needs no `wrk`/`aiohttp` (portable Windows IOCP + Linux
+    epoll, no Python), and — by design — its `http_client.{h,cpp}` core (request
+    serializer + incremental response parser + pooled keep-alive connection) is
+    **the seed of the future API-gateway's upstream HTTP client**, the one
+    outbound-HTTP piece BoltAPI doesn't yet have. See `docs/gateway/`.
+  - **v1 limits:** cleartext only (a documented TLS extension point — OpenSSL is
+    already linked); responses must be `Content-Length`-framed (a chunked or
+    oversized response is reported as a parse error, never a crash); bounded at
+    `kMaxConnections = 1024`.
+
+### Reproduce
+
+```
+# Windows (MSVC, primary)
+cmake -S . -B build/bench -DBOLTAPI_BUILD_BENCHMARKS=ON
+cmake --build build/bench --config Release --target boltapi_bench_server boltapi_loadgen
+powershell -File scripts\run_benchmarks.ps1 -Duration 10 -Connections 64
+
+# Linux/Docker (Clang/lld, never GCC)
+cmake -S . -B build/bench -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+      -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld -DBOLTAPI_BUILD_BENCHMARKS=ON
+cmake --build build/bench -j --target boltapi_bench_server boltapi_loadgen
+scripts/run_benchmarks.sh --duration 10 --connections 64
+docker build -f Dockerfile.linux-bench -t boltapi-linux-bench .   # build + smoke gate
+```
+
+The orchestration scripts start `bench_server`, drive `boltapi_loadgen` against
+each endpoint, scrape the machine-readable `RESULT …` line, and print a table.
+They **always** stop the server (`finally` / `trap EXIT`) — no orphan, no hang.
+`scripts/wrk_crosscheck.sh` optionally cross-checks against `wrk` (Linux only,
+skip-if-absent — never a dependency).
+
+### Endpoint suite (reference run — loopback, conns=32)
+
+Single I/O thread, default worker pool, loopback (no network), this i9-9980HK box.
+Loopback is a *ceiling probe* — real-network numbers will differ.
+
+| Endpoint | req/s | p50 µs | p99 µs | notes |
+|---|---:|---:|---:|---|
+| `/plaintext` | ~63–69 k | ~430–455 | ~1.1–1.5 k | fixed text body |
+| `/json` | ~58–67 k | ~400–442 | ~1.1–4.9 k | hand-built JSON object |
+| `/db` | ~62 k | ~434–442 | ~1.6–2.2 k | **synthetic** (no real DB) |
+| `/queries?n=20` | ~61–65 k | ~442–450 | ~1.1–2.2 k | **synthetic** ×20 rows |
+| `/route/{id}` | ~62–65 k | ~426–455 | ~1.2–1.9 k | parametric-routing echo |
+
+### Methodology
+
+- **Closed-loop, keep-alive, serial per connection** (send one request, read the
+  full response, repeat). This is the keep-alive pattern; it does *not* pipeline.
+- **Coordinated-omission caveat:** latency is measured per request from send →
+  full response on a fixed connection pool. Under pure open-loop max throughput
+  this under-counts the tail vs an open-loop arrival model; the percentiles here
+  are connection-latency, not offered-load-latency. Treat tail numbers as
+  indicative, not SLA-grade.
+- **Histogram:** log-linear (64 sub-buckets/octave, ~1.5% error), fixed static
+  storage, no allocation; `min ≤ p50 ≤ p90 ≤ p99 ≤ p99.9 ≤ max` is asserted by
+  construction.
+- **Acceptance** (used by `Dockerfile.linux-bench` as a gate): every endpoint
+  reports `failed=0` and `ok>0`; the tool always terminates within
+  `duration + margin`, even if the server is killed mid-run.
+
+### Comparison framing vs peers (template — measured later, NOT fabricated)
+
+> **No competitor numbers are published here yet.** To compare fairly, run each
+> framework's `/plaintext` + `/json` on the **same box** with the **same**
+> `boltapi_loadgen` invocation (`--connections 64 --duration 10`), then fill in:
+
+| Framework | /plaintext req/s | /json req/s | p99 µs | notes |
+|---|---:|---:|---:|---|
+| BoltAPI | _measure_ | _measure_ | _measure_ | this suite |
+| nginx (static/proxy) | _measure_ | — | _measure_ | raw-perf baseline |
+| Drogon | _measure_ | _measure_ | _measure_ | C++ async peer |
+
+Anything published in this table must come from a real run with the command and
+box recorded — never an estimate.
+
 ## Notes / TODOs
 
 - The router's literal trie edges live in a shared `bolt::SwissTable` keyed by

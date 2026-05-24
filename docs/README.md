@@ -14,6 +14,16 @@ deeper references and the living design/decision logs.
 - HTTP/3: [`HTTP3_PLAN.md`](HTTP3_PLAN.md) (design + decision log D1…) · [`HTTP3_REMAINING.md`](HTTP3_REMAINING.md) (punch-card)
 - WebRTC: [`WEBRTC_PLAN.md`](WEBRTC_PLAN.md) (data) · [`WEBRTC_MEDIA_PLAN.md`](WEBRTC_MEDIA_PLAN.md) (audio/video) · [`WEBRTC_REMAINING.md`](WEBRTC_REMAINING.md) (punch-card)
 
+## Gateway (design suite — planned milestone, not yet built)
+A Kong/Gravitee-class API gateway on the BoltAPI engine. **Design only** so far —
+these are the executable blueprints (the gateway is sequenced behind the upstream
+HTTP client, whose core ships now as the benchmark load generator).
+- [`gateway/GATEWAY_VISION.md`](gateway/GATEWAY_VISION.md) — positioning, thesis, non-goals, success criteria
+- [`gateway/GATEWAY_COMPETITIVE_RESEARCH.md`](gateway/GATEWAY_COMPETITIVE_RESEARCH.md) — Kong · Gravitee · Envoy · APISIX · Tyk · nginx (borrow vs differ)
+- [`gateway/GATEWAY_ARCHITECTURE.md`](gateway/GATEWAY_ARCHITECTURE.md) — how it lands on the engine (plugins=middleware, upstream client, host routing, Bolt primitives, control-plane open decision)
+- [`gateway/GATEWAY_FEATURES.md`](gateway/GATEWAY_FEATURES.md) — per-capability specs + the FasterAPI→BoltAPI port ledger
+- [`gateway/GATEWAY_ROADMAP.md`](gateway/GATEWAY_ROADMAP.md) — phased punch-card (Phase 0 upstream client → … → control plane → observability)
+
 ## Status, issues, and what's next
 - [`../PROJECT_MAP.md`](../PROJECT_MAP.md) — what exists and its status (the index of record)
 - [`ROADMAP.md`](ROADMAP.md) — **known performance bugs, untried/unverified items, and planned infrastructure (Docker, long-running integration tests)**

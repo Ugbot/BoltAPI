@@ -1,0 +1,63 @@
+# Bolt API — Linux benchmark lane (Clang/lld), parity with the Windows/MSVC bench.
+#
+# Builds the benchmark targets (bench_server + the in-tree async loadgen) with
+# LLVM/Clang + lld (project policy: Clang on Linux, never GCC), against the system
+# OpenSSL (HTTP3/WebRTC OFF — the bench path is cleartext HTTP/1.1). Then RUNS a
+# bounded smoke as a build gate: start the server, drive the loadgen, and fail the
+# image build unless the run completes with failed=0 and ok>0.
+#
+#   docker build -f Dockerfile.linux-bench -t boltapi-linux-bench .
+#
+# To get full numbers (not just the smoke), run the orchestrator in the image:
+#   docker run --rm boltapi-linux-bench scripts/run_benchmarks.sh --skip-build \
+#       --build-dir build/linux-bench --duration 10 --connections 64
+# ---------------------------------------------------------------------------
+FROM ubuntu:24.04 AS bench
+ARG DEBIAN_FRONTEND=noninteractive
+# LLVM/Clang toolchain (never GCC). make + libstdc++-dev supply the GNU libstdc++
+# headers clang++ uses; system OpenSSL is fine (no QUIC-TLS needed for the bench).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        clang lld llvm cmake ninja-build make libstdc++-14-dev \
+        git ca-certificates pkg-config libssl-dev zlib1g-dev bash \
+    && rm -rf /var/lib/apt/lists/*
+ENV CC=clang CXX=clang++
+
+WORKDIR /src
+COPY . .
+
+# Configure: benchmarks ON, HTTP3/WebRTC OFF, tests OFF. Clang pinned explicitly
+# (never auto-detect -> never GCC) + lld linker. epoll async backend on Linux.
+RUN cmake -S . -B build/linux-bench -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_COMPILER=clang \
+        -DCMAKE_CXX_COMPILER=clang++ \
+        -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld" \
+        -DBOLTAPI_WITH_HTTP3=OFF \
+        -DBOLTAPI_WITH_WEBRTC=OFF \
+        -DBOLTAPI_BUILD_TESTS=OFF \
+        -DBOLTAPI_BUILD_BENCHMARKS=ON \
+        -DBOLTAPI_WARNINGS_AS_ERRORS=OFF
+
+RUN cmake --build build/linux-bench -j"$(nproc)" \
+        --target boltapi_bench_server boltapi_loadgen
+
+# Gate: bounded smoke. Start the server, drive the loadgen against /plaintext and
+# /json, and fail the build unless each run reports failed=0 and ok>0. Bounded by
+# `timeout` so the image build can never hang.
+RUN bash -eu -c '\
+    ./build/linux-bench/benchmarks/boltapi_bench_server 18080 >/tmp/srv.log 2>&1 & \
+    SP=$!; sleep 1; \
+    rc=0; \
+    for ep in /plaintext /json; do \
+        out="$(timeout 20 ./build/linux-bench/benchmarks/boltapi_loadgen \
+            --host 127.0.0.1 --port 18080 --path "$ep" \
+            --connections 16 --duration 3 2>/dev/null | grep "^RESULT ")"; \
+        echo "$out"; \
+        echo "$out" | grep -q "failed=0" || { echo "FAIL: $ep had failures"; rc=1; }; \
+        echo "$out" | grep -qE "ok=[1-9][0-9]*" || { echo "FAIL: $ep ok==0"; rc=1; }; \
+    done; \
+    kill "$SP" 2>/dev/null || true; \
+    exit $rc'
+
+CMD ["bash", "scripts/run_benchmarks.sh", "--skip-build", \
+     "--build-dir", "build/linux-bench", "--duration", "10", "--connections", "64"]

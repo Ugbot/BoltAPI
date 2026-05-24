@@ -66,3 +66,30 @@ if(WIN32)
 endif()
 boltapi_apply_hardening(boltapi_media_throughput_bench)
 boltapi_apply_sanitizers(boltapi_media_throughput_bench)
+
+# TechEmpower-style benchmark server: the real App facade over loopback, driven
+# by boltapi_loadgen below. Measures the production request path (router +
+# middleware + Request/Response), not a toy.
+add_executable(boltapi_bench_server bench_server.cpp)
+target_link_libraries(boltapi_bench_server PRIVATE boltapi::boltapi)
+if(WIN32)
+    target_link_libraries(boltapi_bench_server PRIVATE ws2_32 mswsock)
+endif()
+boltapi_apply_hardening(boltapi_bench_server)
+boltapi_apply_sanitizers(boltapi_bench_server)
+
+# In-tree async HTTP/1.1 load generator: a real socket load driver built on
+# BoltAPI's own outbound primitives (IODispatcher async_connect/read/write +
+# WorkerThreadPool). ZERO third-party deps. Its http_client.{h,cpp} core is the
+# seed of the future API-gateway upstream HTTP client (see docs/gateway/).
+add_executable(boltapi_loadgen
+    loadgen/loadgen_main.cpp
+    loadgen/loadgen.cpp
+    loadgen/http_client.cpp)
+target_include_directories(boltapi_loadgen PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/loadgen)
+target_link_libraries(boltapi_loadgen PRIVATE boltapi::boltapi)
+if(WIN32)
+    target_link_libraries(boltapi_loadgen PRIVATE ws2_32 mswsock)
+endif()
+boltapi_apply_hardening(boltapi_loadgen)
+boltapi_apply_sanitizers(boltapi_loadgen)

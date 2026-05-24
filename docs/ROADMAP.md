@@ -23,11 +23,16 @@ Task numbers (`#NN`) refer to the in-repo task tracker.
   `WSARecvMsg` / GSO/GRO would help many-source high-PPS (many QUIC conns, dense
   media), but showed **no measurable win on single-connection loopback**, so it was
   not added speculatively. Needs a *realistic multi-connection* bench to justify.
-- ⚪ **No load/soak baseline.** Current numbers are micro/loopback only
-  (`benchmarks/quic_throughput_bench.cpp`, `media_throughput_bench.cpp`): QUIC
-  ≈ 62 handshakes/s, ≈ 1.7 MB/s, ≈ 5.4–6.0 µs/byte (AEAD-dominated) on this box.
-  No sustained-throughput, many-connection, or HTTP/1.1+2 vs peers numbers under
-  real load. (See §4 integration tests.)
+- 🟡 **Load tooling landed; soak baseline still open.** There is now a real socket
+  load driver — the in-tree async **`benchmarks/loadgen/`** (zero-dep, on the
+  engine's own outbound primitives) + **`benchmarks/bench_server.cpp`** (TechEmpower-
+  style routes) + `scripts/run_benchmarks.{ps1,sh}` + `Dockerfile.linux-bench`
+  (Clang lane, smoke-gated). Headline loopback numbers exist (~63–69k req/s, all
+  endpoints failed=0 on MSVC; Linux/Clang smoke green). STILL open: **sustained
+  soak / many-connection / resource-drift** runs, and **vs-peers** numbers
+  (nginx/Drogon — the comparison-framing template in `docs/BENCHMARKS.md` is ready
+  but unfilled). QUIC/media remain micro/loopback only (≈ 62 handshakes/s,
+  ≈ 1.7 MB/s on this box). (See §4 integration tests.)
 - 🟡 **Middleware per-request `std::function` allocation** (TODO in `middleware.h`).
   The chain allocates per request; an arena-backed continuation is a known perf pass
   not yet done.
