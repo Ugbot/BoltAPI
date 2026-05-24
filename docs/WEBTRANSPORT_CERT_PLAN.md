@@ -82,6 +82,24 @@ Net: WebTransport server logic + cert pinning are correct; the browser pill need
 (2) the OpenSSL ClientHello-extension fix and (3) multi-connection demux — both
 focused QUIC interop efforts. A publicly/locally-trusted cert (e.g. mkcert) would
 also let normal Chrome connect without pinning, but does not bypass (2)/(3).
+
+### UPDATE — verified on a TRULY FRESH connection (chrome-devtools MCP + trace)
+With the Uint8Array pin AND a fresh Chrome QUIC connection (no pooled/wedged one):
+- **failed=0 throughout** — the OpenSSL "bad extension" (2) does NOT occur on a clean
+  first connection; it was an artifact of the single-peer wedging (3) corrupting
+  retried handshakes. So (2) collapses into (3).
+- **No Draining / no cert reject** — the cert pin is honored; cert side DONE.
+- BUT the handshake still does not complete: **Chrome stays at the Initial level**
+  (re-sends Initial pn=1,2,… and never advances to process the server's ServerHello),
+  so 1-RTT is never reached → `wt.ready` times out. The server sends ServerHello
+  (Initial, 99B) + its Handshake flight (526B) as SEPARATE datagrams; aioquic
+  advances on this, Chrome does not.
+THE remaining blocker is now: **Chrome doesn't advance past Initial on the server's
+first flight.** Likely-fix leads: (a) ACK Chrome's Initial in the server's Initial
+(so Chrome stops retransmitting and processes ServerHello), (b) COALESCE the Initial
+(ServerHello) + Handshake flight into one datagram (Chrome may expect/prefer this),
+(c) packet-number/anti-amplification check on the server's first flight. Plus (3)
+per-DCID multi-connection demux so Chrome's retries don't wedge the endpoint.
 - [ ] D6. Update RUNNING.md (WebTransport in-browser works, no flags) + tick #45.
 
 ## Notes / non-goals
