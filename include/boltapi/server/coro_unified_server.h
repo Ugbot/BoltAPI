@@ -23,6 +23,7 @@
 #include "boltapi/net/coro_tcp_listener.h"
 #include "boltapi/net/io_dispatcher.h"
 #include "boltapi/net/tls_context.h"
+#include "boltapi/net/coro_tls_socket.h"
 #include "boltapi/http/http1_parser.h"
 #include "boltapi/http/http1_connection.h"
 #include "boltapi/http/http2_connection.h"
@@ -565,14 +566,15 @@ private:
     core::coro_task<void> handle_cleartext_connection(net::IODispatcher& io, int fd);
 
     // HTTP/1.1 request handling loop
-    core::coro_task<void> handle_http1_connection(net::IODispatcher& io, int fd, bool is_tls);
+    core::coro_task<void> handle_http1_connection(net::IODispatcher& io, int fd, net::CoroTlsSocket* tls);
 
     // HTTP/2 request handling loop
-    core::coro_task<void> handle_http2_connection(net::IODispatcher& io, int fd, bool is_tls);
+    core::coro_task<void> handle_http2_connection(net::IODispatcher& io, int fd, net::CoroTlsSocket* tls);
 
     // WebSocket connection handler coroutine
     core::coro_task<void> handle_websocket_connection(
-        net::IODispatcher& io, int fd, WebSocketConnection& ws_conn);
+        net::IODispatcher& io, int fd, WebSocketConnection& ws_conn,
+        net::CoroTlsSocket* tls);
 
     // Signal handler installation
     void install_signal_handlers();

@@ -1,0 +1,16 @@
+# Bolt API demo — all four protocols in one container.
+#   docker compose up --build
+# Then open http://localhost:8080/  (see RUNNING.md for HTTP/2 / HTTP/3 / WebRTC).
+services:
+  boltapi:
+    build: .
+    image: boltapi
+    ports:
+      - "8080:8080/tcp"   # HTTP/1.1 cleartext + browser pages
+      - "8443:8443/tcp"   # HTTP/1.1 + HTTP/2 over TLS
+      - "8443:8443/udp"   # HTTP/3 (QUIC)
+      - "9000:9000/udp"   # WebRTC media/data
+    # For the most reliable WebRTC path across Docker's NAT on Linux, swap the
+    # port mappings above for host networking:
+    #   network_mode: host
+    restart: unless-stopped

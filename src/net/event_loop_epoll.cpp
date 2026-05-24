@@ -21,6 +21,7 @@
 #include <unordered_map>
 #include <atomic>
 #include <iostream>
+#include <cstdlib>   // std::abort (no exceptions in this build)
 
 namespace bolt::api {
 namespace net {
@@ -46,7 +47,10 @@ public:
         // Create epoll file descriptor
         epoll_fd_ = epoll_create1(EPOLL_CLOEXEC);
         if (epoll_fd_ < 0) {
-            throw std::runtime_error(std::string("epoll_create1() failed: ") + strerror(errno));
+            // -fno-exceptions build: a failed epoll fd at startup is fatal and
+            // unrecoverable from a constructor — log and abort rather than throw.
+            std::cerr << "epoll_create1() failed: " << strerror(errno) << std::endl;
+            std::abort();
         }
 
         // Pre-allocate event array for epoll_wait()
@@ -154,14 +158,9 @@ public:
                 event_type = event_type | IOEvent::ERROR;
             }
 
-            // Invoke handler
-            try {
-                it->second.handler(fd, event_type, it->second.user_data);
-            } catch (const std::exception& e) {
-                std::cerr << "Event handler exception: " << e.what() << std::endl;
-            } catch (...) {
-                std::cerr << "Event handler unknown exception" << std::endl;
-            }
+            // Invoke handler directly — handlers are noexcept in this
+            // exception-free (-fno-exceptions) build.
+            it->second.handler(fd, event_type, it->second.user_data);
         }
 
         // Grow event array if needed

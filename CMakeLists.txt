@@ -292,6 +292,14 @@ if(BOLTAPI_BUILD_EXAMPLES)
     endif()
     boltapi_apply_hardening(boltapi_http3_server)
 
+    # All-four-protocols demo for the Docker/browser story (H1 + H2 + H3 + WebRTC).
+    add_executable(boltapi_docker_demo examples/docker_demo.cpp)
+    target_link_libraries(boltapi_docker_demo PRIVATE boltapi::boltapi)
+    if(WIN32)
+        target_link_libraries(boltapi_docker_demo PRIVATE ws2_32 mswsock iphlpapi)
+    endif()
+    boltapi_apply_hardening(boltapi_docker_demo)
+
     # WebRTC data-channel echo server (debug/example; meaningful under WEBRTC=ON).
     add_executable(boltapi_webrtc_echo examples/webrtc_echo.cpp)
     target_link_libraries(boltapi_webrtc_echo PRIVATE boltapi::boltapi)

@@ -33,6 +33,29 @@ std::unordered_map<std::string, CoroSSEHandler> CoroUnifiedServer::s_sse_handler
 Http1Connection::UltraFastCallback CoroUnifiedServer::s_ultra_fast_callback_ = nullptr;
 CoroUnifiedServer* CoroUnifiedServer::s_instance_ = nullptr;
 
+// ---------------------------------------------------------------------------
+// conn_read / conn_write — route connection app I/O through the TLS socket when
+// the connection is encrypted (tls != nullptr), else the raw fd. This is what
+// makes HTTP/1.1 + HTTP/2 application data go out as TLS records on an HTTPS
+// connection: previously only the handshake went through TLS and app data was
+// written raw to the fd (plaintext), which a real TLS client rejects as a
+// "bad record type". noexcept-free path; bounded by the caller's loops.
+// ---------------------------------------------------------------------------
+namespace {
+core::coro_task<ssize_t> conn_write(net::IODispatcher& io, int fd,
+                                    net::CoroTlsSocket* tls,
+                                    const void* data, std::size_t len) {
+    if (tls != nullptr) co_return co_await tls->write(data, len);
+    co_return co_await io.async_write(fd, data, len);
+}
+core::coro_task<ssize_t> conn_read(net::IODispatcher& io, int fd,
+                                   net::CoroTlsSocket* tls,
+                                   void* data, std::size_t len) {
+    if (tls != nullptr) co_return co_await tls->read(data, len);
+    co_return co_await io.async_read(fd, data, len);
+}
+}  // namespace
+
 // =============================================================================
 // Constructor / Destructor
 // =============================================================================
@@ -460,11 +483,11 @@ core::coro_task<void> CoroUnifiedServer::handle_tls_connection(net::IODispatcher
     if (alpn == "h2") {
         // HTTP/2
         requests_http2_.fetch_add(1, std::memory_order_relaxed);
-        co_await handle_http2_connection(io, fd, true);
+        co_await handle_http2_connection(io, fd, tls_socket.get());
     } else {
         // Default to HTTP/1.1 (alpn == "http/1.1" or empty)
         requests_http1_.fetch_add(1, std::memory_order_relaxed);
-        co_await handle_http1_connection(io, fd, true);
+        co_await handle_http1_connection(io, fd, tls_socket.get());
     }
 
     track_connection_close();
@@ -489,7 +512,7 @@ core::coro_task<void> CoroUnifiedServer::handle_cleartext_connection(net::IODisp
     // Set non-blocking
     net::sys::set_nonblocking(fd);
 
-    co_await handle_http1_connection(io, fd, false);
+    co_await handle_http1_connection(io, fd, nullptr);
 
     track_connection_close();
 }
@@ -499,7 +522,7 @@ core::coro_task<void> CoroUnifiedServer::handle_cleartext_connection(net::IODisp
 // =============================================================================
 
 core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
-    net::IODispatcher& io, int fd, bool is_tls) {
+    net::IODispatcher& io, int fd, net::CoroTlsSocket* tls) {
 
     // Two-phase buffer strategy:
     // Phase 1: 8KB stack buffer for headers (zero allocation fast path)
@@ -542,13 +565,13 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
                 if (!body_detected) {
                     const char* r = "HTTP/1.1 431 Request Header Fields Too Large\r\n"
                         "Content-Length: 0\r\nConnection: close\r\n\r\n";
-                    co_await io.async_write(fd, r, strlen(r));
+                    co_await conn_write(io, fd, tls,r, strlen(r));
                     io.async_close(fd);
                     co_return;
                 }
                 const char* r = "HTTP/1.1 413 Payload Too Large\r\n"
                     "Content-Length: 0\r\nConnection: close\r\n\r\n";
-                co_await io.async_write(fd, r, strlen(r));
+                co_await conn_write(io, fd, tls,r, strlen(r));
                 io.async_close(fd);
                 co_return;
             }
@@ -557,13 +580,13 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
             if (!body_detected && buf_len > config_.max_header_size) {
                 const char* r = "HTTP/1.1 431 Request Header Fields Too Large\r\n"
                     "Content-Length: 0\r\nConnection: close\r\n\r\n";
-                co_await io.async_write(fd, r, strlen(r));
+                co_await conn_write(io, fd, tls,r, strlen(r));
                 io.async_close(fd);
                 co_return;
             }
 
             // Read more data into current buffer
-            ssize_t n = co_await io.async_read(fd, buf + buf_len, buf_cap - buf_len);
+            ssize_t n = co_await conn_read(io, fd, tls,buf + buf_len, buf_cap - buf_len);
             if (n <= 0) {
                 io.async_close(fd);
                 co_return;
@@ -580,7 +603,7 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
                     if (parsed_req.content_length > config_.max_body_size) {
                         const char* r = "HTTP/1.1 413 Payload Too Large\r\n"
                             "Content-Length: 0\r\nConnection: close\r\n\r\n";
-                        co_await io.async_write(fd, r, strlen(r));
+                        co_await conn_write(io, fd, tls,r, strlen(r));
                         io.async_close(fd);
                         co_return;
                     }
@@ -598,7 +621,7 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
                 if (!body_detected && parsed_req.chunked && !parsed_req.has_content_length) {
                     const char* r = "HTTP/1.1 501 Not Implemented\r\n"
                         "Content-Length: 0\r\nConnection: close\r\n\r\n";
-                    co_await io.async_write(fd, r, strlen(r));
+                    co_await conn_write(io, fd, tls,r, strlen(r));
                     io.async_close(fd);
                     co_return;
                 }
@@ -609,7 +632,7 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
                 if (elapsed > timeout) {
                     const char* r = "HTTP/1.1 408 Request Timeout\r\n"
                         "Content-Length: 0\r\nConnection: close\r\n\r\n";
-                    co_await io.async_write(fd, r, strlen(r));
+                    co_await conn_write(io, fd, tls,r, strlen(r));
                     io.async_close(fd);
                     co_return;
                 }
@@ -623,7 +646,7 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
                 "Content-Length: 0\r\n"
                 "Connection: close\r\n"
                 "\r\n";
-            co_await io.async_write(fd, bad_request, strlen(bad_request));
+            co_await conn_write(io, fd, tls,bad_request, strlen(bad_request));
             break;
         }
 
@@ -652,7 +675,7 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
                     "Content-Length: 0\r\n"
                     "Connection: close\r\n"
                     "\r\n";
-                co_await io.async_write(fd, too_large, strlen(too_large));
+                co_await conn_write(io, fd, tls,too_large, strlen(too_large));
                 break;
             }
         }
@@ -691,7 +714,7 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
                         "Content-Length: 0\r\n"
                         "Connection: close\r\n"
                         "\r\n";
-                    co_await io.async_write(fd, too_large, strlen(too_large));
+                    co_await conn_write(io, fd, tls,too_large, strlen(too_large));
                     break;
                 }
             }
@@ -704,7 +727,7 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
                 "Content-Length: 0\r\n"
                 "Connection: close\r\n"
                 "\r\n";
-            co_await io.async_write(fd, too_large, strlen(too_large));
+            co_await conn_write(io, fd, tls,too_large, strlen(too_large));
             break;
         }
 
@@ -750,7 +773,7 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
             
             if (response_size > 0) {
                 // Send the response
-                co_await io.async_write(fd, response_buffer, response_size);
+                co_await conn_write(io, fd, tls,response_buffer, response_size);
                 
                 // Check keep-alive and continue loop
                 keep_alive = parsed_req.keep_alive;
@@ -819,7 +842,7 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
                         "Sec-WebSocket-Accept: " + accept_key + "\r\n"
                         "\r\n";
 
-                    co_await io.async_write(fd, ws_response.data(), ws_response.size());
+                    co_await conn_write(io, fd, tls,ws_response.data(), ws_response.size());
 
                     std::cout << "[CoroUnifiedServer] WebSocket upgrade for path: " << req.path << std::endl;
 
@@ -833,7 +856,7 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
                     (*ws_handler)(ws_conn);
 
                     // Handle WebSocket frames in coroutine loop
-                    co_await handle_websocket_connection(io, fd, ws_conn);
+                    co_await handle_websocket_connection(io, fd, ws_conn, tls);
 
                     // WebSocket connection closed
                     io.async_close(fd);
@@ -862,7 +885,7 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
                     "Access-Control-Allow-Origin: *\r\n"
                     "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
                     "\r\n";
-                co_await io.async_write(fd, sse_headers, strlen(sse_headers));
+                co_await conn_write(io, fd, tls,sse_headers, strlen(sse_headers));
 
                 std::cout << "[CoroUnifiedServer] SSE stream for path: " << req.path << std::endl;
 
@@ -939,7 +962,7 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
 
         if (use_chunked) {
             // For chunked encoding, send headers first
-            co_await io.async_write(fd, resp_str.data(), resp_str.size());
+            co_await conn_write(io, fd, tls,resp_str.data(), resp_str.size());
 
             // Send body as chunk(s) if there is content
             if (!response.body.empty()) {
@@ -951,16 +974,16 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
                 chunk.append(size_buf, len);
                 chunk.append(response.body);
                 chunk.append("\r\n");
-                co_await io.async_write(fd, chunk.data(), chunk.size());
+                co_await conn_write(io, fd, tls,chunk.data(), chunk.size());
             }
 
             // Send final empty chunk: 0\r\n\r\n
             const char* final_chunk = "0\r\n\r\n";
-            co_await io.async_write(fd, final_chunk, 5);
+            co_await conn_write(io, fd, tls,final_chunk, 5);
         } else {
             // Non-chunked: send headers + body together
             resp_str += response.body;
-            co_await io.async_write(fd, resp_str.data(), resp_str.size());
+            co_await conn_write(io, fd, tls,resp_str.data(), resp_str.size());
         }
 
         // Pipelining timeout check: before processing next request from buffer,
@@ -970,7 +993,7 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
             if (elapsed > idle_timeout) {
                 const char* r = "HTTP/1.1 408 Request Timeout\r\n"
                     "Content-Length: 0\r\nConnection: close\r\n\r\n";
-                co_await io.async_write(fd, r, strlen(r));
+                co_await conn_write(io, fd, tls,r, strlen(r));
                 break;
             }
         }
@@ -1021,7 +1044,7 @@ struct PendingH2Request {
 };
 
 core::coro_task<void> CoroUnifiedServer::handle_http2_connection(
-    net::IODispatcher& io, int fd, bool is_tls) {
+    net::IODispatcher& io, int fd, net::CoroTlsSocket* tls) {
 
     // Create HTTP/2 connection
     http2::Http2Connection h2_conn(true);  // Server mode
@@ -1076,7 +1099,7 @@ core::coro_task<void> CoroUnifiedServer::handle_http2_connection(
         const uint8_t* out_data = nullptr;
         size_t out_len = 0;
         while (h2_conn.get_output(&out_data, &out_len)) {
-            ssize_t written = co_await io.async_write(fd, out_data, out_len);
+            ssize_t written = co_await conn_write(io, fd, tls,out_data, out_len);
             if (written <= 0) {
                 io.async_close(fd);
                 co_return;
@@ -1085,7 +1108,7 @@ core::coro_task<void> CoroUnifiedServer::handle_http2_connection(
         }
 
         // Read incoming data
-        ssize_t n = co_await io.async_read(fd, buffer, BUFFER_SIZE);
+        ssize_t n = co_await conn_read(io, fd, tls,buffer, BUFFER_SIZE);
         if (n <= 0) {
             break;  // Connection closed or error
         }
@@ -1134,7 +1157,7 @@ core::coro_task<void> CoroUnifiedServer::handle_http2_connection(
         const uint8_t* out_data = nullptr;
         size_t out_len = 0;
         while (h2_conn.get_output(&out_data, &out_len)) {
-            ssize_t written = co_await io.async_write(fd, out_data, out_len);
+            ssize_t written = co_await conn_write(io, fd, tls,out_data, out_len);
             if (written <= 0) break;
             h2_conn.commit_output(static_cast<size_t>(written));
         }
@@ -1157,7 +1180,8 @@ core::coro_task<void> CoroUnifiedServer::handle_http2_connection(
 // =============================================================================
 
 core::coro_task<void> CoroUnifiedServer::handle_websocket_connection(
-    net::IODispatcher& io, int fd, WebSocketConnection& ws_conn) {
+    net::IODispatcher& io, int fd, WebSocketConnection& ws_conn,
+    net::CoroTlsSocket* tls) {
 
     static constexpr size_t WS_BUFFER_SIZE = 16384;
     uint8_t buffer[WS_BUFFER_SIZE];
@@ -1168,7 +1192,7 @@ core::coro_task<void> CoroUnifiedServer::handle_websocket_connection(
         while (ws_conn.has_pending_output()) {
             const std::string* output = ws_conn.get_pending_output();
             if (output && !output->empty()) {
-                ssize_t written = co_await io.async_write(fd, output->data(), output->size());
+                ssize_t written = co_await conn_write(io, fd, tls,output->data(), output->size());
                 if (written <= 0) {
                     // Write failed - close connection
                     ws_conn.close(1001, "write error");
@@ -1179,7 +1203,7 @@ core::coro_task<void> CoroUnifiedServer::handle_websocket_connection(
         }
 
         // Read incoming WebSocket frames
-        ssize_t n = co_await io.async_read(fd, buffer + buffer_len, WS_BUFFER_SIZE - buffer_len);
+        ssize_t n = co_await conn_read(io, fd, tls,buffer + buffer_len, WS_BUFFER_SIZE - buffer_len);
         if (n <= 0) {
             // Connection closed or error
             if (ws_conn.on_close) {
@@ -1221,7 +1245,7 @@ core::coro_task<void> CoroUnifiedServer::handle_websocket_connection(
             while (ws_conn.has_pending_output()) {
                 const std::string* output = ws_conn.get_pending_output();
                 if (output && !output->empty()) {
-                    ssize_t written = co_await io.async_write(fd, output->data(), output->size());
+                    ssize_t written = co_await conn_write(io, fd, tls,output->data(), output->size());
                     if (written <= 0) {
                         ws_conn.close(1001, "write error");
                         co_return;
@@ -1236,7 +1260,7 @@ core::coro_task<void> CoroUnifiedServer::handle_websocket_connection(
     while (ws_conn.has_pending_output()) {
         const std::string* output = ws_conn.get_pending_output();
         if (output && !output->empty()) {
-            co_await io.async_write(fd, output->data(), output->size());
+            co_await conn_write(io, fd, tls,output->data(), output->size());
         }
         ws_conn.pop_pending_output();
     }

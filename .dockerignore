@@ -1,0 +1,18 @@
+# Keep the build context small + reproducible — source only.
+build/
+out/
+.worktrees/
+.git/
+**/__pycache__/
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.o
+*.a
+*.lib
+tests/interop/pion/pion_interop.exe
+testing/_*.txt
+testing/srv.*
+demo_server.log
+demo_server.out
