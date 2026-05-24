@@ -35,8 +35,10 @@ COPY . .
 
 # Configure + build against the freshly-built OpenSSL. HTTP/3 + WebRTC on,
 # examples on, tests off (the Linux test lane is a separate target).
+ARG BOLTAPI_EXTRA_CXX_FLAGS=
 RUN cmake -S . -B build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_CXX_FLAGS="${BOLTAPI_EXTRA_CXX_FLAGS}" \
         -DOPENSSL_ROOT_DIR=/opt/openssl \
         -DBOLTAPI_WITH_HTTP3=ON \
         -DBOLTAPI_WITH_WEBRTC=ON \
