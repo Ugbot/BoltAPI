@@ -422,6 +422,48 @@ TEST(QuicStream, LossyLinkCompletes) {
 }
 
 // ============================================================================
+// GATE: RFC 9221 QUIC DATAGRAM round-trip (unreliable, unordered). After the
+// handshake, the client send_datagram()s several payloads; the server's
+// on_datagram handler receives each byte-exact and echoes it back; the client
+// receives the echoes. Proves parse + emit + the max_datagram_frame_size gate.
+// ============================================================================
+TEST(QuicDatagram, RoundTripEcho) {
+    auto p_owner = std::make_unique<Pair>();
+    Pair& p = *p_owner;
+
+    std::vector<std::vector<std::uint8_t>> server_got, client_got;
+    p.server.set_datagram_handler([&](const std::uint8_t* d, std::size_t n) {
+        server_got.emplace_back(d, d + n);
+        (void)p.server.send_datagram(d, n);  // echo back
+    });
+    p.client.set_datagram_handler([&](const std::uint8_t* d, std::size_t n) {
+        client_got.emplace_back(d, d + n);
+    });
+
+    auto noop = [](std::uint64_t, const std::uint8_t*, std::size_t, bool) {};
+    ASSERT_TRUE(p.setup(0, 11, noop, noop));
+    ASSERT_TRUE(p.handshake(std::chrono::seconds(10)));
+
+    constexpr int kN = 5;
+    for (int i = 0; i < kN; ++i) {
+        std::vector<std::uint8_t> dg(16 + i, static_cast<std::uint8_t>(0x40 + i));
+        ASSERT_TRUE(p.client.send_datagram(dg.data(), dg.size()))
+            << "send_datagram rejected (round " << i << ")";
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (static_cast<int>(client_got.size()) <= i &&
+               std::chrono::steady_clock::now() < deadline) {
+            p.pump_once();
+        }
+        ASSERT_GT(static_cast<int>(client_got.size()), i)
+            << "no echo for datagram " << i;
+        EXPECT_EQ(client_got[i], dg) << "echoed datagram not byte-exact (" << i << ")";
+    }
+    ASSERT_EQ(static_cast<int>(server_got.size()), kN);
+    p.stop();
+}
+
+// ============================================================================
 // GATE: small per-stream recv window forces window updates; no deadlock.
 // ============================================================================
 TEST(QuicStream, FlowControlNoDeadlock) {

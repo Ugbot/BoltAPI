@@ -253,6 +253,12 @@ using QuicStreamDataFn =
     std::function<void(std::uint64_t stream_id, const std::uint8_t* data,
                        std::size_t len, bool fin)>;
 
+// Raised for each received QUIC DATAGRAM frame (RFC 9221). `data`/`len` is the
+// datagram payload (valid only during the call — copy if retained). Unreliable,
+// unordered; no retransmit. Enables WebTransport/H3 datagrams.
+using QuicDatagramFn =
+    std::function<void(const std::uint8_t* data, std::size_t len)>;
+
 // STREAM payload budget per frame (leaves room for the frame header in a
 // packet). Bounded so a multi-KB message spans several frames/packets.
 inline constexpr std::size_t kMaxStreamChunk = 1024;
@@ -470,6 +476,37 @@ public:
     // ------------------------------------------------------------------------
     void set_stream_data_handler(QuicStreamDataFn fn) noexcept {
         on_stream_data_ = std::move(fn);
+    }
+
+    // RFC 9221 — register a handler for received QUIC DATAGRAM frames.
+    void set_datagram_handler(QuicDatagramFn fn) noexcept {
+        on_datagram_ = std::move(fn);
+    }
+
+    // RFC 9221 — send one QUIC DATAGRAM (unreliable, unordered). Frames a
+    // length-prefixed DATAGRAM (type 0x31) into a 1-RTT packet. Requires 1-RTT
+    // keys + that the peer advertised a max_datagram_frame_size that fits. Returns
+    // false if not sendable (no keys / peer disabled datagrams / too large).
+    bool send_datagram(const std::uint8_t* data, std::size_t len) noexcept {
+        assert((data != nullptr || len == 0) && "send_datagram: null with len>0");
+        if (!one_rtt_keys_ready()) return false;
+        // Peer's limit (0/absent => peer does not accept DATAGRAMs). The limit is
+        // the WHOLE frame size (type byte + length varint + payload, RFC 9221 §3).
+        if (!tls_.have_peer_transport_params()) return false;
+        const TransportParameters& ptp = tls_.peer_transport_params();
+        const std::uint64_t peer_max = ptp.max_datagram_frame_size_present
+                                           ? ptp.max_datagram_frame_size : 0;
+        if (peer_max == 0) return false;
+        std::uint8_t payload[kMaxPayloadSize];
+        std::size_t pos = 0;
+        payload[pos++] = static_cast<std::uint8_t>(FrameType::kDatagramWithLen);
+        pos += varint_encode(len, payload + pos);
+        if (pos + len > sizeof(payload)) return false;          // exceeds MTU budget
+        if (static_cast<std::uint64_t>(pos + len) > peer_max) return false;  // peer cap
+        if (len > 0) std::memcpy(payload + pos, data, len);
+        pos += len;
+        FrameRange ranges[kMaxFrameRangesPerPacket];
+        return send_app_packet(payload, pos, /*ack_eliciting=*/true, ranges, 0);
     }
 
     // Open a client/server-initiated bidirectional stream. Returns its id.
@@ -979,6 +1016,9 @@ private:
         if (type == static_cast<std::uint8_t>(FrameType::kPathChallenge) ||
             type == static_cast<std::uint8_t>(FrameType::kPathResponse))
             return handle_path(data + 1, len - 1, out_consumed);
+        if (type == static_cast<std::uint8_t>(FrameType::kDatagram) ||
+            type == static_cast<std::uint8_t>(FrameType::kDatagramWithLen))
+            return handle_datagram(type == 0x31, data + 1, len - 1, out_consumed);
         return handle_unknown_frame(level, data, len, out_consumed);
     }
 
@@ -996,6 +1036,31 @@ private:
         if (c < 0) return false;  // truncated type varint -> drop the packet
         out_consumed = static_cast<std::size_t>(c);
         return true;  // ignore the GREASE/unknown frame, keep parsing
+    }
+
+    // RFC 9221 DATAGRAM frame (the type byte is already consumed). `with_len`
+    // (0x31): a varint length precedes the payload. Without (0x30): the payload
+    // runs to the end of the packet's frame area. Delivers to on_datagram_ (the
+    // bytes are a view into the decrypted packet buffer — valid for the call).
+    bool handle_datagram(bool with_len, const std::uint8_t* data, std::size_t len,
+                         std::size_t& out_consumed) noexcept {
+        assert((data != nullptr || len == 0) && "handle_datagram: null with len>0");
+        const std::uint8_t* payload = data;
+        std::size_t plen = len;            // 0x30: remainder of the packet
+        std::size_t hdr = 0;
+        if (with_len) {
+            std::uint64_t dl = 0;
+            const int c = varint_decode(data, len, dl);
+            if (c <= 0) return false;
+            hdr = static_cast<std::size_t>(c);
+            if (dl > len - hdr) return false;   // length past buffer -> malformed
+            payload = data + hdr;
+            plen = static_cast<std::size_t>(dl);
+        }
+        // out_consumed counts the bytes AFTER the type byte (which the caller adds).
+        out_consumed = 1 + hdr + plen;
+        if (on_datagram_) on_datagram_(payload, plen);
+        return true;
     }
 
     bool handle_new_token(const std::uint8_t* data, std::size_t len,
@@ -2319,6 +2384,7 @@ private:
     // ---- streams + flow control (wave 5) ----
     static constexpr std::uint64_t kStreamRecvWindow = 128 * 1024;
     QuicStreamDataFn on_stream_data_;
+    QuicDatagramFn   on_datagram_;       // RFC 9221 received-DATAGRAM handler
     // The Stream pool is pre-allocated from the connection arena (each Stream
     // carries large fixed send/recv buffers; embedding kMaxStreams of them by
     // value would blow the stack). Pool-style allocation per CLAUDE.md — no

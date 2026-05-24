@@ -127,6 +127,16 @@ public:
         qc_->set_stream_data_handler(
             [this](std::uint64_t id, const std::uint8_t* d, std::size_t n,
                    bool fin) { on_stream_data(id, d, n, fin); });
+        // RFC 9221/9297 WebTransport datagrams: a QUIC DATAGRAM carries a
+        // quarter-stream-id (varint) prefix identifying the WT session's CONNECT
+        // stream, then the WT datagram payload. The server (demo shape, matching
+        // the auto-200 CONNECT) ECHOES it straight back to that session.
+        if (is_server_) {
+            qc_->set_datagram_handler(
+                [this](const std::uint8_t* d, std::size_t n) {
+                    on_quic_datagram(d, n);
+                });
+        }
     }
 
     void set_request_handler(H3RequestFn fn) noexcept {
@@ -235,6 +245,27 @@ private:
             else            dispatch_response(*s);
             release_slot(*s);
         }
+    }
+
+    // RFC 9297 / WebTransport-over-H3: one received QUIC DATAGRAM. The payload is
+    // a quarter-stream-id (varint, = session CONNECT stream id / 4) + the WT
+    // datagram bytes. We validate the prefix and, in the demo server shape (auto
+    // CONNECT->200), ECHO the whole frame back so it routes to the same session.
+    // (A proper App-facing on_webtransport_datagram callback is a follow-up.)
+    void on_quic_datagram(const std::uint8_t* d, std::size_t n) noexcept {
+        assert((d != nullptr || n == 0) && "on_quic_datagram: null with n>0");
+        std::uint64_t quarter = 0;
+        const int c = quic::varint_decode(d, n, quarter);
+        if (c <= 0) return;  // malformed prefix: drop (bounded)
+        // Only echo for an active WT session stream (quarter*4 is its id).
+        const std::uint64_t session_id = quarter * 4;
+        bool is_wt_session = false;
+        for (std::size_t i = 0; i < kH3MaxStreams; ++i) {
+            if (streams_[i].in_use && streams_[i].id == session_id &&
+                streams_[i].wt) { is_wt_session = true; break; }
+        }
+        if (!is_wt_session) return;
+        (void)qc_->send_datagram(d, n);  // echo prefix+payload back to the session
     }
 
     // Uni streams: read+discard the type prefix; QPACK enc/dec instructions are
