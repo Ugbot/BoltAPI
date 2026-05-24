@@ -10,18 +10,23 @@
 # ---------------------------------------------------------------------------
 FROM ubuntu:24.04 AS test
 ARG DEBIAN_FRONTEND=noninteractive
+# LLVM/Clang toolchain (project policy: Clang on Linux, never GCC — closest parity
+# to the MSVC primary). clang/lld are the compiler+linker; make + libstdc++-dev
+# (via the make/libstdc++ packages) supply the build driver + the GNU libstdc++
+# headers clang++ uses. No g++/gcc invoked for our code.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential cmake ninja-build git ca-certificates pkg-config \
-        perl curl wget zlib1g-dev \
+        clang lld llvm cmake ninja-build make libstdc++-14-dev \
+        git ca-certificates pkg-config perl curl wget zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
+ENV CC=clang CXX=clang++
 
-# OpenSSL 3.6 from source (the 3.5+ QUIC-TLS API HTTP/3 needs).
+# OpenSSL 3.6 from source (the 3.5+ QUIC-TLS API HTTP/3 needs), built with Clang.
 ARG OPENSSL_VERSION=3.6.1
 RUN curl -fsSL "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz" -o /tmp/openssl.tar.gz \
     && tar -xzf /tmp/openssl.tar.gz -C /tmp \
     && cd "/tmp/openssl-${OPENSSL_VERSION}" \
     && ./Configure --prefix=/opt/openssl --openssldir=/opt/openssl \
-                   --libdir=lib linux-x86_64 \
+                   --libdir=lib linux-x86_64-clang \
     && make -j"$(nproc)" && make install_sw \
     && rm -rf /tmp/openssl*
 ENV LD_LIBRARY_PATH=/opt/openssl/lib
@@ -30,10 +35,14 @@ WORKDIR /src
 COPY . .
 
 # Configure: HTTP/3 + WebRTC + tests ON, against the from-source OpenSSL.
-# -Werror OFF for this new GCC lane (the suite is MSVC-primary; Windows enforces
+# Compiler pinned to Clang explicitly (never auto-detect → never GCC) + lld linker.
+# -Werror OFF for this Linux lane (the suite is MSVC-primary; Windows enforces
 # /WX). Linux uses the epoll async backend.
 RUN cmake -S . -B build/linux-h3 -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_COMPILER=clang \
+        -DCMAKE_CXX_COMPILER=clang++ \
+        -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld" \
         -DOPENSSL_ROOT_DIR=/opt/openssl \
         -DBOLTAPI_WITH_HTTP3=ON \
         -DBOLTAPI_WITH_WEBRTC=ON \

@@ -10,10 +10,14 @@
 # ---------------------------------------------------------------------------
 FROM ubuntu:24.04 AS test
 ARG DEBIAN_FRONTEND=noninteractive
+# LLVM/Clang toolchain (project policy: Clang on Linux, never GCC — closest parity
+# to the MSVC primary). clang/lld are the compiler+linker; make + libstdc++-dev
+# supply the GNU libstdc++ headers clang++ uses. No g++/gcc invoked for our code.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential cmake ninja-build git ca-certificates pkg-config \
-        libssl-dev zlib1g-dev \
+        clang lld llvm cmake ninja-build make libstdc++-14-dev \
+        git ca-certificates pkg-config libssl-dev zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
+ENV CC=clang CXX=clang++
 
 WORKDIR /src
 # Source only (extern/bolt submodule must be checked out in the build context).
@@ -21,18 +25,21 @@ COPY . .
 
 # Configure: WebRTC ON, HTTP/3 OFF (system OpenSSL 3.0 has no QUIC-TLS API),
 # tests + examples ON. Linux uses the epoll/io_uring async backend.
+# Compiler pinned to Clang explicitly (never auto-detect → never GCC) + lld linker.
 RUN cmake -S . -B build/linux -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_COMPILER=clang \
+        -DCMAKE_CXX_COMPILER=clang++ \
+        -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld" \
         -DBOLTAPI_WITH_HTTP3=OFF \
         -DBOLTAPI_WITH_WEBRTC=ON \
         -DBOLTAPI_BUILD_EXAMPLES=ON \
         -DBOLTAPI_BUILD_TESTS=ON \
         -DBOLTAPI_WARNINGS_AS_ERRORS=OFF
 # NOTE: -Werror is OFF for this Linux lane. The suite is MSVC-primary (Windows
-# enforces /WX); these tests were never built on GCC, so they trip some GCC-only
-# style warnings (-Wdangling-else / -Wmisleading-indentation in GoogleTest macro
-# uses, etc.) that are not relevant to RUNNING the WebRTC suite on Linux — the
-# point of this lane. Cleaning those for GCC -Werror is separate hygiene.
+# enforces /WX); under Clang some GoogleTest macro expansions trip style warnings
+# (-Wdangling-else etc.) not relevant to RUNNING the WebRTC suite on Linux — the
+# point of this lane. Cleaning those for Clang -Werror is separate hygiene.
 
 # Build the WebRTC lib + the WebRTC/relay test targets + the relay demo server
 # (the relay App must LINK on Linux too). We scope to the WebRTC suite — the
