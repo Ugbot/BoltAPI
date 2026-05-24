@@ -2120,6 +2120,10 @@ private:
         tp.max_idle_timeout_present = true;
         tp.active_connection_id_limit = 4;
         tp.active_connection_id_limit_present = true;
+        // RFC 9221: advertise QUIC DATAGRAM support so the peer may enable HTTP/3
+        // datagrams (required for WebTransport). We accept full-size datagrams.
+        tp.max_datagram_frame_size = 65535;
+        tp.max_datagram_frame_size_present = true;
 
         // RFC 9000 §7.3: both endpoints MUST authenticate the connection IDs they
         // chose by echoing them in transport parameters. initial_source_connection_id

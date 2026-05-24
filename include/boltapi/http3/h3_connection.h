@@ -61,6 +61,7 @@ struct H3Request {
     std::string_view   path;
     std::string_view   scheme;
     std::string_view   authority;
+    std::string_view   protocol;   // :protocol (RFC 9220 extended CONNECT; WebTransport)
     const QpackHeader* headers     = nullptr;  // regular (non-pseudo) headers
     std::size_t        header_count = 0;
     const std::uint8_t* body       = nullptr;
@@ -85,6 +86,8 @@ using H3RequestFn = std::function<void(const H3Request&)>;
 struct H3Stream {
     bool          in_use   = false;
     bool          finished = false;  // dispatched already (guards double-fire)
+    bool          wt       = false;  // a WebTransport session stream (stays open)
+    bool          wt_checked = false;  // extended-CONNECT check already done
     std::uint64_t id       = 0;
     std::size_t   len      = 0;
     // Header (QPACK) block + body are split out by the frame parser at FIN.
@@ -93,10 +96,12 @@ struct H3Stream {
     void reset(std::uint64_t sid) noexcept {
         assert(sid <= quic::kVarIntMax && "stream id out of range");
         assert(!in_use && "reset on an in-use slot");
-        in_use   = true;
-        finished = false;
-        id       = sid;
-        len      = 0;
+        in_use     = true;
+        finished   = false;
+        wt         = false;
+        wt_checked = false;
+        id         = sid;
+        len        = 0;
     }
 };
 
@@ -213,6 +218,15 @@ private:
         H3Stream* s = slot_for(id);
         if (s == nullptr) return;  // pool exhausted; drop (bounded)
         append_stream(*s, d, n);
+        // WebTransport: an extended CONNECT (:protocol=webtransport) arrives as a
+        // HEADERS frame WITHOUT fin — the bidi stream stays open as the session.
+        // Detect it as soon as the HEADERS frame is buffered, answer 200, and never
+        // dispatch it as a normal (FIN-terminated) request.
+        if (is_server_ && !s->finished && !s->wt && !s->wt_checked) {
+            const int r = try_webtransport_connect(*s);
+            if (r == 1) { s->wt = true; s->finished = true; return; }
+            if (r == 0) s->wt_checked = true;  // headers seen, not WT — stop checking
+        }
         if (fin && !s->finished) {
             s->finished = true;
             if (is_server_) dispatch_request(*s);
@@ -253,6 +267,29 @@ private:
         req.stream_id = s.id;
         if (!parse_message(s, req)) return;  // malformed: drop (bounded)
         on_request_(req);
+    }
+
+    // WebTransport extended-CONNECT detection. If s.buf begins with a complete
+    // HEADERS frame whose pseudo-headers are :method=CONNECT + :protocol=webtransport,
+    // answer 200 on the same stream WITHOUT fin (it becomes the session stream) and
+    // return 1. Returns 0 when the leading HEADERS frame is complete but is not a WT
+    // CONNECT, and -1 when that HEADERS frame is not yet fully buffered.
+    int try_webtransport_connect(H3Stream& s) noexcept {
+        assert(s.in_use && "wt check on free slot");
+        assert(s.len <= sizeof(s.buf) && "stream cursor past buffer");
+        FrameView fv{};
+        std::size_t used = 0;
+        const FrameStatus st = frame_parse(s.buf, s.len, fv, used);
+        if (st == FrameStatus::kNeedMore) return -1;
+        if (st != FrameStatus::kOk) return 0;
+        if (fv.type != static_cast<std::uint64_t>(FrameType::kHeaders)) return 0;
+        H3Request req{};
+        req.stream_id = s.id;
+        if (!decode_headers(fv.payload, fv.length, req)) return 0;
+        if (req.method != "CONNECT" || req.protocol != "webtransport") return 0;
+        (void)write_headers(s.id, /*is_response=*/true, 200, {}, {}, {}, {},
+                            nullptr, 0, /*fin=*/false);
+        return 1;
     }
 
     // Decode a complete response stream into last_response_* (client side).
@@ -320,6 +357,7 @@ private:
         if (h.name == ":path")      { req.path      = h.value; return true; }
         if (h.name == ":scheme")    { req.scheme    = h.value; return true; }
         if (h.name == ":authority") { req.authority = h.value; return true; }
+        if (h.name == ":protocol")  { req.protocol  = h.value; return true; }
         if (h.name == ":status")    { req.method    = h.value; return true; }
         return false;
     }
@@ -438,6 +476,14 @@ private:
         SettingsFrame sf{};
         sf.qpack_max_table_capacity = 0;        // static-only QPACK in W5b
         sf.qpack_blocked_streams    = 0;
+        if (is_server_) {
+            // Advertise WebTransport so a browser will offer it. The QUIC layer
+            // advertises max_datagram_frame_size (RFC 9221); these settings are
+            // RFC 9220 (extended CONNECT) + RFC 9297 (H3 datagrams) + WT sessions.
+            sf.enable_connect_protocol = true;
+            sf.h3_datagram             = true;
+            sf.wt_max_sessions         = 1;
+        }
         std::uint8_t payload[kSettingsMaxBytes];
         const std::size_t pn = sf.encode_payload(payload, sizeof(payload));
         (void)frame_and_send(control_id_, FrameType::kSettings, payload, pn,

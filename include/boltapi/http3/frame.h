@@ -60,6 +60,9 @@ enum class SettingId : std::uint64_t {
     kQpackMaxTableCapacity = 0x01,  // RFC 9204 §5
     kMaxFieldSectionSize   = 0x06,  // RFC 9114 §7.2.4.1
     kQpackBlockedStreams   = 0x07,  // RFC 9204 §5
+    kEnableConnectProtocol = 0x08,        // RFC 9220 — extended CONNECT (:protocol)
+    kH3Datagram            = 0x33,        // RFC 9297 — HTTP/3 datagrams
+    kWtMaxSessions         = 0x14e9cd29,  // WebTransport-over-HTTP/3 (SETTINGS_WT_MAX_SESSIONS)
 };
 
 // ----------------------------------------------------------------------------
@@ -149,6 +152,10 @@ struct SettingsFrame {
     std::uint64_t max_field_section_size    = 0;
     std::uint64_t qpack_blocked_streams     = 0;
     bool          has_max_field_section     = false;
+    // WebTransport (advertised by the server so a browser will offer WebTransport).
+    bool          enable_connect_protocol   = false;  // RFC 9220
+    bool          h3_datagram               = false;  // RFC 9297
+    std::uint64_t wt_max_sessions           = 0;      // 0 = WebTransport disabled
 
     // Encode the SETTINGS *payload* (id/value varint pairs) into `out`. Returns
     // payload bytes written, or 0 on overflow. Does NOT prepend the frame header
@@ -166,6 +173,13 @@ struct SettingsFrame {
         }
         pos += put_setting(SettingId::kQpackBlockedStreams,
                            qpack_blocked_streams, out, cap, pos);
+        if (enable_connect_protocol)
+            pos += put_setting(SettingId::kEnableConnectProtocol, 1, out, cap, pos);
+        if (h3_datagram)
+            pos += put_setting(SettingId::kH3Datagram, 1, out, cap, pos);
+        if (wt_max_sessions > 0)
+            pos += put_setting(SettingId::kWtMaxSessions, wt_max_sessions,
+                               out, cap, pos);
         assert(pos <= cap && "settings encode overran buffer");
         return pos;
     }

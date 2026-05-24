@@ -52,6 +52,7 @@ enum class TransportParamId : std::uint64_t {
     kActiveConnectionIdLimit = 0x0e,
     kInitialSourceConnectionId = 0x0f,
     kRetrySourceConnectionId = 0x10,
+    kMaxDatagramFrameSize = 0x20,  // RFC 9221 — QUIC DATAGRAM (needed for WebTransport)
 };
 
 // ----------------------------------------------------------------------------
@@ -89,6 +90,7 @@ struct TransportParameters {
     std::uint64_t ack_delay_exponent = kDefaultAckDelayExponent;
     std::uint64_t max_ack_delay = kDefaultMaxAckDelay;            // ms
     std::uint64_t active_connection_id_limit = kDefaultActiveConnIdLimit;
+    std::uint64_t max_datagram_frame_size = 0;  // RFC 9221; 0 = DATAGRAMs disabled
 
     bool disable_active_migration = false;
 
@@ -122,6 +124,7 @@ struct TransportParameters {
     bool ack_delay_exponent_present = false;
     bool max_ack_delay_present = false;
     bool active_connection_id_limit_present = false;
+    bool max_datagram_frame_size_present = false;
 };
 
 namespace detail {
@@ -228,6 +231,10 @@ inline bool encode_transport_params(const TransportParameters& tp,
         ok = ok && detail::tp_put_int(out, cap, &n,
                                       TransportParamId::kActiveConnectionIdLimit,
                                       tp.active_connection_id_limit);
+    if (tp.max_datagram_frame_size_present)
+        ok = ok && detail::tp_put_int(out, cap, &n,
+                                      TransportParamId::kMaxDatagramFrameSize,
+                                      tp.max_datagram_frame_size);
 
     if (tp.disable_active_migration)
         ok = ok && detail::tp_put_bytes(out, cap, &n,
@@ -368,6 +375,10 @@ inline bool decode_transport_params(const std::uint8_t* data, std::size_t len,
             case TransportParamId::kActiveConnectionIdLimit:
                 ok = read_int(&out->active_connection_id_limit,
                               &out->active_connection_id_limit_present);
+                break;
+            case TransportParamId::kMaxDatagramFrameSize:
+                ok = read_int(&out->max_datagram_frame_size,
+                              &out->max_datagram_frame_size_present);
                 break;
             case TransportParamId::kDisableActiveMigration:
                 // Zero-length flag (RFC 9000 §18.2). A non-empty value is an error.
