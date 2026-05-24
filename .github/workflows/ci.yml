@@ -13,7 +13,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: "linux-gcc",   os: ubuntu-24.04, preset: release, cc: gcc-13,   cxx: g++-13 }
+          # Linux = LLVM/Clang only (project policy: never GCC — closest parity to
+          # the MSVC primary; GCC diverges on C++20 corners).
           - { name: "linux-clang", os: ubuntu-24.04, preset: release, cc: clang-18, cxx: clang++-18 }
           - { name: "macos-clang", os: macos-14,     preset: release, cc: clang,    cxx: clang++ }
           - { name: "windows-msvc", os: windows-2022, preset: msvc }
