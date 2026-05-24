@@ -108,6 +108,42 @@
         } else { log("no echo datagram (datagrams not wired yet)"); }
       } catch (e) { log("datagram phase: " + e); }
 
+      // Try a bidirectional WebTransport stream echo (text + a larger binary
+      // blob) — the server echoes the bytes back on the same stream.
+      try {
+        const bs = await wt.createBidirectionalStream();
+        const w = bs.writable.getWriter();
+        const small = new TextEncoder().encode("bolt-wt-stream");
+        const big = new Uint8Array(8192);
+        for (let i = 0; i < big.length; i++) big[i] = i & 0xff;
+        await w.write(small);
+        await w.write(big);
+        await w.close();  // FIN our side
+        const reader = bs.readable.getReader();
+        const chunks = []; let total = 0;
+        const to = setTimeout(() => reader.cancel(), 5000);
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          chunks.push(value); total += value.length;
+          if (total >= small.length + big.length) break;
+        }
+        clearTimeout(to);
+        const got = new Uint8Array(total); let off = 0;
+        for (const c of chunks) { got.set(c, off); off += c.length; }
+        const want = new Uint8Array(small.length + big.length);
+        want.set(small, 0); want.set(big, small.length);
+        const exact = got.length === want.length &&
+                      got.every((b, i) => b === want[i]);
+        if (exact) {
+          log("bidi stream echo OK (" + total + " bytes, byte-exact)", "ok");
+          window.__wtStream = true;
+        } else {
+          log("bidi stream echo mismatch: got " + total + "/" + want.length, "err");
+          window.__wtStream = false;
+        }
+      } catch (e) { log("bidi stream phase: " + e, "err"); window.__wtStream = false; }
+
       wt.closed.then(() => log("session closed")).catch(() => {});
     }
     document.getElementById("go").addEventListener("click", connect);

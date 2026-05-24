@@ -46,11 +46,19 @@ Status: `[x]` done · `[~]` partial · `[ ]` todo.
       datagram echo round-trip** (webtransport.html sends 'bolt-wt-ping' → echo received).
 
 ## P2 — Streams (session-associated bidi/uni)
-- [ ] Uni-stream type `0x54` (WT uni) + bidi signal value `0x41` with the session id
-      prefix (WebTransport-over-HTTP/3 draft); route stream data to the right session.
-- [ ] App API: `session.open_bidi()/open_uni()`, `on_stream(cb)`, stream read/write
-      over the existing QUIC stream layer with flow control.
-- [ ] Gate: aioquic + Chrome echo on a WT bidi stream (text + large binary).
+- [x] **BIDI WT data streams**: a client bidi stream beginning with the varint
+      signal `0x41` + session id (WebTransport-over-HTTP/3 draft) is detected in
+      h3_connection.h (`try_webtransport_bidi`), the prefix stripped, and the
+      payload ECHOED live on the same stream (demo shape). `kWtBidiStreamSignal` +
+      `UniStreamType::kWebTransport`(0x54) in frame.h.
+- [~] Uni-stream type `0x54` constant declared; uni-stream routing/echo (server
+      opens a return uni stream) is the follow-up.
+- [~] App API: the demo auto-echoes in h3_connection.h; a proper
+      `session.open_bidi()/on_stream()` App API is the follow-up.
+- [x] Gate MET: **Chrome (MCP) bidi stream echo** — webtransport.html
+      `createBidirectionalStream()` writes text + 8 KiB binary, server echoes, page
+      verifies **byte-exact (8206 B)** (`window.__wtStream=true`). Loopback gtest is
+      a follow-up.
 
 ## P3 — Session lifecycle + multiplexing
 - [ ] Capsule protocol (RFC 9297): `CLOSE_WEBTRANSPORT_SESSION` / `DRAIN_WEBTRANSPORT_SESSION`.

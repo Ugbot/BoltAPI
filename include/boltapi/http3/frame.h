@@ -51,7 +51,12 @@ enum class UniStreamType : std::uint64_t {
     kPush         = 0x01,  // §6.2.2 — server push (unused here)
     kQpackEncoder = 0x02,  // RFC 9204 §4.2 — encoder-stream instructions
     kQpackDecoder = 0x03,  // RFC 9204 §4.2 — decoder-stream instructions
+    kWebTransport = 0x54,  // WebTransport-over-HTTP/3 uni stream (then session id)
 };
+
+// WebTransport-over-HTTP/3 BIDI data-stream signal: a client bidi WT stream
+// starts with this varint, then the session (CONNECT stream) id, then WT bytes.
+inline constexpr std::uint64_t kWtBidiStreamSignal = 0x41;
 
 // ----------------------------------------------------------------------------
 // SETTINGS identifiers (RFC 9114 §7.2.4.1 + RFC 9204 §5).

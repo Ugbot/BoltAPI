@@ -90,6 +90,8 @@ struct H3Stream {
     bool          finished = false;  // dispatched already (guards double-fire)
     bool          wt       = false;  // a WebTransport session stream (stays open)
     bool          wt_checked = false;  // extended-CONNECT check already done
+    bool          wt_data  = false;  // a WebTransport DATA stream (bidi 0x41 prefix);
+                                     // its prefix is stripped + payload echoed live
     std::uint64_t id       = 0;
     std::size_t   len      = 0;
     // Header (QPACK) block + body are split out by the frame parser at FIN.
@@ -102,6 +104,7 @@ struct H3Stream {
         finished   = false;
         wt         = false;
         wt_checked = false;
+        wt_data    = false;
         id         = sid;
         len        = 0;
     }
@@ -229,12 +232,28 @@ private:
         // (client role). Both accumulate into a per-stream slot until FIN.
         H3Stream* s = slot_for(id);
         if (s == nullptr) return;  // pool exhausted; drop (bounded)
+
+        // WebTransport BIDI data stream: already classified — its prefix is
+        // stripped, so every incoming chunk is pure WT payload; echo it live on
+        // the same bidi stream (server->client direction). Don't buffer/parse.
+        if (s->wt_data) {
+            if (is_server_ && (n > 0 || fin)) (void)qc_->stream_write(id, d, n, fin);
+            if (fin) release_slot(*s);
+            return;
+        }
+
         append_stream(*s, d, n);
-        // WebTransport: an extended CONNECT (:protocol=webtransport) arrives as a
-        // HEADERS frame WITHOUT fin — the bidi stream stays open as the session.
-        // Detect it as soon as the HEADERS frame is buffered, answer 200, and never
-        // dispatch it as a normal (FIN-terminated) request.
-        if (is_server_ && !s->finished && !s->wt && !s->wt_checked) {
+        // WebTransport stream classification (server). Two cases, BEFORE treating
+        // the stream as an H3 request:
+        //   * a BIDI WebTransport data stream begins with the varint signal 0x41 +
+        //     the session id (WebTransport-over-HTTP/3 draft); strip that prefix,
+        //     mark wt_data, and echo the remaining payload (demo shape).
+        //   * an extended CONNECT (:protocol=webtransport) HEADERS frame opens the
+        //     session (answer 200, keep the stream open).
+        if (is_server_ && !s->finished && !s->wt && !s->wt_data && !s->wt_checked) {
+            const int w = try_webtransport_bidi(*s, fin);
+            if (w == 1) return;       // classified as a WT data stream + echoed
+            if (w == -1) return;      // need more bytes to read the prefix
             const int r = try_webtransport_connect(*s);
             if (r == 1) { s->wt = true; s->finished = true; return; }
             if (r == 0) s->wt_checked = true;  // headers seen, not WT — stop checking
@@ -300,6 +319,35 @@ private:
         req.stream_id = s.id;
         if (!parse_message(s, req)) return;  // malformed: drop (bounded)
         on_request_(req);
+    }
+
+    // WebTransport BIDI data-stream detection (WebTransport-over-HTTP/3 draft). A
+    // client-initiated bidi WT stream begins with the varint signal 0x41 followed
+    // by the WT session id (the CONNECT stream id). When detected we strip that
+    // prefix, mark the stream wt_data, and ECHO the remaining payload back on the
+    // SAME bidi stream (demo shape, matching the CONNECT->200 + datagram echo).
+    // Returns 1 = classified + echoed, 0 = not a WT bidi stream (first varint is
+    // not 0x41), -1 = the 0x41 + session-id prefix is not fully buffered yet.
+    int try_webtransport_bidi(H3Stream& s, bool fin) noexcept {
+        assert(s.in_use && "wt bidi on free slot");
+        assert(s.len <= sizeof(s.buf) && "stream cursor past buffer");
+        std::uint64_t sig = 0;
+        const int c = quic::varint_decode(s.buf, s.len, sig);
+        if (c <= 0) return -1;                 // need more bytes for the signal
+        if (sig != kWtBidiStreamSignal) return 0;
+        std::uint64_t session = 0;
+        const int c2 = quic::varint_decode(s.buf + c, s.len - c, session);
+        if (c2 <= 0) return -1;                // need the session-id varint too
+        s.wt_data = true;
+        const std::size_t prefix = static_cast<std::size_t>(c) + c2;
+        assert(prefix <= s.len && "wt bidi prefix past buffer");
+        if (s.len > prefix)
+            (void)qc_->stream_write(s.id, s.buf + prefix, s.len - prefix, fin);
+        else if (fin)
+            (void)qc_->stream_write(s.id, nullptr, 0, /*fin=*/true);
+        s.len = 0;                             // prefix+payload consumed
+        if (fin) release_slot(s);
+        return 1;
     }
 
     // WebTransport extended-CONNECT detection. If s.buf begins with a complete
