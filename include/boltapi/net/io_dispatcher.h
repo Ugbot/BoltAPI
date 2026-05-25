@@ -167,6 +167,15 @@ struct IODispatcherConfig {
     size_t num_io_threads = 1;        // Number of event loop threads (1-2 recommended)
     core::async_io_config io_config;  // Configuration for async_io backend
     core::WorkerThreadPool* worker_pool = nullptr;  // Worker pool for coroutine execution
+
+    // Inline resume (default): when an I/O op completes, resume the awaiting
+    // coroutine ON THIS event-loop thread up to its next co_await — NO per-request
+    // worker-pool handoff (Drogon/Seastar thread-per-core model; collapses tail
+    // latency + removes MPMC/scheduling overhead). The worker pool is then reserved
+    // for explicitly-offloaded blocking work. Set false to restore the old behavior
+    // (every completion submitted to the worker pool) — only needed if handlers do
+    // BLOCKING work inline (they should co_await or offload instead).
+    bool inline_resume = true;
 };
 
 /// I/O Dispatcher - bridges async I/O to coroutines

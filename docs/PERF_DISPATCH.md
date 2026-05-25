@@ -57,6 +57,19 @@ or a completion on another IO thread is dropped → hang. Fixed.)
 remains — **/json throughput + tail latency** (Drogon 2–4× better on p99) — is the
 **worker handoff**, untouched by slice 1. That is slice 2.
 
+## /json path investigation (it is NOT slow / NOT fionn)
+
+Measured deterministically (`dispatch_alloc_test` with a json handler): `/json` =
+**4 allocs/req** vs `/plaintext` = 3 — exactly **+1 alloc** (the 27-char JSON body
+exceeds std::string SSO). **fionn is not involved**: it's the *parser* (`req.json()`);
+the response `res.json()` only sets a Content-Type + copies the body. So the response
+path has no parsing/serialization cost and no fionn.
+
+The TFB `/json`-looks-slower-than-`/plaintext` reading was a **test-ordering
+artifact**: `/plaintext` ran first against a cold server (first traffic). The tell:
+Drogon's `/json` (30k) > its own `/plaintext` (16k), which is backwards. Fixed in
+`run_compare.sh` by warming each endpoint (discarded run) before timing it.
+
 ## Next — Phase 2 slice 2: inline resume + fast handoff (the tail)
 
 Run fast requests end-to-end on the IO/event-loop thread (zero handoff); keep the

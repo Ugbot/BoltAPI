@@ -258,15 +258,19 @@ void IODispatcher::resume_on_worker(std::coroutine_handle<> handle) noexcept {
         return;
     }
 
-    if (worker_pool_) {
-        // Submit to worker pool - non-blocking
-        if (!worker_pool_->submit(handle)) {
-            // Queue full - use blocking submit as fallback
-            worker_pool_->submit_wait(handle);
-        }
-    } else {
-        // No worker pool - resume inline (not ideal but prevents deadlock)
+    // Inline resume (default): run the coroutine on THIS event-loop thread up to
+    // its next co_await — no per-request worker handoff. This is the hot path; the
+    // coroutine suspends back to the poll loop at its next async op, so the stack is
+    // bounded (no recursion). The worker pool is used only when inline_resume is
+    // disabled (handlers that do blocking work inline).
+    if (config_.inline_resume || worker_pool_ == nullptr) {
         handle.resume();
+        return;
+    }
+
+    // Worker-pool handoff (opt-out path): submit; block-spin only if the queue is full.
+    if (!worker_pool_->submit(handle)) {
+        worker_pool_->submit_wait(handle);
     }
 }
 

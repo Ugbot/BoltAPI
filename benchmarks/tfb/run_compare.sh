@@ -67,6 +67,11 @@ run_fw() {
 
     for ep in $ENDPOINTS; do
         local out rps p99
+        # Warm THIS endpoint first (discarded) so the measured run isn't paying
+        # cold-start/first-traffic cost — otherwise whichever endpoint runs first
+        # looks artificially slow (a test-ordering artifact).
+        docker run --rm --network "$NET" tfb-wrk \
+            -t"$THREADS" -c"$CONNS" -d3s "http://tfb-srv:8080${ep}" >/dev/null 2>&1 || true
         out="$(docker run --rm --network "$NET" tfb-wrk \
                  --latency -t"$THREADS" -c"$CONNS" -d"${DURATION}s" \
                  "http://tfb-srv:8080${ep}" 2>/dev/null || true)"
