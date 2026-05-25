@@ -4,12 +4,43 @@
 // worker thread pool architecture.
 
 #include "boltapi/net/io_dispatcher.h"
+#include "bolt/bolt_channel.h"
 #include <cassert>
 #include <mutex>
 #include <iostream>
 
 namespace bolt::api {
 namespace net {
+
+// Per-IO-thread inbox: a bounded MPSC ring of coroutine handles to resume on the
+// owning IO thread. Producers (any thread) post via post_to_io_thread; the single
+// consumer is the IO thread, which drains at the top of each loop iteration.
+// Capacity is small — posts are rare (starting per-thread accept loops), not a
+// per-request path.
+struct IoInbox {
+    static constexpr size_t kCapacity = 256;
+    bolt::MPSCChannel<std::coroutine_handle<>, kCapacity> queue;
+};
+
+namespace {
+// Resume every handle currently posted to this thread's inbox. Bounded by the
+// ring capacity so a flood can't starve the poll loop. Runs on the owning IO
+// thread (single consumer); each resume runs the coroutine up to its next
+// co_await (pinned to this thread).
+void drain_inbox(IoInbox* inbox) noexcept {
+    if (inbox == nullptr) {
+        return;
+    }
+    std::coroutine_handle<> h;
+    size_t drained = 0;
+    while (drained < IoInbox::kCapacity && inbox->queue.try_pop(&h)) {
+        ++drained;
+        if (h && !h.done()) {
+            h.resume();
+        }
+    }
+}
+}  // namespace
 
 // The engine the CURRENT thread polls, and the dispatcher that owns it. Set by
 // io_thread_loop on each IO thread; cleared on exit. A single thread is an IO
@@ -183,16 +214,23 @@ IODispatcher::IODispatcher(const IODispatcherConfig& config)
     // keep ONE engine that every IO thread polls — preserving the proven Windows
     // model. We probe the first engine's backend to decide.
     auto first = core::async_io::create(config_.io_config);
-    const bool per_thread_engines =
+    per_thread_engines_ =
         first && (first->backend() == core::io_backend::epoll ||
                   first->backend() == core::io_backend::kqueue ||
                   first->backend() == core::io_backend::io_uring);
-    ios_.reserve(per_thread_engines ? config_.num_io_threads : 1);
+    ios_.reserve(per_thread_engines_ ? config_.num_io_threads : 1);
     ios_.emplace_back(std::move(first));
-    if (per_thread_engines) {
+    if (per_thread_engines_) {
         for (size_t i = 1; i < config_.num_io_threads; ++i) {
             ios_.emplace_back(core::async_io::create(config_.io_config));
         }
+    }
+
+    // One inbox per IO thread (post_to_io_thread targets a thread, not an engine —
+    // for the shared backend all threads share ios_[0] but still have own inboxes).
+    inboxes_.reserve(config_.num_io_threads);
+    for (size_t i = 0; i < config_.num_io_threads; ++i) {
+        inboxes_.emplace_back(std::make_unique<IoInbox>());
     }
     // Invariant: at least one engine, and either one (shared) or exactly one per
     // IO thread (per-core). Both are valid for the io_thread_loop index math.
@@ -292,13 +330,19 @@ void IODispatcher::io_thread_loop(size_t thread_id) {
     t_current_owner = this;
     t_current_io = my_io;
 
+    IoInbox* inbox = (thread_id < inboxes_.size()) ? inboxes_[thread_id].get() : nullptr;
+
     while (!shutdown_requested_.load(std::memory_order_acquire)) {
+        // Drain handles posted to THIS thread (e.g. accept-loop startup), resuming
+        // each up to its next co_await — they run pinned to this thread thereafter.
+        drain_inbox(inbox);
         // Poll for I/O events with timeout
         // 1ms timeout to check shutdown periodically without burning CPU
         my_io->poll(1000);  // 1000 microseconds = 1ms
     }
 
     // Final drain of pending events
+    drain_inbox(inbox);
     my_io->poll(0);
 
     t_current_io = nullptr;
@@ -337,6 +381,21 @@ core::async_io* IODispatcher::current_io() noexcept {
     }
     assert(!ios_.empty() && "current_io: no engine");
     return ios_[0].get();
+}
+
+bool IODispatcher::post_to_io_thread(size_t io_thread_index,
+                                     std::coroutine_handle<> h) noexcept {
+    if (io_thread_index >= inboxes_.size() || !h) {
+        return false;
+    }
+    // MPSC push (capacity is ample for the low-volume startup/post path).
+    inboxes_[io_thread_index]->queue.try_push(std::move(h));
+    // Wake the target thread's engine so it drains promptly (for per-thread
+    // engines that thread is the sole poller of ios_[io_thread_index]).
+    const size_t engine_idx = (io_thread_index < ios_.size()) ? io_thread_index : 0;
+    assert(engine_idx < ios_.size() && "post_to_io_thread: engine index OOB");
+    ios_[engine_idx]->wake();
+    return true;
 }
 
 void IODispatcher::async_close(int fd) noexcept {

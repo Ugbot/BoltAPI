@@ -27,6 +27,14 @@ namespace net {
 // Forward declarations
 class IODispatcher;
 
+// Per-IO-thread inbox of coroutine handles to resume ON that thread (defined in
+// the .cpp; a bolt MPSC ring). Used by post_to_io_thread() to START a coroutine
+// on a specific IO thread — e.g. a per-thread accept loop, so its async_accept
+// registers on that thread's OWN engine (thread-per-core; no cross-thread submit,
+// which a single-owner io_uring ring will require). Kept out of this public
+// header so bolt/bolt_channel.h stays a .cpp dependency.
+struct IoInbox;
+
 // =============================================================================
 // Awaitable I/O Operations
 // =============================================================================
@@ -300,6 +308,22 @@ public:
     /// Get number of I/O threads
     size_t num_io_threads() const noexcept { return io_threads_.size(); }
 
+    /// Configured I/O thread count (valid before start(), unlike num_io_threads()).
+    size_t io_thread_count() const noexcept { return config_.num_io_threads; }
+
+    /// True when each IO thread owns its own engine (per-core backends: epoll/
+    /// kqueue/io_uring). False for a shared-completion backend (IOCP: one engine,
+    /// all threads poll it). Drives whether the listener does per-thread accept.
+    bool per_thread_engines() const noexcept { return per_thread_engines_; }
+
+    /// Start a coroutine ON a specific IO thread: enqueue `h` into that thread's
+    /// inbox and wake it, so the thread resumes `h` (running it up to its first
+    /// co_await) on that thread. Used to pin a per-thread accept loop to IO thread
+    /// `io_thread_index` so its ops register on that thread's engine. Thread-safe
+    /// (call from any thread). Returns false on a bad index. Only meaningful for
+    /// per_thread_engines(); the shared backend keeps a single accept loop.
+    bool post_to_io_thread(size_t io_thread_index, std::coroutine_handle<> h) noexcept;
+
     // =========================================================================
     // Statistics
     // =========================================================================
@@ -346,6 +370,11 @@ private:
     // shared-completion backend (IOCP) this holds a single engine that all IO
     // threads poll (kernel distributes completions) — see ctor.
     std::vector<std::unique_ptr<core::async_io>> ios_;
+    bool per_thread_engines_ = false;  // one engine per IO thread (epoll/etc) vs shared (IOCP)
+
+    // One inbox per IO thread (post_to_io_thread). Drained at the top of each
+    // io_thread_loop iteration; sized to num_io_threads in the ctor.
+    std::vector<std::unique_ptr<IoInbox>> inboxes_;
     core::WorkerThreadPool* worker_pool_;
     bool owns_worker_pool_ = false;  // Did we create the pool?
 

@@ -19,6 +19,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace bolt::api {
 namespace net {
@@ -134,7 +135,11 @@ private:
     core::WorkerThreadPool* shared_worker_pool_ = nullptr;
     bool owns_resources_ = true;  // Track if we own the resources
 
-    int listen_fd_ = -1;
+    // Listen sockets. Per-thread-engine backends (epoll/etc): ONE SO_REUSEPORT
+    // socket per IO thread, each accepted on by that thread's own accept loop
+    // (the kernel load-balances connections across them). Shared backend (IOCP):
+    // a single socket with one accept loop. Closed in stop().
+    std::vector<int> listen_fds_;
     std::atomic<bool> running_{false};
     std::atomic<bool> stop_requested_{false};
 

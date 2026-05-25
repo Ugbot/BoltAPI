@@ -113,46 +113,55 @@ int CoroTcpListener::start_background() {
         io_dispatcher = shared_io_dispatcher_;
     }
 
-    // Create listen socket
-    listen_fd_ = create_listen_socket();
-    if (listen_fd_ < 0) {
-        LOG_ERROR("CORO_TCP", "Failed to create listen socket");
+    // Decide the accept topology. Per-thread-engine backends (epoll/kqueue/
+    // io_uring) get ONE SO_REUSEPORT listen socket + ONE accept loop PER IO
+    // thread, each started ON its thread so its async_accept registers on that
+    // thread's own engine (kernel load-balances connections across the sockets →
+    // accepts distribute, connections pin to the accepting thread). The shared
+    // backend (IOCP) keeps a single socket + a single worker-pool accept loop.
+    const bool per_thread = io_dispatcher->per_thread_engines();
+    const size_t accept_loops = per_thread ? io_dispatcher->io_thread_count() : 1;
+
+    auto unwind = [&]() {
+        for (int fd : listen_fds_) {
+            if (fd >= 0) sys::close_socket(fd);
+        }
+        listen_fds_.clear();
         if (owns_resources_) {
             io_dispatcher_->stop();
             worker_pool_->stop();
         }
         running_.store(false);
-        return -1;
-    }
+    };
 
-    LOG_INFO("CORO_TCP", "Listening on fd %d", listen_fd_);
-
-    // Start accept loop coroutine
-    // The accept loop runs as a coroutine, yielding on async_accept
-    auto accept_task = accept_loop(listen_fd_);
-
-    // Release ownership from coro_task (prevents destructor from destroying handle)
-    auto handle = accept_task.release();
-
-    // Submit the accept loop to the worker pool
-    if (!worker_pool->submit(handle)) {
-        LOG_ERROR("CORO_TCP", "Failed to submit accept loop");
-        // Since we released, we must manually destroy on failure
-        if (handle) {
-            handle.destroy();
+    listen_fds_.reserve(accept_loops);
+    for (size_t i = 0; i < accept_loops; ++i) {
+        int fd = create_listen_socket();
+        if (fd < 0) {
+            LOG_ERROR("CORO_TCP", "Failed to create listen socket %zu", i);
+            unwind();
+            return -1;
         }
-        sys::close_socket(listen_fd_);
-        listen_fd_ = -1;
-        if (owns_resources_) {
-            io_dispatcher_->stop();
-            worker_pool_->stop();
-        }
-        running_.store(false);
-        return -1;
+        listen_fds_.push_back(fd);
     }
+    LOG_INFO("CORO_TCP", "Listening on %zu socket(s) (per-thread accept: %s)",
+             listen_fds_.size(), per_thread ? "yes" : "no");
 
-    // The handle is now owned by the worker pool
-    // Worker pool is responsible for destroying it when done
+    // Start the accept loop(s). Each is a coroutine; release its handle (the
+    // worker pool / IO thread owns it thereafter) and start it.
+    for (size_t i = 0; i < accept_loops; ++i) {
+        auto accept_task = accept_loop(listen_fds_[i]);
+        auto handle = accept_task.release();
+        const bool ok = per_thread
+            ? io_dispatcher->post_to_io_thread(i, handle)   // run ON IO thread i
+            : worker_pool->submit(handle);                  // shared: any worker
+        if (!ok) {
+            LOG_ERROR("CORO_TCP", "Failed to start accept loop %zu", i);
+            if (handle) handle.destroy();
+            unwind();
+            return -1;
+        }
+    }
 
     return 0;
 }
@@ -164,11 +173,13 @@ void CoroTcpListener::stop() {
 
     stop_requested_.store(true, std::memory_order_release);
 
-    // Close listen socket to break accept loop
-    if (listen_fd_ >= 0) {
-        sys::close_socket(listen_fd_);
-        listen_fd_ = -1;
+    // Close listen socket(s) to break the accept loop(s).
+    for (int fd : listen_fds_) {
+        if (fd >= 0) {
+            sys::close_socket(fd);
+        }
     }
+    listen_fds_.clear();
 
     // Only stop resources if we own them
     if (owns_resources_) {
@@ -242,23 +253,32 @@ void CoroTcpListener::spawn_connection(int client_fd) {
     // Track active connections
     connections_active_.fetch_add(1, std::memory_order_relaxed);
 
-    // Get the dispatcher and worker pool (works for both owned and shared)
+    // Get the dispatcher (works for both owned and shared)
     IODispatcher* io_disp = dispatcher();
-    core::WorkerThreadPool* wp = worker_pool();
 
     // Create connection handler coroutine
     // Using a proper coroutine function ensures parameters are stored in the frame
     auto conn_task = connection_handler_coro(
         handler_, *io_disp, client_fd, connections_active_);
 
-    // Release ownership from coro_task before submitting
-    // The worker pool will own and destroy the handle when done
+    // Release ownership from coro_task (the handle is detached; lifetime is the
+    // same as before — driven to completion by inline I/O resumes).
     auto handle = conn_task.release();
 
-    // Submit to worker pool
-    if (!wp->submit(handle)) {
-        // Queue full - use blocking submit
-        wp->submit_wait(handle);
+    if (io_disp->per_thread_engines()) {
+        // We are running ON the accepting IO thread. Resume inline so the
+        // connection's reads/writes register on THIS thread's engine — the
+        // connection is PINNED here for its lifetime (no worker handoff, best
+        // cache locality). Runs up to the first co_await, then returns to the
+        // accept loop. Bounded depth (the connection suspends on its first read).
+        handle.resume();
+    } else {
+        // Shared backend (IOCP): hand to the worker pool; the kernel's completion
+        // port distributes the connection's I/O across IO threads (proven model).
+        core::WorkerThreadPool* wp = worker_pool();
+        if (!wp->submit(handle)) {
+            wp->submit_wait(handle);  // Queue full - blocking submit
+        }
     }
 }
 

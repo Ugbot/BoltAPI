@@ -35,15 +35,16 @@ Outcome: near-linear scaling, collapsed p99, high throughput with *few* IO threa
 - [x] All 6 awaitables (`io_dispatcher.cpp`) + `async_close` register via `current_io()` (this thread's engine, owner-tagged; falls back to `ios_[0]` off an IO thread). `io_engine()` returns `ios_[0]` — single-socket `UdpTransport` pins to engine 0 (its ops+completions+re-arm stay consistent).
 - [x] **Gate met:** MSVC `ctest` **252/252** (IOCP, single shared engine — unaffected). Linux/Clang/**epoll**: gateway lane **10/10** (HttpClient + MiddlewareAlloc) + WebRTC/UDP lane **96/96** (MediaRelay/DataChannel/UDP/DTLS/ICE/TURN — recvfrom/sendto + close_async drain). *(Interim: connections funnel to engine 0 until B/C distribute — correct, not yet the scaling win.)*
 
-## Slice B — per-thread accept (SO_REUSEPORT)
-- [ ] One listen socket per IO thread (each `SO_REUSEPORT` — already in `create_listen_socket()`), registered on **that thread's** engine; one `accept_loop` per IO thread.
-- [ ] `coro_tcp_listener.cpp` (N listen fds + N accept loops) + `coro_unified_server.cpp` (start them). Kernel load-balances connections → first op of a connection lands on its accepting thread's engine.
-- [ ] **Gate:** suites green; **scaling sweep ramps past the ~4-thread plateau.**
+## Slice B — per-thread accept (SO_REUSEPORT) + connection pinning  DONE
+- [x] `IODispatcher::post_to_io_thread(i, h)` — start a coroutine ON IO thread i via a per-thread bounded MPSC inbox (`bolt::MPSCChannel`, drained at top of `io_thread_loop` + `wake()`), so its `async_accept` registers on thread i's own engine (no cross-thread submit — what single-owner io_uring needs).
+- [x] `CoroTcpListener`: `listen_fd_` -> `std::vector<int> listen_fds_`. Per-thread backends: ONE `SO_REUSEPORT` socket + ONE `accept_loop` PER IO thread, each `post_to_io_thread(i, ...)`; shared backend (IOCP): single socket + single worker-pool accept loop (unchanged).
+- [x] **Connection pinning folded in** (was slice C's mechanism; trivial once accept is on thread i, and it makes the win measurable): `spawn_connection` resumes the connection coroutine **inline on the accepting IO thread** for per-thread backends (reads/writes register on that thread's engine -> pinned for life, no worker handoff); IOCP keeps worker-submit. Lifetime-neutral vs before (detached handle either way — see slice C follow-up).
+- [x] **Gate met:** MSVC **252/252** (IOCP single socket — unchanged). Linux/Clang/**epoll**: gateway **10/10** + WebRTC/UDP **96/96** (N=1) + a **4-IO-thread load smoke** (`bench_server --io-threads 4`, 64 conns) — failed=0 across /plaintext, /json, /route/{id}; 4 engines/4 SO_REUSEPORT sockets distributing (~8.3k vs ~4.7k rps @1 thread).
 
-## Slice C — connection pinning + CPU affinity
-- [ ] `spawn_connection`: resume the connection coroutine **inline on the accepting IO thread** (not `worker_pool->submit`) → all `co_await`s register on that thread via `t_io` → connection **pinned** for life (no migration).
+## Slice C — CPU affinity + hardening
 - [ ] Wire `bolt_topology` + `scheduler_assign_cpus` to pin each IO thread to a core (P-core/NUMA aware); new `IODispatcherConfig` flag (default on Linux). Worker pool stays for heavy-handler offload (hybrid).
-- [ ] **Gate:** suites green; scaling sweep **near-linear**; p99 collapses toward Drogon's.
+- [ ] **Connection-handle reclamation (follow-up, pre-existing):** detached connection coroutines suspend at `final_suspend` (`coro_task<void>`) and are never `destroy()`ed (the worker loop doesn't either) — a latent leak masked under keep-alive (bounded connection count). Inline-spawn (B) is lifetime-neutral but doesn't fix it. Fix here or in D.
+- [ ] **Gate:** suites green; scaling sweep **near-linear**; p99 collapses toward Drogon's (needs an idle box for trustworthy absolutes).
 
 ## Slice D — per-IO-thread dispatch frame arena  *(depends on C)*
 - [ ] New `dispatch_task<T>` (clone `coro_task<T>` for value return + `release()`/promise `value()`) with promise `operator new/delete` backed by a **thread_local bump arena** — new `include/boltapi/http/dispatch_arena.h` (modeled on `frame_arena.h:47-77`; `thread_local std::byte buf[8192]` → allocation-free). ONLY `dispatch_coro_` uses it (don't touch general `coro_task`).
