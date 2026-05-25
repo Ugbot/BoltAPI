@@ -1,0 +1,26 @@
+# TFB harness — BoltAPI bench server (Clang/lld, system OpenSSL, epoll backend).
+# Build context = repo root:  docker build -f benchmarks/tfb/Dockerfile.boltapi .
+FROM ubuntu:24.04
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        clang lld llvm cmake ninja-build make libstdc++-14-dev \
+        git ca-certificates pkg-config libssl-dev zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+ENV CC=clang CXX=clang++
+
+WORKDIR /src
+COPY . .
+
+RUN cmake -S . -B build/tfb -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+        -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld" \
+        -DBOLTAPI_WITH_HTTP3=OFF -DBOLTAPI_WITH_WEBRTC=OFF \
+        -DBOLTAPI_BUILD_TESTS=OFF -DBOLTAPI_BUILD_BENCHMARKS=ON \
+        -DBOLTAPI_WARNINGS_AS_ERRORS=OFF
+RUN cmake --build build/tfb -j"$(nproc)" --target boltapi_bench_server
+
+EXPOSE 8080
+# Thread-per-core: IO_THREADS / WORKERS overridable at `docker run -e`.
+ENV IO_THREADS=4 WORKERS=0
+CMD ["sh", "-c", "./build/tfb/benchmarks/boltapi_bench_server 8080 --host 0.0.0.0 --io-threads ${IO_THREADS} --workers ${WORKERS}"]

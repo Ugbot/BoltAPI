@@ -1,0 +1,14 @@
+# TFB harness — Drogon equivalent server. Uses the official prebuilt Drogon image
+# (Drogon + deps already installed), so we only compile the tiny app.
+# Build context = repo root: docker build -f benchmarks/tfb/Dockerfile.drogon .
+FROM drogonframework/drogon:latest
+
+WORKDIR /app
+COPY benchmarks/tfb/drogon_app.cpp        ./drogon_app.cpp
+COPY benchmarks/tfb/drogon_CMakeLists.txt ./CMakeLists.txt
+
+RUN cmake -B build -DCMAKE_BUILD_TYPE=Release && \
+    cmake --build build -j"$(nproc)"
+
+EXPOSE 8080
+CMD ["./build/drogon_tfb"]

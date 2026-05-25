@@ -72,13 +72,16 @@ int main(int argc, char** argv) {
         const long long p = std::atoll(argv[1]);
         if (p > 0 && p < 65536) port = static_cast<std::uint16_t>(p);
     }
-    // Optional thread overrides.
+    // Optional thread overrides + bind host (--host 0.0.0.0 for containers).
+    std::string host = "127.0.0.1";
     api::App::Config cfg;
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--io-threads") == 0) {
             cfg.server.num_io_threads = static_cast<std::size_t>(std::atoll(argv[i + 1]));
         } else if (std::strcmp(argv[i], "--workers") == 0) {
             cfg.server.num_workers = static_cast<std::size_t>(std::atoll(argv[i + 1]));
+        } else if (std::strcmp(argv[i], "--host") == 0) {
+            host = argv[i + 1];
         }
     }
 
@@ -124,9 +127,9 @@ int main(int argc, char** argv) {
         res.ok().text(std::string(req.path_param_view("id")));
     });
 
-    std::printf("boltapi_bench_server listening on http://127.0.0.1:%u\n", port);
+    std::printf("boltapi_bench_server listening on http://%s:%u\n", host.c_str(), port);
     std::printf("routes: /plaintext /json /db /queries?n=K /route/{id}\n");
     std::fflush(stdout);
 
-    return app.run("127.0.0.1", port);  // blocking; the scripts kill the process
+    return app.run(host, port);  // blocking; the scripts kill the process
 }

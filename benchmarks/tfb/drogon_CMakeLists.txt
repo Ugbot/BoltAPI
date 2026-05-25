@@ -1,0 +1,11 @@
+cmake_minimum_required(VERSION 3.10)
+project(drogon_tfb CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Drogon is preinstalled in the drogonframework/drogon base image.
+find_package(Drogon CONFIG REQUIRED)
+
+add_executable(drogon_tfb drogon_app.cpp)
+target_link_libraries(drogon_tfb PRIVATE Drogon::Drogon)

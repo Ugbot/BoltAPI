@@ -1,0 +1,9 @@
+# TFB harness — the neutral load tool (wrk), the TechEmpower standard. Both
+# frameworks are driven by this SAME container so the comparison is apples-to-apples.
+# Build context = benchmarks/tfb: docker build -f benchmarks/tfb/Dockerfile.wrk benchmarks/tfb
+FROM ubuntu:24.04
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        wrk ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+ENTRYPOINT ["wrk"]
