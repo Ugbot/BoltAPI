@@ -19,10 +19,49 @@
 #include <cstring>
 #include <cctype>
 #include <chrono>
+#include <charconv>
 #include <vector>
 
 namespace bolt::api {
 namespace http {
+
+namespace {
+
+// Branchless-ish ASCII helpers for the response hot path — NO allocation (the old
+// path copied each header name into a std::string just to lowercase-compare).
+inline char to_lower_ascii(char c) noexcept {
+    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + 32) : c;
+}
+// Case-insensitive equality: `a` vs a lowercase literal `lower`.
+inline bool ieq_ascii(std::string_view a, std::string_view lower) noexcept {
+    if (a.size() != lower.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (to_lower_ascii(a[i]) != lower[i]) return false;
+    }
+    return true;
+}
+// Case-insensitive substring presence of a lowercase `needle` in `hay`.
+inline bool contains_ci(std::string_view hay, std::string_view needle) noexcept {
+    if (needle.empty() || hay.size() < needle.size()) return false;
+    const std::size_t end = hay.size() - needle.size();
+    for (std::size_t i = 0; i <= end; ++i) {
+        std::size_t k = 0;
+        for (; k < needle.size(); ++k) {
+            if (to_lower_ascii(hay[i + k]) != needle[k]) break;
+        }
+        if (k == needle.size()) return true;
+    }
+    return false;
+}
+// Append an unsigned integer as decimal via to_chars (stack buffer, no alloc).
+inline void append_uint(std::string& out, std::uint64_t v) {
+    char tmp[20];
+    auto [p, ec] = std::to_chars(tmp, tmp + sizeof(tmp), v);
+    (void)ec;
+    out.append(tmp, static_cast<std::size_t>(p - tmp));
+}
+
+}  // namespace
 
 // =============================================================================
 // Static Member Initialization
@@ -544,6 +583,11 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
     bool is_first_request = true;
 
     bool keep_alive = true;
+    // Per-connection reusable response buffer — clear() retains capacity, so
+    // response serialization performs NO heap allocation after the first request
+    // (TigerStyle: no per-request alloc on the response path).
+    std::string resp_buf;
+    resp_buf.reserve(4096);
     while (keep_alive && !stop_requested_.load(std::memory_order_relaxed)) {
         // Track start time for timeout
         auto request_start = clock::now();
@@ -585,8 +629,11 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
                 co_return;
             }
 
-            // Read more data into current buffer
-            ssize_t n = co_await conn_read(io, fd, tls,buf + buf_len, buf_cap - buf_len);
+            // Read more data into current buffer. Cleartext takes the dispatcher
+            // awaitable DIRECTLY (no conn_read coroutine frame — zero alloc on the
+            // hot path); TLS keeps the framed helper.
+            ssize_t n = tls ? co_await conn_read(io, fd, tls, buf + buf_len, buf_cap - buf_len)
+                            : co_await io.async_read(fd, buf + buf_len, buf_cap - buf_len);
             if (n <= 0) {
                 io.async_close(fd);
                 co_return;
@@ -911,39 +958,37 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
             response.body = "Hello, World!";
         }
 
-        // Check if chunked transfer encoding is requested
+        // Check if chunked transfer encoding is requested (no allocation).
         bool use_chunked = false;
         auto transfer_encoding_it = response.headers.find("Transfer-Encoding");
-        if (transfer_encoding_it != response.headers.end()) {
-            std::string te_lower = transfer_encoding_it->value;
-            for (char& c : te_lower) c = std::tolower(c);
-            if (te_lower.find("chunked") != std::string::npos) {
-                use_chunked = true;
-            }
+        if (transfer_encoding_it != response.headers.end() &&
+            contains_ci(transfer_encoding_it->value, "chunked")) {
+            use_chunked = true;
         }
 
-        // Build HTTP/1.1 response
-        std::string resp_str;
-        resp_str.reserve(256 + (use_chunked ? 0 : response.body.size()));
+        // Build the HTTP/1.1 response into the per-connection reusable buffer.
+        // clear() keeps capacity -> zero heap allocation after the first request;
+        // to_chars / branchless compares replace the old to_string / per-header
+        // std::string lowercasing that allocated on every response.
+        std::string& resp_str = resp_buf;
+        resp_str.clear();
         resp_str += "HTTP/1.1 ";
-        resp_str += std::to_string(response.status);
-        resp_str += " ";
+        append_uint(resp_str, response.status);
+        resp_str += ' ';
         resp_str += response.status_message;
         resp_str += "\r\n";
 
         // Add Content-Length if not present and not chunked
         if (!use_chunked && response.headers.find("Content-Length") == response.headers.end()) {
             resp_str += "Content-Length: ";
-            resp_str += std::to_string(response.body.size());
+            append_uint(resp_str, response.body.size());
             resp_str += "\r\n";
         }
 
         // Add headers (skip zstd content-encoding as browsers don't support it)
         for (const auto& [name, value] : response.headers) {
-            // Skip ANY content-encoding with zstd value (case-insensitive key check)
-            std::string lower_name = name;
-            for (char& c : lower_name) c = std::tolower(c);
-            if (lower_name == "content-encoding" && value == "zstd") {
+            // Skip ANY content-encoding with zstd value (branchless ci key check).
+            if (ieq_ascii(name, "content-encoding") && value == "zstd") {
                 continue;  // Skip zstd header - browser will fail to decode
             }
             resp_str += name;
@@ -981,9 +1026,14 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
             const char* final_chunk = "0\r\n\r\n";
             co_await conn_write(io, fd, tls,final_chunk, 5);
         } else {
-            // Non-chunked: send headers + body together
+            // Non-chunked: send headers + body together (cleartext writes via the
+            // dispatcher awaitable directly — no conn_write coroutine frame).
             resp_str += response.body;
-            co_await conn_write(io, fd, tls,resp_str.data(), resp_str.size());
+            if (tls) {
+                co_await conn_write(io, fd, tls, resp_str.data(), resp_str.size());
+            } else {
+                co_await io.async_write(fd, resp_str.data(), resp_str.size());
+            }
         }
 
         // Pipelining timeout check: before processing next request from buffer,

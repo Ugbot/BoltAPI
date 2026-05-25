@@ -28,6 +28,14 @@ if(WIN32)
     target_link_libraries(boltapi_app_integration_test PRIVATE ws2_32 mswsock)
 endif()
 
+# Perf: measures + gates heap allocations per request on the full HTTP/1.1
+# dispatch+response path (real App on loopback, fixed-buffer client, global new
+# counter). Deterministic regardless of CPU load. Phase 1 drives allocs/req -> ~0.
+boltapi_add_test(boltapi_dispatch_alloc_test dispatch_alloc_test.cpp)
+if(WIN32)
+    target_link_libraries(boltapi_dispatch_alloc_test PRIVATE ws2_32 mswsock)
+endif()
+
 # Gateway Phase 0: outbound HTTP/1.1 client (bolt::api::http::Client) — drives a
 # real in-process App with the Client over the async dispatcher; byte-exact GET/
 # POST/PUT, path-param/JSON routes, 404, and keep-alive connection reuse.

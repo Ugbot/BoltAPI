@@ -235,11 +235,13 @@ void App::build_dispatch() {
     // dispatch_coro_ so the HTTP/3 path (dispatch_http3) reuses it verbatim.
     App* self = this;
     server_->set_handler(
-        [self](const http::CoroHttpRequest& creq)
-            -> core::coro_task<http::CoroHttpResponse> {
+        [self](const http::CoroHttpRequest& creq) {
             assert(self != nullptr);
             assert(self->router_ != nullptr);
-            co_return co_await self->dispatch_coro_(creq);
+            // Return the dispatch task DIRECTLY — this lambda is not itself a
+            // coroutine (no co_await/co_return), so it adds no pass-through
+            // coroutine frame per request (one fewer heap allocation).
+            return self->dispatch_coro_(creq);
         });
 }
 
