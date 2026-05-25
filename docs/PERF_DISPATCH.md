@@ -70,11 +70,31 @@ artifact**: `/plaintext` ran first against a cold server (first traffic). The te
 Drogon's `/json` (30k) > its own `/plaintext` (16k), which is backwards. Fixed in
 `run_compare.sh` by warming each endpoint (discarded run) before timing it.
 
-## Next — Phase 2 slice 2: inline resume + fast handoff (the tail)
+## Phase 2 slice 2 — inline resume  ✅
 
-Run fast requests end-to-end on the IO/event-loop thread (zero handoff); keep the
-worker pool for opt-in blocking offload, and where a handoff remains make it fast
-(per-worker SPSC + futex, not shared MPMC + yield). Expected to collapse p99 toward
-Drogon's and close the /json gap. It also unlocks the per-IO-thread frame arena →
-kills the remaining 3 allocs/request (single-threaded-per-loop → arena is safe).
-Then Phase 3 (thread-per-core epoll) only if still behind.
+`resume_on_worker()` now resumes the awaiting coroutine INLINE on the IO/event-loop
+thread (up to its next co_await) instead of bouncing it through the worker pool on
+every completion — the per-request cross-thread handoff is gone. Bounded (resume
+runs to next suspend → returns to poll), deadlock-free (all chain I/O is co_await).
+`config.inline_resume` default true; worker pool reserved for opt-in blocking offload.
+
+| | start | P1+epoll | + inline resume | Drogon (same run) |
+|---|---:|---:|---:|---:|
+| /plaintext req/s | 1.9× behind | ~16k (≈Drogon) | **~31k (~2×)** | ~36k |
+| /json req/s | — | ~18k | **~24k** | 9.5k–30k (noisy) |
+| /plaintext p99 | high | ~134 ms | ~122 ms | ~31 ms |
+
+**Inline resume ~doubled throughput** (/plaintext 16k→31k). Tail p99 is still well
+above Drogon's — the remaining cause is the **shared epoll across 8 IO threads**: a
+thread running a request inline isn't polling, so other connections' events wait
+(uneven load + thundering herd). The box is also heavily loaded (Drogon /json swung
+3× run-to-run), so absolute p99 is unreliable here — but the structural fix is clear.
+
+## Next — Phase 3: thread-per-core epoll (the tail)
+
+Per-thread epoll instance + connection sharding (each connection pinned to one IO
+thread for its lifetime; SO_REUSEPORT-style accept). Removes the shared-epoll
+contention/thundering-herd → collapses the tail, scales linearly with cores, and
+needs far fewer than 8 IO threads. Also pins a connection to one thread → makes a
+per-IO-thread frame arena safe → kills the last 3 allocs/request (the 3840 B
+dispatch frame). Re-measure on an idle box for trustworthy absolutes.
