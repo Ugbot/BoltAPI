@@ -90,7 +90,23 @@ thread running a request inline isn't polling, so other connections' events wait
 (uneven load + thundering herd). The box is also heavily loaded (Drogon /json swung
 3× run-to-run), so absolute p99 is unreliable here — but the structural fix is clear.
 
-## Next — Phase 3: thread-per-core epoll (the tail)
+## Per-core scaling test (shared epoll + inline resume)  — plateaus at ~3-4×
+
+IO-thread sweep, /plaintext, loaded box (read the SHAPE):
+
+| IO threads | req/s | vs T=1 |
+|---:|---:|---:|
+| 1 | 6.6k | 1.0× |
+| 4 | 19.7k | ~3.0× |
+| 8 | 20.0k | ~3.0× (flat) |
+| 16 | 25.7k | ~3.9× |
+
+Ramps 1→4 then **plateaus** — 1→16 threads yields only ~3.9× (linear would be ~16×).
+The flat 4→8 region (well under 16 cores) is the **shared-epoll ceiling**: all IO
+threads poll one `epoll_fd` (thundering herd) + contend on the shared free-list/
+fd-slot atomics. This is the motivation for Phase 3.
+
+## Next — Phase 3: thread-per-core epoll (the tail + linear scaling)
 
 Per-thread epoll instance + connection sharding (each connection pinned to one IO
 thread for its lifetime; SO_REUSEPORT-style accept). Removes the shared-epoll
