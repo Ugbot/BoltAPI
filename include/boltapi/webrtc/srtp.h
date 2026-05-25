@@ -287,13 +287,16 @@ inline void srtcp_gcm_iv(const std::uint8_t salt[kGcmSaltLen], std::uint32_t ssr
 // ============================================================================
 // Primitive crypto helpers (OpenSSL EVP).
 // ============================================================================
-// #38 — per-packet SRTP protect/unprotect ran on the media hot path used to
-// EVP_MAC_fetch("HMAC") (a provider lookup) + EVP_CIPHER_CTX_new/free EVERY
-// packet — protect measured ~25x slower than it needs to be. Cache the fetched
-// HMAC algorithm ONCE (process lifetime) and reuse per-thread cipher/MAC
-// contexts (re-init with the new key/iv each call — far cheaper than new/free).
-// thread_local so the single I/O thread keeps hot, reusable contexts; the
-// destructor frees them at thread exit (TigerStyle: explicit teardown).
+// #38 — the SRTP hot path. The cache the fetched HMAC algorithm ONCE (process
+// lifetime). NOTE: the per-thread re-keyed contexts below were an EARLIER #38
+// attempt that only avoided ctx new/free but still re-ran the AES key schedule +
+// HMAC pad computation EVERY packet (measured ~3.8 µs/AES-CTR + ~8.5 µs/HMAC for
+// 1100 B — setup-dominated). The real fix is the per-SESSION keyed contexts
+// further down (`srtp_new_ctr_ctx`/`srtp_ctr_xcrypt`/`srtp_new_hmac_ctx`/
+// `srtp_hmac_keyed` + the GCM equivalents): key ONCE, per-packet set only the IV
+// (cipher) / reset the message (MAC). The free helpers in this block
+// (aes_ctr_xcrypt/hmac_sha1_*/aes_gcm_*) are retained as standalone one-shot
+// utilities but are NOT on the SrtpSession hot path anymore.
 inline EVP_MAC* srtp_hmac_algo() noexcept {
     static EVP_MAC* mac = EVP_MAC_fetch(nullptr, "HMAC", nullptr);  // once
     return mac;
@@ -430,6 +433,127 @@ inline bool aes_gcm_open(const std::uint8_t key[kSessionKeyLen],
 }
 
 // ============================================================================
+// #38 FAST PATH — per-SESSION keyed contexts.
+// ============================================================================
+// The functions above re-supply the key to EVP on EVERY packet, which re-runs the
+// AES key schedule (EVP_*Init with key+iv) and the HMAC ipad/opad (EVP_MAC_init
+// with key) per call — measured ~3.8 µs/AES-CTR + ~8.5 µs/HMAC for a 1100 B
+// packet, i.e. setup-dominated, NOT crypto-dominated. The fix: key each context
+// ONCE at session init, then per packet set only the IV (cipher) or reset the
+// message keeping the key (MAC). A SrtpSession is single-threaded (driven on one
+// I/O thread per direction), so its contexts need no locking.
+
+// AES-128-CTR context keyed once with `key` (key schedule precomputed).
+inline EVP_CIPHER_CTX* srtp_new_ctr_ctx(const std::uint8_t key[kSessionKeyLen]) noexcept {
+    assert(key != nullptr && "new_ctr_ctx: null key");
+    EVP_CIPHER_CTX* c = EVP_CIPHER_CTX_new();
+    if (c == nullptr) return nullptr;
+    const std::uint8_t zero_iv[16] = {0};
+    if (EVP_EncryptInit_ex(c, EVP_aes_128_ctr(), nullptr, key, zero_iv) != 1) {
+        EVP_CIPHER_CTX_free(c);
+        return nullptr;
+    }
+    return c;
+}
+
+// AES-CTR in place using an already-keyed ctx: set ONLY the IV, then xcrypt.
+inline bool srtp_ctr_xcrypt(EVP_CIPHER_CTX* ctx, const std::uint8_t iv[16],
+                            std::uint8_t* buf, std::size_t n) noexcept {
+    assert(ctx != nullptr && iv != nullptr && "ctr_xcrypt: null");
+    assert((buf != nullptr || n == 0) && "ctr_xcrypt: buf");
+    if (n == 0) return true;
+    if (EVP_EncryptInit_ex(ctx, nullptr, nullptr, nullptr, iv) != 1) return false;
+    int len = 0;
+    return EVP_EncryptUpdate(ctx, buf, &len, buf, static_cast<int>(n)) == 1 &&
+           static_cast<std::size_t>(len) == n;
+}
+
+// HMAC-SHA1 context keyed once with `key` (ipad/opad precomputed).
+inline EVP_MAC_CTX* srtp_new_hmac_ctx(const std::uint8_t key[kAuthKeyLen]) noexcept {
+    assert(key != nullptr && "new_hmac_ctx: null key");
+    EVP_MAC* mac = srtp_hmac_algo();
+    if (mac == nullptr) return nullptr;
+    EVP_MAC_CTX* c = EVP_MAC_CTX_new(mac);
+    if (c == nullptr) return nullptr;
+    char digest[] = "SHA1";
+    OSSL_PARAM params[2] = {
+        OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST, digest, 0),
+        OSSL_PARAM_construct_end()};
+    if (EVP_MAC_init(c, key, kAuthKeyLen, params) != 1) {
+        EVP_MAC_CTX_free(c);
+        return nullptr;
+    }
+    return c;
+}
+
+// HMAC over up to two spans using an already-keyed ctx: reset the message
+// (EVP_MAC_init with NULL key reuses the precomputed key schedule), update,
+// finalize, truncate to tag_len. `b` may be empty.
+inline bool srtp_hmac_keyed(EVP_MAC_CTX* ctx,
+                            const std::uint8_t* a, std::size_t alen,
+                            const std::uint8_t* b, std::size_t blen,
+                            std::uint8_t* tag, std::size_t tag_len) noexcept {
+    assert(ctx != nullptr && tag != nullptr && "hmac_keyed: null");
+    assert(tag_len <= 20 && (a != nullptr || alen == 0) && "hmac_keyed: arg");
+    std::uint8_t full[20];
+    std::size_t out_len = 0;
+    bool ok = EVP_MAC_init(ctx, nullptr, 0, nullptr) == 1 &&  // reuse key schedule
+              (alen == 0 || EVP_MAC_update(ctx, a, alen) == 1) &&
+              (blen == 0 || EVP_MAC_update(ctx, b, blen) == 1) &&
+              EVP_MAC_final(ctx, full, &out_len, sizeof(full)) == 1 && out_len == 20;
+    if (ok) std::memcpy(tag, full, tag_len);
+    return ok;
+}
+
+// AES-128-GCM context keyed once (enc=true => seal, else open).
+inline EVP_CIPHER_CTX* srtp_new_gcm_ctx(const std::uint8_t key[kSessionKeyLen],
+                                        bool enc) noexcept {
+    assert(key != nullptr && "new_gcm_ctx: null key");
+    EVP_CIPHER_CTX* c = EVP_CIPHER_CTX_new();
+    if (c == nullptr) return nullptr;
+    const EVP_CIPHER* ciph = EVP_aes_128_gcm();
+    const bool ok =
+        (enc ? EVP_EncryptInit_ex(c, ciph, nullptr, nullptr, nullptr)
+             : EVP_DecryptInit_ex(c, ciph, nullptr, nullptr, nullptr)) == 1 &&
+        EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_GCM_SET_IVLEN, kGcmSaltLen, nullptr) == 1 &&
+        (enc ? EVP_EncryptInit_ex(c, nullptr, nullptr, key, nullptr)
+             : EVP_DecryptInit_ex(c, nullptr, nullptr, key, nullptr)) == 1;
+    if (!ok) { EVP_CIPHER_CTX_free(c); return nullptr; }
+    return c;
+}
+
+// GCM seal with an already-keyed ctx: set IV, add AAD, encrypt in place, get tag.
+inline bool srtp_gcm_seal_keyed(EVP_CIPHER_CTX* ctx, const std::uint8_t iv[kGcmSaltLen],
+                                const std::uint8_t* aad, std::size_t aad_len,
+                                std::uint8_t* text, std::size_t n,
+                                std::uint8_t tag[kGcmTagLen]) noexcept {
+    assert(ctx != nullptr && iv != nullptr && tag != nullptr && "gcm_seal_keyed: null");
+    assert((text != nullptr || n == 0) && (aad != nullptr || aad_len == 0) && "gcm_seal_keyed: arg");
+    int len = 0;
+    return EVP_EncryptInit_ex(ctx, nullptr, nullptr, nullptr, iv) == 1 &&
+           (aad_len == 0 || EVP_EncryptUpdate(ctx, nullptr, &len, aad, static_cast<int>(aad_len)) == 1) &&
+           (n == 0 || EVP_EncryptUpdate(ctx, text, &len, text, static_cast<int>(n)) == 1) &&
+           EVP_EncryptFinal_ex(ctx, text, &len) == 1 &&
+           EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, kGcmTagLen, tag) == 1;
+}
+
+// GCM open with an already-keyed ctx: set IV, add AAD, decrypt in place, verify.
+inline bool srtp_gcm_open_keyed(EVP_CIPHER_CTX* ctx, const std::uint8_t iv[kGcmSaltLen],
+                                const std::uint8_t* aad, std::size_t aad_len,
+                                std::uint8_t* text, std::size_t n,
+                                const std::uint8_t tag[kGcmTagLen]) noexcept {
+    assert(ctx != nullptr && iv != nullptr && tag != nullptr && "gcm_open_keyed: null");
+    assert((text != nullptr || n == 0) && (aad != nullptr || aad_len == 0) && "gcm_open_keyed: arg");
+    int len = 0;
+    return EVP_DecryptInit_ex(ctx, nullptr, nullptr, nullptr, iv) == 1 &&
+           (aad_len == 0 || EVP_DecryptUpdate(ctx, nullptr, &len, aad, static_cast<int>(aad_len)) == 1) &&
+           (n == 0 || EVP_DecryptUpdate(ctx, text, &len, text, static_cast<int>(n)) == 1) &&
+           EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, kGcmTagLen,
+                               const_cast<std::uint8_t*>(tag)) == 1 &&
+           EVP_DecryptFinal_ex(ctx, text, &len) == 1;
+}
+
+// ============================================================================
 // RTP header parsing (just enough to find SSRC + payload offset).
 // ============================================================================
 struct RtpView {
@@ -546,6 +670,7 @@ public:
     SrtpSession() noexcept = default;
     SrtpSession(const SrtpSession&) = delete;
     SrtpSession& operator=(const SrtpSession&) = delete;
+    ~SrtpSession() noexcept { free_ctxs(); }
 
     // Bind master key/salt + profile and derive all session keys. Returns kOk.
     Error init(Profile profile, const std::uint8_t* master_key,
@@ -564,6 +689,31 @@ public:
         e = derive_session_keys(master_key, master_key_len, master_salt,
                                 master_salt_len, /*is_rtcp=*/true, srtcp_keys_);
         if (e != Error::kOk) return e;
+
+        // #38 — key the per-session EVP contexts ONCE (init may be called again,
+        // e.g. to reset replay state, so free any existing contexts first).
+        free_ctxs();
+        if (profile_ == Profile::kAesCm128HmacSha1_80) {
+            rtp_ctr_  = srtp_new_ctr_ctx(srtp_keys_.cipher.data());
+            rtcp_ctr_ = srtp_new_ctr_ctx(srtcp_keys_.cipher.data());
+            rtp_mac_  = srtp_new_hmac_ctx(srtp_keys_.auth.data());
+            rtcp_mac_ = srtp_new_hmac_ctx(srtcp_keys_.auth.data());
+            if (rtp_ctr_ == nullptr || rtcp_ctr_ == nullptr ||
+                rtp_mac_ == nullptr || rtcp_mac_ == nullptr) {
+                free_ctxs();
+                return Error::kCryptoFail;
+            }
+        } else {  // AEAD_AES_128_GCM: separate keyed seal/open contexts.
+            rtp_gcm_enc_  = srtp_new_gcm_ctx(srtp_keys_.cipher.data(),  true);
+            rtp_gcm_dec_  = srtp_new_gcm_ctx(srtp_keys_.cipher.data(),  false);
+            rtcp_gcm_enc_ = srtp_new_gcm_ctx(srtcp_keys_.cipher.data(), true);
+            rtcp_gcm_dec_ = srtp_new_gcm_ctx(srtcp_keys_.cipher.data(), false);
+            if (rtp_gcm_enc_ == nullptr || rtp_gcm_dec_ == nullptr ||
+                rtcp_gcm_enc_ == nullptr || rtcp_gcm_dec_ == nullptr) {
+                free_ctxs();
+                return Error::kCryptoFail;
+            }
+        }
         initialized_ = true;
         return Error::kOk;
     }
@@ -699,14 +849,14 @@ private:
         assert(plen <= 65535 && "cm_protect_rtp: payload bound");
         std::uint8_t iv[16];
         srtp_cm_iv(srtp_keys_.salt.data(), v.ssrc, roc, v.seq, iv);
-        if (!aes_ctr_xcrypt(srtp_keys_.cipher.data(), iv, payload, plen))
+        if (!srtp_ctr_xcrypt(rtp_ctr_, iv, payload, plen))
             return Error::kCryptoFail;
         // Auth covers the RTP header+payload (now ciphertext) ++ ROC (big-endian).
         const std::size_t body = v.header_len + plen;
         std::uint8_t roc_be[4];
         wr_u32(roc_be, roc);
-        if (!hmac_over_two(srtp_keys_.auth.data(), out, body, roc_be, 4,
-                           out + body, kSrtpTagLenCm))
+        if (!srtp_hmac_keyed(rtp_mac_, out, body, roc_be, 4,
+                             out + body, kSrtpTagLenCm))
             return Error::kCryptoFail;
         *out_len = body + kSrtpTagLenCm;
         return Error::kOk;
@@ -722,8 +872,7 @@ private:
         std::uint8_t exp[kSrtpTagLenCm];
         std::uint8_t roc_be[4];
         wr_u32(roc_be, roc);
-        if (!hmac_over_two(srtp_keys_.auth.data(), in, body, roc_be, 4, exp,
-                           kSrtpTagLenCm))
+        if (!srtp_hmac_keyed(rtp_mac_, in, body, roc_be, 4, exp, kSrtpTagLenCm))
             return Error::kCryptoFail;
         if (!ct_equal(exp, in + body, kSrtpTagLenCm)) return Error::kAuthFail;
         std::memcpy(out, in, body);
@@ -731,7 +880,7 @@ private:
         const std::size_t plen = body - v.header_len;
         std::uint8_t iv[16];
         srtp_cm_iv(srtp_keys_.salt.data(), v.ssrc, roc, v.seq, iv);
-        if (!aes_ctr_xcrypt(srtp_keys_.cipher.data(), iv, payload, plen))
+        if (!srtp_ctr_xcrypt(rtp_ctr_, iv, payload, plen))
             return Error::kCryptoFail;
         replay_commit(st, roc, v.seq, idx);
         *out_len = body;
@@ -747,8 +896,8 @@ private:
         srtp_gcm_iv(srtp_keys_.salt.data(), v.ssrc, roc, v.seq, iv);
         std::uint8_t* payload = out + v.header_len;
         // AAD = RTP header (RFC 7714 §8.2); tag appended after ciphertext.
-        if (!aes_gcm_seal(srtp_keys_.cipher.data(), iv, out, v.header_len, payload,
-                          plen, out + v.header_len + plen))
+        if (!srtp_gcm_seal_keyed(rtp_gcm_enc_, iv, out, v.header_len, payload,
+                                 plen, out + v.header_len + plen))
             return Error::kCryptoFail;
         *out_len = v.header_len + plen + kGcmTagLen;
         return Error::kOk;
@@ -765,8 +914,8 @@ private:
         std::memcpy(out, in, body);
         std::uint8_t iv[kGcmSaltLen];
         srtp_gcm_iv(srtp_keys_.salt.data(), v.ssrc, roc, v.seq, iv);
-        if (!aes_gcm_open(srtp_keys_.cipher.data(), iv, out, v.header_len,
-                          out + v.header_len, plen, in + body))
+        if (!srtp_gcm_open_keyed(rtp_gcm_dec_, iv, out, v.header_len,
+                                 out + v.header_len, plen, in + body))
             return Error::kAuthFail;
         replay_commit(st, roc, v.seq, idx);
         *out_len = body;
@@ -783,11 +932,11 @@ private:
         const std::size_t enc_len = rtcp_len - kRtcpHeaderMin;
         std::uint8_t iv[16];
         srtcp_cm_iv(srtcp_keys_.salt.data(), ssrc, index, iv);
-        if (!aes_ctr_xcrypt(srtcp_keys_.cipher.data(), iv, enc, enc_len))
+        if (!srtp_ctr_xcrypt(rtcp_ctr_, iv, enc, enc_len))
             return Error::kCryptoFail;
         wr_u32(out + rtcp_len, index | 0x80000000u);       // E=1 + index trailer
         const std::size_t auth_len = rtcp_len + kSrtcpTrailerLen;
-        if (!hmac_sha1_trunc(srtcp_keys_.auth.data(), out, auth_len,
+        if (!srtp_hmac_keyed(rtcp_mac_, out, auth_len, nullptr, 0,
                              out + auth_len, kSrtcpTagLenCm))
             return Error::kCryptoFail;
         *out_len = auth_len + kSrtcpTagLenCm;
@@ -801,7 +950,7 @@ private:
         assert(srtcp_len >= kRtcpHeaderMin + kSrtcpTrailerLen + kSrtcpTagLenCm && "len");
         const std::size_t auth_len = srtcp_len - kSrtcpTagLenCm;
         std::uint8_t exp[kSrtcpTagLenCm];
-        if (!hmac_sha1_trunc(srtcp_keys_.auth.data(), in, auth_len, exp, kSrtcpTagLenCm))
+        if (!srtp_hmac_keyed(rtcp_mac_, in, auth_len, nullptr, 0, exp, kSrtcpTagLenCm))
             return Error::kCryptoFail;
         if (!ct_equal(exp, in + auth_len, kSrtcpTagLenCm)) return Error::kAuthFail;
         const std::size_t plain_len = auth_len - kSrtcpTrailerLen;  // drop trailer
@@ -810,7 +959,7 @@ private:
         const std::size_t enc_len = plain_len - kRtcpHeaderMin;
         std::uint8_t iv[16];
         srtcp_cm_iv(srtcp_keys_.salt.data(), ssrc, index, iv);
-        if (!aes_ctr_xcrypt(srtcp_keys_.cipher.data(), iv, enc, enc_len))
+        if (!srtp_ctr_xcrypt(rtcp_ctr_, iv, enc, enc_len))
             return Error::kCryptoFail;
         *out_len = plain_len;
         return Error::kOk;
@@ -832,8 +981,8 @@ private:
         std::memcpy(aad + kRtcpHeaderMin, out + rtcp_len, kSrtcpTrailerLen);
         std::uint8_t iv[kGcmSaltLen];
         srtcp_gcm_iv(srtcp_keys_.salt.data(), ssrc, index, iv);
-        if (!aes_gcm_seal(srtcp_keys_.cipher.data(), iv, aad, sizeof(aad), enc,
-                          enc_len, out + rtcp_len + kSrtcpTrailerLen))
+        if (!srtp_gcm_seal_keyed(rtcp_gcm_enc_, iv, aad, sizeof(aad), enc,
+                                 enc_len, out + rtcp_len + kSrtcpTrailerLen))
             return Error::kCryptoFail;
         *out_len = rtcp_len + kSrtcpTrailerLen + kGcmTagLen;
         return Error::kOk;
@@ -853,8 +1002,8 @@ private:
         std::uint8_t* enc = out + kRtcpHeaderMin;
         std::uint8_t iv[kGcmSaltLen];
         srtcp_gcm_iv(srtcp_keys_.salt.data(), ssrc, index, iv);
-        if (!aes_gcm_open(srtcp_keys_.cipher.data(), iv, aad, sizeof(aad), enc,
-                          enc_len, in + body + kSrtcpTrailerLen))
+        if (!srtp_gcm_open_keyed(rtcp_gcm_dec_, iv, aad, sizeof(aad), enc,
+                                 enc_len, in + body + kSrtcpTrailerLen))
             return Error::kAuthFail;
         *out_len = body;
         return Error::kOk;
@@ -870,12 +1019,35 @@ private:
         return hmac_sha1_two(key, a, alen, b, blen, tag, tag_len);
     }
 
+    // Free all per-session EVP contexts (idempotent; safe before re-key / dtor).
+    void free_ctxs() noexcept {
+        if (rtp_ctr_  != nullptr) { EVP_CIPHER_CTX_free(rtp_ctr_);  rtp_ctr_  = nullptr; }
+        if (rtcp_ctr_ != nullptr) { EVP_CIPHER_CTX_free(rtcp_ctr_); rtcp_ctr_ = nullptr; }
+        if (rtp_mac_  != nullptr) { EVP_MAC_CTX_free(rtp_mac_);     rtp_mac_  = nullptr; }
+        if (rtcp_mac_ != nullptr) { EVP_MAC_CTX_free(rtcp_mac_);    rtcp_mac_ = nullptr; }
+        if (rtp_gcm_enc_  != nullptr) { EVP_CIPHER_CTX_free(rtp_gcm_enc_);  rtp_gcm_enc_  = nullptr; }
+        if (rtp_gcm_dec_  != nullptr) { EVP_CIPHER_CTX_free(rtp_gcm_dec_);  rtp_gcm_dec_  = nullptr; }
+        if (rtcp_gcm_enc_ != nullptr) { EVP_CIPHER_CTX_free(rtcp_gcm_enc_); rtcp_gcm_enc_ = nullptr; }
+        if (rtcp_gcm_dec_ != nullptr) { EVP_CIPHER_CTX_free(rtcp_gcm_dec_); rtcp_gcm_dec_ = nullptr; }
+    }
+
     Profile profile_ = Profile::kAesCm128HmacSha1_80;
     bool initialized_ = false;
     SessionKeys srtp_keys_{};
     SessionKeys srtcp_keys_{};
     std::array<SsrcState, kMaxSsrcSlots> ssrc_slots_{};
     std::uint32_t srtcp_index_out_ = 0;
+
+    // #38 — per-session keyed EVP contexts (key schedule computed once). CM uses
+    // ctr_ + mac_; GCM uses gcm_enc_/gcm_dec_. Single-threaded per session.
+    EVP_CIPHER_CTX* rtp_ctr_  = nullptr;
+    EVP_CIPHER_CTX* rtcp_ctr_ = nullptr;
+    EVP_MAC_CTX*    rtp_mac_  = nullptr;
+    EVP_MAC_CTX*    rtcp_mac_ = nullptr;
+    EVP_CIPHER_CTX* rtp_gcm_enc_  = nullptr;
+    EVP_CIPHER_CTX* rtp_gcm_dec_  = nullptr;
+    EVP_CIPHER_CTX* rtcp_gcm_enc_ = nullptr;
+    EVP_CIPHER_CTX* rtcp_gcm_dec_ = nullptr;
 };
 
 }  // namespace bolt::api::webrtc::srtp

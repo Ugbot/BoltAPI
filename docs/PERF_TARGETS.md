@@ -99,16 +99,26 @@ sequential handshake at a time, i.e. handshake *latency*, not throughput).
 
 ## 6. WebRTC media — SRTP  ·  `media_throughput_bench`
 
+Two profiles. **GCM** (AEAD, no HMAC-SHA1) is what modern WebRTC negotiates and is
+the perf path; **CM** (AES-CTR + HMAC-SHA1) is bounded by the OpenSSL SHA-1 core.
+
 | Metric | 🟥 Floor | 🟦 Good | 🟩 Great | Measured now |
 |---|---:|---:|---:|---|
-| `unprotect` (AES-CM-128, 1100 B) | < 1 µs/pkt | < 0.5 µs/pkt | < 0.3 µs/pkt | **~0.35 µs** (🟩 Great) |
-| `protect` (same) | < 1 µs/pkt | < 0.5 µs/pkt | < 0.3 µs/pkt | **~9.3 µs** 🔴 (25× slower — bug #38) |
-| Throughput (per direction) | 500 MB/s | 1.5 GB/s | > 3 GB/s | unprotect ~3 GB/s; protect ~0.12 GB/s 🔴 |
+| AES-CTR keying (1100 B) | < 2 µs | < 1 µs | < 0.6 µs | **~0.5 µs** (🟩, was 3.8 µs pre-#38) |
+| **GCM** `protect` (1100 B) | < 4 µs | < 1.5 µs | < 0.6 µs | **~2.6 µs** (🟥→🟦; EVP per-call overhead) |
+| **CM** `protect` (1100 B) | < 9 µs | < 3 µs | < 1.5 µs | **~7 µs** — SHA-1-bound (see note) |
+| Raw SHA-1 core (1100 B) | < 3 µs | < 1.5 µs | < 0.7 µs | **~5.4 µs** 🔴 (OpenSSL no-asm build) |
+| Per-packet heap allocs | 0 | 0 | 0 | **0** (🟩) |
 
-`unprotect` is already **Great**. The `protect` path is the single highest-value
-perf fix on the board (#38): cache `EVP_CIPHER_CTX`/`EVP_MAC_CTX` + precompute the
-key schedule → bring protect to parity (~0.35 µs). That alone moves protect from
-🔴 to 🟩.
+**#38 status:** the per-packet **AES/HMAC re-keying** that dominated the hot path is
+**fixed** — per-session keyed EVP contexts (key once, per-packet IV/message reset),
+AES-CTR ~7× faster, zero per-packet alloc, all byte-exact round-trips green. The CM
+`protect` residual is **OpenSSL's SHA-1 core** (raw `EVP_Digest` ~5.4 µs/1.1 KB ≈
+200 MB/s — a no-asm SHA-1 in this build), not our code. **Levers:** prefer GCM; link
+an asm-optimized OpenSSL. The previously-reported "protect ~25× slower than
+unprotect / unprotect ~0.35 µs / protect ~9.3 µs" was a **bench artifact** — the
+`media_throughput_bench` *unprotect* phase mismeasures; treat its unprotect numbers
+as unreliable until that phase is fixed (ROADMAP §1 follow-up).
 
 ## 7. JSON (fionn) — `req.json()` parse  ·  (target — micro-bench TODO)
 
@@ -167,9 +177,11 @@ Gates run on the reference box only (machine-dependent); the Linux/Clang lanes g
 - A surface at 🟦/🟩 with a **Measured** value = done, leave it (don't re-chase
   measured-neutral micro-opts — see ROADMAP §1 for the ones already ruled out).
 - A surface at 🟥 or "needs work" = an open optimization with a named lever.
-- Today's headline gaps, in priority order: **SRTP protect (#38)** → **HTTP/1.1 tail
-  latency (middleware alloc)** → **QUIC throughput (profiling pass)** → **multi-core
-  HTTP/1.1 scaling (measure the thread-per-core path)**.
+- Today's headline gaps, in priority order: **HTTP/1.1 tail latency (middleware
+  alloc)** → **QUIC throughput (profiling pass)** → **multi-core HTTP/1.1 scaling
+  (measure the thread-per-core path)** → **OpenSSL SHA-1 build / GCM-by-default**
+  (the SRTP-CM residual after #38's AES re-keying fix). #38's per-packet re-keying
+  is **done** (AES-CTR ~7× faster, zero per-packet alloc).
 
 *Keep this honest: when a run fills a cell, write the measured value + tier and date
 it; when a target is hit, the next tier becomes the goal.*

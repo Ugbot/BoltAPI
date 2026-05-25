@@ -13,12 +13,23 @@ Task numbers (`#NN`) refer to the in-repo task tracker.
 
 ## 1. Performance issues (measured)
 
-- 🔴 **SRTP `protect` ~25× slower than `unprotect`** (`#38`). `media_throughput_bench`
-  measured `protect_rtp` ≈ **9.3 µs/pkt** vs `unprotect_rtp` ≈ **0.35 µs/pkt**
-  (AES-CM-128-HMAC-SHA1-80, 1100 B). Almost certainly per-call EVP key/IV setup or
-  HMAC re-init on the protect path. Fix: cache/reuse `EVP_CIPHER_CTX` / `EVP_MAC_CTX`
-  and precompute session key schedule; re-bench to confirm parity. **Highest-value
-  perf fix.**
+- 🟡 **SRTP `protect` — per-packet EVP re-keying fixed; residual is OpenSSL SHA-1**
+  (`#38`). Root cause (found by a primitive-level diagnostic): the hot path re-ran
+  the **AES key schedule + HMAC ipad/opad EVERY packet** (`EVP_*Init` with key per
+  call) — measured AES-CTR **3.8 µs/call**, HMAC **8.5 µs/call** for 1100 B,
+  setup-dominated. **Fixed** (`srtp.h`): per-**session** keyed EVP contexts — key
+  once at `init()`, per packet set only the IV (cipher) / reset the message keeping
+  the key (MAC). AES-CTR dropped **3.8 µs → ~0.5 µs (~7×)**; zero per-packet heap
+  alloc retained; 248/248 + byte-exact SRTP/DTLS-SRTP/MediaRelay round-trips green.
+  Result: **CM `protect` ~11 µs → ~7 µs**; **GCM `protect` ~2.6 µs** (no HMAC-SHA1).
+  The CM residual is **OpenSSL's SHA-1 core**: a raw `EVP_Digest` of 1100 B measured
+  **~5.4 µs (~200 MB/s)** — abnormally slow, i.e. this OpenSSL build's SHA-1 is
+  generic-C (no asm). Not fixable in our code. **Levers:** (a) prefer **GCM**
+  (AEAD, no HMAC-SHA1) — what modern WebRTC negotiates; (b) link an asm-optimized
+  OpenSSL. The earlier "~25× protect vs unprotect" was a **bench artifact** — the
+  `media_throughput_bench` *unprotect* phase mismeasures (its MB/s and ns/pkt are
+  mutually inconsistent; most packets aren't fully processed). Follow-ups: fix that
+  unprotect measurement; investigate the OpenSSL SHA-1 build.
 - ⚪ **Batched UDP recv/send not implemented** (deferred in W5f/WP). `recvmmsg` /
   `WSARecvMsg` / GSO/GRO would help many-source high-PPS (many QUIC conns, dense
   media), but showed **no measurable win on single-connection loopback**, so it was

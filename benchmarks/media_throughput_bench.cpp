@@ -151,7 +151,8 @@ std::uint64_t protect_phase(srtp::SrtpSession& tx, const PacketPool& pool,
 // ---------------------------------------------------------------------------
 std::uint64_t unprotect_phase(srtp::SrtpSession& rx, const PacketPool& pool,
                               wrtc::TrackRegistry& tracks, bool use_arena,
-                              bolt::Arena& arena, double* out_secs) noexcept {
+                              bolt::Arena& arena, srtp::Profile profile,
+                              double* out_secs) noexcept {
     assert(out_secs != nullptr && "unprotect: out_secs");
     assert(pool.prot_len[0] > rtp::kFixedHeaderSize && "unprotect: pool");
     std::uint8_t stack_buf[kScratch];
@@ -160,8 +161,7 @@ std::uint64_t unprotect_phase(srtp::SrtpSession& rx, const PacketPool& pool,
     for (int i = 0; i < kPackets; ++i) {
         const int k = i % kPool;
         if (k == 0 && i != 0)
-            rx.init(srtp::Profile::kAesCm128HmacSha1_80, kMasterKey, 16,
-                    kMasterSalt, 14);                  // reset replay window
+            rx.init(profile, kMasterKey, 16, kMasterSalt, 14);  // reset replay window
         std::uint8_t* scratch = stack_buf;
         if (use_arena) {
             arena.reset();
@@ -188,15 +188,13 @@ std::uint64_t unprotect_phase(srtp::SrtpSession& rx, const PacketPool& pool,
     return total;
 }
 
-void run_variant(const char* name, bool use_arena) noexcept {
+void run_variant(const char* name, bool use_arena, srtp::Profile profile) noexcept {
     assert(name != nullptr && "run_variant: name");
     assert(kPackets > 0 && "run_variant: packets");
 
     srtp::SrtpSession tx, rx;
-    const srtp::Error te = tx.init(srtp::Profile::kAesCm128HmacSha1_80,
-                                   kMasterKey, 16, kMasterSalt, 14);
-    const srtp::Error re = rx.init(srtp::Profile::kAesCm128HmacSha1_80,
-                                   kMasterKey, 16, kMasterSalt, 14);
+    const srtp::Error te = tx.init(profile, kMasterKey, 16, kMasterSalt, 14);
+    const srtp::Error re = rx.init(profile, kMasterKey, 16, kMasterSalt, 14);
     if (te != srtp::Error::kOk || re != srtp::Error::kOk) {
         std::fprintf(stderr, "srtp init failed\n");
         return;
@@ -214,7 +212,7 @@ void run_variant(const char* name, bool use_arena) noexcept {
     // each (with a fresh tx so the protect-phase below starts from a clean ROC).
     static PacketPool pool;
     srtp::SrtpSession seed;
-    seed.init(srtp::Profile::kAesCm128HmacSha1_80, kMasterKey, 16, kMasterSalt, 14);
+    seed.init(profile, kMasterKey, 16, kMasterSalt, 14);
     for (int k = 0; k < kPool; ++k) {
         pool.rtp_len[k] = build_rtp(pool.rtp[k], kScratch, kVideoPt,
                                     static_cast<std::uint16_t>(1000 + k),
@@ -236,10 +234,10 @@ void run_variant(const char* name, bool use_arena) noexcept {
     const std::uint64_t prot_bytes =
         protect_phase(tx, pool, use_arena, arena, &prot_secs);
 
-    rx.init(srtp::Profile::kAesCm128HmacSha1_80, kMasterKey, 16, kMasterSalt, 14);
+    rx.init(profile, kMasterKey, 16, kMasterSalt, 14);
     double unp_secs = 0.0;
     const std::uint64_t unp_bytes =
-        unprotect_phase(rx, pool, tracks, use_arena, arena, &unp_secs);
+        unprotect_phase(rx, pool, tracks, use_arena, arena, profile, &unp_secs);
 
     const std::uint64_t allocs =
         g_alloc_count.load(std::memory_order_relaxed) - base_alloc;
@@ -258,10 +256,14 @@ void run_variant(const char* name, bool use_arena) noexcept {
 
 int main() {
     std::printf("=== media_throughput_bench (SRTP protect/unprotect + demux) ===\n");
-    std::printf("packets/phase=%d  payload=%zu  profile=AES_CM_128_HMAC_SHA1_80\n\n",
-                kPackets, kPayload);
-    run_variant("stack", /*use_arena=*/false);
-    std::printf("\n");
-    run_variant("arena", /*use_arena=*/true);
+    std::printf("packets/phase=%d  payload=%zu\n\n", kPackets, kPayload);
+    // CM profile (AES-CTR + HMAC-SHA1) — its cost is HMAC/SHA-1-bound (#38).
+    std::printf("-- AES_CM_128_HMAC_SHA1_80 --\n");
+    run_variant("cm/stk", /*use_arena=*/false, srtp::Profile::kAesCm128HmacSha1_80);
+    run_variant("cm/arn", /*use_arena=*/true,  srtp::Profile::kAesCm128HmacSha1_80);
+    // GCM profile (AEAD, no HMAC-SHA1) — the profile modern WebRTC negotiates.
+    std::printf("\n-- AEAD_AES_128_GCM --\n");
+    run_variant("gcm/stk", /*use_arena=*/false, srtp::Profile::kAeadAes128Gcm);
+    run_variant("gcm/arn", /*use_arena=*/true,  srtp::Profile::kAeadAes128Gcm);
     return 0;
 }
