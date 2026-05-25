@@ -4,6 +4,10 @@ Hand-rolled `std::chrono` micro/throughput benchmarks. No third-party benchmark
 dependency (no google-benchmark): warmup + a large fixed iteration count, with a
 `volatile` sink to defeat dead-code elimination.
 
+> This file is **how we measure**. For **what to aim for** — the Floor/Good/Great
+> targets per surface and the CI regression gates — see
+> [`PERF_TARGETS.md`](PERF_TARGETS.md).
+
 Build + run (NOT part of `ctest`):
 
 ```

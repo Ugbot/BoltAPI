@@ -7,7 +7,8 @@ deeper references and the living design/decision logs.
 ## Guides
 - [`JSON.md`](JSON.md) — the `req.json()` / `res.json()` facility (Bolt `fionn`)
 - [`COMPRESSION.md`](COMPRESSION.md) — gzip response compression middleware
-- [`BENCHMARKS.md`](BENCHMARKS.md) — router + throughput numbers
+- [`BENCHMARKS.md`](BENCHMARKS.md) — router + throughput numbers (how we measure)
+- [`PERF_TARGETS.md`](PERF_TARGETS.md) — Floor/Good/Great targets per surface (what to aim for) + CI regression gates
 - [`SEAMS.md`](SEAMS.md) — the `ProtocolRegistry` extension model for H3/WebRTC
 
 ## Protocol design + decision logs
