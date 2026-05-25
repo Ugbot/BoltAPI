@@ -31,15 +31,15 @@ namespace core {
  * Pending I/O operation
  */
 struct pending_op {
-    io_op operation;
-    int fd;
+    io_op operation{io_op::read};
+    int fd{-1};
     io_callback callback;
-    void* user_data;
-    
+    void* user_data{nullptr};
+
     // For read/write
     void* buffer{nullptr};
     size_t size{0};
-    
+
     // For connect
     struct sockaddr_storage addr;
     socklen_t addrlen{0};
@@ -52,6 +52,24 @@ struct pending_op {
 
     // Event flags
     uint32_t events{0};
+
+    // Slot index in the fixed op pool (stable; the op is NEVER freed/relocated,
+    // so reading its fields in the close/complete race can't use-after-free).
+    std::uint32_t pool_index{0};
+
+    // Reset for reuse from the pool (drops the prior callback + captured state).
+    void reset() noexcept {
+        operation = io_op::read;
+        fd = -1;
+        callback = nullptr;
+        user_data = nullptr;
+        buffer = nullptr;
+        size = 0;
+        addrlen = 0;
+        user_src = nullptr;
+        user_srclen = nullptr;
+        events = 0;
+    }
 };
 
 /**
@@ -69,9 +87,53 @@ struct epoll_io::impl {
     async_io::wake_callback wake_cb;
     std::atomic<bool> wake_pending{false};
 
-    // Pending operations indexed by FD
-    std::mutex ops_mutex;
-    std::unordered_map<int, std::unique_ptr<pending_op>> pending_ops;
+    // --- Lock-free op management (no per-op alloc, no mutex) ----------------
+    // Fixed pool of ops (stable storage). The hot path carries the op via
+    // epoll_event.data.u64 = (pool_index+1)<<32 | fd, so completion needs no map.
+    // A tagged free-list of indices hands ops out/back lock-free; an atomic
+    // fd->index slot lets close_async claim+cancel an in-flight op without a map.
+    static constexpr std::uint32_t kOpPoolSize = 8192;   // max concurrent ops
+    static constexpr int           kMaxFds     = 1 << 16;
+    std::vector<pending_op>             op_pool{std::vector<pending_op>(kOpPoolSize)};
+    std::vector<std::uint32_t>          free_next{std::vector<std::uint32_t>(kOpPoolSize)};
+    std::atomic<std::uint64_t>          free_head{0};   // (tag<<32)|(index+1); 0=empty
+    std::vector<std::atomic<std::uint32_t>> fd_slot{std::vector<std::atomic<std::uint32_t>>(kMaxFds)};
+
+    void init_op_pool() noexcept {
+        // Chain: index 0 is head, each free_next points to the next index+1.
+        for (std::uint32_t i = 0; i < kOpPoolSize; ++i) {
+            op_pool[i].pool_index = i;
+            free_next[i] = (i + 1 < kOpPoolSize) ? (i + 2) : 0;  // next index+1, 0=end
+        }
+        free_head.store(1, std::memory_order_relaxed);  // index 0 (idx+1=1)
+        for (auto& s : fd_slot) s.store(0, std::memory_order_relaxed);
+    }
+    // Pop a free op index (tagged Treiber stack). Returns UINT32_MAX if exhausted.
+    std::uint32_t alloc_index() noexcept {
+        std::uint64_t head = free_head.load(std::memory_order_acquire);
+        for (;;) {
+            std::uint32_t idx_p1 = static_cast<std::uint32_t>(head);
+            if (idx_p1 == 0) return UINT32_MAX;  // pool exhausted (overload)
+            std::uint64_t nxt = (((head >> 32) + 1) << 32) | free_next[idx_p1 - 1];
+            if (free_head.compare_exchange_weak(head, nxt, std::memory_order_acq_rel,
+                                                std::memory_order_acquire)) {
+                return idx_p1 - 1;
+            }
+        }
+    }
+    void free_index(std::uint32_t idx) noexcept {
+        std::uint64_t head = free_head.load(std::memory_order_acquire);
+        for (;;) {
+            free_next[idx] = static_cast<std::uint32_t>(head);  // next = old head idx+1
+            std::uint64_t nxt = (((head >> 32) + 1) << 32) | (idx + 1);
+            if (free_head.compare_exchange_weak(head, nxt, std::memory_order_acq_rel,
+                                                std::memory_order_acquire)) return;
+        }
+    }
+    std::atomic<std::uint32_t>* slot_for(int fd) noexcept {
+        if (fd < 0 || fd >= kMaxFds) return nullptr;  // beyond table: not tracked
+        return &fd_slot[static_cast<std::size_t>(fd)];
+    }
 
     // Statistics
     std::atomic<uint64_t> stat_accepts{0};
@@ -85,6 +147,7 @@ struct epoll_io::impl {
     std::atomic<uint64_t> stat_wakes{0};
 
     impl(const async_io_config& cfg) : config(cfg) {
+        init_op_pool();
         epoll_fd = epoll_create1(EPOLL_CLOEXEC);
         if (epoll_fd < 0) {
             // Handle error
@@ -93,10 +156,11 @@ struct epoll_io::impl {
         // Create eventfd for wake mechanism
         wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
         if (wake_fd >= 0) {
-            // Register wake_fd with epoll
+            // Register wake_fd with epoll. data.u64 = 0 is the wake sentinel
+            // (op events carry (index+1)<<32 | fd, so their high word is never 0).
             struct epoll_event ev;
             ev.events = EPOLLIN | EPOLLET;  // Edge-triggered
-            ev.data.fd = wake_fd;
+            ev.data.u64 = 0;
             epoll_ctl(epoll_fd, EPOLL_CTL_ADD, wake_fd, &ev);
         }
     }
@@ -116,45 +180,43 @@ struct epoll_io::impl {
         return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
     }
     
-    int register_op(std::unique_ptr<pending_op> op, uint32_t events) {
-        std::lock_guard<std::mutex> lock(ops_mutex);
-        
+    // Acquire a pooled op (no allocation after warmup). Returns nullptr on
+    // pool exhaustion (treated as a submit failure / overload).
+    pending_op* alloc_op() noexcept {
+        std::uint32_t idx = alloc_index();
+        if (idx == UINT32_MAX) return nullptr;
+        pending_op& op = op_pool[idx];
+        op.reset();
+        op.pool_index = idx;
+        return &op;
+    }
+
+    // Register a pooled op with epoll. The op is carried in data.u64 (no map),
+    // and indexed in fd_slot for close_async cancellation. epoll_ctl is
+    // thread-safe in the kernel, so no user-space lock is needed.
+    int register_op(pending_op* op, uint32_t events) noexcept {
         op->events = events;
-        
-        // Add epoll event
         struct epoll_event ev;
-        ev.events = events | EPOLLET | EPOLLONESHOT;  // Edge-triggered, one-shot
-        ev.data.fd = op->fd;
-        
+        ev.events = events | EPOLLET | EPOLLONESHOT;  // edge-triggered, one-shot
+        ev.data.u64 = (static_cast<std::uint64_t>(op->pool_index + 1) << 32) |
+                      static_cast<std::uint32_t>(op->fd);
+        // Publish the fd->index slot BEFORE arming the fd in epoll. The completion
+        // can fire on another IO thread the instant epoll_ctl arms it, and poll
+        // claims the op via this slot — if it weren't set yet, poll would read a
+        // stale slot, fail its claim check, and DROP the completion (the coroutine
+        // would hang). Ordering: slot first, then arm.
+        std::atomic<std::uint32_t>* s = slot_for(op->fd);
+        if (s) s->store(op->pool_index + 1, std::memory_order_release);
         if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, op->fd, &ev) < 0) {
-            // Try MOD if ADD fails (fd already registered)
-            if (errno == EEXIST) {
-                if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, op->fd, &ev) < 0) {
-                    stat_errors.fetch_add(1, std::memory_order_relaxed);
-                    return -1;
-                }
-            } else {
+            if (errno != EEXIST ||
+                epoll_ctl(epoll_fd, EPOLL_CTL_MOD, op->fd, &ev) < 0) {
                 stat_errors.fetch_add(1, std::memory_order_relaxed);
+                if (s) s->store(0, std::memory_order_release);
+                free_index(op->pool_index);
                 return -1;
             }
         }
-        
-        // Store operation
-        pending_ops[op->fd] = std::move(op);
         return 0;
-    }
-    
-    pending_op* find_and_remove_op(int fd) {
-        std::lock_guard<std::mutex> lock(ops_mutex);
-        
-        auto it = pending_ops.find(fd);
-        if (it == pending_ops.end()) {
-            return nullptr;
-        }
-        
-        pending_op* op = it->second.release();
-        pending_ops.erase(it);
-        return op;
     }
 };
 
@@ -173,14 +235,15 @@ int epoll_io::accept_async(
 ) noexcept {
     impl_->set_nonblocking(listen_fd);
     
-    auto op = std::make_unique<pending_op>();
+    pending_op* op = impl_->alloc_op();
+    if (op == nullptr) return -1;
     op->operation = io_op::accept;
     op->fd = listen_fd;
     op->callback = std::move(callback);
     op->user_data = user_data;
-    
+
     impl_->stat_accepts.fetch_add(1, std::memory_order_relaxed);
-    return impl_->register_op(std::move(op), EPOLLIN);
+    return impl_->register_op(op, EPOLLIN);
 }
 
 int epoll_io::read_async(
@@ -192,16 +255,17 @@ int epoll_io::read_async(
 ) noexcept {
     impl_->set_nonblocking(fd);
     
-    auto op = std::make_unique<pending_op>();
+    pending_op* op = impl_->alloc_op();
+    if (op == nullptr) return -1;
     op->operation = io_op::read;
     op->fd = fd;
     op->buffer = buffer;
     op->size = size;
     op->callback = std::move(callback);
     op->user_data = user_data;
-    
+
     impl_->stat_reads.fetch_add(1, std::memory_order_relaxed);
-    return impl_->register_op(std::move(op), EPOLLIN);
+    return impl_->register_op(op, EPOLLIN);
 }
 
 int epoll_io::write_async(
@@ -213,16 +277,17 @@ int epoll_io::write_async(
 ) noexcept {
     impl_->set_nonblocking(fd);
     
-    auto op = std::make_unique<pending_op>();
+    pending_op* op = impl_->alloc_op();
+    if (op == nullptr) return -1;
     op->operation = io_op::write;
     op->fd = fd;
     op->buffer = const_cast<void*>(buffer);
     op->size = size;
     op->callback = std::move(callback);
     op->user_data = user_data;
-    
+
     impl_->stat_writes.fetch_add(1, std::memory_order_relaxed);
-    return impl_->register_op(std::move(op), EPOLLOUT);
+    return impl_->register_op(op, EPOLLOUT);
 }
 
 int epoll_io::connect_async(
@@ -234,23 +299,25 @@ int epoll_io::connect_async(
 ) noexcept {
     impl_->set_nonblocking(fd);
     
-    auto op = std::make_unique<pending_op>();
+    pending_op* op = impl_->alloc_op();
+    if (op == nullptr) return -1;
     op->operation = io_op::connect;
     op->fd = fd;
     op->callback = std::move(callback);
     op->user_data = user_data;
     memcpy(&op->addr, addr, addrlen);
     op->addrlen = addrlen;
-    
+
     // Start connection
     int ret = connect(fd, addr, addrlen);
     if (ret < 0 && errno != EINPROGRESS) {
         impl_->stat_errors.fetch_add(1, std::memory_order_relaxed);
+        impl_->free_index(op->pool_index);
         return -1;
     }
-    
+
     impl_->stat_connects.fetch_add(1, std::memory_order_relaxed);
-    return impl_->register_op(std::move(op), EPOLLOUT);
+    return impl_->register_op(op, EPOLLOUT);
 }
 
 int epoll_io::recvfrom_async(
@@ -264,7 +331,8 @@ int epoll_io::recvfrom_async(
 ) noexcept {
     impl_->set_nonblocking(fd);
 
-    auto op = std::make_unique<pending_op>();
+    pending_op* op = impl_->alloc_op();
+    if (op == nullptr) return -1;
     op->operation = io_op::recvfrom;
     op->fd = fd;
     op->buffer = buffer;
@@ -275,7 +343,7 @@ int epoll_io::recvfrom_async(
     op->user_data = user_data;
 
     impl_->stat_reads.fetch_add(1, std::memory_order_relaxed);
-    return impl_->register_op(std::move(op), EPOLLIN);
+    return impl_->register_op(op, EPOLLIN);
 }
 
 int epoll_io::sendto_async(
@@ -319,17 +387,23 @@ int epoll_io::close_async(int fd) noexcept {
     // recvfrom completion to decrement in_flight_ — if the callback never fires
     // it hangs forever. Firing it (the callback observes the transport's stop
     // flag, decrements, and does NOT re-arm) unblocks the drain.
-    pending_op* op = impl_->find_and_remove_op(fd);
-    if (op != nullptr) {
-        std::unique_ptr<pending_op> op_guard(op);
-        if (op->callback) {
-            io_event event;
-            event.operation = op->operation;
-            event.fd        = op->fd;
-            event.user_data = op->user_data;
-            event.flags     = 0;
-            event.result    = -1;  // closed / cancelled
-            op->callback(event);
+    // Claim the in-flight op for this fd (atomic exchange — only one of close /
+    // poll-completion wins; the op lives in the fixed pool so reading it is never
+    // a use-after-free). The slot holds pool_index+1 (0 = none).
+    if (auto* s = impl_->slot_for(fd)) {
+        std::uint32_t idx_p1 = s->exchange(0, std::memory_order_acq_rel);
+        if (idx_p1 != 0) {
+            pending_op& op = impl_->op_pool[idx_p1 - 1];
+            if (op.callback) {
+                io_event event;
+                event.operation = op.operation;
+                event.fd        = op.fd;
+                event.user_data = op.user_data;
+                event.flags     = 0;
+                event.result    = -1;  // closed / cancelled
+                op.callback(event);
+            }
+            impl_->free_index(idx_p1 - 1);
         }
     }
 
@@ -358,30 +432,30 @@ int epoll_io::poll(uint32_t timeout_us) noexcept {
     // Process events
     for (int i = 0; i < n; ++i) {
         const struct epoll_event& ev = events[i];
-        int fd = ev.data.fd;
+        const std::uint64_t d = ev.data.u64;
+        const std::uint32_t idx_p1 = static_cast<std::uint32_t>(d >> 32);
 
-        // Check for wake event (eventfd)
-        if (fd == impl_->wake_fd) {
+        // Wake event sentinel (data.u64 == 0; op events always have idx_p1 != 0).
+        if (idx_p1 == 0) {
             impl_->stat_wakes.fetch_add(1, std::memory_order_relaxed);
             impl_->wake_pending.store(false, std::memory_order_release);
-
-            // Read from eventfd to clear it
             uint64_t val;
-            read(impl_->wake_fd, &val, sizeof(val));
-
-            // Invoke wake callback
-            if (impl_->wake_cb) {
-                impl_->wake_cb();
-            }
+            read(impl_->wake_fd, &val, sizeof(val));  // clear eventfd
+            if (impl_->wake_cb) impl_->wake_cb();
             continue;
         }
 
-        // Find and remove pending operation
-        pending_op* op = impl_->find_and_remove_op(fd);
-        if (!op) continue;
-        
-        std::unique_ptr<pending_op> op_guard(op);
-        
+        const int fd = static_cast<int>(static_cast<std::uint32_t>(d));
+
+        // Claim the op (atomic — close_async may race; only one wins). The op
+        // lives in the fixed pool, so reading it is never a use-after-free.
+        if (auto* s = impl_->slot_for(fd)) {
+            if (s->exchange(0, std::memory_order_acq_rel) != idx_p1) {
+                continue;  // close_async already handled (and freed) this op
+            }
+        }
+        pending_op* op = &impl_->op_pool[idx_p1 - 1];
+
         // Execute operation
         io_event event;
         event.operation = op->operation;
@@ -438,12 +512,13 @@ int epoll_io::poll(uint32_t timeout_us) noexcept {
             }
         }
         
-        // Invoke callback
+        // Invoke callback, then return the op to the pool (no deallocation).
         if (op->callback) {
             op->callback(event);
         }
+        impl_->free_index(op->pool_index);
     }
-    
+
     return n;
 }
 
