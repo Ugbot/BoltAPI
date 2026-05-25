@@ -289,8 +289,10 @@ public:
     // Access to underlying infrastructure
     // =========================================================================
 
-    /// Get the async_io engine (for advanced use)
-    core::async_io* io_engine() noexcept { return io_.get(); }
+    /// Get an async_io engine (for advanced use). Returns engine 0 — the engine
+    /// a single-socket transport (e.g. UdpTransport) pins itself to. The HTTP
+    /// hot path does NOT use this; it goes through the per-thread current_io().
+    core::async_io* io_engine() noexcept { return ios_.empty() ? nullptr : ios_[0].get(); }
 
     /// Get the worker pool
     core::WorkerThreadPool* worker_pool() noexcept { return worker_pool_; }
@@ -328,8 +330,22 @@ private:
     // Submit coroutine to worker pool for resumption
     void resume_on_worker(std::coroutine_handle<> handle) noexcept;
 
+    // The async_io engine the CURRENT thread should register an op on. On an IO
+    // thread it returns that thread's own engine (thread-per-core: ops register
+    // on the engine the calling coroutine is pinned to, so the completion is
+    // reaped by the same thread that submitted it). Off an IO thread (e.g. an op
+    // submitted from a worker before a connection is pinned) it falls back to
+    // engine 0. For a shared-engine backend (IOCP) there is one engine and this
+    // always returns it.
+    core::async_io* current_io() noexcept;
+
     IODispatcherConfig config_;
-    std::unique_ptr<core::async_io> io_;
+    // One async_io engine per IO thread for thread-per-core backends (epoll/
+    // kqueue/io_uring): each IO thread polls ONLY ios_[i], so there is no shared
+    // poll set (no thundering herd / no cross-thread op-pool contention). For a
+    // shared-completion backend (IOCP) this holds a single engine that all IO
+    // threads poll (kernel distributes completions) — see ctor.
+    std::vector<std::unique_ptr<core::async_io>> ios_;
     core::WorkerThreadPool* worker_pool_;
     bool owns_worker_pool_ = false;  // Did we create the pool?
 

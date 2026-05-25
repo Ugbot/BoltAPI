@@ -4,11 +4,23 @@
 // worker thread pool architecture.
 
 #include "boltapi/net/io_dispatcher.h"
+#include <cassert>
 #include <mutex>
 #include <iostream>
 
 namespace bolt::api {
 namespace net {
+
+// The engine the CURRENT thread polls, and the dispatcher that owns it. Set by
+// io_thread_loop on each IO thread; cleared on exit. A single thread is an IO
+// thread for at most one dispatcher at a time, so a thread_local pair is enough
+// to route an inline-resumed coroutine's next op to its own thread's engine.
+// The owner tag guards the (unusual) case of an op submitted on this thread for a
+// DIFFERENT dispatcher — that falls back to the other dispatcher's engine 0.
+namespace {
+thread_local IODispatcher*    t_current_owner = nullptr;
+thread_local core::async_io*  t_current_io    = nullptr;
+}  // namespace
 
 // =============================================================================
 // Awaitable Implementations
@@ -21,7 +33,7 @@ void ReadAwaitable::await_suspend(std::coroutine_handle<> handle) noexcept {
     ReadAwaitable* self = this;
 
     // Submit async read to the I/O engine
-    int rc = dispatcher_->io_->read_async(
+    int rc = dispatcher_->current_io()->read_async(
         fd_, buf_, len_,
         [self, handle](const core::io_event& event) {
             // Store result
@@ -46,7 +58,7 @@ void WriteAwaitable::await_suspend(std::coroutine_handle<> handle) noexcept {
 
     WriteAwaitable* self = this;
 
-    int rc = dispatcher_->io_->write_async(
+    int rc = dispatcher_->current_io()->write_async(
         fd_, buf_, len_,
         [self, handle](const core::io_event& event) {
             self->result_ = event.result;
@@ -71,7 +83,7 @@ void RecvFromAwaitable::await_suspend(std::coroutine_handle<> handle) noexcept {
     // They (and `buf_`) must outlive the op — the awaitable temporary lives
     // across the suspension point, and the caller guarantees `src_`/`srclen_`
     // storage outlives the co_await.
-    int rc = dispatcher_->io_->recvfrom_async(
+    int rc = dispatcher_->current_io()->recvfrom_async(
         fd_, buf_, len_, src_, srclen_,
         [self, handle](const core::io_event& event) {
             self->result_ = event.result;
@@ -92,7 +104,7 @@ void SendToAwaitable::await_suspend(std::coroutine_handle<> handle) noexcept {
 
     SendToAwaitable* self = this;
 
-    int rc = dispatcher_->io_->sendto_async(
+    int rc = dispatcher_->current_io()->sendto_async(
         fd_, buf_, len_, dst_, dstlen_,
         [self, handle](const core::io_event& event) {
             self->result_ = event.result;
@@ -113,7 +125,7 @@ void AcceptAwaitable::await_suspend(std::coroutine_handle<> handle) noexcept {
 
     AcceptAwaitable* self = this;
 
-    int rc = dispatcher_->io_->accept_async(
+    int rc = dispatcher_->current_io()->accept_async(
         listen_fd_,
         [self, handle](const core::io_event& event) {
             self->result_fd_ = static_cast<int>(event.result);
@@ -134,7 +146,7 @@ void ConnectAwaitable::await_suspend(std::coroutine_handle<> handle) noexcept {
 
     ConnectAwaitable* self = this;
 
-    int rc = dispatcher_->io_->connect_async(
+    int rc = dispatcher_->current_io()->connect_async(
         fd_, addr_, addrlen_,
         [self, handle](const core::io_event& event) {
             self->result_ = static_cast<int>(event.result);
@@ -158,18 +170,40 @@ IODispatcher::IODispatcher(const IODispatcherConfig& config)
     : config_(config)
     , worker_pool_(config.worker_pool) {
 
-    // Create async I/O engine
-    io_ = core::async_io::create(config_.io_config);
+    // Ensure at least 1 I/O thread (engine count is derived from this).
+    if (config_.num_io_threads == 0) {
+        config_.num_io_threads = 1;
+    }
+
+    // Create the async I/O engine(s). Thread-per-core: for a readiness/per-poll
+    // backend (epoll/kqueue/io_uring) give EACH IO thread its OWN engine so there
+    // is no shared poll set — ios_[i] is polled only by IO thread i. For a shared-
+    // completion backend (IOCP) one engine is correct (the kernel distributes
+    // completions across all threads polling the single completion port), so we
+    // keep ONE engine that every IO thread polls — preserving the proven Windows
+    // model. We probe the first engine's backend to decide.
+    auto first = core::async_io::create(config_.io_config);
+    const bool per_thread_engines =
+        first && (first->backend() == core::io_backend::epoll ||
+                  first->backend() == core::io_backend::kqueue ||
+                  first->backend() == core::io_backend::io_uring);
+    ios_.reserve(per_thread_engines ? config_.num_io_threads : 1);
+    ios_.emplace_back(std::move(first));
+    if (per_thread_engines) {
+        for (size_t i = 1; i < config_.num_io_threads; ++i) {
+            ios_.emplace_back(core::async_io::create(config_.io_config));
+        }
+    }
+    // Invariant: at least one engine, and either one (shared) or exactly one per
+    // IO thread (per-core). Both are valid for the io_thread_loop index math.
+    assert(!ios_.empty() && "IODispatcher must have at least one async_io engine");
+    assert((ios_.size() == 1 || ios_.size() == config_.num_io_threads) &&
+           "engine count must be 1 (shared) or one-per-IO-thread");
 
     // If no worker pool provided, create one
     if (!worker_pool_) {
         owns_worker_pool_ = true;
         // Worker pool will be created and started in start()
-    }
-
-    // Ensure at least 1 I/O thread
-    if (config_.num_io_threads == 0) {
-        config_.num_io_threads = 1;
     }
 }
 
@@ -217,9 +251,11 @@ void IODispatcher::stop() {
 
     shutdown_requested_.store(true, std::memory_order_release);
 
-    // Stop the async I/O engine (this will wake any blocked poll())
-    if (io_) {
-        io_->stop();
+    // Stop the async I/O engine(s) (this will wake any blocked poll())
+    for (auto& io : ios_) {
+        if (io) {
+            io->stop();
+        }
     }
 
     // Join I/O threads
@@ -241,14 +277,32 @@ void IODispatcher::stop() {
 void IODispatcher::io_thread_loop(size_t thread_id) {
     std::cout << "IODispatcher I/O thread " << thread_id << " started" << std::endl;
 
+    // Pick THIS thread's engine. Per-core backends have one engine per IO thread
+    // (poll only ours); the shared backend (IOCP) has a single engine that every
+    // IO thread polls. Both collapse to the same index math.
+    const size_t engine_idx = (thread_id < ios_.size()) ? thread_id : 0;
+    core::async_io* my_io = ios_[engine_idx].get();
+    assert(my_io != nullptr && "io_thread_loop: null engine");
+
+    // Publish the per-thread engine so awaitables resumed inline on this thread
+    // (and ops submitted by coroutines pinned here) register on OUR engine — the
+    // completion is then reaped by THIS thread (no cross-thread handoff). Tagged
+    // with the owning dispatcher so a stray op for a different dispatcher on this
+    // thread does not pick up our engine (it falls back to that dispatcher's #0).
+    t_current_owner = this;
+    t_current_io = my_io;
+
     while (!shutdown_requested_.load(std::memory_order_acquire)) {
         // Poll for I/O events with timeout
         // 1ms timeout to check shutdown periodically without burning CPU
-        io_->poll(1000);  // 1000 microseconds = 1ms
+        my_io->poll(1000);  // 1000 microseconds = 1ms
     }
 
     // Final drain of pending events
-    io_->poll(0);
+    my_io->poll(0);
+
+    t_current_io = nullptr;
+    t_current_owner = nullptr;
 
     std::cout << "IODispatcher I/O thread " << thread_id << " stopped" << std::endl;
 }
@@ -274,9 +328,23 @@ void IODispatcher::resume_on_worker(std::coroutine_handle<> handle) noexcept {
     }
 }
 
+core::async_io* IODispatcher::current_io() noexcept {
+    // On our own IO thread: the engine that thread polls (ops register where they
+    // complete — no cross-thread handoff). Otherwise engine 0 (e.g. an op from a
+    // worker before the connection is pinned to an IO thread).
+    if (t_current_owner == this && t_current_io != nullptr) {
+        return t_current_io;
+    }
+    assert(!ios_.empty() && "current_io: no engine");
+    return ios_[0].get();
+}
+
 void IODispatcher::async_close(int fd) noexcept {
-    if (io_) {
-        io_->close_async(fd);
+    // Close on the engine the calling thread is pinned to: that is where this
+    // fd's in-flight read/write ops were registered, so the close completes them
+    // (the drain semantics UdpTransport::stop and the connection teardown rely on).
+    if (core::async_io* io = current_io()) {
+        io->close_async(fd);
     }
 }
 
