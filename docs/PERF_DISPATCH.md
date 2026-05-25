@@ -106,11 +106,17 @@ The flat 4→8 region (well under 16 cores) is the **shared-epoll ceiling**: all
 threads poll one `epoll_fd` (thundering herd) + contend on the shared free-list/
 fd-slot atomics. This is the motivation for Phase 3.
 
-## Next — Phase 3: thread-per-core epoll (the tail + linear scaling)
+## Next — Phase 3: thread-per-core (epoll → io_uring) + zero-alloc dispatch
 
-Per-thread epoll instance + connection sharding (each connection pinned to one IO
-thread for its lifetime; SO_REUSEPORT-style accept). Removes the shared-epoll
-contention/thundering-herd → collapses the tail, scales linearly with cores, and
-needs far fewer than 8 IO threads. Also pins a connection to one thread → makes a
-per-IO-thread frame arena safe → kills the last 3 allocs/request (the 3840 B
-dispatch frame). Re-measure on an idle box for trustworthy absolutes.
+Traceable punch-card: **`docs/THREAD_PER_CORE_REMAINING.md`** (slices A–E). Full
+design + decision rationale: `~/.claude/plans/foamy-munching-reddy.md`.
+
+Per-thread engine instance + connection sharding (each connection pinned to one IO
+thread for its lifetime; SO_REUSEPORT accept per thread) + CPU affinity (bolt_topology).
+Removes the shared-epoll contention/thundering-herd → collapses the tail, scales
+linearly with cores, needs far fewer IO threads. Pinning also makes a per-IO-thread
+frame arena safe → kills the last allocs/request (the 3840 B dispatch frame). Then a
+real **io_uring ring-per-thread** backend (raw syscalls, epoll stays the fallback) for
+the next 2–2.3×. Research (this session) confirmed thread-per-core + worker-offload
+hybrid beats the "one IO loop + workers" reactor pattern for our trivial-handler goal.
+Re-measure on an idle box for trustworthy absolutes.
