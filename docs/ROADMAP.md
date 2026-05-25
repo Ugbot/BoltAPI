@@ -44,9 +44,16 @@ Task numbers (`#NN`) refer to the in-repo task tracker.
   (nginx/Drogon — the comparison-framing template in `docs/BENCHMARKS.md` is ready
   but unfilled). QUIC/media remain micro/loopback only (≈ 62 handshakes/s,
   ≈ 1.7 MB/s on this box). (See §4 integration tests.)
-- 🟡 **Middleware per-request `std::function` allocation** (TODO in `middleware.h`).
-  The chain allocates per request; an arena-backed continuation is a known perf pass
-  not yet done.
+- ✅ **Middleware chain is now allocation-free** (was: per-request `std::function`
+  + `std::make_shared<Next>` fold). Rebuilt TigerStyle / LMAX-Disruptor: the onion
+  is driven by a borrowed value **handle** (`Next` = `ChainCtx*` + index — no smart
+  pointers, no per-link `std::function`), and every chain coroutine **frame** is
+  bump-allocated from a per-request **frame arena** acquired from a pre-allocated
+  **ring pool** (`include/boltapi/http/frame_arena.h`; the free-list is a Vyukov
+  bounded MPMC ring — sequenced slots, cache-line-padded cursors, lock-free claim/
+  publish). Gated by `middleware_alloc_test` (100k chain runs → **0** global allocs,
+  full onion + short-circuit), green on MSVC + Linux/Clang. Remaining: the
+  top-level dispatch coroutine frame is still one heap frame per request.
 - ℹ️ **Measured-neutral, deliberately reverted** (kept for the record so we don't
   re-chase): `bolt::Arena` per-packet scratch vs fixed stack scratch (both QUIC and
   media) — neutral-to-worse, reverted. Per-SSRC linear scan (≤16) beats a

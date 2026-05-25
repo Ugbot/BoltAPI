@@ -70,10 +70,11 @@ exercised + measured. The single-thread row is the regression gate today.
 | p99 | < 5 ms | < 1 ms | < 400 µs | ~1.1–1.5 ms (≈🟥) |
 | p99.9 | < 20 ms | < 5 ms | < 2 ms | ~3.2–3.9 ms (🟦) |
 
-Tail latency under load is the **weakest current area** — driven by the per-request
-`std::function` middleware alloc + per-request coroutine frame + worker-hop
-scheduling (`docs/ROADMAP.md` §1). The arena-backed-continuation perf pass is the
-main lever to move p50/p99 toward Good/Great.
+Tail latency under load is the **weakest current area**. The per-request middleware
+allocation is now **eliminated** (handle-driven onion + Disruptor-style frame-arena
+ring — `middleware_alloc_test` proves 0 allocs; `docs/ROADMAP.md` §1). Remaining
+levers: the top-level dispatch coroutine frame (still one heap frame/request) and
+worker-hop scheduling.
 
 ## 4. HTTP/2  ·  `[loopback]` (target — harness TODO)
 
@@ -177,11 +178,12 @@ Gates run on the reference box only (machine-dependent); the Linux/Clang lanes g
 - A surface at 🟦/🟩 with a **Measured** value = done, leave it (don't re-chase
   measured-neutral micro-opts — see ROADMAP §1 for the ones already ruled out).
 - A surface at 🟥 or "needs work" = an open optimization with a named lever.
-- Today's headline gaps, in priority order: **HTTP/1.1 tail latency (middleware
-  alloc)** → **QUIC throughput (profiling pass)** → **multi-core HTTP/1.1 scaling
-  (measure the thread-per-core path)** → **OpenSSL SHA-1 build / GCM-by-default**
-  (the SRTP-CM residual after #38's AES re-keying fix). #38's per-packet re-keying
-  is **done** (AES-CTR ~7× faster, zero per-packet alloc).
+- Today's headline gaps, in priority order: **HTTP/1.1 tail latency** (dispatch
+  coroutine frame + worker-hop scheduling — the middleware-alloc part is now **done**:
+  handle-driven onion + frame-arena ring, 0 allocs) → **QUIC throughput (profiling
+  pass)** → **multi-core HTTP/1.1 scaling (measure the thread-per-core path)** →
+  **OpenSSL SHA-1 build / GCM-by-default** (the SRTP-CM residual after #38's AES
+  re-keying fix). #38's per-packet re-keying is **done** (AES-CTR ~7× faster).
 
 *Keep this honest: when a run fills a cell, write the measured value + tier and date
 it; when a target is hit, the next tier becomes the goal.*

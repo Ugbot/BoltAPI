@@ -6,13 +6,12 @@
 // hot path many times, and asserts the delta is exactly zero. Warmup runs
 // first so any one-time lazy init (none expected on these paths) is excluded.
 //
-// SCOPE NOTE (known TODO): the App middleware chain is built from std::function
-// objects, and dispatch wraps each request in a coroutine frame — both of which
-// allocate per request today (see middleware.h / app.h). That path is therefore
-// NOT covered by the zero-alloc assertion here; this test deliberately scopes to
-// what is genuinely allocation-free so the assertion is both meaningful and
-// stable: Router::match() (static + param + wildcard + miss) and HTTP1Parser
-// exercised in isolation on a caller-owned stack buffer.
+// SCOPE NOTE: this test covers Router::match() (static + param + wildcard + miss)
+// and HTTP1Parser in isolation. The App MIDDLEWARE chain is now ALSO allocation-
+// free (handle-driven onion + a Disruptor-style per-request frame-arena pool, no
+// shared_ptr / no per-link std::function) — that is gated separately in
+// middleware_alloc_test.cpp. (The top-level dispatch coroutine frame is still one
+// heap frame per request; eliminating it is a separate item.)
 
 #include "boltapi/router.h"
 #include "boltapi/http/http1_parser.h"

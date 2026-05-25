@@ -622,9 +622,10 @@ private:
                            const std::uint8_t* rtp_data,
                            std::size_t rtp_len) noexcept;
 
-    // Run the middleware chain for one matched route, terminal = handler.
-    core::coro_task<void> run_chain(std::size_t route_index,
-                                    Request& req, Response& res) const;
+    // Terminal of the middleware chain: invoke the matched route handler. Reached
+    // by ChainCtx::terminal (a plain function pointer); it reads the RouteEntry*
+    // from next.ctx()->terminal_ctx. Static so its address is a plain fn pointer.
+    static chain_task chain_terminal(Request& req, Response& res, Next next);
 
     // The shared dispatch coroutine: match -> Request/Response -> middleware
     // chain -> handler -> CoroHttpResponse. Used by BOTH the engine handler

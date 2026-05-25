@@ -38,7 +38,7 @@ namespace {
 AsyncMiddleware make_cors_middleware(std::string origin) {
     assert(!origin.empty());
     return [origin = std::move(origin)](Request& req, Response& res, Next next)
-               -> core::coro_task<void> {
+               -> chain_task {
         res.header("Access-Control-Allow-Origin", origin);
         res.header("Access-Control-Allow-Methods",
                    "GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS");
@@ -72,7 +72,7 @@ AsyncMiddleware make_cors_middleware(std::string origin) {
 constexpr std::size_t kMinCompressBytes = 256;
 
 AsyncMiddleware make_compression_middleware() {
-    return [](Request& req, Response& res, Next next) -> core::coro_task<void> {
+    return [](Request& req, Response& res, Next next) -> chain_task {
         co_await next();
 
         if (!compression::gzip_available()) {
@@ -113,49 +113,23 @@ AsyncMiddleware make_compression_middleware() {
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// Middleware fold: build the chain for a matched route. The terminal Next runs
-// the matched handler; each middleware wraps the inner Next right-to-left. The
-// fold is bounded by middleware_.size() (no unbounded recursion).
+// Terminal of the middleware chain: invoke the matched route handler. Reached via
+// ChainCtx::terminal (a plain function pointer — no std::function, no alloc); the
+// RouteEntry comes from next.ctx()->terminal_ctx. The frame is allocated from the
+// per-request frame arena (chain_task promise operator new via the Next param).
 // ---------------------------------------------------------------------------
-core::coro_task<void> App::run_chain(std::size_t route_index,
-                                     Request& req, Response& res) const {
-    assert(route_index < routes_.size());
-    assert(router_ != nullptr);
-
-    const RouteEntry& entry = routes_[route_index];
-
-    // Terminal continuation: invoke the matched handler. Sync handlers run
-    // inline and produce an already-ready coro_task; async handlers are awaited.
-    Next terminal = [&entry, &req, &res]() -> core::coro_task<void> {
-        if (entry.is_async) {
-            assert(entry.async_ != nullptr);
-            co_await entry.async_(req, res);
-        } else {
-            assert(entry.sync != nullptr);
-            entry.sync(req, res);
-        }
-        co_return;
-    };
-
-    // Fold right-to-left: chain[i] wraps chain[i+1]. We keep the inner Next in a
-    // shared_ptr so each captured lambda owns a stable continuation node. (This
-    // is the per-request std::function/heap cost flagged in middleware.h.)
-    auto inner = std::make_shared<Next>(std::move(terminal));
-    const std::size_t n = middleware_.size();
-    for (std::size_t k = 0; k < n; ++k) {
-        const std::size_t i = n - 1 - k;  // right-to-left
-        const AsyncMiddleware& mw = middleware_[i];
-        auto next_node = inner;  // capture current inner as this link's next()
-        auto wrapped = std::make_shared<Next>(
-            [&mw, &req, &res, next_node]() -> core::coro_task<void> {
-                co_await mw(req, res, *next_node);
-                co_return;
-            });
-        inner = wrapped;
+chain_task App::chain_terminal(Request& req, Response& res, Next next) {
+    assert(next.ctx() != nullptr && "chain_terminal: null ctx");
+    assert(next.ctx()->terminal_ctx != nullptr && "chain_terminal: null entry");
+    const RouteEntry& entry =
+        *static_cast<const RouteEntry*>(next.ctx()->terminal_ctx);
+    if (entry.is_async) {
+        assert(entry.async_ != nullptr);
+        co_await entry.async_(req, res);
+    } else {
+        assert(entry.sync != nullptr);
+        entry.sync(req, res);
     }
-
-    // Drive the outermost link to completion.
-    co_await (*inner)();
     co_return;
 }
 
@@ -317,7 +291,22 @@ core::coro_task<http::CoroHttpResponse> App::dispatch_coro_(
     Request  req(creq, mr.params, mr.param_count);
     Response res(cresp);
 
-    co_await run_chain(idx, req, res);
+    // Drive the middleware onion with a borrowed handle (no shared_ptr, no fold
+    // allocations). Coroutine frames come from a per-request arena acquired from
+    // a pre-allocated pool (released when the chain completes). ChainCtx lives on
+    // this dispatch frame and is borrowed by every Next.
+    const RouteEntry& entry = routes_[idx];
+    http::FrameArena* frames = http::frame_pool_acquire();  // nullptr => global fallback
+    ChainCtx ctx;
+    ctx.middleware   = middleware_.empty() ? nullptr : middleware_.data();
+    ctx.count        = static_cast<std::uint32_t>(middleware_.size());
+    ctx.req          = &req;
+    ctx.res          = &res;
+    ctx.terminal     = &App::chain_terminal;
+    ctx.terminal_ctx = &entry;
+    ctx.frames       = frames;
+    co_await Next(&ctx, 0)();
+    http::frame_pool_release(frames);
 
     cresp.status_message = Response::reason_phrase(cresp.status);
     co_return cresp;

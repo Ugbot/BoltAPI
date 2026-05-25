@@ -36,6 +36,14 @@ if(WIN32)
     target_link_libraries(boltapi_http_client_test PRIVATE ws2_32 mswsock)
 endif()
 
+# Middleware onion is allocation-free: drives the real ChainCtx/Next/chain_task
+# machinery N times under a global new counter, asserts ZERO heap allocs (the
+# handle-driven chain + per-request frame-arena pool — no shared_ptr, no fold).
+boltapi_add_test(boltapi_middleware_alloc_test middleware_alloc_test.cpp)
+if(WIN32)
+    target_link_libraries(boltapi_middleware_alloc_test PRIVATE ws2_32 mswsock)
+endif()
+
 # M1: middleware onion — chain order, short-circuit (401), sync+async mix.
 boltapi_add_test(boltapi_middleware_test middleware_test.cpp)
 if(WIN32)

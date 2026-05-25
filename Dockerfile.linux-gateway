@@ -30,10 +30,13 @@ RUN cmake -S . -B build/linux-gw -G Ninja \
         -DBOLTAPI_BUILD_TESTS=ON \
         -DBOLTAPI_WARNINGS_AS_ERRORS=OFF
 
-RUN cmake --build build/linux-gw -j"$(nproc)" --target boltapi_http_client_test
+RUN cmake --build build/linux-gw -j"$(nproc)" --target \
+        boltapi_http_client_test boltapi_middleware_alloc_test
 
-# Gate: the outbound HTTP client over the epoll async backend. CamelCase case
-# names; the image fails to build if any test fails (hard ctest TIMEOUT ceiling).
+# Gate (Clang/epoll): the outbound HTTP client + the zero-allocation middleware
+# onion (handle-driven chain + Disruptor-style frame-arena ring). The image fails
+# to build if any test fails (hard ctest TIMEOUT ceiling). The MiddlewareAlloc
+# gate proves the chain allocates ZERO on the global heap under Clang too.
 WORKDIR /src/build/linux-gw
-RUN ctest --output-on-failure -j"$(nproc)" -R "HttpClient"
-CMD ["ctest", "--output-on-failure", "-R", "HttpClient"]
+RUN ctest --output-on-failure -j"$(nproc)" -R "HttpClient|MiddlewareAlloc"
+CMD ["ctest", "--output-on-failure", "-R", "HttpClient|MiddlewareAlloc"]
