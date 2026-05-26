@@ -115,8 +115,10 @@ public:
     Stats get_stats() const noexcept;
 
 private:
-    // Accept loop coroutine - runs on worker pool, yields on async_accept
-    core::coro_task<void> accept_loop(int listen_fd);
+    // Accept loop coroutine — detached_task self-destroys on completion, so
+    // the frame is reclaimed when the loop exits (listener stop or fatal accept
+    // error) — no leaked frame for the lifetime of the process.
+    core::detached_task accept_loop(int listen_fd);
 
     // Create and configure the listen socket
     int create_listen_socket();

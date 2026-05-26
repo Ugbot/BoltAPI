@@ -201,7 +201,7 @@ void CoroTcpListener::stop() {
 // Accept Loop Coroutine
 // =============================================================================
 
-core::coro_task<void> CoroTcpListener::accept_loop(int listen_fd) {
+core::detached_task CoroTcpListener::accept_loop(int listen_fd) {
     LOG_INFO("CORO_TCP", "Accept loop started on fd %d", listen_fd);
 
     IODispatcher* io_disp = dispatcher();
@@ -234,8 +234,11 @@ core::coro_task<void> CoroTcpListener::accept_loop(int listen_fd) {
 // =============================================================================
 
 // Helper coroutine that stores its parameters in the coroutine frame
-// This avoids the lambda capture lifetime issue
-static core::coro_task<void> connection_handler_coro(
+// This avoids the lambda capture lifetime issue.
+// detached_task: self-destroys when the connection ends (closes the latent
+// per-connection frame leak — frames previously suspended at final_suspend
+// forever, masked by keep-alive's bounded connection count).
+static core::detached_task connection_handler_coro(
     CoroConnectionHandler& handler,
     IODispatcher& io,
     int fd,

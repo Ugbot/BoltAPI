@@ -426,5 +426,85 @@ private:
     std::coroutine_handle<promise_type> handle_;
 };
 
+// =============================================================================
+// detached_task — fire-and-forget coroutine, owns its own lifetime
+// =============================================================================
+//
+// For top-level coroutines that are NEVER co_awaited and are spawned-and-
+// released (accept loops, connection handlers, future per-thread background
+// jobs). Unlike coro_task<void>, the coroutine self-destroys on completion —
+// closing the latent connection-handle leak that masked itself under keep-
+// alive. The mechanism is the canonical fire-and-forget pattern (different
+// from a final_awaiter that destroy()s in await_suspend, which tripped MSVC
+// heap corruption in an earlier attempt):
+//
+//   - initial_suspend = suspend_always  → lazy: the listener .release()es the
+//     handle and resumes it explicitly (or hands it to the worker pool /
+//     post_to_io_thread). Avoids running coroutine bodies on the creating
+//     thread.
+//   - final_suspend   = suspend_never   → await_ready returns true; the
+//     compiler-emitted code at the end of the coroutine body destroys the
+//     frame automatically. No await_suspend is called for final, so no
+//     destroy-then-return-handle dance for the runtime to trip over.
+//
+// Usage:
+//
+//   detached_task my_loop() { ... co_await some_awaitable; ... }
+//   auto task = my_loop();
+//   auto handle = task.release();             // give up wrapper ownership
+//   handle.resume();                          // or wp->submit(handle) etc.
+//   // After completion, the frame is gone. Do not touch handle.
+//
+// If the handle is NEVER resumed (startup-failure path), the wrapper's dtor
+// destroys it. If .release()'d but never started, the caller MUST call
+// handle.destroy() explicitly — same contract as coro_task.
+class detached_task {
+public:
+    struct promise_type {
+        detached_task get_return_object() noexcept {
+            return detached_task{std::coroutine_handle<promise_type>::from_promise(*this)};
+        }
+        // Lazy start.
+        std::suspend_always initial_suspend() noexcept { return {}; }
+        // Auto-destroy at final: suspend_never's await_ready=true means the
+        // compiler proceeds to coroutine cleanup, including frame destruction.
+        std::suspend_never final_suspend() noexcept { return {}; }
+        void return_void() noexcept {}
+        void unhandled_exception() noexcept {
+            // -fno-exceptions: should never reach here.
+            std::cerr << "FATAL: detached_task unhandled exception" << std::endl;
+            std::abort();
+        }
+    };
+
+    using handle_t = std::coroutine_handle<promise_type>;
+
+    explicit detached_task(handle_t h) noexcept : handle_(h) {}
+    detached_task(const detached_task&) = delete;
+    detached_task& operator=(const detached_task&) = delete;
+    detached_task(detached_task&&) = delete;
+    detached_task& operator=(detached_task&&) = delete;
+
+    // If the wrapper still owns the handle at destruction, the coroutine was
+    // created but never started (or never released to a runner). Destroy it
+    // explicitly to avoid leaking the frame.
+    ~detached_task() noexcept {
+        if (handle_) handle_.destroy();
+    }
+
+    // Release ownership: returns the handle and clears it from the wrapper.
+    // The caller now owns the lifetime — either resume() it (the coroutine
+    // self-destroys on completion via suspend_never final) or, if it will
+    // never start (failure path), call handle.destroy() explicitly.
+    handle_t release() noexcept {
+        return std::exchange(handle_, {});
+    }
+
+    explicit operator bool() const noexcept { return static_cast<bool>(handle_); }
+
+private:
+    handle_t handle_;
+};
+
 } // namespace core
 } // namespace bolt::api
