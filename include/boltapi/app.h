@@ -29,6 +29,7 @@
 #pragma once
 
 #include "boltapi/core/coro_task.h"
+#include "boltapi/http/dispatch_task.h"
 #include "boltapi/middleware.h"
 #include "boltapi/request.h"
 #include "boltapi/response.h"
@@ -631,7 +632,12 @@ private:
     // chain -> handler -> CoroHttpResponse. Used by BOTH the engine handler
     // (set_handler in build_dispatch) and the synchronous HTTP/3 entry
     // (dispatch_http3). Defined in app.cpp.
-    core::coro_task<http::CoroHttpResponse> dispatch_coro_(
+    //
+    // Returns `http::dispatch_task<...>` (NOT `core::coro_task<...>`): the
+    // dispatch_task promise allocates the coroutine frame from FrameArenaPool
+    // instead of `::operator new`, killing the per-request ~3840-byte dispatch
+    // frame allocation flagged by `dispatch_alloc_test`.
+    http::dispatch_task<http::CoroHttpResponse> dispatch_coro_(
         const http::CoroHttpRequest& creq) const;
 
     Config config_;

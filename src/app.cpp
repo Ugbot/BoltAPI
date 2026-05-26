@@ -250,7 +250,7 @@ void App::build_dispatch() {
 // both the engine handler (H1/H2) and the synchronous HTTP/3 entry so all three
 // protocols traverse the SAME router + middleware + handler path.
 // ---------------------------------------------------------------------------
-core::coro_task<http::CoroHttpResponse> App::dispatch_coro_(
+http::dispatch_task<http::CoroHttpResponse> App::dispatch_coro_(
     const http::CoroHttpRequest& creq) const {
     assert(router_ != nullptr);
     assert(route_id_to_index_.size() >= routes_.size() ||
@@ -325,7 +325,7 @@ http::CoroHttpResponse App::dispatch_http3(const http::CoroHttpRequest& req) {
     assert(router_ != nullptr && "dispatch_http3 before build_dispatch");
     assert(started_ && "dispatch_http3 before start");
 
-    core::coro_task<http::CoroHttpResponse> task = dispatch_coro_(req);
+    http::dispatch_task<http::CoroHttpResponse> task = dispatch_coro_(req);
     // Take ownership of the typed handle so we can read the promise value and
     // destroy the frame deterministically (the task no longer owns it).
     auto handle = task.release();

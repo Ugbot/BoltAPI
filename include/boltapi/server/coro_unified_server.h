@@ -24,6 +24,7 @@
 #include "boltapi/net/io_dispatcher.h"
 #include "boltapi/net/tls_context.h"
 #include "boltapi/net/coro_tls_socket.h"
+#include "boltapi/http/dispatch_task.h"
 #include "boltapi/http/http1_parser.h"
 #include "boltapi/http/http1_connection.h"
 #include "boltapi/http/http2_connection.h"
@@ -173,7 +174,10 @@ struct CoroHttpResponse {
     std::string body;
 };
 
-using CoroHttpHandler = std::function<core::coro_task<CoroHttpResponse>(const CoroHttpRequest&)>;
+// Handler returns the dispatch_task — its coroutine frame is arena-backed
+// (FrameArenaPool) instead of `::operator new`. Drop-in awaitable: the
+// `co_await handler_(creq)` sites in coro_unified_server.cpp work unchanged.
+using CoroHttpHandler = std::function<http::dispatch_task<CoroHttpResponse>(const CoroHttpRequest&)>;
 
 /**
  * WebSocket Handler Callback
@@ -335,7 +339,7 @@ struct CoroUnifiedServerConfig {
  *   config.http1_port = 8080;
  *
  *   CoroUnifiedServer server(config);
- *   server.set_handler([](const CoroHttpRequest& req) -> core::coro_task<CoroHttpResponse> {
+ *   server.set_handler([](const CoroHttpRequest& req) -> http::dispatch_task<CoroHttpResponse> {
  *       CoroHttpResponse response;
  *       response.status = 200;
  *       response.body = "Hello, World!";

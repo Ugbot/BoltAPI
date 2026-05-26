@@ -139,11 +139,14 @@ TEST(DispatchAlloc, AllocationsPerRequestOnResponsePath) {
                 "  (%llu allocs / %d reqs)\n\n",
                 per_req, static_cast<unsigned long long>(delta), kIters);
 
-    // Ceiling. Phase 1 cut the baseline 7 -> 3 (resp_str reuse + to_chars +
-    // branchless headers; removed the dispatch-wrapper + conn_read/conn_write
-    // coroutine frames). The remaining 3 are the dispatch coroutine frame (~3840 B),
-    // the Content-Type header value (~32 B), and one ~16 B alloc — eliminated in
-    // Phase 2 (a per-IO-thread frame arena, safe once inline-resume removes thread
-    // migration) + a no-alloc header store. Tighten this ceiling as those land.
-    EXPECT_LE(per_req, 3.0) << "allocs/request on the dispatch+response path";
+    // Ceiling history:
+    //   - Phase 1: 7 -> 3 (resp_str reuse + to_chars + branchless headers +
+    //     removed the dispatch wrapper + conn_read/conn_write frames).
+    //   - Phase 3 slice D-part-2: 3 -> 2. The dispatch coroutine frame (~3840 B)
+    //     is now arena-backed: App::dispatch_coro_ returns
+    //     http::dispatch_task<T> (not core::coro_task<T>), whose promise
+    //     operator new draws from FrameArenaPool instead of `::operator new`.
+    // Remaining 2 are the ~32 B Content-Type header value and one ~16 B alloc;
+    // further reductions await a no-alloc header store.
+    EXPECT_LE(per_req, 2.0) << "allocs/request on the dispatch+response path";
 }
