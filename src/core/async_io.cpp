@@ -4,6 +4,7 @@
 
 #include "boltapi/core/async_io.h"
 #include <iostream>
+#include <mutex>
 
 namespace bolt::api {
 namespace core {
@@ -36,11 +37,26 @@ std::unique_ptr<async_io> async_io::create(const async_io_config& config) {
 #ifdef __linux__
         case io_backend::epoll:
             return std::make_unique<epoll_io>(config);
-            
-        case io_backend::io_uring:
-            // TODO: Check if io_uring is available
-            // Fall back to epoll if not
+
+        case io_backend::io_uring: {
+            // Try the real io_uring backend; fall back to epoll if the kernel
+            // (or container seccomp) won't let us. NEVER abort — Docker default
+            // seccomp blocks io_uring_setup/enter (ENOSYS/EPERM) and old kernels
+            // miss IORING_FEAT_EXT_ARG; both are expected and handled here.
+            auto u = std::make_unique<io_uring_io>(config);
+            if (u->usable()) {
+                return u;
+            }
+            // Setup failed → epoll. Log once so test logs make the fallback
+            // visible (no per-instance spam — every dispatcher would print it).
+            static std::once_flag warned;
+            std::call_once(warned, []() {
+                std::cerr << "async_io: io_uring unavailable "
+                             "(kernel <5.11 or seccomp blocked) — using epoll"
+                          << std::endl;
+            });
             return std::make_unique<epoll_io>(config);
+        }
 #endif
             
 #ifdef _WIN32

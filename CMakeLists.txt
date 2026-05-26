@@ -138,6 +138,7 @@ elseif(APPLE)
 elseif(UNIX)
     list(APPEND BOLTAPI_ENGINE_SOURCES
         src/core/async_io_epoll.cpp
+        src/core/async_io_uring.cpp   # io_uring (ring-per-thread); falls back to epoll on old kernel / Docker seccomp
         src/net/event_loop_epoll.cpp
     )
 endif()

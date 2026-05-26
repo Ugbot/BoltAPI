@@ -430,6 +430,13 @@ public:
 
     stats get_stats() const noexcept override;
 
+    /// Probe whether io_uring is usable on this kernel/sandbox: true iff
+    /// io_uring_setup succeeded AND the required features (IORING_FEAT_EXT_ARG,
+    /// kernel ≥5.11) are present. The factory checks this and falls back to
+    /// epoll when false (Docker default seccomp blocks the io_uring syscalls →
+    /// ENOSYS/EPERM; old kernels also miss EXT_ARG). NEVER aborts.
+    bool usable() const noexcept;
+
 private:
     struct impl;
     std::unique_ptr<impl> impl_;
