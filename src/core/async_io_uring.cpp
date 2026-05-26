@@ -38,6 +38,7 @@
 
 #include <vector>
 #include <atomic>
+#include <mutex>
 #include <cstring>
 #include <cassert>
 #include <thread>
@@ -166,9 +167,22 @@ struct io_uring_io::impl {
     // Pending SQEs not yet submitted (lazy-submit at the next poll → batching).
     unsigned pending_submits{0};
 
-    // Op pool — single-owner free-list (slice A: each ring is owned by one IO
-    // thread). The atomic fd-slot stays atomic because close_async is the lone
-    // cross-thread caller.
+    // Submit-side mutex. Three reasons it has to exist:
+    //  1. io_uring's SQ ring is SINGLE-PRODUCER by design (one writer to
+    //     `*sq_tail`). Multiple threads calling submit_op concurrently must
+    //     serialize the SQE write + tail bump.
+    //  2. The op-pool free-list is a plain stack (no atomic Treiber stack here;
+    //     keeping it simple). alloc_op + free_op need serialization.
+    //  3. The pending_submits counter (queued SQEs not yet io_uring_enter'd)
+    //     is read by the IO thread in do_poll and written by submitters.
+    // Server-side post-slice-B: connections are pinned, ALL submits happen on
+    // the same IO thread → mutex is uncontended (a few cycles per acquire,
+    // dwarfed by the syscall avoided when batching). Client-side / pre-pinning
+    // (e.g. HTTP client's first async_connect from the calling thread): the
+    // mutex actually contends but correctness is the priority.
+    std::mutex submit_mu;
+
+    // Op pool — protected by submit_mu (mutex above).
     static constexpr std::uint32_t kOpPoolSize = 4096;
     static constexpr int           kMaxFds     = 1 << 16;
     std::vector<uring_pending_op> op_pool{std::vector<uring_pending_op>(kOpPoolSize)};
@@ -289,7 +303,9 @@ struct io_uring_io::impl {
         // Wake-fd: an eventfd watched via POLL_ADD. Re-armed each completion.
         wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
         if (wake_fd >= 0) {
-            arm_wake_poll();
+            // Single-threaded during ctor — no contention; lock for invariant only.
+            std::lock_guard<std::mutex> lk(submit_mu);
+            arm_wake_poll_locked();
         }
 
         setup_ok = true;
@@ -348,7 +364,10 @@ struct io_uring_io::impl {
     }
 
     // Arm a single-shot POLL_ADD on wake_fd; user_data = kWakeUserData (0).
-    void arm_wake_poll() noexcept {
+    // Called from the IO thread (do_poll) with submit_mu HELD by the caller —
+    // the lock protects the SQE write + sq_tail bump shared with cross-thread
+    // submitters.
+    void arm_wake_poll_locked() noexcept {
         if (wake_armed || wake_fd < 0) return;
         struct io_uring_sqe* s = next_sqe();
         if (s == nullptr) return;  // SQ full — re-arm on next poll
@@ -360,148 +379,147 @@ struct io_uring_io::impl {
         wake_armed = true;
     }
 
-    // Common path: fill submit slot, publish, register fd_slot, account stat.
-    // Returns 0 on success, -1 on SQ full / op-pool exhaustion (caller fails the op).
-    int submit_op(io_op op_kind, int fd, uring_pending_op* op,
-                  void (*fill)(struct io_uring_sqe*, uring_pending_op*)) noexcept {
-        if (op == nullptr) return -1;
-        op->operation = op_kind;
-        op->fd = fd;
-
-        // Publish the fd→index slot BEFORE arming so a completion can never
-        // arrive ahead of the slot (the epoll backend hit this exact race once).
-        if (auto* slot = slot_for(fd)) {
-            slot->store(op->pool_index + 1, std::memory_order_release);
-        }
-
-        struct io_uring_sqe* s = next_sqe();
-        if (s == nullptr) {
-            // Rollback slot publication + return the op.
-            if (auto* slot = slot_for(fd)) slot->store(0, std::memory_order_release);
-            free_op(op->pool_index);
-            return -1;
-        }
-        fill(s, op);
-        s->user_data = op->pool_index + 1;
-        publish_sqe();
-        return 0;
-    }
-
     // -----------------------------------------------------------------------
-    // Submit dispatch (8 ops)
+    // Submit dispatch (8 ops). Each takes submit_mu around alloc + SQE fill +
+    // sq_tail bump (io_uring SQ ring is single-producer; cross-thread submitters
+    // — e.g. HTTP client's first async_connect from the calling thread before
+    // the connection pins itself to an IO thread — must serialize here).
     // -----------------------------------------------------------------------
     int submit_accept(int listen_fd, io_callback cb, void* udata) noexcept {
+        std::lock_guard<std::mutex> lk(submit_mu);
         uring_pending_op* op = alloc_op();
         if (op == nullptr) return -1;
+        op->operation = io_op::accept;
+        op->fd = listen_fd;
         op->callback = std::move(cb);
         op->user_data = udata;
         op->addrlen = sizeof(op->addr);
-        const int rc = submit_op(io_op::accept, listen_fd, op,
-            [](struct io_uring_sqe* s, uring_pending_op* o){
-                s->opcode = IORING_OP_ACCEPT;
-                s->fd = o->fd;
-                s->addr = reinterpret_cast<__u64>(&o->addr);
-                s->off  = reinterpret_cast<__u64>(&o->addrlen);  // addr2
-                s->accept_flags = SOCK_CLOEXEC;
-            });
-        if (rc == 0) stat_accepts.fetch_add(1, std::memory_order_relaxed);
-        return rc;
+        struct io_uring_sqe* s = next_sqe();
+        if (s == nullptr) { free_op(op->pool_index); return -1; }
+        s->opcode = IORING_OP_ACCEPT;
+        s->fd = listen_fd;
+        s->addr = reinterpret_cast<__u64>(&op->addr);
+        s->off  = reinterpret_cast<__u64>(&op->addrlen);  // addr2
+        s->accept_flags = SOCK_CLOEXEC;
+        s->user_data = op->pool_index + 1;
+        publish_sqe();
+        stat_accepts.fetch_add(1, std::memory_order_relaxed);
+        return 0;
     }
 
     int submit_read(int fd, void* buffer, std::size_t size,
                     io_callback cb, void* udata) noexcept {
+        std::lock_guard<std::mutex> lk(submit_mu);
         uring_pending_op* op = alloc_op();
         if (op == nullptr) return -1;
+        op->operation = io_op::read;
+        op->fd = fd;
         op->callback = std::move(cb);
         op->user_data = udata;
         op->buf = buffer;
         op->len = size;
-        const int rc = submit_op(io_op::read, fd, op,
-            [](struct io_uring_sqe* s, uring_pending_op* o){
-                s->opcode = IORING_OP_RECV;
-                s->fd = o->fd;
-                s->addr = reinterpret_cast<__u64>(o->buf);
-                s->len  = static_cast<__u32>(o->len);
-            });
-        if (rc == 0) stat_reads.fetch_add(1, std::memory_order_relaxed);
-        return rc;
+        struct io_uring_sqe* s = next_sqe();
+        if (s == nullptr) { free_op(op->pool_index); return -1; }
+        s->opcode = IORING_OP_RECV;
+        s->fd = fd;
+        s->addr = reinterpret_cast<__u64>(buffer);
+        s->len  = static_cast<__u32>(size);
+        s->user_data = op->pool_index + 1;
+        publish_sqe();
+        stat_reads.fetch_add(1, std::memory_order_relaxed);
+        return 0;
     }
 
     int submit_write(int fd, const void* buffer, std::size_t size,
                      io_callback cb, void* udata) noexcept {
+        std::lock_guard<std::mutex> lk(submit_mu);
         uring_pending_op* op = alloc_op();
         if (op == nullptr) return -1;
+        op->operation = io_op::write;
+        op->fd = fd;
         op->callback = std::move(cb);
         op->user_data = udata;
         op->cbuf = buffer;
         op->len = size;
-        const int rc = submit_op(io_op::write, fd, op,
-            [](struct io_uring_sqe* s, uring_pending_op* o){
-                s->opcode = IORING_OP_SEND;
-                s->fd = o->fd;
-                s->addr = reinterpret_cast<__u64>(o->cbuf);
-                s->len  = static_cast<__u32>(o->len);
-            });
-        if (rc == 0) stat_writes.fetch_add(1, std::memory_order_relaxed);
-        return rc;
+        struct io_uring_sqe* s = next_sqe();
+        if (s == nullptr) { free_op(op->pool_index); return -1; }
+        s->opcode = IORING_OP_SEND;
+        s->fd = fd;
+        s->addr = reinterpret_cast<__u64>(buffer);
+        s->len  = static_cast<__u32>(size);
+        s->user_data = op->pool_index + 1;
+        publish_sqe();
+        stat_writes.fetch_add(1, std::memory_order_relaxed);
+        return 0;
     }
 
     int submit_connect(int fd, const struct sockaddr* addr, socklen_t addrlen,
                        io_callback cb, void* udata) noexcept {
         if (addrlen > sizeof(sockaddr_storage)) return -1;
+        std::lock_guard<std::mutex> lk(submit_mu);
         uring_pending_op* op = alloc_op();
         if (op == nullptr) return -1;
+        op->operation = io_op::connect;
+        op->fd = fd;
         op->callback = std::move(cb);
         op->user_data = udata;
         std::memcpy(&op->addr, addr, addrlen);
         op->addrlen = addrlen;
-        const int rc = submit_op(io_op::connect, fd, op,
-            [](struct io_uring_sqe* s, uring_pending_op* o){
-                s->opcode = IORING_OP_CONNECT;
-                s->fd = o->fd;
-                s->addr = reinterpret_cast<__u64>(&o->addr);
-                s->off  = static_cast<__u64>(o->addrlen);
-            });
-        if (rc == 0) stat_connects.fetch_add(1, std::memory_order_relaxed);
-        return rc;
+        struct io_uring_sqe* s = next_sqe();
+        if (s == nullptr) { free_op(op->pool_index); return -1; }
+        s->opcode = IORING_OP_CONNECT;
+        s->fd = fd;
+        s->addr = reinterpret_cast<__u64>(&op->addr);
+        s->off  = static_cast<__u64>(op->addrlen);
+        s->user_data = op->pool_index + 1;
+        publish_sqe();
+        stat_connects.fetch_add(1, std::memory_order_relaxed);
+        return 0;
     }
 
     int submit_recvfrom(int fd, void* buffer, std::size_t size,
                         struct sockaddr* user_src, socklen_t* user_srclen,
                         io_callback cb, void* udata) noexcept {
+        std::lock_guard<std::mutex> lk(submit_mu);
         uring_pending_op* op = alloc_op();
         if (op == nullptr) return -1;
+        op->operation = io_op::recvfrom;
+        op->fd = fd;
         op->callback = std::move(cb);
         op->user_data = udata;
         op->buf = buffer;
         op->len = size;
         op->user_src = user_src;
         op->user_srclen = user_srclen;
-        // The msghdr+iovec MUST live in the op slot — kernel reads async, so
-        // the awaitable's stack-bound src/srclen are not safe to pass through.
+        // msghdr+iovec live IN the op slot (kernel reads async, the awaitable's
+        // stack-bound src/srclen are not safe to pass through directly).
         op->iov.iov_base = buffer;
         op->iov.iov_len = size;
         op->msg.msg_name = &op->addr;
         op->msg.msg_namelen = sizeof(op->addr);
         op->msg.msg_iov = &op->iov;
         op->msg.msg_iovlen = 1;
-        const int rc = submit_op(io_op::recvfrom, fd, op,
-            [](struct io_uring_sqe* s, uring_pending_op* o){
-                s->opcode = IORING_OP_RECVMSG;
-                s->fd = o->fd;
-                s->addr = reinterpret_cast<__u64>(&o->msg);
-                s->len  = 1;
-            });
-        if (rc == 0) stat_reads.fetch_add(1, std::memory_order_relaxed);
-        return rc;
+        struct io_uring_sqe* s = next_sqe();
+        if (s == nullptr) { free_op(op->pool_index); return -1; }
+        s->opcode = IORING_OP_RECVMSG;
+        s->fd = fd;
+        s->addr = reinterpret_cast<__u64>(&op->msg);
+        s->len  = 1;
+        s->user_data = op->pool_index + 1;
+        publish_sqe();
+        stat_reads.fetch_add(1, std::memory_order_relaxed);
+        return 0;
     }
 
     int submit_sendto(int fd, const void* buffer, std::size_t size,
                       const struct sockaddr* dst, socklen_t dstlen,
                       io_callback cb, void* udata) noexcept {
         if (dstlen > sizeof(sockaddr_storage)) return -1;
+        std::lock_guard<std::mutex> lk(submit_mu);
         uring_pending_op* op = alloc_op();
         if (op == nullptr) return -1;
+        op->operation = io_op::sendto;
+        op->fd = fd;
         op->callback = std::move(cb);
         op->user_data = udata;
         op->cbuf = buffer;
@@ -516,36 +534,33 @@ struct io_uring_io::impl {
         op->msg.msg_namelen = op->addrlen;
         op->msg.msg_iov = &op->iov;
         op->msg.msg_iovlen = 1;
-        const int rc = submit_op(io_op::sendto, fd, op,
-            [](struct io_uring_sqe* s, uring_pending_op* o){
-                s->opcode = IORING_OP_SENDMSG;
-                s->fd = o->fd;
-                s->addr = reinterpret_cast<__u64>(&o->msg);
-                s->len  = 1;
-            });
-        if (rc == 0) stat_writes.fetch_add(1, std::memory_order_relaxed);
-        return rc;
+        struct io_uring_sqe* s = next_sqe();
+        if (s == nullptr) { free_op(op->pool_index); return -1; }
+        s->opcode = IORING_OP_SENDMSG;
+        s->fd = fd;
+        s->addr = reinterpret_cast<__u64>(&op->msg);
+        s->len  = 1;
+        s->user_data = op->pool_index + 1;
+        publish_sqe();
+        stat_writes.fetch_add(1, std::memory_order_relaxed);
+        return 0;
     }
 
-    // close_async stays SYNCHRONOUS (cancel+close), mirroring epoll. This
-    // preserves the contract UdpTransport::stop relies on: every in-flight op
-    // on this fd MUST get a callback before close returns, so the drain spin
-    // (in_flight_ == 0) terminates promptly. IORING_OP_CLOSE would also work
-    // but adds a second completion to reconcile with the cancellation flow;
-    // matching epoll's sync semantics keeps behavior identical across backends.
+    // close_async: just ::close(fd) — DO NOT touch the op pool or fire
+    // callbacks from this thread. io_uring's op pool + free-list are
+    // single-owner (the IO thread that runs poll); close_async is the lone
+    // cross-thread entry (UdpTransport::stop / connection teardown can call
+    // from anywhere). Closing the fd causes the kernel to complete any
+    // pending op on it with a negative cqe->res (-ECANCELED / -EBADF);
+    // those completions land in the IO thread's next poll() and fire their
+    // callbacks there (correct thread, normal free_op). The UdpTransport
+    // drain on in_flight_ observes those decrements normally — just with
+    // a poll-cycle of latency vs the epoll backend's synchronous fire.
+    //
+    // Earlier version (cancel+fire+free here, mirroring epoll) corrupted
+    // the single-owner free-list under cross-thread close.
     int close_async_impl(int fd) noexcept {
         if (fd < 0) return -1;
-        if (auto* slot = slot_for(fd)) {
-            const std::uint32_t idx_p1 = slot->exchange(0, std::memory_order_acq_rel);
-            if (idx_p1 != 0 && idx_p1 - 1 < kOpPoolSize) {
-                uring_pending_op& op = op_pool[idx_p1 - 1];
-                if (op.callback) {
-                    io_event ev{op.operation, fd, op.user_data, -1, 0};
-                    op.callback(ev);
-                }
-                free_op(idx_p1 - 1);
-            }
-        }
         ::close(fd);
         stat_closes.fetch_add(1, std::memory_order_relaxed);
         return 0;
@@ -564,12 +579,17 @@ struct io_uring_io::impl {
 
         stat_polls.fetch_add(1, std::memory_order_relaxed);
 
-        // Re-arm wake POLL_ADD if previous one fired and we haven't re-armed yet
-        // (e.g. SQ full at the prior arm).
-        if (!wake_armed) arm_wake_poll();
+        unsigned to_submit = 0;
+        {
+            // Re-arm wake POLL_ADD if previous fired and we haven't re-armed yet
+            // (e.g. SQ full at the prior arm). Under submit_mu — shares the SQE
+            // write path with cross-thread submitters.
+            std::lock_guard<std::mutex> lk(submit_mu);
+            if (!wake_armed) arm_wake_poll_locked();
+            to_submit = pending_submits;
+            pending_submits = 0;
+        }
 
-        // Submit any pending SQEs + (optionally) wait via EXT_ARG timeout.
-        const unsigned to_submit = pending_submits;
         unsigned min_complete = 0;
         unsigned flags = 0;
 
@@ -599,7 +619,6 @@ struct io_uring_io::impl {
                 stat_errors.fetch_add(1, std::memory_order_relaxed);
                 // Don't abort — fall through to reap whatever's already in CQ.
             }
-            pending_submits = 0;
         }
 
         // Reap CQEs, bounded by max_events so a flood can't starve other work.
@@ -616,14 +635,19 @@ struct io_uring_io::impl {
             ++reaped;
 
             if (ud == kWakeUserData) {
-                // wake-fd POLL_ADD fired: clear the eventfd, dispatch wake_cb, re-arm.
+                // wake-fd POLL_ADD fired: clear the eventfd, dispatch wake_cb,
+                // mark for re-arm (top of next poll). wake_armed flag is touched
+                // only by the IO thread (here + arm_wake_poll_locked); but the
+                // lock is cheap and consistent with the submit path.
                 std::uint64_t v = 0;
                 while (::read(wake_fd, &v, sizeof(v)) > 0) { /* drain */ }
-                wake_armed = false;
+                {
+                    std::lock_guard<std::mutex> lk(submit_mu);
+                    wake_armed = false;
+                }
                 stat_wakes.fetch_add(1, std::memory_order_relaxed);
                 wake_pending.store(false, std::memory_order_release);
                 if (wake_cb) wake_cb();
-                // arm_wake_poll() will run at the top of the next poll cycle.
                 continue;
             }
 
@@ -633,14 +657,11 @@ struct io_uring_io::impl {
                 continue;
             }
             uring_pending_op& op = op_pool[idx_p1 - 1];
-            // Claim ownership against a racing close_async via the fd-slot.
-            if (auto* slot = slot_for(op.fd)) {
-                const std::uint32_t prev = slot->exchange(0, std::memory_order_acq_rel);
-                if (prev != idx_p1) {
-                    // close_async (or a previous reap) already claimed/freed it.
-                    continue;
-                }
-            }
+            // cqe->user_data is authoritative — no fd_slot match needed.
+            // io_uring allows multiple ops in flight on the same fd (HTTP
+            // client overlaps write/read on a keep-alive socket); the
+            // earlier fd_slot-based match dropped callbacks for all but
+            // the most recently submitted op on a given fd.
 
             // RECVMSG: write the peer address back to the caller's out-params.
             if (op.operation == io_op::recvfrom && op.user_src && op.user_srclen) {
@@ -658,8 +679,15 @@ struct io_uring_io::impl {
                 (res < 0) ? ssize_t{-1} : res,
                 0u
             };
+            // Fire the callback OUTSIDE the lock — it can resume a coroutine
+            // that submits a new op (which re-acquires submit_mu); holding the
+            // lock around resume would self-deadlock. Then briefly lock to
+            // return the slot to the pool.
             if (op.callback) op.callback(ev);
-            free_op(idx_p1 - 1);
+            {
+                std::lock_guard<std::mutex> lk(submit_mu);
+                free_op(idx_p1 - 1);
+            }
             stat_events.fetch_add(1, std::memory_order_relaxed);
         }
         __atomic_store_n(cq_head, head, __ATOMIC_RELEASE);
