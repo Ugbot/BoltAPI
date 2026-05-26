@@ -5,7 +5,11 @@
 
 #include "boltapi/net/io_dispatcher.h"
 #include "bolt/bolt_channel.h"
+#include "bolt/bolt_port.h"        // bolt_pin_current_thread
+#include "bolt/bolt_topology.h"    // CpuTopology, bolt_detect_topology
+#include "bolt/bolt_scheduler.h"   // scheduler_assign_cpus
 #include <cassert>
+#include <cstdint>
 #include <mutex>
 #include <iostream>
 
@@ -270,6 +274,29 @@ void IODispatcher::start() {
         worker_pool_ = pool;
     }
 
+    // Plan IO-thread CPU pinning (thread-per-core: each thread gets a dedicated
+    // logical CPU so its working set stays in L1/L2). Topology detect is one-shot
+    // on the stack — bolt_scheduler's standard pattern. UINT32_MAX entries mean
+    // "no pin" (e.g. when pin_io_threads is false, or topology has fewer CPUs).
+    planned_cpus_.assign(config_.num_io_threads, UINT32_MAX);
+    if (config_.pin_io_threads) {
+        bolt::CpuTopology topo;
+        if (bolt::bolt_detect_topology(&topo)) {
+            // scheduler_assign_cpus writes up to kMaxWorkers; ensure fit.
+            const uint32_t want = (config_.num_io_threads < bolt::kMaxWorkers)
+                ? static_cast<uint32_t>(config_.num_io_threads)
+                : bolt::kMaxWorkers;
+            uint32_t out[bolt::kMaxWorkers];
+            for (uint32_t i = 0; i < bolt::kMaxWorkers; ++i) out[i] = UINT32_MAX;
+            bolt::scheduler_assign_cpus(topo, want, config_.prefer_p_cores, out);
+            for (uint32_t i = 0; i < want; ++i) {
+                planned_cpus_[i] = out[i];
+            }
+        }
+        // Topology-detect failure: planned_cpus_ stays UINT32_MAX → io_thread_loop
+        // skips pinning, runtime degrades to OS scheduling (still correct).
+    }
+
     // Start I/O threads
     io_threads_.reserve(config_.num_io_threads);
     for (size_t i = 0; i < config_.num_io_threads; ++i) {
@@ -313,7 +340,20 @@ void IODispatcher::stop() {
 }
 
 void IODispatcher::io_thread_loop(size_t thread_id) {
-    std::cout << "IODispatcher I/O thread " << thread_id << " started" << std::endl;
+    // Pin to the planned CPU FIRST so every subsequent alloc/runtime touch lands
+    // on the right NUMA node / L2 (best-effort: failure is non-fatal — see
+    // start()). UINT32_MAX means "no pin" (pin_io_threads off or unknown topo).
+    if (thread_id < planned_cpus_.size() && planned_cpus_[thread_id] != UINT32_MAX) {
+        // bolt_pin_current_thread is at GLOBAL scope (bolt_port.h declares it
+        // outside namespace bolt — see line 321 of bolt_port.h).
+        const bool pinned = ::bolt_pin_current_thread(planned_cpus_[thread_id]);
+        std::cout << "IODispatcher I/O thread " << thread_id
+                  << (pinned ? " pinned to CPU " : " pin FAILED for CPU ")
+                  << planned_cpus_[thread_id] << std::endl;
+    } else {
+        std::cout << "IODispatcher I/O thread " << thread_id
+                  << " started (no CPU pin)" << std::endl;
+    }
 
     // Pick THIS thread's engine. Per-core backends have one engine per IO thread
     // (poll only ours); the shared backend (IOCP) has a single engine that every

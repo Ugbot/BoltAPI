@@ -184,6 +184,17 @@ struct IODispatcherConfig {
     // (every completion submitted to the worker pool) — only needed if handlers do
     // BLOCKING work inline (they should co_await or offload instead).
     bool inline_resume = true;
+
+    // CPU affinity: pin each IO thread to a single logical CPU at startup.
+    // Thread-per-core works best with hard pinning — completion+work stay in
+    // L1/L2, no kernel-driven migration across the runtime. Best-effort: a
+    // failed pin (insufficient privileges / sandbox) does not fail startup. On
+    // macOS this is a scheduler HINT, not a hard pin (Darwin semantics).
+    bool pin_io_threads = true;
+    // When pin_io_threads, prefer P-cores over E-cores on hybrid CPUs (12th-gen+
+    // Intel, Apple Silicon). Best for trivial-handler latency on a P-core; for
+    // mostly background workloads set false to free P-cores for the app.
+    bool prefer_p_cores = true;
 };
 
 /// I/O Dispatcher - bridges async I/O to coroutines
@@ -375,6 +386,11 @@ private:
     // One inbox per IO thread (post_to_io_thread). Drained at the top of each
     // io_thread_loop iteration; sized to num_io_threads in the ctor.
     std::vector<std::unique_ptr<IoInbox>> inboxes_;
+
+    // Planned logical-CPU index for each IO thread (computed in start() from
+    // bolt::CpuTopology + scheduler_assign_cpus). UINT32_MAX = no pin / unknown.
+    // io_thread_loop(i) calls bolt_pin_current_thread(planned_cpus_[i]) once.
+    std::vector<uint32_t> planned_cpus_;
     core::WorkerThreadPool* worker_pool_;
     bool owns_worker_pool_ = false;  // Did we create the pool?
 

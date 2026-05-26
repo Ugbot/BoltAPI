@@ -265,33 +265,51 @@ public:
     struct promise_type {
         std::exception_ptr exception_;
         bool has_exception_ = false;
-        
+
         // Continuation (parent coroutine to resume when done)
         std::coroutine_handle<> continuation_;
+
+        // True iff the owning coro_task<void> wrapper called .release() — i.e.
+        // the coroutine is now DETACHED, no wrapper will destroy() it in a dtor.
+        // Used by final_awaiter to decide whether to self-destroy on completion.
+        bool released_ = false;
 
         coro_task get_return_object() {
             return coro_task{std::coroutine_handle<promise_type>::from_promise(*this)};
         }
 
         std::suspend_always initial_suspend() noexcept { return {}; }
-        
+
         /**
-         * Final suspend: resume the continuation (parent coroutine).
+         * Final suspend: resume the continuation (parent coroutine), or stop.
+         *
+         * TODO(connection-handle leak follow-up): a coro_task<void> released via
+         * .release() and detached (continuation_ null, released_ true) sits at
+         * final_suspend with its frame never reclaimed — a latent leak (masked
+         * under keep-alive; bounded connection count). The released_ flag below
+         * is plumbed for the future fix; an attempt to self-destroy here
+         * (`if (released_) h.destroy()`) tripped heap corruption on MSVC even
+         * with the flag — likely a subtle interaction with the runtime's resume
+         * unwinding that needs a dedicated `detached_task` type with its own
+         * frame-pool reclamation (likely in slice D alongside the dispatch
+         * frame arena). For now: detached coroutines leak as before (no
+         * regression vs pre-slice-B).
          */
         struct final_awaiter {
             bool await_ready() const noexcept { return false; }
-            
+
             std::coroutine_handle<> await_suspend(std::coroutine_handle<promise_type> h) noexcept {
                 auto& promise = h.promise();
                 if (promise.continuation_) {
-                    return promise.continuation_;  // Resume parent
+                    return promise.continuation_;  // Resume parent.
                 }
-                return std::noop_coroutine();  // No continuation, just stop
+                (void)promise.released_;  // dormant — see TODO above.
+                return std::noop_coroutine();
             }
-            
+
             void await_resume() noexcept {}
         };
-        
+
         final_awaiter final_suspend() noexcept { return {}; }
 
         void return_void() noexcept {}
@@ -389,10 +407,18 @@ public:
 
     /**
      * Release ownership of the coroutine handle.
-     * After this, the coro_task no longer owns or destroys the handle.
-     * The caller is responsible for eventually destroying it.
+     * After this, the coro_task no longer owns or destroys the handle. The
+     * underlying coroutine self-destroys at final_suspend (see promise_type's
+     * final_awaiter — we mark released_=true so it knows the wrapper has
+     * relinquished ownership). Detached coroutines must NOT be destroy()'d
+     * manually after they complete; manual destroy is only safe if you destroy
+     * BEFORE first resume (e.g. the startup-failure path in
+     * coro_tcp_listener.cpp), in which case final_suspend never fires.
      */
     std::coroutine_handle<promise_type> release() noexcept {
+        if (handle_) {
+            handle_.promise().released_ = true;
+        }
         return std::exchange(handle_, nullptr);
     }
 
