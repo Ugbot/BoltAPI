@@ -110,6 +110,7 @@ set(BOLTAPI_ENGINE_SOURCES
     src/net/tls_socket.cpp
     # http
     src/http/client.cpp     # Gateway Phase 0: outbound HTTP/1.1 client (upstream forwarding)
+    src/http/tls_client.cpp # Synchronous TLS+HTTP/1.1 outbound (OIDC discovery / JWKS / token)
     src/http/h2_server_push.cpp
     src/http/hpack.cpp
     src/http/http1_connection.cpp
