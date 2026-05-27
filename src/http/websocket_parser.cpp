@@ -43,7 +43,7 @@ int FrameParser::parse_frame(
     const uint8_t* ptr = data;
     size_t remaining = length;
     
-    while (remaining > 0 && state_ != State::COMPLETE && state_ != State::ERROR) {
+    while (remaining > 0 && state_ != State::COMPLETE && state_ != State::kError) {
         switch (state_) {
             case State::READING_HEADER: {
                 if (remaining < 2) {

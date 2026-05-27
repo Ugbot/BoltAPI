@@ -187,7 +187,11 @@ private:
         READING_MASKING_KEY,
         READING_PAYLOAD,
         COMPLETE,
-        ERROR
+        // Renamed from ERROR — Windows headers (`wingdi.h`) `#define ERROR 0`,
+        // which corrupts this enum the moment any user transitively pulls
+        // <windows.h> before this header. Using `kError` keeps the enum
+        // Windows-clean.
+        kError
     };
     
     State state_;
