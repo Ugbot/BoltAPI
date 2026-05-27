@@ -81,6 +81,8 @@ endif()
 # M2: WebSocket echo end-to-end through App — RFC6455 handshake (101 +
 # Sec-WebSocket-Accept), masked client text frames echoed back unmasked,
 # multiple messages on one connection, and a close frame.
+boltapi_add_test(boltapi_ws_subprotocol_test ws_subprotocol_test.cpp)
+
 boltapi_add_test(boltapi_ws_echo_test ws_echo_test.cpp)
 if(WIN32)
     target_link_libraries(boltapi_ws_echo_test PRIVATE ws2_32 mswsock)

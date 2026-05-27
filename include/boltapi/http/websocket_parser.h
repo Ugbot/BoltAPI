@@ -232,6 +232,22 @@ public:
         const std::string& ws_version,
         const std::string& ws_key
     );
+
+    /**
+     * Pick a subprotocol to echo in the 101 response per RFC 6455 §4.2.2.
+     * `client_offered` is the raw `Sec-WebSocket-Protocol` header value (may
+     * include multiple comma-separated tokens). Returns the selected name,
+     * or empty string if the client offered nothing (omit the header in
+     * that case).
+     *
+     * Selection policy (intentionally permissive so browsers don't refuse
+     * the upgrade when they sent a non-empty Sec-WebSocket-Protocol):
+     *   1) If `mqtt` is in the offered list, pick "mqtt" (first-class
+     *      support — the boltapi MQTT bus rides this subprotocol).
+     *   2) Otherwise, pick the first non-empty offered token verbatim.
+     *   3) If nothing was offered, return "".
+     */
+    static std::string select_subprotocol(std::string_view client_offered);
 };
 
 } // namespace websocket

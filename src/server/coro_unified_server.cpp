@@ -870,6 +870,7 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
         std::string_view ws_key_sv   = req.find_header("Sec-WebSocket-Key", &has_ws_key);
         std::string_view conn_sv     = req.find_header("Connection");
         std::string_view ws_ver_sv   = req.find_header("Sec-WebSocket-Version");
+        std::string_view ws_proto_sv = req.find_header("Sec-WebSocket-Protocol");
 
         if (has_upgrade && has_ws_key) {
             std::string upgrade_val(upgrade_sv);
@@ -886,12 +887,25 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
                     // Valid WebSocket upgrade - compute accept key and send 101
                     std::string accept_key = websocket::HandshakeUtils::compute_accept_key(ws_key);
 
+                    // Subprotocol negotiation (RFC 6455 §4.2.2). Browsers
+                    // (notably Chrome) refuse the upgrade when they sent a
+                    // non-empty `Sec-WebSocket-Protocol` and the 101 response
+                    // omits it — even though the RFC says omission means "no
+                    // subprotocol selected". For known subprotocols (today:
+                    // `mqtt`) we echo the selection; for anything else we
+                    // pick the FIRST offered token to keep clients happy.
+                    std::string selected_subprotocol =
+                        websocket::HandshakeUtils::select_subprotocol(ws_proto_sv);
+
                     std::string ws_response =
                         "HTTP/1.1 101 Switching Protocols\r\n"
                         "Upgrade: websocket\r\n"
                         "Connection: Upgrade\r\n"
-                        "Sec-WebSocket-Accept: " + accept_key + "\r\n"
-                        "\r\n";
+                        "Sec-WebSocket-Accept: " + accept_key + "\r\n";
+                    if (!selected_subprotocol.empty()) {
+                        ws_response += "Sec-WebSocket-Protocol: " + selected_subprotocol + "\r\n";
+                    }
+                    ws_response += "\r\n";
 
                     co_await conn_write(io, fd, tls,ws_response.data(), ws_response.size());
 

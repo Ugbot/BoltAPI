@@ -402,8 +402,45 @@ bool HandshakeUtils::validate_upgrade_request(
     if (ws_key.empty() || ws_key.length() != 24) {
         return false;
     }
-    
+
     return true;
+}
+
+std::string HandshakeUtils::select_subprotocol(std::string_view client_offered) {
+    // RFC 6455 §4.2.2: server selects ONE subprotocol from the client's list,
+    // or none. We bake first-class support for "mqtt" (the boltapi MQTT bus
+    // subprotocol); otherwise we echo the first offered token verbatim to
+    // keep browsers from refusing the upgrade.
+    if (client_offered.empty()) return std::string();
+
+    // Walk comma-separated tokens; trim ASCII whitespace; skip empties.
+    // Bounded scan — header sizes are already capped upstream.
+    const std::size_t n = client_offered.size();
+    std::string first;
+    std::size_t i = 0;
+    while (i < n) {
+        // Skip leading whitespace.
+        while (i < n && (client_offered[i] == ' ' || client_offered[i] == '\t')) {
+            ++i;
+        }
+        // Read the token.
+        const std::size_t start = i;
+        while (i < n && client_offered[i] != ',') ++i;
+        std::size_t end = i;
+        while (end > start && (client_offered[end - 1] == ' ' ||
+                               client_offered[end - 1] == '\t')) {
+            --end;
+        }
+        if (end > start) {
+            const std::string_view tok(client_offered.data() + start, end - start);
+            // "mqtt" wins outright (case-sensitive — RFC 6455 tokens are
+            // case-sensitive and mqtt.js + browsers send lowercase).
+            if (tok == "mqtt") return std::string("mqtt");
+            if (first.empty()) first.assign(tok);
+        }
+        if (i < n && client_offered[i] == ',') ++i;
+    }
+    return first;
 }
 
 } // namespace websocket
