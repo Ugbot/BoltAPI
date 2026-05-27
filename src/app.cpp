@@ -744,6 +744,15 @@ void App::serve_http3_request(http3::H3Connection& h3,
     http::CoroHttpRequest creq;
     creq.method = r.method;
     creq.path   = r.path;
+    // Mirror H1/H2: expose '?query' as a separate view so Request::query()
+    // doesn't depend on path-splitting at each call site.
+    {
+        std::string_view full = r.path;
+        const auto qpos = full.find('?');
+        creq.query = (qpos == std::string_view::npos)
+                         ? std::string_view{}
+                         : full.substr(qpos + 1);
+    }
     creq.body   = std::string_view(reinterpret_cast<const char*>(r.body),
                                    r.body_len);
     for (std::size_t i = 0; i < r.header_count &&

@@ -28,6 +28,14 @@ if(WIN32)
     target_link_libraries(boltapi_app_integration_test PRIVATE ws2_32 mswsock)
 endif()
 
+# Regression gate for Request::query_param() on HTTP/1.1 — the H1 parser used
+# to strip '?...' before path capture, so query() returned empty. Same harness
+# pattern as app_integration_test: real App on loopback + raw client socket.
+boltapi_add_test(boltapi_query_param_test query_param_test.cpp)
+if(WIN32)
+    target_link_libraries(boltapi_query_param_test PRIVATE ws2_32 mswsock)
+endif()
+
 # Perf: measures + gates heap allocations per request on the full HTTP/1.1
 # dispatch+response path (real App on loopback, fixed-buffer client, global new
 # counter). Deterministic regardless of CPU load. Phase 1 drives allocs/req -> ~0.

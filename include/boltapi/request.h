@@ -190,7 +190,16 @@ public:
     }
 
     // Raw query string (without leading '?'); allocation-free view.
+    // Reads the dedicated CoroHttpRequest::query field, populated by the H1
+    // parser, the H2 connection, and the H3 dispatch path. (Previously this
+    // searched req_.path for '?' — but the H1 parser strips '?...' from the
+    // path before view capture, so the search always returned empty on HTTP/1.)
+    // Falls back to splitting req_.path for safety on any path that hasn't
+    // been migrated yet, so behavior is monotonically better, never worse.
     std::string_view query() const noexcept {
+        if (!req_.query.empty()) {
+            return std::string_view(req_.query);
+        }
         std::string_view t(req_.path);
         const std::size_t qm = t.find('?');
         return (qm == std::string_view::npos) ? std::string_view{}

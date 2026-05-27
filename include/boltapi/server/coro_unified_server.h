@@ -99,6 +99,13 @@ struct CoroHttpRequest {
 
     std::string_view method;
     std::string_view path;
+    // Raw query string (without leading '?'). Populated by the H1 parser (split
+    // at '?'), the H2 connection (split from :path), and the H3 dispatch path.
+    // Empty when the request had no query string. Read by Request::query()/
+    // query_param(). H1 used to split req.path at '?' on every read, but the
+    // H1 parser strips '?...' from the path before view capture, so the split
+    // never found anything — fixed by carrying the query through explicitly.
+    std::string_view query;
     std::string_view body;
 
     CoroHttpHeaderView headers[MAX_HEADERS];

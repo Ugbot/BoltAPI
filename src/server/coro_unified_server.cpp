@@ -736,6 +736,10 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
         CoroHttpRequest req;
         req.method = std::string_view(parsed_req.method_str);
         req.path = std::string_view(parsed_req.path);
+        // Carry the query string through explicitly — the H1 parser strips
+        // '?...' from path before view capture, so Request::query() couldn't
+        // recover it from path. parsed_req.query is set by parse_url_components.
+        req.query = std::string_view(parsed_req.query);
         const size_t hdr_n = std::min(parsed_req.header_count,
                                       CoroHttpRequest::MAX_HEADERS);
         for (size_t i = 0; i < hdr_n; i++) {
@@ -1124,7 +1128,16 @@ core::coro_task<void> CoroUnifiedServer::handle_http2_connection(
             if (name == ":method") {
                 req.method = req.own(value);
             } else if (name == ":path") {
-                req.path = req.own(value);
+                // Own the whole ':path' (may include '?query'); additionally
+                // expose the query slice via req.query so Request::query()
+                // doesn't have to split on every read. Both views point into
+                // the same owned backing string.
+                std::string_view owned = req.own(value);
+                req.path = owned;
+                const auto qpos = owned.find('?');
+                req.query = (qpos == std::string_view::npos)
+                                ? std::string_view{}
+                                : owned.substr(qpos + 1);
             } else if (!name.empty() && name[0] != ':') {
                 // Regular header (skip other pseudo-headers like :scheme, :authority)
                 std::string_view nv = req.own(name);
