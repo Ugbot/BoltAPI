@@ -490,6 +490,13 @@ boltapi_add_test(boltapi_bwe_test bwe_test.cpp)
 # default flags-OFF build via a dummy protocol; does NOT require the flags on.
 boltapi_add_test(boltapi_protocol_seam_test protocol_seam_test.cpp)
 
+# ---- boltapi::auth submodule -----------------------------------------------
+# Reusable enterprise primitives (TOTP, password policy, signed tokens,
+# bounded-key rate limiter, SCIM, SMTP, mTLS identity). One test per primitive.
+# Each gtest links OpenSSL explicitly because the primitives are crypto-backed.
+boltapi_add_test(boltapi_auth_totp_test auth_totp_test.cpp)
+target_link_libraries(boltapi_auth_totp_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+
 # WebRTC manual/debug demo server (NOT a ctest gate — no add_test). Starts the
 # full App with the WebRTC surface + on_data_channel("chat") echo + media echo on
 # a fixed port and blocks, so the python interop harnesses / a browser / a

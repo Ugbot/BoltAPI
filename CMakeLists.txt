@@ -177,6 +177,16 @@ add_library(boltapi STATIC
     src/webrtc/sctp.cpp         # minimal SCTP association (CRC-32c, handshake, DATA/SACK)
     src/webrtc/data_channel.cpp # DCEP + IDataChannel + channel routing
     src/webrtc/peer_hub.cpp     # DTLS<->SCTP bridge + App channel surfacing
+    # auth toolkit (boltapi::auth submodule — reusable enterprise primitives;
+    # OpenSSL-EVP-backed, exception-free, allocation-bounded). One library;
+    # consumers get them by linking boltapi::boltapi.
+    src/auth/totp.cpp
+    src/auth/signed_token.cpp
+    src/auth/password_policy.cpp
+    src/auth/ratelimit_key.cpp
+    src/auth/scim.cpp
+    src/auth/smtp_client.cpp
+    src/auth/mtls_identity.cpp
     ${BOLTAPI_ENGINE_SOURCES}
 )
 add_library(boltapi::boltapi ALIAS boltapi)
