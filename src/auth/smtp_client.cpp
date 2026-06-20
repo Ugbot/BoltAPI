@@ -194,7 +194,7 @@ long long wire_read(Wire& w, char* buf, size_t cap) noexcept {
 }
 
 bool send_line(Wire& w, const std::string& line) noexcept {
-    return wire_write(w, line.data(), line.size()) == long long(line.size());
+    return wire_write(w, line.data(), line.size()) == static_cast<long long>(line.size());
 }
 
 int read_reply(Wire& w, std::string* msg) noexcept {
@@ -340,7 +340,7 @@ Result SmtpClient::send(const Message& m) noexcept {
 
     std::string body = compose_rfc5322(m);
     body.append(".\r\n");
-    if (wire_write(w, body.data(), body.size()) != long long(body.size())) {
+    if (wire_write(w, body.data(), body.size()) != static_cast<long long>(body.size())) {
         r.error = "body write"; close_wire(w); return r;
     }
     code = read_reply(w, &buf);
