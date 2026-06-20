@@ -167,7 +167,7 @@ handler path.
 
 Feature-complete across HTTP/1.1–3 and WebRTC (data + audio + video), with
 RFC-vector unit gates and live interop gates (aioquic for HTTP/3, aiortc for
-WebRTC). Current suite: **239/239** green on MSVC. Roadmap and decisions live in
+WebRTC). Current suite: **238/238** green on MSVC (default build; 1 expected aiortc-interop skip under `BOLTAPI_WITH_WEBRTC=OFF`). Roadmap and decisions live in
 [`PROJECT_MAP.md`](PROJECT_MAP.md) and [`docs/`](docs/).
 
 ## Documentation
