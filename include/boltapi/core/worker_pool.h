@@ -348,18 +348,27 @@ inline WorkerThreadPool::Stats WorkerThreadPool::get_stats() const noexcept {
 }
 
 inline void WorkerThreadPool::worker_loop(size_t /*worker_id*/) {
+    uint32_t idle_spins = 0;
     while (!shutdown_requested_.load(std::memory_order_acquire)) {
         auto handle_opt = task_queue_.try_pop();
         if (handle_opt) {
+            idle_spins = 0;
             auto handle = *handle_opt;
             if (handle && !handle.done()) {
                 handle.resume();
                 tasks_executed_.fetch_add(1, std::memory_order_relaxed);
             }
         } else {
-            // No work - brief pause then check again
-            // In production, would use futex or similar for wake-up
-            std::this_thread::yield();
+            // Backoff: a few yields for responsiveness, then sleep so idle workers
+            // don't burn a full core each. With inline_resume=true on Linux, the pool
+            // rarely gets tasks — the IO thread handles everything — so sleeping here
+            // is the right default. A futex wake-up is the ideal; 200μs is fine today.
+            ++idle_spins;
+            if (idle_spins < 4u) {
+                std::this_thread::yield();
+            } else {
+                std::this_thread::sleep_for(std::chrono::microseconds(200));
+            }
         }
     }
 
