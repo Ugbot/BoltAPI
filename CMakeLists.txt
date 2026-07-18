@@ -57,6 +57,8 @@ if(NOT TARGET bolt::bolt)
     # JSON path for Bolt API (include/boltapi/json.h wraps it). See docs/JSON.md.
     set(BOLT_BUILD_PARSE      ON  CACHE BOOL "" FORCE)
     set(BOLT_BUILD_INGEST     OFF CACHE BOOL "" FORCE)
+    # The reactor (event loop + async I/O) now lives in bolt::reactor (STATION-78).
+    set(BOLT_BUILD_REACTOR    ON  CACHE BOOL "" FORCE)
     add_subdirectory(extern/bolt EXCLUDE_FROM_ALL)
 endif()
 
@@ -94,17 +96,12 @@ endif()
 # compile per OS.
 # ---------------------------------------------------------------------------
 set(BOLTAPI_ENGINE_SOURCES
-    # core
-    src/core/async_io.cpp
-    src/core/logger.cpp
-    src/core/worker_pool.cpp
-    # net (portable)
-    src/net/coro_tcp_listener.cpp
+    # The reactor — async_io / event_loop / io_dispatcher / coro_tcp_listener /
+    # tcp_socket / worker_pool / logger (+ per-OS backends) — was hoisted into
+    # bolt::reactor (STATION-78); boltapi links it below. TLS + HTTP stay here.
+    # net (portable, non-reactor)
     src/net/coro_tls_socket.cpp
-    src/net/event_loop.cpp
-    src/net/io_dispatcher.cpp
     src/net/tcp_listener.cpp
-    src/net/tcp_socket.cpp
     src/net/tls_cert_generator.cpp
     src/net/tls_context.cpp
     src/net/tls_socket.cpp
@@ -130,24 +127,8 @@ set(BOLTAPI_ENGINE_SOURCES
     src/server/coro_unified_server.cpp
 )
 
-# Per-OS async I/O + event loop backends (exactly one each).
-if(WIN32)
-    list(APPEND BOLTAPI_ENGINE_SOURCES
-        src/core/async_io_iocp.cpp
-        src/net/event_loop_iocp.cpp
-    )
-elseif(APPLE)
-    list(APPEND BOLTAPI_ENGINE_SOURCES
-        src/core/async_io_kqueue.cpp
-        src/net/event_loop_kqueue.cpp
-    )
-elseif(UNIX)
-    list(APPEND BOLTAPI_ENGINE_SOURCES
-        src/core/async_io_epoll.cpp
-        src/core/async_io_uring.cpp   # io_uring (ring-per-thread); falls back to epoll on old kernel / Docker seccomp
-        src/net/event_loop_epoll.cpp
-    )
-endif()
+# Per-OS async I/O + event loop backends (IOCP / epoll+io_uring / kqueue) now
+# live in bolt::reactor (STATION-78), gated there behind the same OS switch.
 
 # ---------------------------------------------------------------------------
 # boltapi — the library (STATIC; grows as milestones land)
@@ -198,7 +179,7 @@ target_compile_features(boltapi PUBLIC cxx_std_20)
 # bolt::parse hosts fionn (the JSON parser); link it explicitly so the json
 # facade's TU resolves bolt::parse::json::* even though bolt::bolt also
 # transitively re-exports it when BOLT_BUILD_PARSE=ON.
-target_link_libraries(boltapi PUBLIC bolt::bolt bolt::parse OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(boltapi PUBLIC bolt::bolt bolt::parse bolt::reactor OpenSSL::SSL OpenSSL::Crypto)
 if(WIN32)
     # ws2_32/mswsock for sockets; iphlpapi for GetAdaptersAddresses (ICE host
     # candidate enumeration in src/webrtc/ice.cpp).
