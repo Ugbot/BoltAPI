@@ -195,6 +195,212 @@ void materialize_stream(CoroHttpResponse& response, bool drop_transfer_encoding)
     if (drop_transfer_encoding) response.headers.remove("Transfer-Encoding");
 }
 
+// =====================================================================
+// Off-the-I/O-thread streaming (native-reactor fix, STATION-114 follow-up).
+//
+// A Response::stream producer is a SYNCHRONOUS callable that may loop for the
+// whole life of the connection (e.g. an open SSE stream). Driving it inline on
+// the connection's single I/O thread (the old stream_chunked_h1 below) wedges
+// that thread for the stream's lifetime, starving every other connection. The
+// fix: run the producer on a worker-pool BLOCKING thread and hand each framed
+// chunk to the I/O thread through a bounded, mutex-guarded buffer, waking the
+// I/O coroutine via the reactor's cross-thread post (post_to_io_thread). The
+// I/O thread performs the actual socket writes (co_await async_write) and stays
+// free to service all other connections between them. Backpressure caps the
+// staged bytes so a fast producer + slow client cannot grow memory unbounded.
+//
+// BUFFERED (non-streaming) responses NEVER reach this code — they take the
+// unchanged `if (!streamed)` path in handle_http1_connection, byte-for-byte as
+// before. This machinery is entered only when response.stream_producer is set.
+// =====================================================================
+
+// Fully write `len` bytes to `fd` via the reactor, yielding the I/O thread
+// between partial writes. Returns false if the peer is gone / a hard error.
+core::coro_task<bool> stream_co_write_all(net::IODispatcher& io, int fd,
+                                          const char* data, std::size_t len) {
+    std::size_t off = 0;
+    while (off < len) {
+        ssize_t n = co_await io.async_write(fd, data + off, len - off);
+        if (n <= 0) co_return false;
+        off += static_cast<std::size_t>(n);
+    }
+    co_return true;
+}
+
+// Bounded producer -> I/O-thread handoff. shared_ptr-owned so an orphaned
+// producer (client vanished mid-stream, a non-terminating SSE loop) can safely
+// outlive the connection coroutine frame without UAF; it drops its ref when it
+// finally returns and the handoff is freed then.
+struct H1StreamHandoff {
+    std::mutex               mtx;
+    std::condition_variable  producer_cv;   // producer parks here under backpressure
+    std::string              pending;       // chunk-framed bytes awaiting socket write
+    bool                     producer_done = false;  // producer returned (no more bytes)
+    bool                     cancelled     = false;  // client gone -> stop buffering
+    bool                     io_waiting    = false;  // I/O coroutine parked at DataReady
+    std::coroutine_handle<>  io_handle{};            // resume target (valid iff io_waiting)
+    net::IODispatcher*       io = nullptr;
+    std::size_t              io_thread_index = 0;
+    // Backpressure high-water: the producer parks once this many unflushed bytes
+    // are staged, bounding memory when a fast producer meets a slow client.
+    static constexpr std::size_t kHighWaterBytes = 1u << 20;  // 1 MiB
+};
+
+// Parks the I/O coroutine until the producer stages bytes OR finishes. Single
+// consumer (the I/O coroutine); the handle is captured+cleared under the same
+// lock by the one producer wake that fires, so there is exactly one resume per
+// park (no lost/double wakeup). Resumes immediately (no park) if bytes are
+// already staged or the producer is done — closing the check-then-park race.
+struct H1StreamDataReady {
+    H1StreamHandoff* h;
+    bool await_ready() const noexcept { return false; }
+    bool await_suspend(std::coroutine_handle<> co) noexcept {
+        std::unique_lock<std::mutex> lk(h->mtx);
+        if (!h->pending.empty() || h->producer_done) {
+            return false;  // data/done already available -> resume now
+        }
+        h->io_handle  = co;
+        h->io_waiting = true;
+        return true;       // park; a producer wake posts us back to the I/O thread
+    }
+    void await_resume() const noexcept {}
+};
+
+// Drive a chunked streaming response with the producer OFFLOADED to the worker
+// pool. Returns true if the terminating chunk was written (peer still there),
+// false if the client vanished mid-stream. `io_thread_index` is the thread this
+// connection is resumed on (0 — the only correct target under num_io_threads==1
+// or a shared-engine/IOCP backend; the caller gates on that).
+core::coro_task<bool> stream_chunked_h1_offloaded(
+        net::IODispatcher& io, int fd, CoroHttpResponse& response,
+        bool keep_alive, std::size_t io_thread_index) {
+    assert(response.stream_producer != nullptr);
+    assert(response.status >= 100);
+    assert(io.worker_pool() != nullptr && "streaming needs the worker pool");
+
+    // 1) Status line + headers — byte-identical to the sync path.
+    std::string head;
+    head.reserve(256);
+    head += "HTTP/1.1 ";
+    append_uint(head, response.status);
+    head += ' ';
+    head += response.status_message;
+    head += "\r\n";
+    bool saw_te = false;
+    for (const auto& [name, value] : response.headers) {
+        if (ieq_ascii(name, "content-length")) continue;   // invalid with chunked
+        if (ieq_ascii(name, "transfer-encoding")) saw_te = true;
+        head += name; head += ": "; head += value; head += "\r\n";
+    }
+    if (!saw_te) head += "Transfer-Encoding: chunked\r\n";  // defensive
+    if (!keep_alive) head += "Connection: close\r\n";
+    head += "\r\n";
+    if (!(co_await stream_co_write_all(io, fd, head.data(), head.size()))) {
+        co_return false;  // client already gone; producer never starts
+    }
+
+    // 2) Launch the producer on a worker-pool BLOCKING thread. It frames each
+    //    sink() write into the shared handoff and wakes this coroutine; it never
+    //    touches the socket/fd, so closing the fd at teardown is always safe. The
+    //    future is intentionally discarded (fire-and-forget): the producer owns a
+    //    shared_ptr ref, so we never join it on the I/O thread.
+    auto h = std::make_shared<H1StreamHandoff>();
+    h->io = &io;
+    h->io_thread_index = io_thread_index;
+    auto producer = std::move(response.stream_producer);
+    response.stream_producer = nullptr;
+
+    (void)io.worker_pool()->submit_blocking(
+        [h, producer = std::move(producer)]() {
+            H1StreamHandoff* hp = h.get();
+            CoroHttpResponse::StreamSink sink = [hp](std::string_view s) {
+                if (s.empty()) return;  // a 0-length chunk would end the stream early
+                std::coroutine_handle<> wake{};
+                {
+                    std::unique_lock<std::mutex> lk(hp->mtx);
+                    hp->producer_cv.wait(lk, [hp] {
+                        return hp->pending.size() < H1StreamHandoff::kHighWaterBytes
+                               || hp->cancelled;
+                    });
+                    if (hp->cancelled) return;  // client gone -> swallow the rest
+                    char sizebuf[24];
+                    const int m = std::snprintf(sizebuf, sizeof(sizebuf), "%zx\r\n",
+                                                s.size());
+                    assert(m > 0 && static_cast<std::size_t>(m) < sizeof(sizebuf));
+                    hp->pending.append(sizebuf, static_cast<std::size_t>(m));
+                    hp->pending.append(s.data(), s.size());
+                    hp->pending.append("\r\n", 2);
+                    if (hp->io_waiting) {
+                        wake = hp->io_handle;
+                        hp->io_waiting = false;
+                        hp->io_handle = {};
+                    }
+                }
+                if (wake) hp->io->post_to_io_thread(hp->io_thread_index, wake);
+            };
+            producer(sink);
+            // Producer finished: flag done and wake the I/O coroutine once more.
+            std::coroutine_handle<> wake{};
+            {
+                std::unique_lock<std::mutex> lk(hp->mtx);
+                hp->producer_done = true;
+                if (hp->io_waiting) {
+                    wake = hp->io_handle;
+                    hp->io_waiting = false;
+                    hp->io_handle = {};
+                }
+            }
+            if (wake) hp->io->post_to_io_thread(hp->io_thread_index, wake);
+        });
+
+    // 3) Pump: park until bytes/done, drain them to the socket, repeat. The I/O
+    //    thread is FREE between writes (each is a co_await). TigerStyle: every
+    //    iteration makes progress (drains >=1 staged byte or observes done).
+    bool alive = true;
+    std::string to_write;
+    for (;;) {
+        co_await H1StreamDataReady{h.get()};
+
+        bool done = false;
+        {
+            std::unique_lock<std::mutex> lk(h->mtx);
+            to_write.clear();
+            to_write.swap(h->pending);
+            done = h->producer_done;
+        }
+        h->producer_cv.notify_one();  // freed handoff space -> unblock backpressure
+
+        if (!to_write.empty()) {
+            if (!(co_await stream_co_write_all(io, fd, to_write.data(),
+                                               to_write.size()))) {
+                alive = false;  // client vanished mid-stream
+            }
+        }
+        if (!alive) break;
+        if (done) {
+            std::unique_lock<std::mutex> lk(h->mtx);
+            if (h->pending.empty()) break;   // producer done AND fully drained
+        }
+    }
+
+    // 4) Detach the producer: stop buffering + stop parking. It owns its own
+    //    shared_ptr ref, so it may outlive this frame — NO join on the I/O thread,
+    //    hence no teardown stall even for a non-terminating producer.
+    {
+        std::unique_lock<std::mutex> lk(h->mtx);
+        h->cancelled  = true;
+        h->io_waiting = false;
+        h->io_handle  = {};
+    }
+    h->producer_cv.notify_all();
+
+    // 5) Terminating 0-length chunk when the peer is still connected.
+    if (alive) {
+        alive = co_await stream_co_write_all(io, fd, "0\r\n\r\n", 5);
+    }
+    co_return alive;
+}
+
 }  // namespace
 
 // =============================================================================
@@ -333,6 +539,15 @@ int CoroUnifiedServer::start_background() {
     // Create worker thread pool
     core::WorkerPoolConfig worker_config;
     worker_config.num_workers = config_.num_workers;
+    // NATIVE-REACTOR FIX: a cleartext streaming response (Response::stream) runs
+    // its SYNCHRONOUS producer on a BLOCKING worker thread for the stream's
+    // lifetime (off the single I/O thread). Size the blocking pool for the max
+    // concurrent streams we intend to serve — the WorkerPoolConfig default of 2
+    // would leave a 3rd concurrent stream's producer stuck in the queue. Buffered
+    // responses never touch this pool; idle blocking threads park cheaply.
+    worker_config.blocking_workers =
+        std::max<std::size_t>(worker_config.blocking_workers,
+                              config_.num_streaming_workers);
     worker_pool_ = std::make_unique<core::WorkerThreadPool>(worker_config);
     worker_pool_->start();
 
@@ -1122,7 +1337,26 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
         if (response.stream_producer) {
             if (tls == nullptr) {
                 keep_alive = parsed_req.keep_alive;
-                if (!stream_chunked_h1(fd, response, keep_alive)) {
+                // NATIVE-REACTOR FIX: run the synchronous producer OFF the I/O
+                // thread (worker pool) and post its framed chunks back for the
+                // I/O thread to write, so a long-lived stream never monopolizes
+                // the reactor. This is correct only when this connection can be
+                // resumed on I/O thread 0: a single I/O thread (the only one), or
+                // a shared-engine backend (IOCP) where any thread services any
+                // fd. For a per-core backend (epoll/kqueue) with >1 I/O thread we
+                // cannot know this connection's owning thread here, so fall back
+                // to the inline synchronous drive (correct — it only blocks one of
+                // several I/O threads). BUFFERED responses are untouched either way.
+                const bool can_offload =
+                    io.io_thread_count() == 1 || !io.per_thread_engines();
+                bool ok;
+                if (can_offload) {
+                    ok = co_await stream_chunked_h1_offloaded(
+                        io, fd, response, keep_alive, /*io_thread_index=*/0);
+                } else {
+                    ok = stream_chunked_h1(fd, response, keep_alive);
+                }
+                if (!ok) {
                     keep_alive = false;  // client gone mid-stream → close
                 }
                 streamed = true;

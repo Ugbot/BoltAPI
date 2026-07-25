@@ -336,6 +336,15 @@ struct CoroUnifiedServerConfig {
     size_t num_io_threads = 1;     // 1-2 recommended
     size_t num_workers = 0;        // 0 = auto (CPU count)
 
+    // Max concurrently-active streaming responses (Response::stream) on the
+    // cleartext HTTP/1.1 path. Each open stream runs its SYNCHRONOUS producer on
+    // one worker-pool BLOCKING thread for the stream's lifetime (off the I/O
+    // thread — see coro_unified_server.cpp's offloaded streaming), so this sizes
+    // the blocking-worker pool. Bounds concurrent streams as deliberate
+    // backpressure; extra idle blocking threads park cheaply. The default 2
+    // (WorkerPoolConfig) would wedge a 3rd concurrent stream, so we lift it here.
+    size_t num_streaming_workers = 8;
+
     // Backlog
     int backlog = 1024;
 
