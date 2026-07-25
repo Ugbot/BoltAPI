@@ -179,6 +179,27 @@ struct CoroHttpResponse {
     std::string status_message = "OK";
     CoroResponseHeaders headers;
     std::string body;
+
+    // --- Incremental streaming (STATION-96) ---------------------------------
+    // When `stream_producer` is set (via bolt::api::Response::stream), the server
+    // sends this response with Transfer-Encoding: chunked and NO Content-Length,
+    // then DRIVES the producer: every `sink(bytes)` call the producer makes is
+    // flushed to the socket as its own chunk frame ({hexlen}\r\n{bytes}\r\n), and
+    // when the producer returns the server writes the terminating 0-length chunk.
+    // This makes token-by-token output hit the wire as it is produced instead of
+    // being buffered until the handler returns.
+    //
+    // The producer is a SYNCHRONOUS callable run inside the connection coroutine
+    // (on the I/O thread, exactly where a buffered handler's body already runs),
+    // so it may block while it generates — the same blocking contract the classic
+    // buffered path already has. `sink` performs a fully-draining socket write; it
+    // is valid ONLY for the duration of the producer call (do not capture it).
+    //
+    // Empty `stream_producer` (the default) => the classic fully-buffered response
+    // path, byte-identical to before. `body` is IGNORED when a producer is set.
+    using StreamSink     = std::function<void(std::string_view)>;
+    using StreamProducer = std::function<void(const StreamSink&)>;
+    StreamProducer stream_producer;  // empty on the buffered path
 };
 
 // Handler returns the dispatch_task — its coroutine frame is arena-backed

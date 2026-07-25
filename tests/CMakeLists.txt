@@ -28,6 +28,15 @@ if(WIN32)
     target_link_libraries(boltapi_app_integration_test PRIVATE ws2_32 mswsock)
 endif()
 
+# STATION-96: App-level streaming responses (Response::stream / chunked
+# incremental output). Real App on loopback + a chunked-aware raw client; proves
+# buffered routes stay byte-identical, streaming routes emit chunk frames, and
+# auth middleware short-circuits before any stream starts.
+boltapi_add_test(boltapi_stream_response_test stream_response_test.cpp)
+if(WIN32)
+    target_link_libraries(boltapi_stream_response_test PRIVATE ws2_32 mswsock)
+endif()
+
 # Regression gate for Request::query_param() on HTTP/1.1 — the H1 parser used
 # to strip '?...' before path capture, so query() returned empty. Same harness
 # pattern as app_integration_test: real App on loopback + raw client socket.

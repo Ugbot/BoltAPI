@@ -103,6 +103,23 @@ struct CoroResponseHeaders {
         ++count;
     }
 
+    // Remove the FIRST header matching `name` (case-insensitive). Returns true
+    // when one was removed. Remaining headers keep their order (compact shift).
+    // Used to strip a hop-by-hop header (e.g. Transfer-Encoding) when a response
+    // built for HTTP/1.1 chunked is re-materialized for a transport that frames
+    // its own body (HTTP/2 DATA frames). Bounded; no allocation.
+    bool remove(std::string_view name) noexcept {
+        iterator it = find(name);
+        if (it == end()) return false;
+        for (iterator p = it; p + 1 != end(); ++p) {
+            p->name  = std::move((p + 1)->name);
+            p->value = std::move((p + 1)->value);
+        }
+        assert(count > 0);
+        --count;
+        return true;
+    }
+
     // Map-compatible find-or-create. Returns a mutable ref to the value so
     // callers can do `h[k] = v` (replace) or `h[k] += v` (append-in-place).
     std::string& operator[](std::string_view name) {

@@ -18,9 +18,13 @@
 #include <iostream>
 #include <cstring>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <charconv>
 #include <vector>
+#ifndef _WIN32
+#include <sys/select.h>
+#endif
 
 namespace bolt::api {
 namespace http {
@@ -59,6 +63,136 @@ inline void append_uint(std::string& out, std::uint64_t v) {
     auto [p, ec] = std::to_chars(tmp, tmp + sizeof(tmp), v);
     (void)ec;
     out.append(tmp, static_cast<std::size_t>(p - tmp));
+}
+
+// =====================================================================
+// Incremental streaming (STATION-96) — cleartext HTTP/1.1 chunked output.
+// =====================================================================
+
+inline int stream_sock_errno() noexcept {
+#ifdef _WIN32
+    return ::WSAGetLastError();
+#else
+    return errno;
+#endif
+}
+
+inline bool stream_would_block(int e) noexcept {
+#ifdef _WIN32
+    return e == WSAEWOULDBLOCK;
+#else
+    return e == EWOULDBLOCK || e == EAGAIN;
+#endif
+}
+
+// Fully send `len` bytes to the connection socket `fd`, blocking until drained.
+// Returns false if the peer is gone / a hard error occurred (client disconnect
+// mid-stream). Runs on the I/O thread from inside the streaming producer, where
+// a synchronous send is correct: the producer (a blocking generate()) already
+// owns the thread, and no overlapped op is in flight on this fd meanwhile. A
+// non-blocking socket that reports would-block is waited on via select() with a
+// bounded retry so a wedged peer cannot hang the reactor forever.
+bool stream_send_all(int fd, const void* data, std::size_t len) noexcept {
+#ifdef _WIN32
+    SOCKET s = static_cast<SOCKET>(fd);
+#else
+    int s = fd;
+#endif
+    const char* p = static_cast<const char*>(data);
+    std::size_t off = 0;
+    int stalls = 0;
+    while (off < len) {
+        ssize_t n = net::sys::send_bytes(s, p + off, len - off);
+        if (n > 0) { off += static_cast<std::size_t>(n); stalls = 0; continue; }
+        const int e = stream_sock_errno();
+#ifndef _WIN32
+        if (n < 0 && e == EINTR) continue;
+#endif
+        if (n < 0 && stream_would_block(e)) {
+            fd_set wf;
+            FD_ZERO(&wf);
+            FD_SET(s, &wf);
+            timeval tv{1, 0};  // 1s writability wait
+            const int r = ::select(static_cast<int>(s) + 1, nullptr, &wf, nullptr, &tv);
+            if (r <= 0 && ++stalls > 30) return false;  // ~30s wedged → give up
+            continue;
+        }
+        return false;  // peer reset / hard error
+    }
+    return true;
+}
+
+// Drive a chunked, incrementally-flushed streaming response over a cleartext
+// (non-TLS) HTTP/1.1 connection. Sends the status line + headers (with the
+// handler-set Transfer-Encoding: chunked and NO Content-Length), then invokes
+// the producer, framing each sink() call as one chunk and flushing it to the
+// wire immediately. Returns false if the client disconnected mid-stream (caller
+// closes and does not keep-alive). Synchronous by construction — see
+// stream_send_all. TigerStyle: bounded, never emits a premature 0-length chunk.
+bool stream_chunked_h1(int fd, CoroHttpResponse& response, bool keep_alive) {
+    assert(response.stream_producer != nullptr);
+    assert(response.status >= 100);
+
+    // 1) Status line + headers. Transfer-Encoding: chunked is already present
+    //    (Response::stream set it); Content-Length must NOT appear with chunked.
+    std::string head;
+    head.reserve(256);
+    head += "HTTP/1.1 ";
+    append_uint(head, response.status);
+    head += ' ';
+    head += response.status_message;
+    head += "\r\n";
+    bool saw_te = false;
+    for (const auto& [name, value] : response.headers) {
+        if (ieq_ascii(name, "content-length")) continue;  // invalid with chunked
+        if (ieq_ascii(name, "transfer-encoding")) saw_te = true;
+        head += name;
+        head += ": ";
+        head += value;
+        head += "\r\n";
+    }
+    if (!saw_te) head += "Transfer-Encoding: chunked\r\n";  // defensive
+    if (!keep_alive) head += "Connection: close\r\n";
+    head += "\r\n";
+    if (!stream_send_all(fd, head.data(), head.size())) return false;
+
+    // 2) Drive the producer. Each non-empty sink() write becomes one chunk frame
+    //    ({hexlen}\r\n{bytes}\r\n) flushed immediately. `alive` latches false on
+    //    the first failed write so the rest of the producer's writes become
+    //    no-ops (we cannot cancel a synchronous generate(), but we stop touching
+    //    a dead socket) — bounded, no UB, no reactor hang.
+    bool alive = true;
+    char sizebuf[24];
+    CoroHttpResponse::StreamSink sink =
+        [fd, &alive, &sizebuf](std::string_view s) {
+            if (!alive || s.empty()) return;  // never emit a 0-length chunk
+            const int m = std::snprintf(sizebuf, sizeof(sizebuf), "%zx\r\n", s.size());
+            assert(m > 0 && static_cast<std::size_t>(m) < sizeof(sizebuf));
+            if (!stream_send_all(fd, sizebuf, static_cast<std::size_t>(m))) { alive = false; return; }
+            if (!stream_send_all(fd, s.data(), s.size()))                    { alive = false; return; }
+            if (!stream_send_all(fd, "\r\n", 2))                            { alive = false; return; }
+        };
+    response.stream_producer(sink);
+
+    // 3) Terminating 0-length chunk (only if the peer is still there).
+    if (!alive) return false;
+    return stream_send_all(fd, "0\r\n\r\n", 5);
+}
+
+// Run a streaming producer's writes into `response.body` as a flat concatenation
+// and clear the producer, converting a streaming response into an equivalent
+// BUFFERED one. Used for transports that cannot do a synchronous per-chunk
+// socket write on this path (TLS HTTP/1.1 and HTTP/2): the bytes are identical,
+// only the incremental flush is lost. For HTTP/2 the hop-by-hop Transfer-Encoding
+// header is stripped (H2 frames its own body via DATA frames).
+void materialize_stream(CoroHttpResponse& response, bool drop_transfer_encoding) {
+    if (!response.stream_producer) return;
+    std::string acc;
+    response.stream_producer(
+        [&acc](std::string_view s) { acc.append(s.data(), s.size()); });
+    response.body = std::move(acc);
+    response.stream_producer = nullptr;
+    if (drop_transfer_encoding) response.headers.remove("Transfer-Encoding");
 }
 
 }  // namespace
@@ -976,13 +1110,36 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
             response.body = "Hello, World!";
         }
 
+        // STATION-96: incremental streaming response. When the handler set a
+        // stream producer (Response::stream) on a cleartext HTTP/1.1 connection,
+        // drive it here: Transfer-Encoding: chunked headers, then each producer
+        // write() flushed to the socket as its own chunk frame — true
+        // token-by-token streaming. TLS falls back to a buffered chunked body
+        // (a synchronous per-chunk TLS write isn't available on this path); the
+        // frames are byte-identical, only the incremental flush is lost. The
+        // buffered/chunked path below is UNCHANGED for the non-streaming case.
+        bool streamed = false;
+        if (response.stream_producer) {
+            if (tls == nullptr) {
+                keep_alive = parsed_req.keep_alive;
+                if (!stream_chunked_h1(fd, response, keep_alive)) {
+                    keep_alive = false;  // client gone mid-stream → close
+                }
+                streamed = true;
+            } else {
+                materialize_stream(response, /*drop_transfer_encoding=*/false);
+                // -> normal buffered chunked path below (TE header retained).
+            }
+        }
+
         // Check if chunked transfer encoding is requested (no allocation).
         bool use_chunked = false;
         auto transfer_encoding_it = response.headers.find("Transfer-Encoding");
-        if (transfer_encoding_it != response.headers.end() &&
+        if (!streamed && transfer_encoding_it != response.headers.end() &&
             contains_ci(transfer_encoding_it->value, "chunked")) {
             use_chunked = true;
         }
+      if (!streamed) {
 
         // Build the HTTP/1.1 response into the per-connection reusable buffer.
         // clear() keeps capacity -> zero heap allocation after the first request;
@@ -1053,6 +1210,7 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
                 co_await io.async_write(fd, resp_str.data(), resp_str.size());
             }
         }
+      }  // if (!streamed)
 
         // Pipelining timeout check: before processing next request from buffer,
         // verify we haven't exceeded idle timeout since start of this request
@@ -1208,6 +1366,14 @@ core::coro_task<void> CoroUnifiedServer::handle_http2_connection(
                 response.status_message = "OK";
                 response.headers.set("Content-Type", "text/plain");
                 response.body = "Hello, World!";
+            }
+
+            // STATION-96: HTTP/2 frames its own body via DATA frames and has no
+            // chunked transfer-encoding, so a streaming producer is materialized
+            // into a buffered body here (byte-identical frames, not incremental)
+            // and the hop-by-hop Transfer-Encoding header is stripped.
+            if (response.stream_producer) {
+                materialize_stream(response, /*drop_transfer_encoding=*/true);
             }
 
             // Send response on the HTTP/2 stream

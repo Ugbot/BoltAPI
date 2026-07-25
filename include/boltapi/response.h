@@ -93,6 +93,43 @@ public:
         return *this;
     }
 
+    // --- Incremental streaming (STATION-96) ---
+    // Stream the body with Transfer-Encoding: chunked, flushing each producer
+    // write() to the socket as it is produced (true token-by-token streaming)
+    // instead of buffering the whole body. `producer` is a synchronous callable
+    // that receives a sink and calls `sink(bytes)` any number of times; each call
+    // is one chunk frame on the wire. Returning from the producer ends the stream
+    // (the server writes the terminating 0-length chunk). Empty writes are
+    // dropped (a 0-length chunk would prematurely end the stream).
+    //
+    //   res.stream("text/event-stream", [=](const auto& sink) {
+    //       backend.generate(req, [&](const std::string& tok) {
+    //           sink("data: " + tok + "\n\n");   // hits the wire immediately
+    //       });
+    //   });
+    //
+    // The producer runs inside the connection coroutine on the I/O thread (the
+    // same place a buffered handler body runs) AFTER the middleware chain — so an
+    // auth middleware that short-circuits with 401 runs first and NO stream is
+    // ever started. On a TLS or HTTP/2 connection the producer output is buffered
+    // and framed by the normal path (byte-identical frames, just not incremental);
+    // cleartext HTTP/1.1 streams incrementally.
+    using StreamSink     = CoroHttpResponse::StreamSink;
+    using StreamProducer = CoroHttpResponse::StreamProducer;
+
+    Response& stream(std::string_view content_type, StreamProducer producer) & {
+        assert(producer != nullptr);
+        assert(!content_type.empty());
+        assert(content_type.size() < 256);
+        assert(out_.stream_producer == nullptr);  // set once per response
+        if (out_.status < 100) out_.status = 200;
+        out_.status_message = reason_phrase(out_.status);
+        out_.headers.set("Content-Type", content_type);
+        out_.headers.set("Transfer-Encoding", "chunked");
+        out_.stream_producer = std::move(producer);
+        return *this;
+    }
+
     // --- Named-status helpers (set status + canonical reason phrase) ---
     Response& ok()            & noexcept { return status(200); }
     Response& created()       & noexcept { return status(201); }
