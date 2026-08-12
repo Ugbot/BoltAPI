@@ -176,4 +176,5 @@ WebRTC). Current suite: **238/238** green on MSVC (default build; 1 expected aio
 - HTTP/3: [`docs/HTTP3_PLAN.md`](docs/HTTP3_PLAN.md) · WebRTC: [`docs/WEBRTC_PLAN.md`](docs/WEBRTC_PLAN.md) / [`docs/WEBRTC_MEDIA_PLAN.md`](docs/WEBRTC_MEDIA_PLAN.md)
 
 ## License
-See `LICENSE` (TBD).
+Licensed under the [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0).
+See [`LICENSE`](LICENSE) for the full text.
