@@ -1,8 +1,11 @@
 # Bolt API examples
 
-Built when `BOLTAPI_BUILD_EXAMPLES=ON` (default for a top-level build). Binaries
-land in `build/<preset>/` (e.g. `build/msvc/Release/`). Each takes an optional
-`[port]` (default 8080).
+Built when `BOLTAPI_BUILD_EXAMPLES=ON` (default for a top-level build). Each takes
+an optional `[port]` (default 8080).
+
+Binaries land under the build directory for your preset — `build/msvc/Release/` on
+Windows, `build/release/examples/` on Linux/macOS. The commands below use the MSVC
+path; adjust for your platform.
 
 | Binary | Source | Needs flag | What it shows |
 |---|---|---|---|

@@ -1,6 +1,6 @@
 # HTTP/3 (QUIC) Implementation Plan — Bolt API
 
-> **Status:** planning only. This is a tickable punch-card for a full, correct,
+> **Status:** planning only. This is a tickable checklist for a full, correct,
 > high-performance HTTP/3 implementation behind the existing M3 protocol seam
 > (`include/boltapi/protocol.h`, `include/boltapi/transport.h`, see `docs/SEAMS.md`).
 > No code in this repo changes yet. **Correctness first, performance second —
@@ -21,7 +21,7 @@
   use.
 - "PORT" means: lift the algorithm/pure code into `src/proto/http3/` under
   `bolt::api::h3`, strip the `fasterapi::quic` namespace, swap `std::unordered_map`
-  / `std::vector` / `new` / `malloc` for Bolt pools/tables/arenas per `CLAUDE.md`,
+  / `std::vector` / `new` / `malloc` for Bolt pools/tables/arenas per `CONTRIBUTING.md`,
   and keep the wire-format logic byte-identical (it is RFC-correct already).
 - Tick `- [ ]` -> `- [x]` as items land. Each phase ends with a **GATE**: do not
   start the next phase until the gate's tests are green.
@@ -73,7 +73,7 @@ allocation, asserts on bounds (TigerStyle, matching the seam headers).
       *Note:* keep an `#if OPENSSL_VERSION` adapter shim so a future move to
       OpenSSL 3.5's native QUIC API is a single translation unit, not a rewrite.
 - [ ] **0.2 Justify the third-party dependency vs the "prefer Bolt / no
-      third-party" rule.** *What:* `CLAUDE.md` says prefer Bolt and import pure
+      third-party" rule.** *What:* `CONTRIBUTING.md` says prefer Bolt and import pure
       algorithms over linking libraries. **Crypto is the one justified
       exception**: TLS 1.3 + AEAD must not be hand-rolled (correctness and
       timing-side-channel risk are unacceptable, and a bespoke TLS stack would
@@ -169,7 +169,7 @@ Goal: parse/serialize QUIC packets and frames correctly. Crypto functions exist
       Phase 9.2). *What:* Initial
       / 0-RTT / Handshake / Retry / Version-Negotiation (long) and 1-RTT (short)
       headers; DCID/SCID extraction. *PORT*
-      `C:\code\FasterAPI\src\cpp\http\quic\quic_packet.{h,cpp}`. *Bolt primitive:*
+      `FasterAPI src/cpp/http/quic/quic_packet.{h,cpp}`. *Bolt primitive:*
       parse/write through `bolt::wire` (`extern/bolt/include/bolt/wire/bolt_wire.h`)
       for zero-copy framing; `bolt_port.h` bitops for header-byte flags.
 - [x] **2.3 Packet number spaces + decoding.** *DONE*
@@ -189,7 +189,7 @@ Goal: parse/serialize QUIC packets and frames correctly. Crypto functions exist
 - [ ] **2.5 Version negotiation + Retry.** *What:* respond to unknown versions
       with a VN packet; issue/validate Retry tokens (stateless address validation,
       Retry integrity tag). *PORT*
-      `C:\code\FasterAPI\src\cpp\http\quic\quic_version_retry.h` (23KB, real).
+      `FasterAPI src/cpp/http/quic/quic_version_retry.h` (23KB, real).
       *Bolt primitive:* `bolt::SwissTable` not needed here; token MAC via OpenSSL.
 - [ ] **2.6 Stateless reset + connection-ID issuance scaffolding.** *What:*
       generate routable CIDs, stateless-reset tokens; prep the CID->connection map
@@ -198,15 +198,15 @@ Goal: parse/serialize QUIC packets and frames correctly. Crypto functions exist
       CID for the Phase 5 connection map.
 
 **GATE 2:** byte-exact round-trip unit tests for varint, every header type, every
-frame type, VN/Retry — seeded with random inputs (per `CLAUDE.md` testing rule).
+frame type, VN/Retry — seeded with random inputs (per `CONTRIBUTING.md` testing rule).
 
 ---
 
 ## Phase 3 — TLS handshake + packet protection (crypto wiring)
 
 This is the gap the FasterAPI audit identified: the crypto layer is **real and
-production-grade**, but the *base* `quic_connection.cpp` never invoked it
-(`AUDIT_NOTES.md:137-140`). We port the **secure** path and drive it.
+production-grade**, but the *base* `quic_connection.cpp` never invoked it. We port
+the **secure** path and drive it.
 
 - [x] **3.1 Crypto buffer (per-level CRYPTO stream reassembly).** *DONE (wave 4)*
       (`CryptoReassembly` in `include/boltapi/quic/connection.h`). ADAPTED from
@@ -327,7 +327,7 @@ connections over loopback UDP transfer randomized multi-KB payloads on a bidi
 stream (byte-exact echo with FIN), a ~15 % seeded-drop variant still completes
 via retransmission with cwnd grow/back-off, and a constrained flow-control
 window forces window updates without deadlock; plus RTT/PTO + NewReno + stream-id
-+ reassembly units. (Satisfies `CLAUDE.md`: more than one route/verb-equivalent
++ reassembly units. (Satisfies `CONTRIBUTING.md`: more than one route/verb-equivalent
 exercised at the transport via bidirectional streams, randomized data, real loss.)
 Remaining Phase-4 polish (idle timeout, CONNECTION_CLOSE emission/Closing drain,
 multi-concurrent-stream stress) rides into wave 5b alongside the H3 bridge. See
@@ -340,31 +340,31 @@ DECISION LOG D8.
 - [ ] **5.1 HTTP/3 frame layer.** *What:* DATA, HEADERS, SETTINGS, GOAWAY,
       MAX_PUSH_ID, CANCEL_PUSH, PUSH_PROMISE; control/QPACK encoder/decoder uni
       streams; stream-type prefixes. *PORT*
-      `C:\code\FasterAPI\src\cpp\http\http3\http3_frames.h` and
-      `C:\code\FasterAPI\src\cpp\http\http3_parser.{h,cpp}`. *Bolt primitive:*
+      `FasterAPI src/cpp/http/http3/http3_frames.h` and
+      `FasterAPI src/cpp/http/http3_parser.{h,cpp}`. *Bolt primitive:*
       `bolt::wire` for frame framing; `bolt::Arena` per-request scratch.
 - [ ] **5.2 QPACK static table + Huffman.** *What:* RFC 9204 static table; reuse
       the existing HPACK Huffman tables. *PORT*
-      `C:\code\FasterAPI\src\cpp\http\qpack\qpack_static_table.h`; **reuse Bolt's
+      `FasterAPI src/cpp/http/qpack/qpack_static_table.h`; **reuse Bolt's
       existing** `src/http/huffman*.cpp` rather than porting FasterAPI's. *Bolt
       primitive:* `bolt::SwissTable` for name/value -> index lookup.
 - [ ] **5.3 QPACK dynamic table.** *What:* insert-with/without-name-ref,
       duplicate, eviction, capacity, absolute/relative/post-base indexing.
-      *PORT* `C:\code\FasterAPI\src\cpp\http\qpack\qpack_dynamic_table.h` (audit:
+      *PORT* `FasterAPI src/cpp/http/qpack/qpack_dynamic_table.h` (audit:
       QPACK is **real**). *Bolt primitive:* ring buffer for the entry array;
       `bolt::SwissTable` for the lookup index.
 - [ ] **5.4 QPACK encoder + decoder + encoder/decoder instruction streams.**
       *What:* full RFC 9204 encode/decode incl. blocked-stream handling, Required
       Insert Count, Known Received Count, Section Acknowledgement / Stream Cancel /
       Insert Count Increment. *PORT*
-      `C:\code\FasterAPI\src\cpp\http\qpack\qpack_encoder.h` +
+      `FasterAPI src/cpp/http/qpack/qpack_encoder.h` +
       `qpack_decoder.h` (and `src/cpp/http/http3/qpack.h`). *Bolt primitive:*
       `bolt::Arena` for header-block scratch; tables from 5.2/5.3.
 - [ ] **5.5 HTTP/3 connection orchestration.** *What:* tie QUIC streams + H3
       frames + QPACK together: open control/QPACK streams, parse requests, manage
       per-request stream state, build responses. *PORT the orchestration shape from*
-      `C:\code\FasterAPI\src\cpp\http\http3_connection.{h,cpp}` and
-      `C:\code\FasterAPI\src\cpp\http\h3_handler.{h,cpp}`, **but** retarget its
+      `FasterAPI src/cpp/http/http3_connection.{h,cpp}` and
+      `FasterAPI src/cpp/http/h3_handler.{h,cpp}`, **but** retarget its
       request/response structs onto Bolt's `CoroHttpRequest`/`CoroHttpResponse`
       (do not keep FasterAPI's `Http3Handler::Request` `std::unordered_map`
       headers). *Bolt primitive:* `bolt::SwissTable` (stream-id -> request state);
@@ -446,7 +446,7 @@ behavior is byte-for-byte the current build.
 
 ## Phase 8 — Testing & interop (correctness gates throughout)
 
-> Per `CLAUDE.md`: tests must exceed "hello world" — multiple routes, multiple
+> Per `CONTRIBUTING.md`: tests must exceed "hello world" — multiple routes, multiple
 > verbs, randomized inputs. Don't mock; build the real thing.
 
 - [ ] **8.1 Unit: varint** — exhaustive boundaries + random round-trip. *PORT*
@@ -456,11 +456,11 @@ behavior is byte-for-byte the current build.
       A.3/A.5) byte-exact + random AEAD round-trip across all three suites +
       negative auth-fail tests. See item 3.6.
 - [ ] **8.3 Unit: packet/frame round-trip** — *PORT*
-      `C:\code\FasterAPI\src\cpp\http\quic\test_quic_packet.cpp`.
+      `FasterAPI src/cpp/http/quic/test_quic_packet.cpp`.
 - [ ] **8.4 Unit: ACK tracker** — *PORT*
-      `C:\code\FasterAPI\src\cpp\http\quic\test_quic_ack_tracker.cpp`.
+      `FasterAPI src/cpp/http/quic/test_quic_ack_tracker.cpp`.
 - [ ] **8.5 Unit: connection state** — *PORT/ADAPT*
-      `C:\code\FasterAPI\src\cpp\http\quic\test_quic_connection.cpp`, **but retarget
+      `FasterAPI src/cpp/http/quic/test_quic_connection.cpp`, **but retarget
       to the secure connection** (the originals only tested the plaintext base —
       audit:140). Add a real two-endpoint encrypted handshake test.
 - [ ] **8.6 Unit: QPACK roundtrip** — encoder<->decoder incl. dynamic table,
@@ -534,28 +534,28 @@ green before *any* Phase 9 perf work is merged.
 
 ## Salvage map — FasterAPI -> Bolt API
 
-| FasterAPI file (`C:\code\FasterAPI\src\cpp\http\...`) | Action | Reason |
+| FasterAPI file (under `src/cpp/http/`) | Action | Reason |
 |---|---|---|
-| `quic\quic_varint.h` | **port as-is** | Pure, correct RFC 9000 §16 codec; only namespace changes. |
-| `quic\quic_packet.{h,cpp}` | **adapt** | Correct header/CID logic; retarget I/O onto `bolt::wire` zero-copy. |
-| `quic\quic_frames.h` | **adapt** | All frame types present; swap buffers to `bolt::wire`/arena. |
-| `quic\quic_packet_number_space.h` | **port as-is** | Small, correct PN-space logic. |
-| `quic\quic_version_retry.h` | **port** | Real VN + Retry incl. integrity tag. |
-| `quic\quic_crypto_buffer.h` | **port** | Real per-level CRYPTO reassembly. |
-| `quic\quic_packet_protection.h` | **port as-is** | Audit: **real** OpenSSL EVP AEAD/HKDF/HP (RFC 9001). Crypto — do not rewrite. |
-| `quic\quic_tls.h` | **port** | Audit: **real** `SSL_QUIC_METHOD` quictls integration (974 LOC). |
-| `quic\quic_handshake.h` | **port** | Real handshake level/key driver. |
-| `quic\quic_secure_connection.h` | **port (becomes the connection)** | Audit: real encrypt/decrypt; this is the path the base class never invoked. |
-| `quic\quic_connection.{h,cpp}` | **adapt shape, drop the stub crypto** | State machine reusable; its `:138/:170` "decrypt when crypto is implemented" TODOs are the plaintext stub — replace with 3.5/secure path. |
-| `quic\quic_ack_tracker.{h,cpp}` | **port** | Real ACK range tracking. |
-| `quic\quic_congestion.{h,cpp}` | **port** | Real NewReno. |
-| `quic\quic_flow_control.{h,cpp}` | **port** | Real stream+conn flow control. |
-| `quic\quic_stream.{h,cpp}` + `quic\stream_reassembly_buffer.h` | **adapt** | Reusable; swap `unordered_map`/`vector` for SwissTable/ring buffer. |
+| `quic/quic_varint.h` | **port as-is** | Pure, correct RFC 9000 §16 codec; only namespace changes. |
+| `quic/quic_packet.{h,cpp}` | **adapt** | Correct header/CID logic; retarget I/O onto `bolt::wire` zero-copy. |
+| `quic/quic_frames.h` | **adapt** | All frame types present; swap buffers to `bolt::wire`/arena. |
+| `quic/quic_packet_number_space.h` | **port as-is** | Small, correct PN-space logic. |
+| `quic/quic_version_retry.h` | **port** | Real VN + Retry incl. integrity tag. |
+| `quic/quic_crypto_buffer.h` | **port** | Real per-level CRYPTO reassembly. |
+| `quic/quic_packet_protection.h` | **port as-is** | Audit: **real** OpenSSL EVP AEAD/HKDF/HP (RFC 9001). Crypto — do not rewrite. |
+| `quic/quic_tls.h` | **port** | Audit: **real** `SSL_QUIC_METHOD` quictls integration (974 LOC). |
+| `quic/quic_handshake.h` | **port** | Real handshake level/key driver. |
+| `quic/quic_secure_connection.h` | **port (becomes the connection)** | Audit: real encrypt/decrypt; this is the path the base class never invoked. |
+| `quic/quic_connection.{h,cpp}` | **adapt shape, drop the stub crypto** | State machine reusable; its `:138/:170` "decrypt when crypto is implemented" TODOs are the plaintext stub — replace with 3.5/secure path. |
+| `quic/quic_ack_tracker.{h,cpp}` | **port** | Real ACK range tracking. |
+| `quic/quic_congestion.{h,cpp}` | **port** | Real NewReno. |
+| `quic/quic_flow_control.{h,cpp}` | **port** | Real stream+conn flow control. |
+| `quic/quic_stream.{h,cpp}` + `quic/stream_reassembly_buffer.h` | **adapt** | Reusable; swap `unordered_map`/`vector` for SwissTable/ring buffer. |
 | (loss recovery — embedded in connection/congestion) | **rewrite** as `quic_loss_recovery.{h,cpp}` | Tangled in FasterAPI; extract a clean RFC 9002 unit. |
-| `http3\http3_frames.h`, `http3_parser.{h,cpp}` | **port/adapt** | Correct H3 framing; framing via `bolt::wire`. |
-| `http3\qpack.h`, `qpack\qpack_static_table.h` | **port** | Real static table. |
-| `qpack\qpack_dynamic_table.h` | **adapt** | Real; back the entry store with a ring buffer + SwissTable index. |
-| `qpack\qpack_encoder.h`, `qpack_decoder.h` | **port** | Audit: QPACK is **real**. |
+| `http3/http3_frames.h`, `http3_parser.{h,cpp}` | **port/adapt** | Correct H3 framing; framing via `bolt::wire`. |
+| `http3/qpack.h`, `qpack/qpack_static_table.h` | **port** | Real static table. |
+| `qpack/qpack_dynamic_table.h` | **adapt** | Real; back the entry store with a ring buffer + SwissTable index. |
+| `qpack/qpack_encoder.h`, `qpack_decoder.h` | **port** | Audit: QPACK is **real**. |
 | `http3_connection.{h,cpp}`, `h3_handler.{h,cpp}` | **adapt (rewrite the request bridge)** | Orchestration reusable; **replace** `Http3Handler::Request` (`unordered_map` headers) with `CoroHttpRequest` -> App dispatch. |
 | `http3_server.h`, `quic_handlers.cpp` | **drop** | FasterAPI's own server/glue; Bolt uses `UdpTransport` + `Http3Protocol` + `App` instead. |
 | `test_quic_packet.cpp`, `test_quic_ack_tracker.cpp` | **port** | Reusable unit tests. |
@@ -616,7 +616,7 @@ callback API (`SSL_set_quic_tls_cbs` + `OSSL_DISPATCH`).** Rationale:
    H1/H2 TLS and for the live WebRTC DTLS gate (`tests/dtls_test.cpp`,
    `OpenSSL::SSL`/`OpenSSL::Crypto`). Path (a) is impossible (API absent); path
    (c) — vendoring quictls — would add a second TLS stack and directly violate
-   `CLAUDE.md`'s "prefer Bolt / import pure algorithms over linking libraries"
+   `CONTRIBUTING.md`'s "prefer Bolt / import pure algorithms over linking libraries"
    for no benefit, and risks symbol clashes with the OpenSSL we already link.
    The TLS-1.3/AEAD dependency exception (Phase 0.2) is satisfied by the OpenSSL
    we *already have*.
@@ -1119,7 +1119,7 @@ neutral-or-better, else revert" rule. Default `ctest` stayed **220/220** green
     build/seal/parse/open + framing CPU from loopback scheduling jitter.
     CPU/byte = process (user+kernel) CPU over the bulk phase ÷ bytes.
 
-**Numbers on this box (MSVC VS2022 Release, x64). Stable metrics:**
+**Numbers on the reference machine (MSVC VS2022 Release, x64). Stable metrics:**
 
 | metric            | value          |
 |-------------------|----------------|
@@ -1211,7 +1211,7 @@ loopback `http3_app_test` remains the authoritative "serves requests" signal);
 `2..5` = CONNECTED but the response was WRONG (status/body), surfaced as a real
 FAIL. This distinguishes "interop pending" from "regression".
 
-**OBSERVED interop status (this box, MSVC Release, aioquic 1.3.0).** The run
+**OBSERVED interop status (reference machine, MSVC Release, aioquic 1.3.0).** The run
 gets far: client Initial succeeds, **QUIC version 1 negotiates**, the client
 reaches `CLIENT_EXPECT_ENCRYPTED_EXTENSIONS` and the server keeps answering
 PINGs — but aioquic logs **"Payload decryption failed"** at the Handshake
@@ -1245,7 +1245,7 @@ in-process handshake passed, so the deviation was self-consistent (both our ends
 agreed) but RFC-wrong (a conformant peer could not match our Handshake/1-RTT
 keys).
 
-**Root cause #1 — hardcoded SHA-256 key schedule.** OpenSSL 3.6 on this box
+**Root cause #1 — hardcoded SHA-256 key schedule.** the OpenSSL 3.6 build used here
 negotiates `TLS_AES_256_GCM_SHA384` by default (it honours the client's order and
 aioquic offers AES-256 first). That suite uses **SHA-384 → 48-byte traffic
 secrets**. But (a) `hkdf_extract`/`hkdf_expand`/`hkdf_expand_label` /

@@ -1,5 +1,10 @@
 # Bolt API — working agreement
 
+> The public, canonical statement of the engineering standard, toolchain policy,
+> and testing bar is [`CONTRIBUTING.md`](CONTRIBUTING.md). This file is the
+> agent-facing working agreement and restates that standard in short form — if
+> the two ever disagree, `CONTRIBUTING.md` wins and this file should be fixed.
+
 - Use the @PROJECT_MAP.md to find what we have, and update it as we go.
 - Bolt API is a high-performance C++20 HTTP framework: a hard fork of FasterAPI's
   proven coroutine HTTP core (`CoroUnifiedServer`), re-homed onto **Bolt**

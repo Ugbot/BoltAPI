@@ -60,7 +60,9 @@ Requires CMake ≥ 3.21, a C++20 compiler, OpenSSL 3.x, and the Bolt submodule.
 **Windows uses MSVC / clang-cl — never MinGW.**
 
 ```sh
-git clone --recursive <repo>     # or: git submodule update --init --recursive
+git clone --recursive https://github.com/Ugbot/BoltAPI.git
+# already cloned without --recursive?
+git submodule update --init --recursive
 ```
 
 **Windows (MSVC):**
@@ -163,18 +165,37 @@ One `App::run` builds the router once, then a single coroutine dispatches each
 request — H1, H2, and H3 all flow through the **same** router + middleware +
 handler path.
 
-## Status
+## Status & maturity
 
 Feature-complete across HTTP/1.1–3 and WebRTC (data + audio + video), with
 RFC-vector unit gates and live interop gates (aioquic for HTTP/3, aiortc for
-WebRTC). Current suite: **238/238** green on MSVC (default build; 1 expected aiortc-interop skip under `BOLTAPI_WITH_WEBRTC=OFF`). Roadmap and decisions live in
-[`PROJECT_MAP.md`](PROJECT_MAP.md) and [`docs/`](docs/).
+WebRTC). CI gates every push and PR on Windows/MSVC, Linux/Clang, and macOS/Clang,
+plus an assertions-on debug build, an ASan/UBSan build, a flags-on (HTTP/3 +
+WebRTC) build, and four Linux container parity lanes (HTTP/3, WebRTC, benchmarks,
+gateway) — each container runs its own `ctest` gate as a build step, so a green
+image build is a green test run.
+
+**There is no stable release yet.** The API may still change, and the project has
+not been deployed at scale in production. Before adopting it, please read
+[`docs/ROADMAP.md`](docs/ROADMAP.md) — it is a deliberately blunt list of known
+gaps, unverified areas, and limitations.
 
 ## Documentation
 - [`docs/README.md`](docs/README.md) — documentation index
 - [`docs/JSON.md`](docs/JSON.md) · [`docs/COMPRESSION.md`](docs/COMPRESSION.md) · [`docs/SEAMS.md`](docs/SEAMS.md) · [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)
 - HTTP/3: [`docs/HTTP3_PLAN.md`](docs/HTTP3_PLAN.md) · WebRTC: [`docs/WEBRTC_PLAN.md`](docs/WEBRTC_PLAN.md) / [`docs/WEBRTC_MEDIA_PLAN.md`](docs/WEBRTC_MEDIA_PLAN.md)
+- [`RUNNING.md`](RUNNING.md) — run the all-protocols demo in Docker
+- [`PROJECT_MAP.md`](PROJECT_MAP.md) — component-by-component status
+
+## Contributing
+
+Contributions are welcome. [`CONTRIBUTING.md`](CONTRIBUTING.md) covers the build,
+the Tiger Style + HFT engineering standard, the toolchain policy, and the testing
+bar. Please also read the [Code of Conduct](CODE_OF_CONDUCT.md).
+
+Security issues should be reported privately — see [`SECURITY.md`](SECURITY.md).
 
 ## License
+
 Licensed under the [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0).
-See [`LICENSE`](LICENSE) for the full text.
+See [`LICENSE`](LICENSE) for the full text and [`NOTICE`](NOTICE) for attribution.

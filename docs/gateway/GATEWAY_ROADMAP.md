@@ -1,4 +1,4 @@
-# Gateway Roadmap — phased plan + punch-card
+# Gateway Roadmap — phased plan + checklist
 
 > Suite: [VISION](GATEWAY_VISION.md) ·
 > [COMPETITIVE_RESEARCH](GATEWAY_COMPETITIVE_RESEARCH.md) ·

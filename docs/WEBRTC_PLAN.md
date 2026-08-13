@@ -1,4 +1,4 @@
-# Bolt API — WebRTC Implementation Punch-Card
+# Bolt API — WebRTC Implementation Checklist
 
 > Ordered, tickable plan to take WebRTC from the M3 **seam stub**
 > (`src/proto/webrtc_stub.cpp` → `NotImplemented`) to a real, correctness-first,
@@ -19,9 +19,9 @@
 
 ## 0. Honest assessment of the FasterAPI WebRTC inheritance
 
-The audit (`FasterAPI/AUDIT_NOTES.md:99-102`, `FASTERAPI_AUDIT.md:35`) rates the
-FasterAPI WebRTC at **~40% scaffold: interfaces exist, transport + crypto do
-not.** Confirmed by reading the source:
+An audit of the predecessor project rated the FasterAPI WebRTC at **~40%
+scaffold: interfaces exist, transport + crypto do not.** Confirmed by reading the
+source:
 
 - **`webrtc/sdp_parser.{h,cpp}`** — *the one genuinely reusable piece.* A real
   line-by-line SDP parser/generator (v/o/s/c/t/m/a), zero-copy `string_view`
@@ -403,7 +403,7 @@ the audit's "mostly REBUILD."
 >   partial-reliability (RFC 3758), DCEP. This is real work but bounded, fully
 >   pool-allocated, and aligns with the project's "use our own stack" mandate.
 >
-> **Recommendation: build Option B** (matches `CLAUDE.md`: "use our server here
+> **Recommendation: build Option B** (matches `CONTRIBUTING.md`: "use our server here
 > to back the python not whatever libraries you can find"). Keep Option A behind
 > `BOLTAPI_WEBRTC_USRSCTP` as a bring-up/interop oracle only. Items below assume B.
 
@@ -567,7 +567,7 @@ the audit's "mostly REBUILD."
 
 ## 10. Testing (correctness gates before any perf work)
 
-> Per `CLAUDE.md`: tests are more than hello-world — multiple channels, multiple
+> Per `CONTRIBUTING.md`: tests are more than hello-world — multiple channels, multiple
 > message types, randomized payloads. **Don't mock — build the real path.**
 
 - [x] **STUN unit tests** — RFC 5769 vectors: parse/generate, XOR-MAPPED-ADDRESS,
@@ -659,7 +659,7 @@ the audit's "mostly REBUILD."
       Bolt primitive: `bolt_batch_pool.h`.
 - [ ] **Per-packet arena, zero hot-path malloc** — every inbound packet parsed in
       a reset-per-packet `bolt::Arena`; assert no `new`/`malloc` on the data path
-      (the `CLAUDE.md` mandate). Bolt primitive: `bolt_arena.h`.
+      (the `CONTRIBUTING.md` mandate). Bolt primitive: `bolt_arena.h`.
 - [ ] **Zero-copy framing** — STUN attributes, SCTP chunks, DCEP, RTP later, all
       framed/parsed via `bolt::wire` over the receive buffer with no intermediate
       copies. Bolt primitive: `bolt/wire/bolt_wire.h`, `bolt_wire_stream.h`.
@@ -712,7 +712,7 @@ the audit's "mostly REBUILD."
 - [ ] **SFU / room relay** — re-introduce the `webrtc/signaling.{h,cpp}` room
       model (**ADAPT**) for multi-peer broadcast.
 - [ ] **Python binding** (`fasterapi/webrtc/*.py` — **DROP & rewrite** via Cython
-      per `CLAUDE.md`) once the C++ path is solid.
+      per `CONTRIBUTING.md`) once the C++ path is solid.
 - [ ] **WebTransport** (`http/webtransport_connection.*`) — shares H3's
       `UdpTransport`; pursue only if requested.
 

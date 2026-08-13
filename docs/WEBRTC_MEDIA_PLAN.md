@@ -1,4 +1,4 @@
-# Bolt API — WebRTC Media (audio + video) Punch-Card
+# Bolt API — WebRTC Media (audio + video) Checklist
 
 > Extends WebRTC beyond data channels (docs/WEBRTC_PLAN.md) to **audio + video**,
 > targeting aiortc's `server` example: accept an offer, then **echo/relay** the

@@ -1,4 +1,4 @@
-# WebRTC — Remaining Work (ordered punch-card, Pion-parity: data + audio + video)
+# WebRTC — Remaining Work (ordered checklist, Pion-parity: data + audio + video)
 
 > Goal: a full WebRTC stack — **data channels + streaming audio + streaming video** —
 > on par with Pion (aiortc's `server` shape), all Bolt-native except OpenSSL crypto.
@@ -121,7 +121,7 @@ Every WebRTC test/interop MUST be non-hanging:
       reports **0 heap allocs** on both the protect and unprotect+demux per-packet
       paths. The Arena variant measured NEUTRAL-to-slightly-worse for single-use
       per-packet scratch (≈9405→9435 ns/pkt protect; ≈362→376 ns/pkt unpr+demux on
-      this box) so the production hub KEEPS its fixed stack scratch (zero-alloc,
+      the reference machine) so the production hub KEEPS its fixed stack scratch (zero-alloc,
       faster). Per-SSRC lookup uses the bounded `TrackRegistry` (≤`kMaxTracks`=16) —
       a `bolt::SwissTable` is not a win at that size (linear scan over ≤16 hot
       entries beats a hash probe); revisit if `kMaxTracks` grows large.

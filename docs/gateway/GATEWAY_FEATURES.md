@@ -5,9 +5,9 @@
 > [ARCHITECTURE](GATEWAY_ARCHITECTURE.md) · **FEATURES** (this) ·
 > [ROADMAP](GATEWAY_ROADMAP.md).
 
-One spec per capability. Each notes **what FasterAPI already has** (reusable
-reference at `C:\code\FasterAPI`, mostly inside the dropped MCP subsystem — so it
-is *source to study/port*, not a live dependency) and **what BoltAPI must build
+One spec per capability. Each notes **what FasterAPI already has** (the predecessor
+project, mostly inside its dropped MCP subsystem — so it is *source to study/port*,
+not a live dependency) and **what BoltAPI must build
 fresh**. Legend: ✅ exists in BoltAPI today · ♻️ port/adapt from FasterAPI ·
 🆕 build new.
 

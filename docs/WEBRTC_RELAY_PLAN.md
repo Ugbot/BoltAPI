@@ -1,11 +1,11 @@
-# WebRTC — completion + relay/SFU punch-card
+# WebRTC — completion + relay/SFU checklist
 
 Goal: stream **audio + video both directions** in a browser easily, reach **Pion
 parity**, and grow into a full **WebRTC relay / SFU** (N peers, selective forwarding,
 no transcode). Builds on `docs/WEBRTC_PLAN.md` + `WEBRTC_MEDIA_PLAN.md` +
 `WEBRTC_REMAINING.md`. Tiger Style (bounded, noexcept, ≥2 asserts/fn, no malloc on the
 media path). Verify with aiortc (have), **Pion (Go)** — the strongest gate for the
-relay goal — and real Chrome via the **chrome-devtools MCP** (getUserMedia).
+relay goal — and real Chrome via **Chrome DevTools automation** (getUserMedia).
 
 Status: `[x]` done · `[~]` partial/unit-gated · `[ ]` todo.
 
@@ -30,14 +30,14 @@ Status: `[x]` done · `[~]` partial/unit-gated · `[ ]` todo.
       Chrome offers (a video m-line has ~147 a=lines > the 128 cap → Overflow → HTTP
       400). Raised the caps (attrs 256, media 8, formats 48) AND made the parser
       **overflow-tolerant** (skip extras past a cap instead of failing). Chrome now
-      connects + echoes through Bolt (verified via the chrome-devtools MCP).
+      connects + echoes through Bolt (verified via Chrome DevTools automation).
 - [x] **#37 — negotiate, don't just echo.** The SDP **answer** now emits `a=rtcp-fb`
       (nack, nack pli, ccm fir, transport-cc, goog-remb — offer-intersected per codec) +
       `a=rtx (apt)` + `a=extmap` (mid, rtp-stream-id, transport-cc, abs-send-time, each at
       the offer's id). `negotiate_media`/`append_media_section` in webrtc/sdp.{h,cpp};
       gated by `media_sdp_test`; **verified in real Chrome** (answer carries all lines,
       Chrome accepts + connects). (`a=ulpfec` deferred — RED/ULPFEC relay is unit-gated.)
-- [x] **Browser getUserMedia echo** verified in real Chrome via the chrome-devtools MCP
+- [x] **Browser getUserMedia echo** verified in real Chrome via Chrome DevTools automation
       (synthetic canvas+oscillator media, since the MCP Chrome has no camera/fake-device
       flag): connected, 2 echoed tracks, 422 inbound packets. (`testing/web/media.html`.)
 - [x] **#38 — fix SRTP `protect`** per-packet `EVP_MAC_fetch` + `EVP_CIPHER_CTX_new/free`.
@@ -90,7 +90,7 @@ Status: `[x]` done · `[~]` partial/unit-gated · `[ ]` todo.
       layer selection + the pacer.
 - [x] Bidirectional: every peer both publishes and subscribes (1 up + N down per peer).
 - [x] Gate: **2 browsers** join a room via Bolt → each sees the other (SFU forwarding) —
-      verified via the chrome-devtools MCP (both connected, `ontrack` audio+video forwarded,
+      verified via Chrome DevTools automation (both connected, `ontrack` audio+video forwarded,
       real RTP packets) + a deterministic loopback gate `MediaRelay.ForwardsAudioVideoBetween
       PeersByteExact` (two real DTLS-SRTP peers, A↔B audio+video forwarded BYTE-EXACT, 16
       rounds each way). **N peers** (hub ≤64) + simulcast layer-switch are follow-ups.
@@ -112,7 +112,7 @@ Status: `[x]` done · `[~]` partial/unit-gated · `[ ]` todo.
 ## P5 — Interop + harness
 - [ ] aiortc (have data+media) — extend to simulcast + RTX/FEC.
 - [ ] **Pion peer** (`tests/interop/pion/`) — data + media + as an SFU counterpart.
-- [ ] Browser (Chrome/Firefox) getUserMedia via the chrome-devtools MCP; multi-tab room.
+- [ ] Browser (Chrome/Firefox) getUserMedia via Chrome DevTools automation; multi-tab room.
 - [ ] `testing/web/` room page (N tiles); one demo server ties it together.
 - [ ] CI WEBRTC=ON leg: unit + loopback + bounded interop.
 

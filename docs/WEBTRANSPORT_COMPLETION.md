@@ -1,9 +1,9 @@
-# WebTransport — completion punch-card
+# WebTransport — completion checklist
 
 Full WebTransport-over-HTTP/3: browser `wt.ready` → datagrams + bidi/uni streams,
 multiple sessions. Builds on QUIC (`docs/QUIC_COMPLETION.md`) and the cert work
 (`docs/WEBTRANSPORT_CERT_PLAN.md`). Tiger Style; verify with aioquic, Pion
-(webtransport-go), and Chrome via the **chrome-devtools MCP**.
+(webtransport-go), and Chrome via **Chrome DevTools automation**.
 
 Status: `[x]` done · `[~]` partial · `[ ]` todo.
 
@@ -27,7 +27,7 @@ Status: `[x]` done · `[~]` partial · `[ ]` todo.
       `ERR_METHOD_NOT_SUPPORTED` and never sent CONNECT. Emitting BOTH (cross-draft)
       makes Chrome open the WebTransport session. (enable_connect_protocol 0x08 +
       h3_datagram 0x33 + QUIC max_datagram_frame_size were already correct.)
-- [x] Gate MET: chrome-devtools MCP — `new WebTransport(url,{serverCertificateHashes})`
+- [x] Gate MET: Chrome DevTools automation — `new WebTransport(url,{serverCertificateHashes})`
       → **READY**. Server trace: `WT-CONNECT? decode=1 method='CONNECT'
       protocol='webtransport' path='/wt'` → 200; page logs "READY — WebTransport
       session open". The full path works end-to-end with real Chrome:

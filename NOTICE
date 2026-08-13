@@ -1,0 +1,26 @@
+Bolt API
+Copyright 2026 Ben Gamble
+
+This product includes software developed by Ben Gamble and the Bolt API
+contributors, licensed under the Apache License, Version 2.0.
+
+--------------------------------------------------------------------------------
+Third-party components
+--------------------------------------------------------------------------------
+
+Bolt API's HTTP engine is a hard fork of the coroutine HTTP core from FasterAPI,
+a predecessor project by the same author.
+
+Bolt (https://github.com/Ugbot/bolt) is included as a git submodule under
+extern/bolt and is covered by its own license. It is not distributed as part of
+this source tree.
+
+Bolt API links against OpenSSL (https://www.openssl.org/) for TLS, DTLS, and
+cryptographic primitives, and optionally against zlib (https://zlib.net/) for
+gzip response compression. These are external dependencies resolved at build
+time; they are not vendored into this repository and remain under their own
+licenses.
+
+Portions of the QPACK implementation (include/boltapi/http3/) are derived from
+the static table in RFC 9204 Appendix A and the Huffman code in RFC 7541
+Appendix B.
