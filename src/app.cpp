@@ -762,6 +762,23 @@ void App::serve_http3_request(http3::H3Connection& h3,
 
     http::CoroHttpResponse resp = dispatch_http3(creq);
 
+    // HTTP/3 frames its own body, so a streaming producer (chunked or
+    // fixed-length) is materialized into the body here — same bytes, no
+    // incremental flush. Transfer-Encoding is hop-by-hop and illegal in H3.
+    if (resp.stream_producer) {
+        std::string acc;
+        resp.stream_producer([&acc](std::string_view s) { acc.append(s.data(), s.size()); });
+        resp.body                = std::move(acc);
+        resp.stream_producer     = nullptr;
+        resp.fixed_stream_length = http::CoroHttpResponse::kNoFixedLength;
+        resp.headers.remove("Transfer-Encoding");
+        char clbuf[24];
+        const int m = std::snprintf(clbuf, sizeof(clbuf), "%zu", resp.body.size());
+        assert(m > 0 && static_cast<std::size_t>(m) < sizeof(clbuf));
+        resp.headers.set("Content-Length",
+                         std::string_view(clbuf, static_cast<std::size_t>(m)));
+    }
+
     // Marshal response headers into the H3 send shape (views into resp storage).
     http3::H3ResponseHeader hdrs[http::CoroResponseHeaders::MAX_RESPONSE_HEADERS];
     std::size_t hc = 0;
@@ -771,10 +788,14 @@ void App::serve_http3_request(http3::H3Connection& h3,
         hdrs[hc].value = e.value;
         ++hc;
     }
+    // body_bytes() is the owned `body` for every classic response and the
+    // caller-owned bytes for a send_borrowed one — going through it is what
+    // keeps a zero-copy body from being serialized as empty here.
+    const std::string_view out_body = resp.body_bytes();
     const std::uint8_t* body =
-        reinterpret_cast<const std::uint8_t*>(resp.body.data());
+        reinterpret_cast<const std::uint8_t*>(out_body.data());
     (void)h3.send_response(r.stream_id, resp.status, hdrs, hc, body,
-                           resp.body.size());
+                           out_body.size());
 }
 #endif  // BOLTAPI_WITH_HTTP3
 

@@ -200,6 +200,47 @@ struct CoroHttpResponse {
     using StreamSink     = std::function<void(std::string_view)>;
     using StreamProducer = std::function<void(const StreamSink&)>;
     StreamProducer stream_producer;  // empty on the buffered path
+
+    // --- Fixed-length (identity) body paths ---------------------------------
+    // Chunked streaming (above) cannot carry Content-Length, so it can serve
+    // neither a Range reply (206 REQUIRES Content-Length + Content-Range) nor a
+    // HEAD reply (Content-Length, no body). These three ADDITIVE fields are the
+    // identity-framed alternatives. All default to "off", so a response that
+    // touches none of them takes the pre-existing paths byte-for-byte.
+    //
+    //  * borrowed_data / borrowed_size — the body IS these caller-owned bytes.
+    //    They go straight from the caller's memory to the socket: ZERO copies
+    //    (the buffered path costs two — one into `body`, one into the header
+    //    buffer). `body` is ignored while borrowed_data != nullptr. The caller
+    //    owns the lifetime; see Response::send_borrowed for the exact rule.
+    //  * body_separate_write — write `body` with its own socket write instead
+    //    of appending it to the header buffer, saving one full-body copy.
+    //    Implied for borrowed bodies. Purely a write-shape choice: the bytes on
+    //    the wire are identical either way.
+    //  * fixed_stream_length >= 0 — drive `stream_producer` under
+    //    "Content-Length: N, no chunk framing". The producer MUST emit exactly
+    //    N bytes; the server never writes past N and closes the connection
+    //    rather than leave a short body under a declared length.
+    static constexpr int64_t kNoFixedLength = -1;
+
+    const char* borrowed_data       = nullptr;
+    size_t      borrowed_size       = 0;
+    bool        body_separate_write = false;
+    int64_t     fixed_stream_length = kNoFixedLength;
+
+    // The bytes that ARE this response's body — borrowed if the caller supplied
+    // borrowed bytes, else the owned `body`. Total and allocation-free; every
+    // body writer (H1/H2/H3) must go through it so a borrowed body can never be
+    // silently served as empty.
+    std::string_view body_bytes() const noexcept {
+        if (borrowed_data != nullptr) return std::string_view(borrowed_data, borrowed_size);
+        return std::string_view(body);
+    }
+
+    // True when this response wants identity fixed-length producer streaming.
+    bool is_fixed_stream() const noexcept {
+        return fixed_stream_length >= 0 && stream_producer != nullptr;
+    }
 };
 
 // Handler returns the dispatch_task — its coroutine frame is arena-backed

@@ -179,6 +179,136 @@ bool stream_chunked_h1(int fd, CoroHttpResponse& response, bool keep_alive) {
     return stream_send_all(fd, "0\r\n\r\n", 5);
 }
 
+// --- Fixed-length (identity) streaming ------------------------------------
+// Content-Length: N and NO chunk framing, so 206 Partial Content works (a Range
+// reply REQUIRES Content-Length + Content-Range, neither of which can coexist
+// with Transfer-Encoding: chunked). Reached only when the handler called
+// Response::send_fixed; every other response takes its pre-existing path.
+enum class FixedStreamResult : uint8_t {
+    kComplete,       // exactly `declared` bytes written; connection reusable
+    kPeerGone,       // client vanished mid-body; close
+    kLengthMismatch  // producer under/over-produced; MUST close (frame is bad)
+};
+
+// Emit status line + headers for an identity fixed-length body. Drops any
+// Transfer-Encoding (illegal here) and any caller Content-Length, then writes
+// the single authoritative `Content-Length: declared`. Bounded: one pass over a
+// fixed-capacity header array.
+void build_fixed_head(std::string& head, const CoroHttpResponse& response,
+                      uint64_t declared, bool keep_alive) {
+    assert(response.status >= 100);
+    assert(head.empty());
+    head.reserve(256);
+    head += "HTTP/1.1 ";
+    append_uint(head, response.status);
+    head += ' ';
+    head += response.status_message;
+    head += "\r\n";
+    for (const auto& [name, value] : response.headers) {
+        // Both are re-derived below; a duplicate or a stale value would
+        // mis-frame the body.
+        if (ieq_ascii(name, "content-length")) continue;
+        if (ieq_ascii(name, "transfer-encoding")) continue;
+        head += name;
+        head += ": ";
+        head += value;
+        head += "\r\n";
+    }
+    head += "Content-Length: ";
+    append_uint(head, declared);  // uint64_t: no narrowing on any target
+    head += "\r\n";
+    if (!keep_alive) head += "Connection: close\r\n";
+    head += "\r\n";
+    assert(head.size() >= 20);
+}
+
+// Drive a fixed-length streaming response over a cleartext HTTP/1.1 connection.
+//
+// The declared-length guarantee, which is what keeps the connection reusable:
+//   * the sink REFUSES any write that would push the running total past
+//     `declared` — the server never emits more bytes than it announced, so it
+//     can never bleed into the next response on this connection;
+//   * the running total is compared to `declared` after the producer returns,
+//     and any inequality is reported as kLengthMismatch so the caller closes
+//     the connection instead of leaving a short body under a declared length.
+// Zero-copy: each sink() write goes straight from the producer's memory to the
+// socket. Synchronous by construction (see stream_send_all) — the same contract
+// a buffered handler body already runs under, and bounded by `declared`.
+FixedStreamResult stream_fixed_h1(int fd, CoroHttpResponse& response, bool keep_alive) {
+    assert(response.stream_producer != nullptr);
+    assert(response.fixed_stream_length >= 0);
+
+    const uint64_t declared = static_cast<uint64_t>(response.fixed_stream_length);
+
+    std::string head;
+    build_fixed_head(head, response, declared, keep_alive);
+    if (!stream_send_all(fd, head.data(), head.size())) return FixedStreamResult::kPeerGone;
+
+    uint64_t written   = 0;
+    bool     peer_gone = false;
+    bool     overrun   = false;
+    CoroHttpResponse::StreamSink sink =
+        [fd, declared, &written, &peer_gone, &overrun](std::string_view s) {
+            if (s.empty() || peer_gone || overrun) return;
+            if (s.size() > declared - written) {
+                overrun = true;  // refuse: never write past what we announced
+                return;
+            }
+            if (!stream_send_all(fd, s.data(), s.size())) { peer_gone = true; return; }
+            written += s.size();
+        };
+    response.stream_producer(sink);
+    response.stream_producer = nullptr;
+
+    assert(written <= declared);  // the sink's refusal makes this total
+    if (overrun || written != declared) {
+        std::fprintf(stderr,
+                     "[boltapi] send_fixed: declared %llu bytes, producer emitted %llu%s "
+                     "-- closing connection to avoid a mis-framed response\n",
+                     static_cast<unsigned long long>(declared),
+                     static_cast<unsigned long long>(written),
+                     overrun ? " (overrun refused)" : "");
+        return FixedStreamResult::kLengthMismatch;
+    }
+    return peer_gone ? FixedStreamResult::kPeerGone : FixedStreamResult::kComplete;
+}
+
+// Convert a fixed-length streaming response into a buffered one for transports
+// that cannot do the per-chunk synchronous socket write (TLS H1, HTTP/2,
+// HTTP/3). Reconciles Content-Length with what the producer ACTUALLY emitted so
+// the frame is always self-consistent, and reports whether that matched the
+// declaration — a mismatch still closes the connection (the frame is fine, but
+// the response is wrong and the caller must find out).
+bool materialize_fixed(CoroHttpResponse& response) {
+    assert(response.fixed_stream_length >= 0);
+    assert(response.stream_producer != nullptr);
+
+    const uint64_t declared = static_cast<uint64_t>(response.fixed_stream_length);
+    std::string acc;
+    acc.reserve(static_cast<std::size_t>(declared));
+    response.stream_producer(
+        [&acc](std::string_view s) { acc.append(s.data(), s.size()); });
+    const bool matched = (acc.size() == declared);
+
+    response.body                = std::move(acc);
+    response.stream_producer     = nullptr;
+    response.fixed_stream_length = CoroHttpResponse::kNoFixedLength;
+    response.headers.remove("Transfer-Encoding");
+    char buf[24];
+    const int m = std::snprintf(buf, sizeof(buf), "%zu", response.body.size());
+    assert(m > 0 && static_cast<std::size_t>(m) < sizeof(buf));
+    response.headers.set("Content-Length",
+                         std::string_view(buf, static_cast<std::size_t>(m)));
+    if (!matched) {
+        std::fprintf(stderr,
+                     "[boltapi] send_fixed: declared %llu bytes, producer emitted %zu "
+                     "-- Content-Length corrected, closing connection\n",
+                     static_cast<unsigned long long>(declared), response.body.size());
+    }
+    assert(response.stream_producer == nullptr);
+    return matched;
+}
+
 // Run a streaming producer's writes into `response.body` as a flat concatenation
 // and clear the producer, converting a streaming response into an equivalent
 // BUFFERED one. Used for transports that cannot do a synchronous per-chunk
@@ -432,6 +562,25 @@ core::coro_task<ssize_t> conn_read(net::IODispatcher& io, int fd,
                                    void* data, std::size_t len) {
     if (tls != nullptr) co_return co_await tls->read(data, len);
     co_return co_await io.async_read(fd, data, len);
+}
+
+// Fully write `len` bytes, looping over partial writes and yielding the I/O
+// thread between them. Used by the separate-body-write path (send_borrowed /
+// send_owned), where headers and body are two writes instead of one
+// concatenation — so a partial write must not silently truncate the body.
+// Bounded: every iteration either advances `off` or returns.
+core::coro_task<bool> conn_write_all(net::IODispatcher& io, int fd,
+                                     net::CoroTlsSocket* tls,
+                                     const char* data, std::size_t len) {
+    assert(data != nullptr || len == 0);
+    std::size_t off = 0;
+    while (off < len) {
+        ssize_t n = co_await conn_write(io, fd, tls, data + off, len - off);
+        if (n <= 0) co_return false;
+        off += static_cast<std::size_t>(n);
+    }
+    assert(off == len);
+    co_return true;
 }
 }  // namespace
 
@@ -1333,8 +1482,27 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
         // (a synchronous per-chunk TLS write isn't available on this path); the
         // frames are byte-identical, only the incremental flush is lost. The
         // buffered/chunked path below is UNCHANGED for the non-streaming case.
+        // Latched by a fixed-length body whose produced size did not match its
+        // declaration. The buffered path below re-reads keep_alive from the
+        // request, so the decision has to survive in its own flag.
+        bool force_close = false;
         bool streamed = false;
-        if (response.stream_producer) {
+        if (response.is_fixed_stream()) {
+            // Fixed-length (identity) streaming: Content-Length, no chunking —
+            // the shape a 206 Range reply needs. Never emits more bytes than it
+            // declared, and closes the connection rather than leave a short
+            // body under a declared length (either would mis-frame whatever
+            // response came next on this keep-alive connection).
+            if (tls == nullptr) {
+                keep_alive = parsed_req.keep_alive;
+                const FixedStreamResult r = stream_fixed_h1(fd, response, keep_alive);
+                if (r != FixedStreamResult::kComplete) keep_alive = false;
+                streamed = true;
+            } else {
+                if (!materialize_fixed(response)) force_close = true;
+                // -> normal buffered path below, Content-Length reconciled.
+            }
+        } else if (response.stream_producer) {
             if (tls == nullptr) {
                 keep_alive = parsed_req.keep_alive;
                 // NATIVE-REACTOR FIX: run the synchronous producer OFF the I/O
@@ -1387,10 +1555,18 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
         resp_str += response.status_message;
         resp_str += "\r\n";
 
-        // Add Content-Length if not present and not chunked
+        // The bytes that ARE the body: borrowed (zero-copy, caller-owned) when
+        // the handler used send_borrowed, else the owned `body`. Identical to
+        // `response.body` for every pre-existing caller.
+        const std::string_view out_body = response.body_bytes();
+
+        // Add Content-Length if not present and not chunked. Note the condition:
+        // an EXPLICIT Content-Length is never overwritten and is emitted by the
+        // header loop below — which is what lets a HEAD reply declare a length
+        // with no body at all.
         if (!use_chunked && response.headers.find("Content-Length") == response.headers.end()) {
             resp_str += "Content-Length: ";
-            append_uint(resp_str, response.body.size());
+            append_uint(resp_str, out_body.size());
             resp_str += "\r\n";
         }
 
@@ -1406,8 +1582,10 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
             resp_str += "\r\n";
         }
 
-        // Check keep-alive
-        keep_alive = parsed_req.keep_alive;
+        // Check keep-alive. force_close is latched when a fixed-length body's
+        // produced size disagreed with its declaration: the frame was corrected
+        // but the response is wrong, so the connection does not get reused.
+        keep_alive = parsed_req.keep_alive && !force_close;
         if (!keep_alive) {
             resp_str += "Connection: close\r\n";
         }
@@ -1419,14 +1597,14 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
             co_await conn_write(io, fd, tls,resp_str.data(), resp_str.size());
 
             // Send body as chunk(s) if there is content
-            if (!response.body.empty()) {
+            if (!out_body.empty()) {
                 // Format: {size_hex}\r\n{data}\r\n
                 char size_buf[32];
-                int len = snprintf(size_buf, sizeof(size_buf), "%zx\r\n", response.body.size());
+                int len = snprintf(size_buf, sizeof(size_buf), "%zx\r\n", out_body.size());
                 std::string chunk;
-                chunk.reserve(len + response.body.size() + 2);
+                chunk.reserve(len + out_body.size() + 2);
                 chunk.append(size_buf, len);
-                chunk.append(response.body);
+                chunk.append(out_body);
                 chunk.append("\r\n");
                 co_await conn_write(io, fd, tls,chunk.data(), chunk.size());
             }
@@ -1434,6 +1612,16 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
             // Send final empty chunk: 0\r\n\r\n
             const char* final_chunk = "0\r\n\r\n";
             co_await conn_write(io, fd, tls,final_chunk, 5);
+        } else if (response.body_separate_write) {
+            // Zero/one-copy body (send_borrowed / send_owned): headers and body
+            // are two fully-drained writes instead of one concatenation, which
+            // is what removes the whole-body copy into resp_str. Both writes
+            // loop over partial writes, so a large body cannot be truncated.
+            bool wrote = co_await conn_write_all(io, fd, tls, resp_str.data(), resp_str.size());
+            if (wrote && !out_body.empty()) {
+                wrote = co_await conn_write_all(io, fd, tls, out_body.data(), out_body.size());
+            }
+            if (!wrote) keep_alive = false;  // peer gone mid-body -> close
         } else {
             // Non-chunked: send headers + body together (cleartext writes via the
             // dispatcher awaitable directly — no conn_write coroutine frame).
@@ -1606,8 +1794,20 @@ core::coro_task<void> CoroUnifiedServer::handle_http2_connection(
             // chunked transfer-encoding, so a streaming producer is materialized
             // into a buffered body here (byte-identical frames, not incremental)
             // and the hop-by-hop Transfer-Encoding header is stripped.
-            if (response.stream_producer) {
+            if (response.is_fixed_stream()) {
+                // Fixed-length streaming on H2: same bytes, H2's own DATA
+                // framing. Content-Length is reconciled to what was produced.
+                (void)materialize_fixed(response);
+                response.headers.remove("Transfer-Encoding");
+            } else if (response.stream_producer) {
                 materialize_stream(response, /*drop_transfer_encoding=*/true);
+            }
+            // send_response takes a std::string, so a borrowed (zero-copy) body
+            // is copied in here — H2 costs one copy where H1 costs none.
+            if (response.borrowed_data != nullptr) {
+                response.body.assign(response.borrowed_data, response.borrowed_size);
+                response.borrowed_data = nullptr;
+                response.borrowed_size = 0;
             }
 
             // Send response on the HTTP/2 stream

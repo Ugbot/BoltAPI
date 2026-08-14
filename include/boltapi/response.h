@@ -15,8 +15,10 @@
 
 #include <cassert>
 #include <cstdint>
+#include <cstdio>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace bolt::api {
 
@@ -130,6 +132,107 @@ public:
         return *this;
     }
 
+    // --- Fixed-length (identity) bodies: Range / HEAD / zero-copy -----------
+    // stream() above forces Transfer-Encoding: chunked, which cannot carry a
+    // Content-Length — so it can serve neither a 206 Range reply (Content-Length
+    // + Content-Range are REQUIRED) nor a HEAD reply. These are the additive
+    // identity-framed alternatives. None of them changes stream()/send().
+
+    // Declare Content-Length without producing a body. This is the HEAD shape:
+    //
+    //   res.status(200).content_type(ct).content_length(object_size);   // no body
+    //
+    // The connection only synthesizes Content-Length when the header is ABSENT,
+    // so an explicit zero-body Content-Length survives to the wire unchanged.
+    Response& content_length(uint64_t n) & {
+        assert(out_.status >= 100);
+        assert(n <= (1ull << 40));  // 1 TiB sanity ceiling
+        char buf[24];
+        const int m = std::snprintf(buf, sizeof(buf), "%llu",
+                                    static_cast<unsigned long long>(n));
+        assert(m > 0 && static_cast<std::size_t>(m) < sizeof(buf));
+        out_.headers.set("Content-Length", std::string_view(buf, static_cast<std::size_t>(m)));
+        return *this;
+    }
+
+    // ZERO-COPY body. `bytes` becomes the response body verbatim: it is written
+    // straight from the caller's memory to the socket. send() costs two copies
+    // (into the response body, then into the header buffer); this costs none.
+    // Content-Length is derived from bytes.size() unless the caller set it.
+    //
+    // LIFETIME — the one rule, and it is on the caller: `bytes` MUST stay valid
+    // until this response has been written to the socket. That write happens on
+    // the connection's I/O thread AFTER the handler returns and BEFORE that
+    // connection reads its next request. So:
+    //   OK   — a per-request/per-thread arena that is reset at the START of the
+    //          next request (the shape a warehouse/object-store read produces),
+    //          a cache or mapping that outlives the request, static data.
+    //   NOT  — any local of the handler. Its storage is gone by write time.
+    //          Use send() (copies) or send_owned() (moves) for those.
+    // Nothing here can check that for you; picking this overload is the promise.
+    //
+    // Note: the built-in gzip middleware inspects the OWNED body, so a borrowed
+    // body is passed through uncompressed (identical to the streaming paths).
+    Response& send_borrowed(std::string_view bytes) & noexcept {
+        assert(bytes.data() != nullptr || bytes.empty());
+        assert(out_.status >= 100);
+        out_.borrowed_data       = bytes.data();
+        out_.borrowed_size       = bytes.size();
+        out_.body_separate_write = true;
+        return *this;
+    }
+
+    // Hand over an already-built body without copying it. Costs exactly the one
+    // copy that built `bytes` (send() costs two) and carries none of
+    // send_borrowed's lifetime obligation — the response owns the bytes.
+    Response& send_owned(std::string&& bytes) & noexcept {
+        assert(bytes.size() <= (1u << 30));  // 1 GiB sanity cap, matches send()
+        assert(out_.status >= 100);
+        out_.body                = std::move(bytes);
+        out_.body_separate_write = true;
+        return *this;
+    }
+
+    // Fixed-length (identity) STREAMING: emits `Content-Length: content_length`
+    // and NO Transfer-Encoding, then drives `producer` writing each sink() call
+    // straight to the socket with no chunk framing. 200 and 206 both work:
+    //
+    //   res.status(206)
+    //      .header("Content-Range", "bytes 0-1023/8192")
+    //      .send_fixed("application/octet-stream", 1024,
+    //                  [=](const auto& sink) { sink(slice); });
+    //
+    // CONTRACT: the producer must emit EXACTLY content_length bytes. The server
+    // never writes past the declared length (a write that would overrun is
+    // refused, not truncated-and-continued), and if the produced total does not
+    // equal the declared length the connection is closed instead of leaving a
+    // mis-framed stream that would corrupt the next response on it.
+    //
+    // The producer runs synchronously on the connection's I/O thread — the same
+    // contract, and the same place, a buffered handler body already runs in.
+    // On TLS/HTTP-2/HTTP-3 the output is materialized and framed by the normal
+    // path (same bytes, same Content-Length, just not incremental).
+    Response& send_fixed(uint64_t n, StreamProducer producer) & {
+        assert(producer != nullptr);
+        assert(out_.stream_producer == nullptr);  // set once per response
+        if (out_.status < 100) out_.status = 200;
+        out_.status_message = reason_phrase(out_.status);
+        out_.headers.remove("Transfer-Encoding");  // identity framing only
+        content_length(n);                         // authoritative declared length
+        out_.fixed_stream_length = static_cast<int64_t>(n);
+        out_.stream_producer     = std::move(producer);
+        assert(out_.is_fixed_stream());
+        return *this;
+    }
+
+    Response& send_fixed(std::string_view content_type, uint64_t n,
+                         StreamProducer producer) & {
+        assert(!content_type.empty());
+        assert(content_type.size() < 256);
+        out_.headers.set("Content-Type", content_type);
+        return send_fixed(n, std::move(producer));
+    }
+
     // --- Named-status helpers (set status + canonical reason phrase) ---
     Response& ok()            & noexcept { return status(200); }
     Response& created()       & noexcept { return status(201); }
@@ -152,6 +255,7 @@ public:
             case 201: return "Created";
             case 202: return "Accepted";
             case 204: return "No Content";
+            case 206: return "Partial Content";     // Range replies
             case 301: return "Moved Permanently";
             case 302: return "Found";
             case 304: return "Not Modified";
@@ -162,6 +266,7 @@ public:
             case 405: return "Method Not Allowed";
             case 409: return "Conflict";
             case 415: return "Unsupported Media Type";
+            case 416: return "Range Not Satisfiable";  // unsatisfiable Range
             case 422: return "Unprocessable Entity";
             case 429: return "Too Many Requests";
             case 500: return "Internal Server Error";

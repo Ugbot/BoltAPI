@@ -37,6 +37,16 @@ if(WIN32)
     target_link_libraries(boltapi_stream_response_test PRIVATE ws2_32 mswsock)
 endif()
 
+# Fixed-length (identity, NOT chunked) responses: send_borrowed / send_owned /
+# send_fixed / content_length. Pins the wire format a Range (206) and a HEAD
+# reply need — Content-Length + no Transfer-Encoding — proves the declared
+# length always equals the written length (over-produce refused, under-produce
+# closes the connection), and proves keep-alive survives all of them.
+boltapi_add_test(boltapi_fixed_length_response_test fixed_length_response_test.cpp)
+if(WIN32)
+    target_link_libraries(boltapi_fixed_length_response_test PRIVATE ws2_32 mswsock)
+endif()
+
 # Regression gate for Request::query_param() on HTTP/1.1 — the H1 parser used
 # to strip '?...' before path capture, so query() returned empty. Same harness
 # pattern as app_integration_test: real App on loopback + raw client socket.
