@@ -46,10 +46,25 @@ int HTTP1Parser::parse(
     if (!data || len == 0) {
         return -1;  // Need more data
     }
-    
+
     pos_ = 0;
     mark_ = 0;
-    
+
+    // parse() restarts from the top of the buffer on every call, and the
+    // engine's read loop passes the SAME HTTP1Request while an incomplete
+    // body accumulates (one retry per socket read). The request's own
+    // accumulation state must restart with it: without this, header_count
+    // grew by the full header set on EVERY retry, tripping MAX_HEADERS after
+    // ~a dozen reads — any body large enough to need >~12 reads (≈2 MB at
+    // typical recv sizes) was answered 400 with no body. Found via S3
+    // multipart part uploads (10 MB parts), which could never succeed.
+    state_ = HTTP1State::START;
+    out_request.header_count = 0;
+    out_request.content_length = 0;
+    out_request.has_content_length = false;
+    out_request.chunked = false;
+    out_request.upgrade = false;
+
     // Parse request line: METHOD SP URL SP VERSION CRLF
     
     // 1. Parse method
