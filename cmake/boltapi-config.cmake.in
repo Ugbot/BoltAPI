@@ -1,0 +1,44 @@
+@PACKAGE_INIT@
+
+# boltapi's exported targets carry IMPORTED dependencies in their interfaces.
+# Nothing would re-find them in a consumer's project, so without this file
+# `find_package(boltapi)` fails at generate time on undefined imported targets —
+# the export names them but the consumer has no way to resolve them.
+#
+# What actually reaches the interface (all PUBLIC on target boltapi, checked
+# against boltapi-targets.cmake, not assumed):
+#
+#   bolt::bolt / bolt::parse / bolt::reactor  the compute core, fionn JSON,
+#       and the async reactor. Non-negotiable — boltapi cannot link without all
+#       three, and the root CMakeLists refuses to configure if any is absent.
+#   OpenSSL::SSL / OpenSSL::Crypto  UNCONDITIONAL. boltapi has no cleartext-only
+#       build: the engine uses libcrypto even without TLS (WebSocket accept-key
+#       SHA-1, HTTP/2, DTLS/SRTP, QUIC), which is why the removed
+#       BOLTAPI_ENABLE_TLS option was inert. find_dependency is therefore
+#       unguarded here — a guard would only ever be true.
+#   ZLIB::ZLIB  only when this boltapi was built with gzip actually available
+#       (BOLTAPI_WITH_GZIP=ON *and* zlib found). Baked in below so a consumer of
+#       an identity-passthrough boltapi is not forced to have zlib.
+#
+# Not listed: ws2_32 / mswsock / iphlpapi (Windows) are plain system library
+# names, not imported targets — they need no find_dependency.
+include(CMakeFindDependencyMacro)
+
+find_dependency(bolt)
+find_dependency(OpenSSL)
+
+set(BOLTAPI_BUILT_WITH_GZIP @BOLTAPI_HAVE_GZIP@)
+if(BOLTAPI_BUILT_WITH_GZIP)
+    find_dependency(ZLIB)
+endif()
+
+# Compile-time seams the library was built with, exposed so a consumer can see
+# what it is linking rather than guessing from behaviour. These mirror the
+# PUBLIC compile definitions already on the target; they are informational.
+set(BOLTAPI_BUILT_WITH_HTTP3      @BOLTAPI_WITH_HTTP3@)
+set(BOLTAPI_BUILT_WITH_WEBRTC     @BOLTAPI_WITH_WEBRTC@)
+set(BOLTAPI_BUILT_WITH_BOLT_ARENA @BOLTAPI_USE_BOLT_ARENA@)
+
+include("${CMAKE_CURRENT_LIST_DIR}/boltapi-targets.cmake")
+
+check_required_components(boltapi)

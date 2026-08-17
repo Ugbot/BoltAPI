@@ -69,6 +69,11 @@ In both modes it asserts that a request **without** `Accept-Encoding` and a
 
 ## Future codecs
 
-`BOLTAPI_WITH_BROTLI` / `BOLTAPI_WITH_ZSTD` options exist but are off and unwired.
-They would slot into the same seam (add `br_encode`/`zstd_encode`, extend the
-middleware's coding negotiation).
+There are **no** brotli/zstd options today. `BOLTAPI_WITH_BROTLI` and
+`BOLTAPI_WITH_ZSTD` used to be declared in the root `CMakeLists.txt` and were
+never referenced anywhere else — setting either changed nothing — so they were
+deleted rather than left as knobs that advertise a capability the build does not
+have. Adding a codec means adding the option **and** wiring it: `br_encode` /
+`zstd_encode` alongside `gzip_encode` in `src/compression.cpp`, plus the
+middleware's coding negotiation. Declare the option in the same step that reads
+it.

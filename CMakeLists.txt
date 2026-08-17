@@ -20,16 +20,47 @@ option(BOLTAPI_BUILD_EXAMPLES   "Build Bolt API examples"   ${BOLTAPI_IS_TOPLEVE
 option(BOLTAPI_BUILD_BENCHMARKS "Build Bolt API benchmarks" OFF)
 option(BOLTAPI_WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
 
-# Feature toggles (wired up in later milestones; declared now so the build
-# surface is stable). Defaults keep M0 dependency-light.
-option(BOLTAPI_ENABLE_TLS   "Enable TLS/HTTPS (needs OpenSSL)" ON)   # M1: forked engine needs OpenSSL
+# Declared HERE, with the other options, NOT next to the install block at the
+# bottom of this file. bolt hit exactly that ordering bug: BOLT_INSTALL was
+# declared beside its install rules, ~400 lines after the subdirectory that
+# gated a header install on it, so the header shipped missing while the target
+# exported fine. Nothing in boltapi reads BOLTAPI_INSTALL early today — but a
+# tests/ or examples/ subdirectory that grows an install rule would, and by
+# then the bug is silent. Keep option declarations in one block at the top.
+option(BOLTAPI_INSTALL "Generate install/export rules for boltapi" ${BOLTAPI_IS_TOPLEVEL})
+if(SKBUILD)
+    # scikit-build packages whatever cmake-install produces; static archives
+    # have no business inside a Python wheel.
+    set(BOLTAPI_INSTALL OFF)
+endif()
+
+# Feature toggles. Every one of these is READ somewhere below — a declared knob
+# that does nothing is worse than no knob, because it tells a consumer a
+# capability is configurable when it is not.
 option(BOLTAPI_WITH_GZIP    "gzip response compression (zlib stopgap)" ON)
-option(BOLTAPI_WITH_BROTLI  "Enable Brotli compression"        OFF)
-option(BOLTAPI_WITH_ZSTD    "Enable zstd compression"          OFF)
-option(BOLTAPI_WITH_JSON    "Enable simdjson JSON parsing"      OFF)
 option(BOLTAPI_WITH_HTTP3   "Enable HTTP/3 seam (scaffold)"     OFF)
 option(BOLTAPI_WITH_WEBRTC  "Enable WebRTC seam (scaffold)"     OFF)
 option(BOLTAPI_USE_BOLT_ARENA "Use bolt::Arena for request buffers" OFF) # risk-gated
+
+# DELETED (2026-08-17), all four were declared and then never referenced again
+# anywhere in this repo — verified by grep across CMake, C++ and headers:
+#
+#   BOLTAPI_WITH_BROTLI / BOLTAPI_WITH_ZSTD  no brotli/zstd codec exists.
+#       src/compression.cpp implements gzip only (see docs/COMPRESSION.md).
+#       Setting either did nothing; the response was still identity or gzip.
+#   BOLTAPI_WITH_JSON  "Enable simdjson JSON parsing" — simdjson is BANNED by
+#       this repo's dependency policy (JSON is bolt::parse / fionn, see
+#       docs/JSON.md). The option could never do anything but mislead.
+#   BOLTAPI_ENABLE_TLS  inert. `find_package(OpenSSL REQUIRED)` below is
+#       UNCONDITIONAL and boltapi links OpenSSL::SSL + OpenSSL::Crypto
+#       unconditionally, because the engine needs libcrypto even for cleartext
+#       (WebSocket accept-key SHA-1, HTTP/2, DTLS/SRTP, QUIC). Gating the find
+#       on the option would not build — so the option is removed and the truth
+#       documented: TLS is not optional in boltapi, OpenSSL 3.x is a hard
+#       dependency, and boltapi-config.cmake find_dependency()s it accordingly.
+#
+# Passing -DBOLTAPI_ENABLE_TLS=ON (etc.) still configures; CMake merely notes
+# the variable was unused. No consumer in this family sets any of them.
 
 set(CMAKE_CXX_STANDARD          20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -42,24 +73,75 @@ include(BoltApiSanitizers)   # option(BOLTAPI_SANITIZE) + boltapi_apply_sanitize
 # ---------------------------------------------------------------------------
 # Bolt submodule (zero-dependency compute core). Build only what we link.
 # ---------------------------------------------------------------------------
-# Gestalt2: share one top-level bolt across all consumers so a single
-# bolt::bolt target is defined. Standalone boltapi builds (target absent)
-# still vendor extern/bolt. See Gestalt2/README.md.
-if(NOT TARGET bolt::bolt)
-    if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/extern/bolt/CMakeLists.txt)
+# THREE ways bolt can arrive, tried in this order. Every branch announces
+# itself, because "which bolt am I linking" is the first question when a build
+# misbehaves and it used to be unanswerable from the log.
+#
+#   1. Already defined  — a superproject (Gestalt2) added bolt before us and
+#      shares ONE bolt::bolt across every consumer. See Gestalt2/README.md.
+#   2. find_package     — an INSTALLED bolt (cmake --install + CMAKE_PREFIX_PATH).
+#      This branch did not exist before; without it, a boltapi checkout whose
+#      nested extern/bolt is deliberately empty (which is exactly the state
+#      under the shared-bolt rule) could not configure standalone AT ALL — the
+#      EXISTS check below fired a FATAL_ERROR telling you to init a submodule
+#      the superproject intends to stay empty.
+#   3. Vendored submodule — a plain standalone clone with the submodule inited.
+if(TARGET bolt::bolt)
+    message(STATUS "boltapi: bolt supplied by the enclosing project (shared target)")
+else()
+    find_package(bolt QUIET)
+    if(bolt_FOUND)
+        message(STATUS "boltapi: bolt found as an installed package (${bolt_DIR})")
+    elseif(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/extern/bolt/CMakeLists.txt)
+        message(STATUS "boltapi: building the vendored extern/bolt submodule")
+        set(BOLT_BUILD_TESTS      OFF CACHE BOOL "" FORCE)
+        set(BOLT_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
+        set(BOLT_BUILD_IO         OFF CACHE BOOL "" FORCE)
+        # bolt::parse hosts fionn — Bolt's skip-aware JSON parser. It is the canonical
+        # JSON path for Bolt API (include/boltapi/json.h wraps it). See docs/JSON.md.
+        set(BOLT_BUILD_PARSE      ON  CACHE BOOL "" FORCE)
+        set(BOLT_BUILD_INGEST     OFF CACHE BOOL "" FORCE)
+        # The reactor (event loop + async I/O) now lives in bolt::reactor (STATION-78).
+        set(BOLT_BUILD_REACTOR    ON  CACHE BOOL "" FORCE)
+        add_subdirectory(extern/bolt EXCLUDE_FROM_ALL)
+    else()
         message(FATAL_ERROR
-            "extern/bolt is missing. Run: git submodule update --init --recursive")
+            "boltapi: no bolt found. Either\n"
+            "  (a) install bolt and point at it:\n"
+            "        cmake -S <bolt> -B b -DBOLT_BUILD_PARSE=ON -DBOLT_BUILD_REACTOR=ON\n"
+            "        cmake --build b && cmake --install b --prefix <pfx>\n"
+            "        cmake -S . -B build -DCMAKE_PREFIX_PATH=<pfx>\n"
+            "  or (b) vendor it:\n"
+            "        git submodule update --init --recursive")
     endif()
-    set(BOLT_BUILD_TESTS      OFF CACHE BOOL "" FORCE)
-    set(BOLT_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
-    set(BOLT_BUILD_IO         OFF CACHE BOOL "" FORCE)
-    # bolt::parse hosts fionn — Bolt's skip-aware JSON parser. It is the canonical
-    # JSON path for Bolt API (include/boltapi/json.h wraps it). See docs/JSON.md.
-    set(BOLT_BUILD_PARSE      ON  CACHE BOOL "" FORCE)
-    set(BOLT_BUILD_INGEST     OFF CACHE BOOL "" FORCE)
-    # The reactor (event loop + async I/O) now lives in bolt::reactor (STATION-78).
-    set(BOLT_BUILD_REACTOR    ON  CACHE BOOL "" FORCE)
-    add_subdirectory(extern/bolt EXCLUDE_FROM_ALL)
+endif()
+
+# boltapi needs MORE than bolt::bolt: bolt::parse (fionn, the JSON path) and
+# bolt::reactor (the async event loop + I/O, hoisted out of boltapi by
+# STATION-78) are both hard link deps further down.
+#
+# On the vendored branch above we FORCE those bolt options ON, so they are
+# guaranteed. On the other two branches we do not control how bolt was built —
+# the superproject may have left BOLT_BUILD_REACTOR at its default (OFF for a
+# non-top-level bolt), and an installed bolt may simply not carry the targets.
+# Both cases previously surfaced ~150 lines later as `Target "boltapi" links to
+# target "bolt::reactor" but the target was not found`, which does not say what
+# to turn on. Ask here, name the flag.
+set(_boltapi_missing_bolt "")
+foreach(_boltapi_req IN ITEMS bolt::bolt bolt::parse bolt::reactor)
+    if(NOT TARGET ${_boltapi_req})
+        list(APPEND _boltapi_missing_bolt ${_boltapi_req})
+    endif()
+endforeach()
+if(_boltapi_missing_bolt)
+    string(REPLACE ";" ", " _boltapi_missing_str "${_boltapi_missing_bolt}")
+    message(FATAL_ERROR
+        "boltapi: the bolt in use is missing: ${_boltapi_missing_str}.\n"
+        "boltapi requires bolt::parse (fionn JSON, include/boltapi/json.h) and "
+        "bolt::reactor (async event loop + I/O, STATION-78).\n"
+        "Rebuild/reinstall bolt with -DBOLT_BUILD_PARSE=ON -DBOLT_BUILD_REACTOR=ON, "
+        "or — if a superproject supplies bolt — set those two CACHE variables "
+        "before it calls add_subdirectory(bolt).")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -347,4 +429,92 @@ if(BOLTAPI_BUILD_BENCHMARKS)
     add_subdirectory(benchmarks)
 endif()
 
-message(STATUS "Bolt API ${PROJECT_VERSION}: tests=${BOLTAPI_BUILD_TESTS} examples=${BOLTAPI_BUILD_EXAMPLES} benchmarks=${BOLTAPI_BUILD_BENCHMARKS} sanitize=${BOLTAPI_SANITIZE} tls=${BOLTAPI_ENABLE_TLS}")
+# ---------------------------------------------------------------------------
+# Install + export
+#
+# Gated on BOLTAPI_INSTALL (declared at the TOP of this file). These rules did
+# not exist at all before: `$<INSTALL_INTERFACE:include>` appeared on both
+# library targets, promising an installed layout that nothing implemented, and
+# there was no install(), no export(), and no package config file — so
+# `find_package(boltapi)` could never succeed and boltapi was consumable only
+# by add_subdirectory.
+#
+# Gated rather than unconditional for the same two reasons bolt is: an embedded
+# build acquires install rules it never asked for, and under scikit-build's
+# cmake-install packaging the static archive lands inside a Python wheel.
+# ---------------------------------------------------------------------------
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+
+if(BOLTAPI_INSTALL)
+
+install(DIRECTORY include/boltapi
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    FILES_MATCHING PATTERN "*.h"
+)
+
+# ONE VOCABULARY. Without EXPORT_NAME, `install(EXPORT ... NAMESPACE boltapi::)`
+# exports boltapi::boltapi_headers, while add_subdirectory gives
+# boltapi::headers. Only boltapi::boltapi coincides. A consumer written against
+# one resolution mode would then fail to configure against the other — the exact
+# silent trap this reform exists to remove. The EXPORT_NAME below is derived the
+# same way the in-tree aliases are: `boltapi::` + the target name with its
+# `boltapi_` prefix stripped (boltapi -> boltapi, boltapi_headers -> headers),
+# which is verified for both aliases in this file.
+foreach(_boltapi_t IN ITEMS boltapi boltapi_headers)
+    string(REGEX REPLACE "^boltapi_" "" _boltapi_export_name "${_boltapi_t}")
+    set_target_properties(${_boltapi_t} PROPERTIES EXPORT_NAME ${_boltapi_export_name})
+endforeach()
+
+install(TARGETS boltapi boltapi_headers
+    EXPORT boltapi-targets
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
+install(EXPORT boltapi-targets
+    FILE      boltapi-targets.cmake
+    NAMESPACE boltapi::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/boltapi
+)
+
+write_basic_package_version_file(
+    ${CMAKE_CURRENT_BINARY_DIR}/boltapi-config-version.cmake
+    VERSION       ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion
+)
+
+configure_package_config_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/boltapi-config.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/boltapi-config.cmake
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/boltapi
+)
+
+install(FILES
+    ${CMAKE_CURRENT_BINARY_DIR}/boltapi-config.cmake
+    ${CMAKE_CURRENT_BINARY_DIR}/boltapi-config-version.cmake
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/boltapi
+)
+
+# An installed boltapi's exported interface names bolt::bolt / bolt::parse /
+# bolt::reactor, so a consumer needs bolt to be an installed PACKAGE. If this
+# boltapi was built against a bolt that arrived via add_subdirectory (the
+# superproject or the vendored submodule), those targets exist in this build
+# tree but there is no bolt-config.cmake for the consumer to find, and
+# `find_package(boltapi)` fails on undefined imported targets. That is invisible
+# until someone unpacks the install elsewhere, so say it at the moment the
+# package is about to be produced.
+if(NOT bolt_FOUND)
+    message(WARNING
+        "boltapi: BOLTAPI_INSTALL is ON but bolt was NOT resolved via "
+        "find_package, so no installed bolt package is guaranteed to exist. "
+        "boltapi-config.cmake calls find_dependency(bolt) and the consumer's "
+        "configure will fail unless a matching bolt is installed and on "
+        "CMAKE_PREFIX_PATH. Install bolt first and reconfigure boltapi with "
+        "-DCMAKE_PREFIX_PATH=<bolt-prefix> for a distributable package.")
+endif()
+
+endif()  # BOLTAPI_INSTALL
+
+message(STATUS "Bolt API ${PROJECT_VERSION}: tests=${BOLTAPI_BUILD_TESTS} examples=${BOLTAPI_BUILD_EXAMPLES} benchmarks=${BOLTAPI_BUILD_BENCHMARKS} sanitize=${BOLTAPI_SANITIZE} install=${BOLTAPI_INSTALL} gzip=${BOLTAPI_HAVE_GZIP} http3=${BOLTAPI_WITH_HTTP3} webrtc=${BOLTAPI_WITH_WEBRTC}")

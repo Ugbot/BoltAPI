@@ -77,6 +77,48 @@ tools/fuzz_check/          # throwaway standalone validation of the fuzz util (n
 | Bolt primitives wired (Arena/SPSC/swiss/topology) | 🚧 | swiss=router done. **Request-body Arena**: `include/boltapi/http/body_buffer_arena.h` now dual-impl behind `option(BOLTAPI_USE_BOLT_ARENA)` (default OFF=slot-pool unchanged; ON=thread-local `bolt::Arena` bump alloc, Handle=non-owning view, self-guarding per-request `thread_body_arena_reset()` reclaims only when no view is live — safe under any-worker coroutine resumption). Reset wired in `coro_unified_server.cpp` (HTTP/1.1 keep-alive iter end ×2; HTTP/2 conn teardown). 45/45 ctest in BOTH modes on MSVC; ON also exercised under Linux ASan/UBSan CI. Dead `ring_buffer.h`/`coro_resumer.h` (SPSCRingBuffer/CoroResumer) removed — were unreferenced. TODO: Bolt topology/affinity thread pinning in worker_pool (deferred perf pass). |
 | Benchmark tooling (loadgen + bench_server + scripts) | ✅ | **In-tree async HTTP/1.1 load generator** `benchmarks/loadgen/` (zero third-party deps, built on the engine's own `IODispatcher` async_connect/read/write + WorkerThreadPool): `http_client.{h,cpp}` (request serializer + incremental response parser + pooled keep-alive `ClientConn` — transport-agnostic, **the seed of the gateway upstream HTTP client**), `latency_histogram.h` (log-linear, fixed storage, p50/p90/p99/p999), `loadgen.{h,cpp}` (1 coroutine/conn, bounded `kMaxConnections=1024`, self-terminating), `loadgen_main.cpp` (CLI + machine-scrapable `RESULT` line). **`benchmarks/bench_server.cpp`** TechEmpower-style routes over the real `App` (`/plaintext /json /db /queries?n=K /route/{id}`; `/db`+`/queries` are an honest synthetic CPU proxy — no PostgreSQL). **`scripts/run_benchmarks.{ps1,sh}`** orchestration (always stops server, no orphan/hang) + `wrk_crosscheck.sh` (skip-if-absent). CMake under `BOLTAPI_BUILD_BENCHMARKS` (not ctest). **Verified MSVC** (~63–69k req/s loopback, all endpoints failed=0, histogram monotonic, no orphan) **+ Linux/Clang+lld** via `Dockerfile.linux-bench` (build + bounded smoke gate green, failed=0). `docs/BENCHMARKS.md` extended (methodology, endpoint suite, comparison-framing template). |
 
+## Consuming boltapi (install / find_package)
+
+boltapi is a SHIPPED artifact and resolves bolt three ways, announced in the
+configure log (`-- boltapi: bolt ...`):
+
+1. **already defined** — a superproject (Gestalt2) added bolt first; one shared
+   `bolt::bolt`. `BOLTAPI_INSTALL` defaults OFF here (not top-level).
+2. **`find_package(bolt)`** — an INSTALLED bolt via `CMAKE_PREFIX_PATH`. This is
+   the branch that makes a standalone build possible when the nested
+   `extern/bolt` submodule is deliberately empty (the shared-bolt rule).
+3. **vendored `extern/bolt`** — a plain clone with the submodule inited.
+
+Whichever way bolt arrives, boltapi hard-requires `bolt::bolt` + `bolt::parse`
+(fionn JSON) + `bolt::reactor` (async event loop, STATION-78) and fails the
+configure by name if any is absent.
+
+```sh
+# bolt first (PARSE + REACTOR are mandatory for boltapi)
+cmake -S <bolt> -B b -DBOLT_BUILD_PARSE=ON -DBOLT_BUILD_REACTOR=ON
+cmake --build b && cmake --install b --prefix /opt/bolt
+# then boltapi
+cmake -S . -B build -DCMAKE_PREFIX_PATH=/opt/bolt
+cmake --build build && cmake --install build --prefix /opt/boltapi
+```
+
+A consumer then needs only `find_package(boltapi)`; bolt, OpenSSL and (when
+built with gzip) zlib arrive transitively via `boltapi-config.cmake`. The
+exported names are IDENTICAL to the in-tree aliases — `boltapi::boltapi` and
+`boltapi::headers` — so the same `target_link_libraries` line works under
+`find_package` and `add_subdirectory` alike.
+
+`BOLTAPI_INSTALL` (default = top-level, forced OFF under `SKBUILD`) gates every
+install rule. **Known limitation:** an installed boltapi's export names
+`bolt::*`, so a boltapi built against an `add_subdirectory` bolt produces a
+package whose consumers need a separately-installed bolt; the configure warns
+when that combination is about to be packaged.
+
+**Not consumable standalone:** `tools/{qpack,router,rtp,srtp}_check` are
+throwaway standalone `project()`s that reach into `../../extern/bolt/include` by
+raw relative path, so they only work in a vendored-submodule checkout. They are
+not referenced from the root build.
+
 ## Toolchain
 - C++20; Windows = **MSVC / clang-cl, never MinGW**; Linux = **LLVM/Clang + lld,
   never GCC** (closest parity to the MSVC primary; GCC diverges on C++20 corners).
