@@ -40,6 +40,10 @@ endif()
 option(BOLTAPI_WITH_GZIP    "gzip response compression (zlib stopgap)" ON)
 option(BOLTAPI_WITH_HTTP3   "Enable HTTP/3 seam (scaffold)"     OFF)
 option(BOLTAPI_WITH_WEBRTC  "Enable WebRTC seam (scaffold)"     OFF)
+# Neo4j's CLIENT WIRE PROTOCOL (raw TCP + PackStream). Unrelated to extern/bolt,
+# our columnar core -- the two just share a word. OPTIONAL and default OFF: a
+# default configure compiles no Neo4j-Bolt TU and pays nothing.
+option(BOLTAPI_WITH_NEO4J_BOLT "Enable the Neo4j Bolt client wire protocol" OFF)
 option(BOLTAPI_USE_BOLT_ARENA "Use bolt::Arena for request buffers" OFF) # risk-gated
 
 # DELETED (2026-08-17), all four were declared and then never referenced again
@@ -306,6 +310,22 @@ if(BOLTAPI_WITH_WEBRTC)
 endif()
 
 # ---------------------------------------------------------------------------
+# Neo4j Bolt client wire protocol (EXTENSION protocol, same recipe as above).
+#
+# Raw TCP with its own 20-byte handshake and 2-byte chunk framing, so it does
+# NOT ride the HTTP router -- it plugs in as an IProtocol via ProtocolRegistry.
+# The define is PUBLIC so proto/neo4j_bolt.h consumers and tests compile against
+# the same flag value the library was built with.
+# ---------------------------------------------------------------------------
+if(BOLTAPI_WITH_NEO4J_BOLT)
+    target_sources(boltapi PRIVATE
+        src/proto/neo4j_bolt_packstream.cpp
+        src/proto/neo4j_bolt_server.cpp)
+    target_compile_definitions(boltapi PUBLIC BOLTAPI_WITH_NEO4J_BOLT=1)
+    message(STATUS "Bolt API Neo4j-Bolt wire protocol: ENABLED (PackStream v2, Bolt 4.4 + 5.0-5.4)")
+endif()
+
+# ---------------------------------------------------------------------------
 # Bolt-native request body arena (risk-gated, opt-in). When ON, the request
 # body buffer is backed by a thread-local bolt::Arena (bump allocator, reset
 # per request) instead of the default slot-pool. PUBLIC so headers compiled in
@@ -517,4 +537,4 @@ endif()
 
 endif()  # BOLTAPI_INSTALL
 
-message(STATUS "Bolt API ${PROJECT_VERSION}: tests=${BOLTAPI_BUILD_TESTS} examples=${BOLTAPI_BUILD_EXAMPLES} benchmarks=${BOLTAPI_BUILD_BENCHMARKS} sanitize=${BOLTAPI_SANITIZE} install=${BOLTAPI_INSTALL} gzip=${BOLTAPI_HAVE_GZIP} http3=${BOLTAPI_WITH_HTTP3} webrtc=${BOLTAPI_WITH_WEBRTC}")
+message(STATUS "Bolt API ${PROJECT_VERSION}: tests=${BOLTAPI_BUILD_TESTS} examples=${BOLTAPI_BUILD_EXAMPLES} benchmarks=${BOLTAPI_BUILD_BENCHMARKS} sanitize=${BOLTAPI_SANITIZE} install=${BOLTAPI_INSTALL} gzip=${BOLTAPI_HAVE_GZIP} http3=${BOLTAPI_WITH_HTTP3} webrtc=${BOLTAPI_WITH_WEBRTC} neo4j_bolt=${BOLTAPI_WITH_NEO4J_BOLT}")

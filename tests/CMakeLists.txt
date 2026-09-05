@@ -534,3 +534,44 @@ if(BOLTAPI_WITH_WEBRTC)
     boltapi_apply_hardening(boltapi_webrtc_debug_server)
     boltapi_apply_sanitizers(boltapi_webrtc_debug_server)
 endif()
+
+# ---- Neo4j Bolt CLIENT WIRE PROTOCOL (BOLTAPI_WITH_NEO4J_BOLT) --------------
+# "Bolt" here is Neo4j's wire protocol, not extern/bolt (our columnar core).
+# Registered only when the optional protocol is compiled in; a default configure
+# builds none of this.
+if(BOLTAPI_WITH_NEO4J_BOLT)
+    # Golden PackStream vectors + handshake negotiation (pure, no sockets).
+    boltapi_add_test(boltapi_neo4j_bolt_packstream_test neo4j_bolt_packstream_test.cpp)
+
+    # The server state machine, driven by a hand-rolled raw-socket Bolt client.
+    boltapi_add_test(boltapi_neo4j_bolt_wire_test neo4j_bolt_wire_test.cpp)
+    if(WIN32)
+        target_link_libraries(boltapi_neo4j_bolt_wire_test PRIVATE ws2_32 mswsock)
+    endif()
+
+    # Standalone echo server the OFFICIAL neo4j python driver is pointed at.
+    add_executable(boltapi_neo4j_bolt_echo_server neo4j_bolt_echo_server_main.cpp)
+    target_link_libraries(boltapi_neo4j_bolt_echo_server PRIVATE boltapi::boltapi)
+    target_include_directories(boltapi_neo4j_bolt_echo_server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    if(WIN32)
+        target_link_libraries(boltapi_neo4j_bolt_echo_server PRIVATE ws2_32 mswsock)
+    endif()
+    boltapi_apply_hardening(boltapi_neo4j_bolt_echo_server)
+    boltapi_apply_sanitizers(boltapi_neo4j_bolt_echo_server)
+
+    # Conformance-by-external-client. SKIPs (77) with a printed reason when the
+    # official driver is not importable -- never silently passes.
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    set(_bolt_py "${Python3_EXECUTABLE}")
+    if(DEFINED ENV{BOLTAPI_NEO4J_PYTHON})
+        set(_bolt_py "$ENV{BOLTAPI_NEO4J_PYTHON}")
+    endif()
+    if(_bolt_py)
+        add_test(NAME boltapi_neo4j_bolt_driver_conformance
+                 COMMAND "${_bolt_py}"
+                         "${CMAKE_CURRENT_SOURCE_DIR}/neo4j_bolt_driver_conformance.py"
+                         "$<TARGET_FILE:boltapi_neo4j_bolt_echo_server>")
+        set_tests_properties(boltapi_neo4j_bolt_driver_conformance
+                             PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
+    endif()
+endif()

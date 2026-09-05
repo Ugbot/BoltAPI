@@ -59,11 +59,16 @@ enum class ProtocolId : std::uint8_t {
     Http2  = 1,
     Http3  = 2,
     WebRtc = 3,
+    // Neo4j's CLIENT WIRE PROTOCOL (raw TCP, its own handshake + chunk framing
+    // + PackStream). Unrelated to extern/bolt, our columnar core -- the two
+    // just share a word. An EXTENSION protocol like Http3/WebRtc: gated by
+    // BOLTAPI_WITH_NEO4J_BOLT, registered via a factory, no core dispatch edit.
+    Neo4jBolt = 4,
 };
 
 // Number of distinct ProtocolId values — sizes the bounded registry. Update
 // alongside the enum (TigerStyle: the bound is explicit, asserted below).
-inline constexpr std::size_t kProtocolIdCount = 4;
+inline constexpr std::size_t kProtocolIdCount = 5;
 
 inline constexpr const char* protocol_name(ProtocolId id) noexcept {
     switch (id) {
@@ -71,6 +76,7 @@ inline constexpr const char* protocol_name(ProtocolId id) noexcept {
         case ProtocolId::Http2:  return "HTTP/2";
         case ProtocolId::Http3:  return "HTTP/3";
         case ProtocolId::WebRtc: return "WebRTC";
+        case ProtocolId::Neo4jBolt: return "Neo4j-Bolt";
     }
     return "?";
 }
@@ -263,6 +269,10 @@ Status register_http3(ProtocolRegistry& reg);
 // Registers a stub WebRtcProtocol factory into `reg`. Returns ok on success.
 Status register_webrtc(ProtocolRegistry& reg);
 #endif
+
+// The Neo4j-Bolt registration entry point lives in proto/neo4j_bolt.h because,
+// unlike the H3/WebRTC stubs, it needs the caller's executor + config. Include
+// that header under BOLTAPI_WITH_NEO4J_BOLT to reach it.
 
 }  // namespace proto
 }  // namespace bolt::api
