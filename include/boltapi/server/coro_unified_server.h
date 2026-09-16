@@ -377,6 +377,21 @@ struct CoroUnifiedServerConfig {
     size_t num_io_threads = 1;     // 1-2 recommended
     size_t num_workers = 0;        // 0 = auto (CPU count)
 
+    // Stack size for EVERY thread this server creates (I/O threads, main
+    // workers, blocking workers). All of them can end up resuming a
+    // request-handling coroutine and running arbitrary handler code up to
+    // its next co_await — with the default inline_resume=true on
+    // IODispatcherConfig, the I/O threads do this on essentially every
+    // request. std::thread offers no portable stack-size control, so a
+    // bare std::thread here would silently inherit the platform pthread
+    // default (512 KiB on macOS) — comfortably enough for a shallow
+    // handler, but not for a deeply recursive one (e.g. chukonu's
+    // canonical-plan builders over a multi-way JOIN), where it is a
+    // whole-process crash, not a per-request failure. 8 MiB matches a
+    // typical Linux pthread default and gives real headroom.
+    // G2ICE-111/G2ICE-112.
+    size_t stack_size_bytes = core::kDefaultStackBytes;
+
     // Max concurrently-active streaming responses (Response::stream) on the
     // cleartext HTTP/1.1 path. Each open stream runs its SYNCHRONOUS producer on
     // one worker-pool BLOCKING thread for the stream's lifetime (off the I/O

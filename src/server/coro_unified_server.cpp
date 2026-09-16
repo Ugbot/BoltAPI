@@ -688,6 +688,11 @@ int CoroUnifiedServer::start_background() {
     // Create worker thread pool
     core::WorkerPoolConfig worker_config;
     worker_config.num_workers = config_.num_workers;
+    // G2ICE-111/G2ICE-112: every thread this server spawns gets an explicit
+    // stack size (see stacked_thread.h) — both the main and blocking workers
+    // here, and the I/O threads below, can resume request-handling
+    // coroutines and run arbitrary (including deeply recursive) handler code.
+    worker_config.stack_size_bytes = config_.stack_size_bytes;
     // NATIVE-REACTOR FIX: a cleartext streaming response (Response::stream) runs
     // its SYNCHRONOUS producer on a BLOCKING worker thread for the stream's
     // lifetime (off the single I/O thread). Size the blocking pool for the max
@@ -704,6 +709,11 @@ int CoroUnifiedServer::start_background() {
     net::IODispatcherConfig io_config;
     io_config.num_io_threads = config_.num_io_threads;
     io_config.worker_pool = worker_pool_.get();
+    // G2ICE-111/G2ICE-112: with inline_resume (io_config's default), I/O
+    // threads resume request-handling coroutines DIRECTLY and run arbitrary
+    // handler code — this is the single highest-leverage stack-size knob in
+    // the server (see io_dispatcher.h's stack_size_bytes comment).
+    io_config.stack_size_bytes = config_.stack_size_bytes;
     io_dispatcher_ = std::make_unique<net::IODispatcher>(io_config);
     io_dispatcher_->start();
 
