@@ -1190,10 +1190,11 @@ int App::start_background(std::string_view host, uint16_t port) {
     return server_->start_background();
 }
 
-void App::stop() {
-    if (server_ && started_) {
-        server_->stop();
-    }
+// Shared tail: tear down the optional HTTP/3 + WebRTC transports. Both
+// App::stop() and App::stop_gracefully() end with exactly this — factored out
+// so the graceful path cannot silently skip it (it did, by construction,
+// before this split existed as two near-duplicate bodies).
+void App::teardown_transports_() noexcept {
 #if defined(BOLTAPI_WITH_HTTP3)
     // Stop the HTTP/3 receive loop + close the UDP socket BEFORE freeing the
     // QUIC/H3 state (the connection's send fn uses the transport). Idempotent.
@@ -1228,7 +1229,41 @@ void App::stop() {
     webrtc_full_ice_.reset();   // WI: full ICE agent (borrows the transport)
     webrtc_agent_.reset();
 #endif
+}
+
+void App::stop() {
+    if (server_ && started_) {
+        server_->stop();
+    }
+    teardown_transports_();
     started_ = false;
+}
+
+// G2K8S-7 — the graceful counterpart to stop(). server_->stop() is an
+// IMMEDIATE stop: it stops the listeners AND the io_dispatcher AND the
+// worker pool in the same call, with no wait for a request already in
+// flight to finish — a request mid-read or mid-write when SIGTERM lands can
+// be cut off (the io_dispatcher that would resume its coroutine dies before
+// the coroutine does). server_->shutdown_gracefully() is the sequenced
+// version CoroUnifiedServer already implements and already exercises via
+// its own per-connection track_connection_open/close bookkeeping: stop
+// accepting NEW connections first, then wait (bounded by
+// config_.server.shutdown_timeout_ms, default 30s) for connections_active_
+// to reach zero, and only then stop io_dispatcher_/worker_pool_. Until this
+// method existed, nothing on the App facade ever called it, so the fully
+// graceful path was dead code.
+//
+// Returns true if every in-flight connection finished before the timeout,
+// false if the timeout was reached and remaining connections were force-
+// closed (the caller may want to log that distinction).
+bool App::stop_gracefully() {
+    bool drained = true;
+    if (server_ && started_) {
+        drained = server_->shutdown_gracefully();
+    }
+    teardown_transports_();
+    started_ = false;
+    return drained;
 }
 
 bool App::is_running() const noexcept {

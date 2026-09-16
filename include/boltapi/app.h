@@ -409,7 +409,18 @@ public:
     int run(std::string_view host, uint16_t port);
     // Non-blocking; server runs on background threads.
     int start_background(std::string_view host, uint16_t port);
+    // Immediate stop: stops listeners, the io_dispatcher, and the worker pool
+    // in one call with no wait for an in-flight request to finish. Use
+    // stop_gracefully() instead when a request mid-flight matters (SIGTERM
+    // from an orchestrator, see G2K8S-7).
     void stop();
+    // Graceful stop: stops accepting NEW connections immediately, then waits
+    // (bounded by config_.server.shutdown_timeout_ms, default 30s) for every
+    // ALREADY-OPEN connection to finish before stopping the io_dispatcher and
+    // worker pool. Returns false if the timeout was reached and remaining
+    // connections were force-closed, true if every connection drained on its
+    // own. Safe to call whether or not the server is running.
+    bool stop_gracefully();
     bool is_running() const noexcept;
 
     // Introspection.
@@ -527,6 +538,11 @@ private:
 
     // Build the router + the engine handler. Called once from run/start.
     void build_dispatch();
+
+    // Shared tail of stop() and stop_gracefully(): tears down the optional
+    // HTTP/3 + WebRTC transports. Factored out so the graceful path cannot
+    // silently skip it.
+    void teardown_transports_() noexcept;
 
     // M3 seam hook: if enable_http3/enable_webrtc are set, consult the protocol
     // registry. Stub factories return NotImplemented, which is logged; H1/H2
