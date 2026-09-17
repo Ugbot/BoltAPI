@@ -11,27 +11,27 @@ Middleware::Middleware()
       auth_failed_requests_(0), cors_preflight_requests_(0) {
     
     // Register default middleware functions
-    middleware_funcs_[Type::RATE_LIMIT] = [this](HttpRequest* req, HttpResponse* res) {
+    middleware_funcs_[static_cast<size_t>(Type::RATE_LIMIT)] = [this](HttpRequest* req, HttpResponse* res) {
         return rate_limit_middleware(req, res);
     };
     
-    middleware_funcs_[Type::AUTHENTICATION] = [this](HttpRequest* req, HttpResponse* res) {
+    middleware_funcs_[static_cast<size_t>(Type::AUTHENTICATION)] = [this](HttpRequest* req, HttpResponse* res) {
         return auth_middleware(req, res);
     };
     
-    middleware_funcs_[Type::CORS] = [this](HttpRequest* req, HttpResponse* res) {
+    middleware_funcs_[static_cast<size_t>(Type::CORS)] = [this](HttpRequest* req, HttpResponse* res) {
         return cors_middleware(req, res);
     };
     
-    middleware_funcs_[Type::LOGGING] = [this](HttpRequest* req, HttpResponse* res) {
+    middleware_funcs_[static_cast<size_t>(Type::LOGGING)] = [this](HttpRequest* req, HttpResponse* res) {
         return logging_middleware(req, res);
     };
     
-    middleware_funcs_[Type::SECURITY] = [this](HttpRequest* req, HttpResponse* res) {
+    middleware_funcs_[static_cast<size_t>(Type::SECURITY)] = [this](HttpRequest* req, HttpResponse* res) {
         return security_middleware(req, res);
     };
     
-    middleware_funcs_[Type::COMPRESSION] = [this](HttpRequest* req, HttpResponse* res) {
+    middleware_funcs_[static_cast<size_t>(Type::COMPRESSION)] = [this](HttpRequest* req, HttpResponse* res) {
         return compression_middleware(req, res);
     };
 }
@@ -39,7 +39,7 @@ Middleware::Middleware()
 Middleware::~Middleware() = default;
 
 int Middleware::add_middleware(Type type, std::function<int(HttpRequest*, HttpResponse*)> func) noexcept {
-    middleware_funcs_[type] = std::move(func);
+    middleware_funcs_[static_cast<size_t>(type)] = std::move(func);
     return 0;
 }
 
@@ -77,9 +77,9 @@ int Middleware::process_request(HttpRequest* request, HttpResponse* response) no
     };
     
     for (Type type : middleware_order) {
-        auto it = middleware_funcs_.find(type);
-        if (it != middleware_funcs_.end()) {
-            int result = it->second(request, response);
+        const auto& func = middleware_funcs_[static_cast<size_t>(type)];
+        if (func) {
+            int result = func(request, response);
             if (result != 0) {
                 blocked_requests_.fetch_add(1);
                 return result;

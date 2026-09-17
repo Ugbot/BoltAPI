@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <string>
 #include <memory>
 #include <functional>
@@ -34,7 +35,8 @@ public:
         CORS,
         LOGGING,
         SECURITY,
-        COMPRESSION
+        COMPRESSION,
+        _COUNT  // sentinel: number of Type values, NOT a real middleware type
     };
 
     // Rate limiting configuration
@@ -138,8 +140,14 @@ public:
     std::unordered_map<std::string, uint64_t> get_stats() const noexcept;
 
 private:
-    // Middleware functions
-    std::unordered_map<Type, std::function<int(HttpRequest*, HttpResponse*)>> middleware_funcs_;
+    // Middleware functions. Type is a plain enum starting at 0 with a _COUNT
+    // sentinel (see above) -- a std::array indexed by static_cast<size_t>(type)
+    // is exact and allocation-free where the old
+    // std::unordered_map<Type, function<>> paid a node alloc per registration
+    // and a hash probe on every process_request() (every HTTP request, when
+    // this class is wired up).
+    std::array<std::function<int(HttpRequest*, HttpResponse*)>,
+               static_cast<size_t>(Type::_COUNT)> middleware_funcs_;
     
     // Configuration
     RateLimitConfig rate_limit_config_;

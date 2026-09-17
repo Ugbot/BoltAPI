@@ -3,7 +3,10 @@
 #include "boltapi/http/http2_frame.h"
 #include "boltapi/http/request_body_buffer.h"
 #include "boltapi/core/result.h"
+#include "bolt/bolt_arena.h"
+#include "bolt/join/bolt_swiss_growable.h"
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -528,7 +531,7 @@ public:
     /**
      * Get number of active streams.
      */
-    size_t stream_count() const noexcept { return streams_.size(); }
+    size_t stream_count() const noexcept { return stream_index_.size; }
 
     /**
      * Update initial window size for all streams (SETTINGS_INITIAL_WINDOW_SIZE).
@@ -543,7 +546,30 @@ public:
     uint32_t initial_window_size() const noexcept { return initial_window_size_; }
 
 private:
-    std::unordered_map<uint32_t, Http2Stream> streams_;
+    // G2CHK-85: streams_ used to be std::unordered_map<uint32_t, Http2Stream>
+    // -- a node-allocating map churning open/close on EVERY request on a
+    // long-lived HTTP/2 connection (the same "connection table" shape the
+    // SwissTableGrowable header names as its own model use case). Streams
+    // open and close far more often, over a connection's life, than any
+    // fixed cap could hold (unlike QUIC's connection.h stream_map_, which is
+    // a small bolt::SwissTable because QUIC streams are never erased) --
+    // hence the growable/erasable sibling, not the fixed one.
+    //
+    // Http2Stream is a fat, non-POD object (string/vector/map members) that
+    // callers hold a raw Http2Stream* into across other create/remove calls
+    // (see Http2Connection::handle_*_frame), so its address must stay stable
+    // regardless of index-table growth. stream_pool_ supplies that: a
+    // unique_ptr's pointee address never moves when the owning vector
+    // reallocates (only the pointer, itself vector-owned, moves). stream_id
+    // -> pool slot lives in the growable table; free_slots_ recycles slots
+    // (destroy + reconstruct on reuse) so a long connection does not grow the
+    // pool without bound just because streams keep closing and reopening.
+    static constexpr uint32_t kStreamIndexMaxCapacity = 8192;
+
+    bolt::Arena stream_index_arena_;
+    bolt::SwissTableGrowable stream_index_;  // stream_id -> stream_pool_ slot
+    std::vector<std::unique_ptr<Http2Stream>> stream_pool_;
+    std::vector<uint32_t> free_slots_;
     uint32_t initial_window_size_;
 };
 

@@ -1,5 +1,6 @@
 #include "boltapi/http/http2_stream.h"
 #include <algorithm>
+#include <cassert>
 
 namespace bolt::api {
 namespace http2 {
@@ -366,39 +367,74 @@ result<void> Http2Stream::consume_recv_window(uint32_t size) noexcept {
 
 // StreamManager implementation
 
+namespace {
+// One StreamManager per HTTP/2 connection; small initial block since most
+// connections use a handful of concurrent streams, capped well above any
+// realistic SETTINGS_MAX_CONCURRENT_STREAMS so growth is smooth in practice
+// and only a pathological peer ever hits kStreamIndexMaxCapacity.
+bolt::ArenaConfig stream_index_arena_config() noexcept {
+    bolt::ArenaConfig cfg;
+    cfg.initial_block_size = 16u * 1024;
+    cfg.max_block_size = 4u * 1024 * 1024;
+    return cfg;
+}
+}  // namespace
+
 StreamManager::StreamManager(uint32_t initial_window_size)
-    : initial_window_size_(initial_window_size) {}
+    : stream_index_arena_(stream_index_arena_config()),
+      initial_window_size_(initial_window_size) {
+    const bool created = bolt::SwissTableGrowable::create(
+        &stream_index_, 32, &stream_index_arena_, kStreamIndexMaxCapacity);
+    assert(created && "stream index table creation cannot fail at 32 slots");
+    assert(stream_index_.size == 0);
+    (void)created;
+}
 
 result<Http2Stream*> StreamManager::create_stream(uint32_t stream_id) noexcept {
     // Check if stream already exists
-    if (streams_.find(stream_id) != streams_.end()) {
+    if (stream_index_.find(stream_id) >= 0) {
         return err<Http2Stream*>(error_code::internal_error);
     }
 
-    // Create new stream
-    auto result = streams_.emplace(
-        std::piecewise_construct,
-        std::forward_as_tuple(stream_id),
-        std::forward_as_tuple(stream_id, initial_window_size_)
-    );
+    // Reuse a closed stream's pool slot if one is free; otherwise grow the
+    // pool by one. Either way the slot gets a FRESH Http2Stream (reuse does
+    // not carry over a prior stream's headers/body state).
+    uint32_t idx;
+    if (!free_slots_.empty()) {
+        idx = free_slots_.back();
+        free_slots_.pop_back();
+        stream_pool_[idx] = std::make_unique<Http2Stream>(stream_id, initial_window_size_);
+    } else {
+        idx = static_cast<uint32_t>(stream_pool_.size());
+        stream_pool_.push_back(std::make_unique<Http2Stream>(stream_id, initial_window_size_));
+    }
 
-    if (!result.second) {
+    if (!stream_index_.insert(stream_id, idx)) {
+        // Index full (kStreamIndexMaxCapacity reached) -- release the slot we
+        // just took rather than leaking a live Http2Stream nothing can reach.
+        stream_pool_[idx].reset();
+        free_slots_.push_back(idx);
         return err<Http2Stream*>(error_code::internal_error);
     }
 
-    return ok(&result.first->second);
+    return ok(stream_pool_[idx].get());
 }
 
 Http2Stream* StreamManager::get_stream(uint32_t stream_id) noexcept {
-    auto it = streams_.find(stream_id);
-    if (it == streams_.end()) {
+    const int32_t idx = stream_index_.find(stream_id);
+    if (idx < 0) {
         return nullptr;
     }
-    return &it->second;
+    assert(static_cast<size_t>(idx) < stream_pool_.size());
+    return stream_pool_[static_cast<size_t>(idx)].get();
 }
 
 void StreamManager::remove_stream(uint32_t stream_id) noexcept {
-    streams_.erase(stream_id);
+    const int32_t idx = stream_index_.find(stream_id);
+    if (idx < 0) return;
+    stream_index_.erase(stream_id);
+    stream_pool_[static_cast<size_t>(idx)].reset();  // free the stream promptly
+    free_slots_.push_back(static_cast<uint32_t>(idx));
 }
 
 void StreamManager::update_initial_window_size(uint32_t new_size) noexcept {
@@ -406,8 +442,9 @@ void StreamManager::update_initial_window_size(uint32_t new_size) noexcept {
     int32_t diff = static_cast<int32_t>(new_size) - static_cast<int32_t>(initial_window_size_);
 
     // Update all existing streams
-    for (auto& pair : streams_) {
-        Http2Stream& stream = pair.second;
+    for (uint32_t i = stream_index_.next_live(0); i < stream_index_.capacity;
+         i = stream_index_.next_live(i + 1)) {
+        Http2Stream& stream = *stream_pool_[stream_index_.slots[i].value];
 
         // Update send window by difference
         if (diff > 0) {

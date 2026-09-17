@@ -21,6 +21,27 @@ boltapi_add_test(boltapi_util_fuzz_test util_fuzz_test.cpp)
 # have OOB'd the old fixed [16] per-node child array).
 boltapi_add_test(boltapi_router_fanout_test router_fanout_test.cpp)
 
+# G2CHK-85: StreamManager (stream_id -> Http2Stream) off std::unordered_map
+# onto bolt::SwissTableGrowable + a stable-address pool. No prior test touched
+# StreamManager at all; this covers create/get/remove, pointer stability across
+# other-stream churn, slot recycling, and iteration (update_initial_window_size).
+boltapi_add_test(boltapi_http2_stream_manager_test http2_stream_manager_test.cpp)
+
+# G2CHK-85: CorsMiddleware's two unordered_set<string> lookup caches off,
+# replaced with a linear scan over the config vectors it already carries.
+# CorsMiddleware has no prior test (not wired into the live App path -- see
+# src/app.cpp's comment -- so this is new coverage for the preflight logic
+# this change touches, not just the container swap).
+boltapi_add_test(boltapi_cors_middleware_test cors_middleware_test.cpp)
+
+# G2CHK-85: Middleware's middleware_funcs_ off std::unordered_map<Type,
+# function<>> onto a fixed std::array indexed by static_cast<size_t>(Type).
+# Also dead code today (see cors_middleware_test.cpp's note); this drives
+# process_request()'s array read/write + short-circuit behavior directly via
+# add_middleware() probes rather than the fragile legacy rate-limit/auth/
+# CORS bodies.
+boltapi_add_test(boltapi_middleware_dispatch_test middleware_dispatch_test.cpp)
+
 # M1: App facade integration test — spins a real App on an ephemeral cleartext
 # HTTP/1.1 port and drives it with a raw client socket + http_fuzz inputs.
 boltapi_add_test(boltapi_app_integration_test app_integration_test.cpp)

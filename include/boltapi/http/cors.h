@@ -17,7 +17,6 @@
 #include "boltapi/http/http1_connection.h"
 #include <string>
 #include <string_view>
-#include <unordered_set>
 #include <unordered_map>
 #include <vector>
 #include <regex>
@@ -237,24 +236,18 @@ public:
 
 private:
     CorsConfig config_;
-    std::unordered_set<std::string> allowed_methods_set_;
-    std::unordered_set<std::string> allowed_headers_set_;  // Lowercase
     bool allow_all_origins_{false};
 
     /**
-     * Build lookup sets from config vectors
+     * Compute derived config flags. allowed_methods/allowed_headers used to be
+     * copied into std::unordered_set members here; for the handful of entries
+     * a real config carries (~5 methods, ~5-10 headers), that bought nothing
+     * but a heap alloc per entry -- is_cors_method_allowed/are_headers_allowed
+     * below now scan config_.allowed_methods/allowed_headers directly, the
+     * same linear-scan-over-a-small-vector shape is_origin_allowed already
+     * used for config_.allowed_origins.
      */
     void build_sets() {
-        allowed_methods_set_.clear();
-        for (const auto& method : config_.allowed_methods) {
-            allowed_methods_set_.insert(method);
-        }
-
-        allowed_headers_set_.clear();
-        for (const auto& header : config_.allowed_headers) {
-            allowed_headers_set_.insert(to_lowercase(header));
-        }
-
         // Check for wildcard origin
         allow_all_origins_ = false;
         for (const auto& origin : config_.allowed_origins) {
@@ -316,7 +309,7 @@ private:
 
         // Check requested method
         std::string request_method = get_header_value(headers, "Access-Control-Request-Method");
-        if (!request_method.empty() && allowed_methods_set_.find(request_method) == allowed_methods_set_.end()) {
+        if (!request_method.empty() && !is_method_allowed(request_method)) {
             result.allowed = false;
             return result;
         }
@@ -332,6 +325,28 @@ private:
         add_preflight_headers(result, origin);
 
         return result;
+    }
+
+    /**
+     * Linear scan over config_.allowed_methods (exact match). Small,
+     * config-time list -- see build_sets()'s comment on why this beats a set.
+     */
+    bool is_method_allowed(const std::string& method) const noexcept {
+        for (const auto& allowed : config_.allowed_methods) {
+            if (allowed == method) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Linear scan over config_.allowed_headers, case-insensitive.
+     */
+    bool is_header_allowed(const std::string& header) const noexcept {
+        std::string lname = to_lowercase(header);
+        for (const auto& allowed : config_.allowed_headers) {
+            if (to_lowercase(allowed) == lname) return true;
+        }
+        return false;
     }
 
     /**
@@ -360,7 +375,7 @@ private:
             }
 
             // Check if allowed (case-insensitive)
-            if (!header.empty() && allowed_headers_set_.find(to_lowercase(header)) == allowed_headers_set_.end()) {
+            if (!header.empty() && !is_header_allowed(header)) {
                 return false;
             }
 
