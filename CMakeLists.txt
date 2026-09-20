@@ -44,6 +44,10 @@ option(BOLTAPI_WITH_WEBRTC  "Enable WebRTC seam (scaffold)"     OFF)
 # our columnar core -- the two just share a word. OPTIONAL and default OFF: a
 # default configure compiles no Neo4j-Bolt TU and pays nothing.
 option(BOLTAPI_WITH_NEO4J_BOLT "Enable the Neo4j Bolt client wire protocol" OFF)
+# PostgreSQL frontend/backend wire protocol (G2ETL-35). Simple-query protocol
+# only in v1 (see include/boltapi/proto/postgres_wire.h). OPTIONAL and default
+# OFF, same rationale as BOLTAPI_WITH_NEO4J_BOLT above.
+option(BOLTAPI_WITH_PG_WIRE "Enable the PostgreSQL wire protocol (v3, simple query)" OFF)
 option(BOLTAPI_USE_BOLT_ARENA "Use bolt::Arena for request buffers" OFF) # risk-gated
 
 # DELETED (2026-08-17), all four were declared and then never referenced again
@@ -326,6 +330,23 @@ if(BOLTAPI_WITH_NEO4J_BOLT)
 endif()
 
 # ---------------------------------------------------------------------------
+# PostgreSQL frontend/backend wire protocol (G2ETL-35, same recipe as above).
+#
+# Raw TCP with its own startup handshake and length-prefixed message framing,
+# so it does NOT ride the HTTP router -- self-contained listener + worker
+# threads (no ProtocolRegistry coupling needed: it is driven directly by a
+# host the way neo4j_bolt.cpp drives Neo4jBoltProtocol). The define is PUBLIC
+# so proto/postgres_wire.h consumers compile against the same flag value the
+# library was built with.
+# ---------------------------------------------------------------------------
+if(BOLTAPI_WITH_PG_WIRE)
+    target_sources(boltapi PRIVATE
+        src/proto/postgres_wire_server.cpp)
+    target_compile_definitions(boltapi PUBLIC BOLTAPI_WITH_PG_WIRE=1)
+    message(STATUS "Bolt API Postgres-wire protocol: ENABLED (v3 startup + simple query)")
+endif()
+
+# ---------------------------------------------------------------------------
 # Bolt-native request body arena (risk-gated, opt-in). When ON, the request
 # body buffer is backed by a thread-local bolt::Arena (bump allocator, reset
 # per request) instead of the default slot-pool. PUBLIC so headers compiled in
@@ -537,4 +558,4 @@ endif()
 
 endif()  # BOLTAPI_INSTALL
 
-message(STATUS "Bolt API ${PROJECT_VERSION}: tests=${BOLTAPI_BUILD_TESTS} examples=${BOLTAPI_BUILD_EXAMPLES} benchmarks=${BOLTAPI_BUILD_BENCHMARKS} sanitize=${BOLTAPI_SANITIZE} install=${BOLTAPI_INSTALL} gzip=${BOLTAPI_HAVE_GZIP} http3=${BOLTAPI_WITH_HTTP3} webrtc=${BOLTAPI_WITH_WEBRTC} neo4j_bolt=${BOLTAPI_WITH_NEO4J_BOLT}")
+message(STATUS "Bolt API ${PROJECT_VERSION}: tests=${BOLTAPI_BUILD_TESTS} examples=${BOLTAPI_BUILD_EXAMPLES} benchmarks=${BOLTAPI_BUILD_BENCHMARKS} sanitize=${BOLTAPI_SANITIZE} install=${BOLTAPI_INSTALL} gzip=${BOLTAPI_HAVE_GZIP} http3=${BOLTAPI_WITH_HTTP3} webrtc=${BOLTAPI_WITH_WEBRTC} neo4j_bolt=${BOLTAPI_WITH_NEO4J_BOLT} pg_wire=${BOLTAPI_WITH_PG_WIRE}")
