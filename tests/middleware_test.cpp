@@ -140,14 +140,14 @@ TEST(Middleware, ChainOrderOnion) {
     api::App app;
 
     app.use_async([](api::Request&, api::Response& res, api::Next next)
-                      -> core::coro_task<void> {
+                      -> api::chain_task {
         res.raw().headers["X-Trace"] += "mw0-pre;";
         co_await next();
         res.raw().headers["X-Trace"] += "mw0-post;";
         co_return;
     });
     app.use_async([](api::Request&, api::Response& res, api::Next next)
-                      -> core::coro_task<void> {
+                      -> api::chain_task {
         res.raw().headers["X-Trace"] += "mw1-pre;";
         co_await next();
         res.raw().headers["X-Trace"] += "mw1-post;";
@@ -184,7 +184,7 @@ TEST(Middleware, ShortCircuitDeniesHandler) {
     g_handler_calls.store(0);
 
     app.use_async([](api::Request& req, api::Response& res, api::Next next)
-                      -> core::coro_task<void> {
+                      -> api::chain_task {
         if (req.header("X-Token") != "secret") {
             res.status(401).text("denied");
             co_return;  // short-circuit: handler never invoked
@@ -236,7 +236,7 @@ TEST(Middleware, SyncAndAsyncMix) {
 
     // Async middleware.
     app.use_async([](api::Request&, api::Response& res, api::Next next)
-                      -> core::coro_task<void> {
+                      -> api::chain_task {
         res.raw().headers["X-Mix"] += "async;";
         co_await next();
         co_return;

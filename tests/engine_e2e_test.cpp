@@ -104,7 +104,7 @@ int main() {
 
     CoroUnifiedServer server(config);
 
-    server.set_handler([](const CoroHttpRequest& req) -> core::coro_task<CoroHttpResponse> {
+    server.set_handler([](const CoroHttpRequest& req) -> bolt::api::http::dispatch_task<CoroHttpResponse> {
         CoroHttpResponse resp;
         resp.status = 200;
         resp.status_message = "OK";
