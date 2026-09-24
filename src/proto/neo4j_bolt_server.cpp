@@ -665,6 +665,7 @@ Neo4jBoltProtocol::Neo4jBoltProtocol(const Config& cfg, IExecutorFactory& factor
     : cfg_(cfg), factory_(factory), auth_(auth) {
     assert(cfg_.max_connections > 0);
     assert(cfg_.message_buffer_bytes > 0 && cfg_.write_buffer_bytes > 0);
+    assert(cfg_.worker_stack_bytes >= 256u * 1024u);
 }
 
 Neo4jBoltProtocol::~Neo4jBoltProtocol() { stop(); }
@@ -725,7 +726,8 @@ Status Neo4jBoltProtocol::serve(transport::ITransport& source) {
         IQueryExecutor* e = factory_.create();
         if (e == nullptr) break;
         execs.push_back(e);
-        workers_.emplace_back([this, k, e]() noexcept { worker_loop(*bound_, *e, k); });
+        workers_.emplace_back(cfg_.worker_stack_bytes,
+                              [this, k, e]() noexcept { worker_loop(*bound_, *e, k); });
     }
     if (execs.empty()) {
         running_.store(false, std::memory_order_release);

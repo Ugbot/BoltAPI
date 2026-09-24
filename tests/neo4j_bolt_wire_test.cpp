@@ -525,3 +525,114 @@ TEST(BoltProtocolSeam, RegistersIntoTheProtocolRegistry) {
     EXPECT_TRUE(p->serve(other).is_err());
     other.stop();
 }
+
+namespace {
+
+// Recurses through ~4 MiB of real stack frames, the shape of a host running a
+// whole recursive Cypher compile on the worker. Far past the 512 KiB macOS
+// secondary-thread default, well inside Config::worker_stack_bytes.
+constexpr std::uint32_t kDeepFrameBytes = 16u * 1024u;
+constexpr std::uint32_t kDeepFrames     = 256u;
+
+// Opaque stride: the compiler cannot shrink the frame to the bytes it sees.
+volatile std::uint32_t g_deep_stride = 512u;
+
+[[gnu::noinline]] std::uint32_t deep_recurse(std::uint32_t depth) noexcept {
+    volatile std::uint8_t frame[kDeepFrameBytes];
+    const std::uint32_t stride = g_deep_stride;
+    for (std::uint32_t k = 0; k < kDeepFrameBytes; k += stride) {
+        frame[k] = static_cast<std::uint8_t>(depth + k);
+    }
+    if (depth == 0) return frame[0];
+    return deep_recurse(depth - 1) + frame[kDeepFrameBytes - stride];
+}
+
+class DeepExecutor final : public nb::IQueryExecutor {
+public:
+    bool begin_query(std::string_view cypher, const ps::PackValue& params,
+                     std::string_view* out_fields, std::uint32_t fields_cap,
+                     std::uint32_t& out_field_count,
+                     nb::QueryFailure& out_failure) noexcept override {
+        (void)deep_recurse(kDeepFrames);
+        return inner_.begin_query(cypher, params, out_fields, fields_cap,
+                                  out_field_count, out_failure);
+    }
+    bool pull(std::int64_t n, nb::IRecordSink& sink, bool& out_has_more,
+              nb::QueryFailure& out_failure) noexcept override {
+        return inner_.pull(n, sink, out_has_more, out_failure);
+    }
+    void discard() noexcept override { inner_.discard(); }
+
+private:
+    boltapi_test::EchoExecutor inner_;
+};
+
+class DeepFactory final : public nb::IExecutorFactory {
+public:
+    nb::IQueryExecutor* create() noexcept override { return new DeepExecutor(); }
+    void destroy(nb::IQueryExecutor* e) noexcept override { delete e; }
+};
+
+}  // namespace
+
+TEST(BoltWorkerStack, DefaultIsTheExplicitRequestThreadStack) {
+    const nb::Config cfg;
+    EXPECT_EQ(cfg.worker_stack_bytes, bolt::api::core::kDefaultStackBytes);
+    EXPECT_GE(cfg.worker_stack_bytes, 8u * 1024u * 1024u);
+}
+
+// G2GRAPH-264: workers were bare std::thread, so a deep compile on a worker
+// took the whole process down on macOS with no diagnostic.
+TEST(BoltWorkerStack, DeepRecursiveQuerySurvivesOnAWorker) {
+    DeepFactory factory;
+    nb::Config cfg;
+    cfg.bind.host = "127.0.0.1";
+    cfg.bind.port = 0;
+    cfg.max_connections = 1;
+    cfg.message_buffer_bytes = 64 * 1024;
+    cfg.write_buffer_bytes = 64 * 1024;
+    cfg.accept_poll_ms = 25;
+    cfg.idle_timeout_ms = 5000;
+    nb::Neo4jBoltProtocol proto(cfg, factory);
+    ASSERT_TRUE(proto.start_background().is_ok());
+    ASSERT_NE(proto.local_port(), 0);
+
+    WireClient c;
+    ASSERT_TRUE(c.connect(proto.local_port()));
+    const std::uint8_t proposals[16] = {0x00, 0x00, 0x01, 0xFF, 0x00, 0x08, 0x08, 0x05,
+                                        0x00, 0x02, 0x04, 0x04, 0x00, 0x00, 0x00, 0x03};
+    const nb::Version v = c.handshake(proposals);
+    ASSERT_TRUE(v.valid());
+    Msg hello;
+    (void)hello.w.begin_struct(static_cast<std::uint8_t>(nb::Signature::Hello), 1);
+    (void)hello.w.begin_dict(1);
+    (void)hello.w.put_string("user_agent");
+    (void)hello.w.put_string("boltapi-wire-test/1.0");
+    ASSERT_TRUE(hello.send(c));
+    Reply hr;
+    ASSERT_TRUE(hr.read(c));
+    ASSERT_EQ(hr.signature(), nb::Signature::Success);
+    if (v.has_logon()) {
+        Msg logon;
+        (void)logon.w.begin_struct(static_cast<std::uint8_t>(nb::Signature::Logon), 1);
+        (void)logon.w.begin_dict(1);
+        (void)logon.w.put_string("scheme");
+        (void)logon.w.put_string("none");
+        ASSERT_TRUE(logon.send(c));
+        Reply lr;
+        ASSERT_TRUE(lr.read(c));
+        ASSERT_EQ(lr.signature(), nb::Signature::Success);
+    }
+
+    Msg run;
+    (void)run.w.begin_struct(static_cast<std::uint8_t>(nb::Signature::Run), 3);
+    (void)run.w.put_string("RETURN 1");
+    (void)run.w.begin_dict(0);
+    (void)run.w.begin_dict(0);
+    ASSERT_TRUE(run.send(c));
+    Reply r;
+    ASSERT_TRUE(r.read(c));
+    EXPECT_EQ(r.signature(), nb::Signature::Success);
+    c.close();
+    proto.stop();
+}
