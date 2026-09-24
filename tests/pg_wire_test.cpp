@@ -436,3 +436,156 @@ TEST_F(PgWire, SetIsAnsweredByTheWireLayer) {
     ASSERT_EQ(PgClient::types(r), "EZ");
     EXPECT_EQ(PgClient::sqlstate(r[0]), "0A000");
 }
+
+TEST(PgWireCodec, TransactionCommands) {
+    bool ro = true;
+    pg::CodecError e;
+    EXPECT_EQ(pg::classify_transaction_command("BEGIN", ro, e), pg::TxCommand::Begin);
+    EXPECT_FALSE(ro);
+    EXPECT_EQ(pg::classify_transaction_command("begin read only;", ro, e), pg::TxCommand::Begin);
+    EXPECT_TRUE(ro);
+    EXPECT_EQ(pg::classify_transaction_command(
+                  "START TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE", ro, e),
+              pg::TxCommand::Begin);
+    EXPECT_FALSE(ro);
+    EXPECT_EQ(pg::classify_transaction_command("BEGIN ISOLATION LEVEL SERIALIZABLE", ro, e),
+              pg::TxCommand::Refused);
+    EXPECT_STREQ(e.sqlstate, "0A000");
+    EXPECT_EQ(pg::classify_transaction_command("commit", ro, e), pg::TxCommand::Commit);
+    EXPECT_EQ(pg::classify_transaction_command("END TRANSACTION", ro, e), pg::TxCommand::Commit);
+    EXPECT_EQ(pg::classify_transaction_command("COMMIT AND NO CHAIN", ro, e), pg::TxCommand::Commit);
+    EXPECT_EQ(pg::classify_transaction_command("ROLLBACK WORK", ro, e), pg::TxCommand::Rollback);
+    EXPECT_EQ(pg::classify_transaction_command("abort", ro, e), pg::TxCommand::Rollback);
+    EXPECT_EQ(pg::classify_transaction_command("ROLLBACK TO SAVEPOINT s", ro, e),
+              pg::TxCommand::Refused);
+    EXPECT_EQ(pg::classify_transaction_command("SAVEPOINT s", ro, e), pg::TxCommand::Refused);
+    EXPECT_EQ(pg::classify_transaction_command("COMMIT AND CHAIN", ro, e), pg::TxCommand::Refused);
+    EXPECT_EQ(pg::classify_transaction_command("PREPARE TRANSACTION 'x'", ro, e),
+              pg::TxCommand::Refused);
+    EXPECT_EQ(pg::classify_transaction_command("BEGIN; select 1", ro, e), pg::TxCommand::None);
+    EXPECT_EQ(pg::classify_transaction_command("select 1", ro, e), pg::TxCommand::None);
+    EXPECT_EQ(pg::classify_transaction_command("beginning", ro, e), pg::TxCommand::None);
+    EXPECT_EQ(pg::classify_transaction_command("PREPARE p AS select 1", ro, e),
+              pg::TxCommand::None);
+    EXPECT_EQ(pg::classify_transaction_command("COMMIT PREPARED 'x'", ro, e),
+              pg::TxCommand::Refused);
+    EXPECT_EQ(pg::classify_transaction_command("ROLLBACK TO s", ro, e), pg::TxCommand::Refused);
+}
+
+namespace {
+char ready_status(const std::vector<Msg>& r) {
+    return r.empty() || r.back().type != 'Z' || r.back().body.empty() ? '?' : r.back().body[0];
+}
+}  // namespace
+
+TEST_F(PgWire, SimpleQueryTransactionBlock) {
+    c_.msg('Q', std::string("BEGIN\0", 6));
+    auto r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "CZ");
+    EXPECT_EQ(r[0].body, std::string("BEGIN\0", 6));
+    EXPECT_EQ(ready_status(r), 'T');
+    c_.msg('Q', std::string("select 1\0", 9));
+    r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "TDCZ");
+    EXPECT_EQ(ready_status(r), 'T');
+    c_.msg('Q', std::string("COMMIT\0", 7));
+    r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "CZ");
+    EXPECT_EQ(r[0].body, std::string("COMMIT\0", 7));
+    EXPECT_EQ(ready_status(r), 'I');
+    EXPECT_EQ(factory_.last->executes, 1);   // BEGIN/COMMIT never reach the engine
+    c_.msg('Q', std::string("ROLLBACK\0", 9));   // outside a block: warning only
+    r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "NCZ");
+    EXPECT_EQ(PgClient::sqlstate(r[0]), "25P01");
+    EXPECT_EQ(ready_status(r), 'I');
+}
+
+TEST_F(PgWire, FailedBlockRefusesUntilEnd) {
+    c_.msg('Q', std::string("BEGIN\0", 6));
+    (void)c_.roundtrip();
+    c_.msg('Q', std::string("SET search_path = x\0", 20));   // an error, no write
+    auto r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "EZ");
+    EXPECT_EQ(ready_status(r), 'E');
+    c_.msg('Q', std::string("select 1\0", 9));
+    r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "EZ");
+    EXPECT_EQ(PgClient::sqlstate(r[0]), "25P02");
+    EXPECT_EQ(ready_status(r), 'E');
+    c_.msg('Q', std::string("COMMIT\0", 7));   // a failed block commits as ROLLBACK
+    r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "CZ");
+    EXPECT_EQ(r[0].body, std::string("ROLLBACK\0", 9));
+    EXPECT_EQ(ready_status(r), 'I');
+}
+
+TEST_F(PgWire, RollbackAfterWriteSaysNothingWasUndone) {
+    c_.msg('Q', std::string("BEGIN\0", 6));
+    (void)c_.roundtrip();
+    c_.msg('Q', std::string("ddl insert\0", 11));
+    auto r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "CZ");
+    c_.msg('Q', std::string("ROLLBACK\0", 9));
+    r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "EZ");
+    EXPECT_EQ(PgClient::sqlstate(r[0]), "0A000");
+    EXPECT_EQ(ready_status(r), 'I');   // the block is over either way
+    c_.msg('Q', std::string("BEGIN READ ONLY\0", 16));
+    (void)c_.roundtrip();
+    c_.msg('Q', std::string("ddl insert\0", 11));
+    r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "EZ");
+    EXPECT_EQ(PgClient::sqlstate(r[0]), "25006");
+    EXPECT_EQ(factory_.last->executes, 1);   // the read-only refusal never ran it
+    c_.msg('Q', std::string("ROLLBACK\0", 9));
+    r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "CZ");
+    EXPECT_EQ(ready_status(r), 'I');
+}
+
+// pgJDBC with autocommit off and a fetch size: BEGIN rides in the same
+// batch, rows come from a named portal across several Syncs.
+TEST_F(PgWire, ExtendedBeginThenCursorFetchAcrossSyncs) {
+    c_.parse("", "BEGIN");
+    c_.bind("", "", {});
+    c_.execute("");
+    c_.parse("", "select rows");
+    c_.bind("", "", {});
+    c_.execute("");
+    c_.sync();
+    auto r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "12C12DCZ");
+    EXPECT_EQ(r[2].body, std::string("BEGIN\0", 6));
+    EXPECT_EQ(ready_status(r), 'T');
+
+    c_.parse("", "rows 5");
+    c_.bind("C_1", "", {});
+    c_.execute("C_1", 2);
+    c_.sync();
+    r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "12DDsZ");
+    EXPECT_EQ(ready_status(r), 'T');
+    c_.execute("C_1", 2);
+    c_.sync();
+    r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "DDsZ");
+    EXPECT_EQ(PgClient::col0(r[1]), "4");
+    c_.execute("C_1", 2);
+    c_.sync();
+    r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "DCZ");
+
+    c_.parse("", "COMMIT");
+    c_.bind("", "", {});
+    c_.execute("");
+    c_.sync();
+    r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "12CZ");
+    EXPECT_EQ(ready_status(r), 'I');
+    c_.execute("C_1", 2);   // named portals close with the block
+    c_.sync();
+    r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "EZ");
+    EXPECT_EQ(PgClient::sqlstate(r[0]), "34000");
+}

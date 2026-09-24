@@ -52,32 +52,60 @@ std::string_view find_param(const StartupParams& p, std::string_view key) noexce
     return {};
 }
 
+// ErrorResponse + ReadyForQuery, failing an open transaction block.
+void simple_fail(int fd, MsgWriter& w, ExtendedSession& ext, const char* sqlstate,
+                 std::string_view message) noexcept {
+    assert(sqlstate != nullptr);
+    send_error(fd, w, sqlstate, message);
+    ext.tx_on_error();
+    assert(ext.tx_status() != 'T');
+    send_ready_for_query(fd, w, ext.tx_status());
+}
+
+void simple_tag(int fd, MsgWriter& w, ExtendedSession& ext, const char* tag) noexcept {
+    assert(tag != nullptr);
+    w.begin('C');
+    w.put_cstring(tag);
+    if (w.finish() && !w.send(fd)) return;
+    send_ready_for_query(fd, w, ext.tx_status());
+}
+
 // One Simple-Query round trip: RowDescription (if any columns) + DataRow* +
 // CommandComplete, or ErrorResponse on failure — then ALWAYS ReadyForQuery,
 // which is what lets a client keep issuing queries on the same connection
 // after either outcome.
-void handle_simple_query(int fd, MsgWriter& w, IQueryExecutor& exec,
-                         std::string_view sql) noexcept {
+void handle_simple_query(int fd, MsgWriter& w, ExtendedSession& ext,
+                         IQueryExecutor& exec, std::string_view sql) noexcept {
     if (sql.empty()) {
         w.begin('I');
         if (w.finish()) (void)w.send(fd);
-        send_ready_for_query(fd, w);
+        send_ready_for_query(fd, w, ext.tx_status());
         return;
     }
     {
         const char* tag = nullptr;
+        QueryFailure qf;
+        const ExtendedSession::TxStep ts = ext.tx_statement(sql, fd, w, tag, qf);
+        if (ts == ExtendedSession::TxStep::Failed) {
+            simple_fail(fd, w, ext, qf.sqlstate, qf.message);
+            return;
+        }
+        if (ts == ExtendedSession::TxStep::Tagged) {
+            simple_tag(fd, w, ext, tag);
+            return;
+        }
         CodecError ce;
         const SessionCommand sc = classify_session_command(sql, tag, ce);
         if (sc == SessionCommand::Refused) {
-            send_error(fd, w, ce.sqlstate, ce.message);
-            send_ready_for_query(fd, w);
+            simple_fail(fd, w, ext, ce.sqlstate, ce.message);
             return;
         }
         if (sc == SessionCommand::Accepted) {
-            w.begin('C');
-            w.put_cstring(tag);
-            if (w.finish() && !w.send(fd)) return;
-            send_ready_for_query(fd, w);
+            simple_tag(fd, w, ext, tag);
+            return;
+        }
+        if (!ext.tx_admit(sql, qf)) {
+            simple_fail(fd, w, ext, qf.sqlstate, qf.message);
             return;
         }
     }
@@ -86,15 +114,13 @@ void handle_simple_query(int fd, MsgWriter& w, IQueryExecutor& exec,
     QueryFailure failure;
     const bool ok = exec.execute(sql, fields, kMaxFields, field_count, failure);
     if (!ok) {
-        send_error(fd, w, failure.sqlstate, failure.message);
-        send_ready_for_query(fd, w);
+        simple_fail(fd, w, ext, failure.sqlstate, failure.message);
         return;
     }
     if (field_count > 0) {
         if (!put_row_description(w, fields, field_count, nullptr)) {
-            send_error(fd, w, "54000", "result row is too wide for this "
-                       "endpoint's wire buffer");
-            send_ready_for_query(fd, w);
+            simple_fail(fd, w, ext, "54000", "result row is too wide for this "
+                        "endpoint's wire buffer");
             return;
         }
         if (!w.send(fd)) return;
@@ -112,10 +138,9 @@ void handle_simple_query(int fd, MsgWriter& w, IQueryExecutor& exec,
                 w.put_bytes(values[c].data(), values[c].size());
             }
             if (!w.finish()) {
-                send_error(fd, w, "54000",
-                          "a result row exceeded this endpoint's wire buffer "
-                          "and was refused rather than sent truncated");
-                send_ready_for_query(fd, w);
+                simple_fail(fd, w, ext, "54000",
+                            "a result row exceeded this endpoint's wire buffer "
+                            "and was refused rather than sent truncated");
                 return;
             }
             if (!w.send(fd)) return;
@@ -128,7 +153,7 @@ void handle_simple_query(int fd, MsgWriter& w, IQueryExecutor& exec,
     if (w.finish()) {
         if (!w.send(fd)) return;
     }
-    send_ready_for_query(fd, w);
+    send_ready_for_query(fd, w, ext.tx_status());
 }
 
 }  // namespace
@@ -362,7 +387,7 @@ void Protocol::worker_loop(IQueryExecutor& exec, std::uint16_t worker_id) noexce
                     conn_seq_.load(std::memory_order_relaxed)));       // fabricated secret
                 if (w.finish()) (void)w.send(fd);
 
-                send_ready_for_query(fd, w);
+                send_ready_for_query(fd, w, 'I');
 
                 // Simple-Query loop, until Terminate/error/idle-timeout.
                 bool alive = true;
@@ -386,7 +411,7 @@ void Protocol::worker_loop(IQueryExecutor& exec, std::uint16_t worker_id) noexce
                                 reinterpret_cast<const char*>(in.data()),
                                 plen > 0 && in[plen - 1] == 0 ? plen - 1 : plen);
                             ext.on_simple_query();
-                            handle_simple_query(fd, w, exec, sql);
+                            handle_simple_query(fd, w, ext, exec, sql);
                             break;
                         }
                         case 'X':   // Terminate

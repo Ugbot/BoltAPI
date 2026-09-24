@@ -701,6 +701,159 @@ SessionCommand classify_session_command(std::string_view sql, const char*& tag,
     return SessionCommand::Refused;
 }
 
+namespace {
+
+constexpr std::uint32_t kMaxTxWords = 16;
+
+// Words of a transaction-control statement: identifier runs separated by
+// whitespace/commas. Any other character makes the statement unparseable
+// here (`bad`), so it is never mistaken for transaction control.
+struct TxWords {
+    std::string_view w[kMaxTxWords];
+    std::uint32_t    n   = 0;
+    bool             bad = false;
+};
+
+// Words before the first such character are kept (two-phase commands
+// carry a quoted gid).
+TxWords split_tx_words(std::string_view s) noexcept {
+    TxWords out;
+    std::size_t i = 0;
+    while (i < s.size()) {                                  // bounded by s.size()
+        const char c = s[i];
+        if (is_space(c) || c == ',') { ++i; continue; }
+        if (!is_ident_char(c) || c == '$') { out.bad = true; return out; }
+        const std::size_t start = i;
+        while (i < s.size() && is_ident_char(s[i]) && s[i] != '$') ++i;
+        if (out.n == kMaxTxWords) { out.bad = true; return out; }
+        out.w[out.n++] = s.substr(start, i - start);
+    }
+    assert(out.n <= kMaxTxWords);
+    return out;
+}
+
+TxCommand tx_refuse(CodecError& err, const char* sqlstate, const char* msg) noexcept {
+    err.sqlstate = sqlstate;
+    err.message  = msg;
+    return TxCommand::Refused;
+}
+
+// Transaction modes after BEGIN / START TRANSACTION, from word `k`.
+TxCommand parse_tx_modes(const TxWords& t, std::uint32_t k, bool& read_only,
+                         CodecError& err) noexcept {
+    assert(k <= t.n);
+    while (k < t.n) {                                       // bounded by kMaxTxWords
+        const std::string_view a = t.w[k];
+        const std::string_view b = k + 1 < t.n ? t.w[k + 1] : std::string_view{};
+        if (ieq(a, "READ") && (ieq(b, "ONLY") || ieq(b, "WRITE"))) {
+            read_only = ieq(b, "ONLY");
+            k += 2;
+        } else if (ieq(a, "DEFERRABLE")) {
+            k += 1;
+        } else if (ieq(a, "NOT") && ieq(b, "DEFERRABLE")) {
+            k += 2;
+        } else if (ieq(a, "ISOLATION") && ieq(b, "LEVEL") && k + 2 < t.n) {
+            const std::string_view l1 = t.w[k + 2];
+            const std::string_view l2 = k + 3 < t.n ? t.w[k + 3] : std::string_view{};
+            if (ieq(l1, "READ") && (ieq(l2, "COMMITTED") || ieq(l2, "UNCOMMITTED"))) {
+                k += 4;
+            } else if (ieq(l1, "SERIALIZABLE") || (ieq(l1, "REPEATABLE") && ieq(l2, "READ"))) {
+                return tx_refuse(err, "0A000", "REPEATABLE READ / SERIALIZABLE "
+                                 "isolation is not available: this endpoint has no "
+                                 "transactions, each statement reads current data");
+            } else {
+                return tx_refuse(err, "42601", "unrecognized isolation level");
+            }
+        } else {
+            return tx_refuse(err, "42601", "unrecognized transaction mode");
+        }
+    }
+    return TxCommand::Begin;
+}
+
+// Tail of COMMIT/END/ROLLBACK/ABORT from word `k`: [WORK|TRANSACTION]
+// [AND NO CHAIN].
+TxCommand parse_tx_end(const TxWords& t, std::uint32_t k, TxCommand cmd,
+                       CodecError& err) noexcept {
+    assert(cmd == TxCommand::Commit || cmd == TxCommand::Rollback);
+    if (k < t.n && (ieq(t.w[k], "WORK") || ieq(t.w[k], "TRANSACTION"))) ++k;
+    if (k + 3 == t.n && ieq(t.w[k], "AND") && ieq(t.w[k + 1], "NO") &&
+        ieq(t.w[k + 2], "CHAIN")) {
+        k += 3;
+    }
+    if (k + 2 == t.n && ieq(t.w[k], "AND") && ieq(t.w[k + 1], "CHAIN")) {
+        return tx_refuse(err, "0A000", "AND CHAIN is not supported");
+    }
+    if (k < t.n && ieq(t.w[k], "TO")) {
+        return tx_refuse(err, "0A000", "savepoints are not supported");
+    }
+    if (k != t.n) return tx_refuse(err, "42601", "unexpected words after transaction command");
+    return cmd;
+}
+
+bool ieq_prefix(std::string_view s, std::size_t at, const char* kw) noexcept {
+    const std::size_t n = std::strlen(kw);
+    if (at + n > s.size()) return false;
+    if (!ieq(s.substr(at, n), kw)) return false;
+    return at + n == s.size() || !is_ident_char(s[at + n]);
+}
+
+}  // namespace
+
+TxCommand classify_transaction_command(std::string_view sql, bool& read_only,
+                                       CodecError& err) noexcept {
+    read_only = false;
+    const TxWords t = split_tx_words(trim(sql));
+    if (t.n == 0) return TxCommand::None;
+    const std::string_view v = t.w[0];
+    if (t.n >= 2 && ((ieq(v, "PREPARE") && ieq(t.w[1], "TRANSACTION")) ||
+                     ((ieq(v, "COMMIT") || ieq(v, "ROLLBACK")) && ieq(t.w[1], "PREPARED")))) {
+        return tx_refuse(err, "0A000", "two-phase commit is not supported");
+    }
+    if (t.bad) return TxCommand::None;
+    if (ieq(v, "BEGIN")) {
+        std::uint32_t k = 1;
+        if (k < t.n && (ieq(t.w[k], "WORK") || ieq(t.w[k], "TRANSACTION"))) ++k;
+        return parse_tx_modes(t, k, read_only, err);
+    }
+    if (ieq(v, "START")) {
+        if (t.n < 2 || !ieq(t.w[1], "TRANSACTION")) return TxCommand::None;
+        return parse_tx_modes(t, 2, read_only, err);
+    }
+    if (ieq(v, "COMMIT") || ieq(v, "END")) return parse_tx_end(t, 1, TxCommand::Commit, err);
+    if (ieq(v, "ROLLBACK") || ieq(v, "ABORT")) {
+        return parse_tx_end(t, 1, TxCommand::Rollback, err);
+    }
+    if (ieq(v, "SAVEPOINT") || (ieq(v, "RELEASE") && t.n >= 2)) {
+        return tx_refuse(err, "0A000", "savepoints are not supported");
+    }
+    return TxCommand::None;
+}
+
+bool is_query_shaped(std::string_view sql) noexcept {
+    std::size_t i = 0;
+    while (i < sql.size()) {                                // bounded by sql.size()
+        const char c = sql[i];
+        if (is_space(c) || c == '(') { ++i; continue; }
+        if (c == '-' && i + 1 < sql.size() && sql[i + 1] == '-') {
+            while (i < sql.size() && sql[i] != '\n') ++i;
+            continue;
+        }
+        if (c == '/' && i + 1 < sql.size() && sql[i + 1] == '*') {
+            const std::size_t e = sql.find("*/", i + 2);
+            i = e == std::string_view::npos ? sql.size() : e + 2;
+            continue;
+        }
+        break;
+    }
+    static constexpr const char* kReads[] = {"SELECT", "WITH", "VALUES", "TABLE",
+                                             "SHOW", "EXPLAIN"};
+    for (const char* kw : kReads) {
+        if (ieq_prefix(sql, i, kw)) return true;
+    }
+    return false;
+}
+
 std::uint32_t max_param_ref(std::string_view sql) noexcept {
     std::uint32_t mx = 0;
     (void)scan_placeholders(

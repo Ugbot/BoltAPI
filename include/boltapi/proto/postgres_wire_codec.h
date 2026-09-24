@@ -92,6 +92,26 @@ enum class SessionCommand : std::uint8_t {
 SessionCommand classify_session_command(std::string_view sql, const char*& tag,
                                         CodecError& err) noexcept;
 
+// Transaction-control statements. There are no transactions behind this
+// wire layer (every statement is applied when it runs), so it answers these
+// itself and tracks only the block status clients read from ReadyForQuery.
+enum class TxCommand : std::uint8_t {
+    None     = 0,   // not transaction control: hand it on
+    Begin    = 1,   // BEGIN / START TRANSACTION [modes]
+    Commit   = 2,   // COMMIT / END
+    Rollback = 3,   // ROLLBACK / ABORT
+    Refused  = 4,   // savepoints, two-phase, chaining, strict isolation
+};
+
+// Classify `sql`. `read_only` receives READ ONLY for Begin.
+TxCommand classify_transaction_command(std::string_view sql, bool& read_only,
+                                       CodecError& err) noexcept;
+
+// Does the statement read (SELECT/WITH/VALUES/TABLE/SHOW/EXPLAIN, after
+// leading whitespace, comments and parentheses)? Anything else is treated
+// as a write.
+bool is_query_shaped(std::string_view sql) noexcept;
+
 // Largest `$n` referenced outside literals/comments (0 if none) — used to
 // infer the parameter count when Parse declares fewer types than it uses.
 std::uint32_t max_param_ref(std::string_view sql) noexcept;
