@@ -13,6 +13,7 @@
 #include "boltapi/http/hpack.h"
 #include "boltapi/net/sys_compat.h"
 #include "boltapi/proto/flight_sql_codec.h"
+#include "boltapi/proto/flight_sql_metadata.h"
 
 #include <bolt/api/core/stacked_thread.h>
 
@@ -74,8 +75,12 @@ constexpr std::string_view kServicePrefix = "/arrow.flight.protocol.FlightServic
 
 enum class Method : std::uint8_t {
     kUnknown, kHandshake, kListFlights, kGetFlightInfo, kGetSchema, kDoGet,
-    kListActions,
+    kListActions, kDoAction,
 };
+
+constexpr std::string_view kSqlPkg = "arrow.flight.protocol.sql.";
+// A prepared-statement handle is the statement behind this prefix.
+constexpr std::string_view kHandleMagic = "boltapi-fsql-ps1:";
 
 Method method_for(std::string_view path) noexcept {
     if (path.substr(0, kServicePrefix.size()) != kServicePrefix) return Method::kUnknown;
@@ -86,6 +91,7 @@ Method method_for(std::string_view path) noexcept {
     if (m == "GetSchema") return Method::kGetSchema;
     if (m == "DoGet") return Method::kDoGet;
     if (m == "ListActions") return Method::kListActions;
+    if (m == "DoAction") return Method::kDoAction;
     return Method::kUnknown;
 }
 
@@ -292,13 +298,19 @@ private:
     // ---- RPCs --------------------------------------------------------------
     void dispatch(Stream& s) noexcept;
     bool authorized(const Stream& s) noexcept;
-    bool statement_from_descriptor(Stream& s, std::string_view msg,
-                                   std::string_view* sql) noexcept;
+    bool command_from_descriptor(Stream& s, std::string_view msg,
+                                 std::string_view* any) noexcept;
+    bool produce(Stream& s, std::string_view any_bytes, bool from_ticket,
+                 std::int64_t* rows, cd::IpcMessage* schema,
+                 std::string* ticket) noexcept;
     bool run_query(Stream& s, std::string_view sql, std::int64_t* rows,
                    cd::IpcMessage* schema) noexcept;
+    bool leading_schema(Stream& s, cd::IpcMessage* schema) noexcept;
     void rpc_get_flight_info(Stream& s, std::string_view msg) noexcept;
     void rpc_get_schema(Stream& s, std::string_view msg) noexcept;
     void rpc_do_get(Stream& s, std::string_view msg) noexcept;
+    void rpc_do_action(Stream& s, std::string_view msg) noexcept;
+    void rpc_list_actions(Stream& s) noexcept;
 
     const Config&            cfg_;
     IQueryExecutor&          exec_;
@@ -328,6 +340,7 @@ private:
     std::string                    ipc_;
     std::string                    msg_;
     std::string                    scratch_;
+    char                           fail_buf_[512] = {};
 };
 
 void Conn::serve(int fd) noexcept {
@@ -690,8 +703,12 @@ void Conn::dispatch(Stream& s) noexcept {
         respond_error(s, GrpcCode::kUnimplemented, m);
         return;
     }
-    if (s.method == Method::kListFlights || s.method == Method::kListActions) {
+    if (s.method == Method::kListFlights) {
         (void)send_trailers(s, GrpcCode::kOk, {}, true);   // empty stream
+        return;
+    }
+    if (s.method == Method::kListActions) {
+        rpc_list_actions(s);
         return;
     }
     std::string_view msg;
@@ -718,14 +735,28 @@ void Conn::dispatch(Stream& s) noexcept {
         case Method::kGetFlightInfo: rpc_get_flight_info(s, msg); return;
         case Method::kGetSchema:     rpc_get_schema(s, msg);      return;
         case Method::kDoGet:         rpc_do_get(s, msg);          return;
+        case Method::kDoAction:      rpc_do_action(s, msg);       return;
         default: break;
     }
     respond_error(s, GrpcCode::kInternal, "unrouted Flight method");
 }
 
-bool Conn::statement_from_descriptor(Stream& s, std::string_view msg,
-                                     std::string_view* sql) noexcept {
+bool is_sql(std::string_view type_name, std::string_view short_name) noexcept {
+    return type_name.size() == kSqlPkg.size() + short_name.size() &&
+           type_name.substr(0, kSqlPkg.size()) == kSqlPkg &&
+           type_name.substr(kSqlPkg.size()) == short_name;
+}
+
+bool handle_sql(std::string_view handle, std::string_view* sql) noexcept {
     assert(sql != nullptr);
+    if (handle.substr(0, kHandleMagic.size()) != kHandleMagic) return false;
+    *sql = handle.substr(kHandleMagic.size());
+    return true;
+}
+
+bool Conn::command_from_descriptor(Stream& s, std::string_view msg,
+                                   std::string_view* any) noexcept {
+    assert(any != nullptr);
     cd::Descriptor d;
     if (!cd::decode_descriptor(msg, &d)) {
         respond_error(s, GrpcCode::kInvalidArgument, "malformed FlightDescriptor");
@@ -736,29 +767,85 @@ bool Conn::statement_from_descriptor(Stream& s, std::string_view msg,
                       "only CMD FlightDescriptors (Flight SQL commands) are supported");
         return false;
     }
+    *any = d.cmd;
+    return true;
+}
+
+// Resolves one Flight SQL command (an Any, from a descriptor or a ticket)
+// into ipc_ plus its leading schema. `ticket` (optional) receives the
+// ticket DoGet needs to reproduce the same stream.
+bool Conn::produce(Stream& s, std::string_view any_bytes, bool from_ticket,
+                   std::int64_t* rows, cd::IpcMessage* schema,
+                   std::string* ticket) noexcept {
+    assert(rows != nullptr && schema != nullptr);
     cd::AnyMsg any;
-    if (!cd::decode_any(d.cmd, &any)) {
+    if (!cd::decode_any(any_bytes, &any)) {
         respond_error(s, GrpcCode::kInvalidArgument,
-                      "FlightDescriptor.cmd is not a google.protobuf.Any");
+                      from_ticket ? "ticket is not a Flight SQL ticket issued by this endpoint"
+                                  : "FlightDescriptor.cmd is not a google.protobuf.Any");
         return false;
     }
-    if (any.type_name != "arrow.flight.protocol.sql.CommandStatementQuery") {
-        char m[256];
+    std::string_view sql;
+    if (is_sql(any.type_name, "CommandStatementQuery")) {
+        std::string_view txn;
+        if (!cd::decode_statement_query(any.value, &sql, &txn)) {
+            respond_error(s, GrpcCode::kInvalidArgument, "malformed CommandStatementQuery");
+            return false;
+        }
+        if (!txn.empty()) {
+            respond_error(s, GrpcCode::kUnimplemented, "transactions are not supported");
+            return false;
+        }
+    } else if (is_sql(any.type_name, "TicketStatementQuery") && from_ticket) {
+        if (!cd::decode_single_bytes(any.value, &sql)) {
+            respond_error(s, GrpcCode::kInvalidArgument, "malformed TicketStatementQuery");
+            return false;
+        }
+    } else if (is_sql(any.type_name, "CommandPreparedStatementQuery")) {
+        std::string_view handle;
+        if (!cd::decode_single_bytes(any.value, &handle) || !handle_sql(handle, &sql)) {
+            respond_error(s, GrpcCode::kInvalidArgument,
+                          "prepared_statement_handle was not issued by this endpoint");
+            return false;
+        }
+    } else {
+        QueryFailure f;
+        switch (metadata::build(any.type_name, any.value, exec_, cfg_, &ipc_, rows, f,
+                                fail_buf_, sizeof(fail_buf_))) {
+            case metadata::Outcome::kOk:
+                if (ticket != nullptr) ticket->assign(any_bytes.data(), any_bytes.size());
+                return leading_schema(s, schema);
+            case metadata::Outcome::kFailed:
+                respond_error(s, f.code, f.message != nullptr ? f.message : "metadata failed");
+                return false;
+            case metadata::Outcome::kNotMetadata:
+                break;
+        }
         const std::string_view name = any.type_name.substr(0, 160);
-        std::snprintf(m, sizeof(m),
-                      "Flight SQL command %.*s is not supported yet; this endpoint "
-                      "serves CommandStatementQuery only",
+        std::snprintf(fail_buf_, sizeof(fail_buf_),
+                      "Flight SQL command %.*s is not supported by this endpoint",
                       static_cast<int>(name.size()), name.data());
-        respond_error(s, GrpcCode::kUnimplemented, m);
+        respond_error(s, GrpcCode::kUnimplemented, fail_buf_);
         return false;
     }
-    std::string_view txn;
-    if (!cd::decode_statement_query(any.value, sql, &txn)) {
-        respond_error(s, GrpcCode::kInvalidArgument, "malformed CommandStatementQuery");
-        return false;
+    if (!run_query(s, sql, rows, schema)) return false;
+    if (ticket != nullptr) {
+        std::string handle;
+        cd::pb_put_bytes(&handle, 1, sql);
+        ticket->clear();
+        cd::encode_any(ticket, "TicketStatementQuery", handle);
     }
-    if (!txn.empty()) {
-        respond_error(s, GrpcCode::kUnimplemented, "transactions are not supported");
+    return true;
+}
+
+bool Conn::leading_schema(Stream& s, cd::IpcMessage* schema) noexcept {
+    assert(schema != nullptr);
+    std::size_t pos = 0;
+    bool bad = false;
+    if (!cd::ipc_next_message(ipc_, &pos, schema, &bad) ||
+        schema->header_type != cd::kIpcHeaderSchema) {
+        respond_error(s, GrpcCode::kInternal,
+                      "result is an Arrow IPC stream without a leading schema");
         return false;
     }
     return true;
@@ -782,28 +869,16 @@ bool Conn::run_query(Stream& s, std::string_view sql, std::int64_t* rows,
         respond_error(s, f.code, f.message != nullptr ? f.message : "query failed");
         return false;
     }
-    std::size_t pos = 0;
-    bool bad = false;
-    if (!cd::ipc_next_message(ipc_, &pos, schema, &bad) ||
-        schema->header_type != cd::kIpcHeaderSchema) {
-        respond_error(s, GrpcCode::kInternal,
-                      "executor produced an Arrow IPC stream without a leading schema");
-        return false;
-    }
-    return true;
+    return leading_schema(s, schema);
 }
 
 void Conn::rpc_get_flight_info(Stream& s, std::string_view msg) noexcept {
-    std::string_view sql;
-    if (!statement_from_descriptor(s, msg, &sql)) return;
+    std::string_view cmd;
+    if (!command_from_descriptor(s, msg, &cmd)) return;
     std::int64_t rows = 0;
     cd::IpcMessage schema;
-    if (!run_query(s, sql, &rows, &schema)) return;
-    // The ticket carries the statement itself; see flight_sql.h SCOPE.
-    std::string handle;
-    cd::pb_put_bytes(&handle, 1, sql);
     std::string ticket;
-    cd::encode_any(&ticket, "TicketStatementQuery", handle);
+    if (!produce(s, cmd, false, &rows, &schema, &ticket)) return;
     msg_.clear();
     cd::encode_flight_info(&msg_, schema.encapsulated, msg, ticket, rows);
     if (!send_response_headers(s) || !send_message(s, msg_)) return;
@@ -811,11 +886,11 @@ void Conn::rpc_get_flight_info(Stream& s, std::string_view msg) noexcept {
 }
 
 void Conn::rpc_get_schema(Stream& s, std::string_view msg) noexcept {
-    std::string_view sql;
-    if (!statement_from_descriptor(s, msg, &sql)) return;
+    std::string_view cmd;
+    if (!command_from_descriptor(s, msg, &cmd)) return;
     std::int64_t rows = 0;
     cd::IpcMessage schema;
-    if (!run_query(s, sql, &rows, &schema)) return;
+    if (!produce(s, cmd, false, &rows, &schema, nullptr)) return;
     msg_.clear();
     cd::pb_put_bytes(&msg_, 1, schema.encapsulated);
     if (!send_response_headers(s) || !send_message(s, msg_)) return;
@@ -824,20 +899,15 @@ void Conn::rpc_get_schema(Stream& s, std::string_view msg) noexcept {
 
 void Conn::rpc_do_get(Stream& s, std::string_view msg) noexcept {
     std::string_view ticket;
-    cd::AnyMsg any;
-    std::string_view sql;
-    if (!cd::decode_single_bytes(msg, &ticket) || !cd::decode_any(ticket, &any) ||
-        any.type_name != "arrow.flight.protocol.sql.TicketStatementQuery" ||
-        !cd::decode_single_bytes(any.value, &sql)) {
-        respond_error(s, GrpcCode::kInvalidArgument,
-                      "ticket is not a TicketStatementQuery issued by this endpoint");
+    if (!cd::decode_single_bytes(msg, &ticket)) {
+        respond_error(s, GrpcCode::kInvalidArgument, "malformed Ticket");
         return;
     }
     std::int64_t rows = 0;
     cd::IpcMessage m;
-    if (!run_query(s, sql, &rows, &m)) return;
+    if (!produce(s, ticket, true, &rows, &m, nullptr)) return;
     if (!send_response_headers(s)) return;
-    // ipc_ stays untouched while streaming: run_query is not re-entered.
+    // ipc_ stays untouched while streaming: produce is not re-entered.
     std::size_t pos = 0;
     bool bad = false;
     for (std::size_t i = 0; i < kMaxIpcMessages; ++i) {
@@ -849,6 +919,90 @@ void Conn::rpc_do_get(Stream& s, std::string_view msg) noexcept {
     if (bad) {
         (void)send_trailers(s, GrpcCode::kInternal, "malformed Arrow IPC stream", false);
         return;
+    }
+    (void)send_trailers(s, GrpcCode::kOk, {}, false);
+}
+
+// Action{type=1, body=2}; the Flight SQL action bodies are Any-wrapped.
+void Conn::rpc_do_action(Stream& s, std::string_view msg) noexcept {
+    std::string_view type;
+    std::string_view body;
+    cd::PbReader r(msg);
+    cd::PbField f;
+    for (std::size_t guard = 0; guard < 64 && r.next(&f); ++guard) {
+        if (f.number == 1 && f.wire == cd::kWireBytes) type = f.bytes;
+        else if (f.number == 2 && f.wire == cd::kWireBytes) body = f.bytes;
+    }
+    if (!r.ok()) {
+        respond_error(s, GrpcCode::kInvalidArgument, "malformed Action");
+        return;
+    }
+    cd::AnyMsg any;
+    const bool have_any = cd::decode_any(body, &any);
+    if (type == "CreatePreparedStatement") {
+        std::string_view sql;
+        std::string_view txn;
+        if (!have_any || !is_sql(any.type_name, "ActionCreatePreparedStatementRequest") ||
+            !cd::decode_statement_query(any.value, &sql, &txn)) {
+            respond_error(s, GrpcCode::kInvalidArgument,
+                          "CreatePreparedStatement body is not an "
+                          "Any<ActionCreatePreparedStatementRequest>");
+            return;
+        }
+        if (!txn.empty()) {
+            respond_error(s, GrpcCode::kUnimplemented, "transactions are not supported");
+            return;
+        }
+        std::int64_t rows = 0;
+        cd::IpcMessage schema;
+        if (!run_query(s, sql, &rows, &schema)) return;
+        std::string handle(kHandleMagic);
+        handle.append(sql.data(), sql.size());
+        std::string result;
+        cd::pb_put_bytes(&result, 1, handle);
+        cd::pb_put_bytes(&result, 2, schema.encapsulated);
+        std::string wrapped;
+        cd::encode_any(&wrapped, "ActionCreatePreparedStatementResult", result);
+        msg_.clear();
+        cd::pb_put_bytes(&msg_, 1, wrapped);   // Result{body}
+        if (!send_response_headers(s) || !send_message(s, msg_)) return;
+        (void)send_trailers(s, GrpcCode::kOk, {}, false);
+        return;
+    }
+    if (type == "ClosePreparedStatement") {
+        std::string_view handle;
+        std::string_view sql;
+        if (!have_any || !is_sql(any.type_name, "ActionClosePreparedStatementRequest") ||
+            !cd::decode_single_bytes(any.value, &handle) || !handle_sql(handle, &sql)) {
+            respond_error(s, GrpcCode::kInvalidArgument,
+                          "ClosePreparedStatement: handle was not issued by this endpoint");
+            return;
+        }
+        (void)send_trailers(s, GrpcCode::kOk, {}, true);   // stateless: nothing to free
+        return;
+    }
+    const std::string_view name = type.substr(0, 160);
+    std::snprintf(fail_buf_, sizeof(fail_buf_),
+                  "Flight action %.*s is not supported by this endpoint",
+                  static_cast<int>(name.size()), name.data());
+    respond_error(s, GrpcCode::kUnimplemented, fail_buf_);
+}
+
+void Conn::rpc_list_actions(Stream& s) noexcept {
+    static constexpr std::string_view kActions[2][2] = {
+        {"CreatePreparedStatement",
+         "Creates a prepared statement (no parameters). Request: "
+         "Any<ActionCreatePreparedStatementRequest>"},
+        {"ClosePreparedStatement",
+         "Closes a prepared statement handle. Request: "
+         "Any<ActionClosePreparedStatementRequest>"},
+    };
+    if (!send_response_headers(s)) return;
+    for (const auto& a : kActions) {
+        msg_.clear();
+        cd::pb_put_bytes(&msg_, 1, a[0]);
+        cd::pb_put_bytes(&msg_, 2, a[1]);
+        if (!send_message(s, msg_)) return;
     }
     (void)send_trailers(s, GrpcCode::kOk, {}, false);
 }

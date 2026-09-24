@@ -24,29 +24,48 @@
 //     is refused with UNIMPLEMENTED).
 //   - protobuf: a ~100-line varint/length-delimited reader and writer
 //     covering FlightDescriptor, FlightInfo, FlightEndpoint, Ticket,
-//     FlightData, SchemaResult, google.protobuf.Any, CommandStatementQuery
-//     and TicketStatementQuery; unknown fields are skipped per proto3.
-//   - Arrow IPC: produced by the host's executor (Gestalt2 uses bolt's
-//     arrow_ipc writer); this layer only splits the stream into messages
-//     (flight_sql_codec.h) to fill FlightInfo.schema and FlightData.
-// Codecs are in flight_sql_codec.{h,cpp}.
+//     FlightData, SchemaResult, google.protobuf.Any, Action/Result and
+//     the Flight SQL commands; unknown fields are skipped per proto3.
+//   - Arrow IPC: query results are produced by the host's executor
+//     (Gestalt2 uses bolt's arrow_ipc writer); this layer splits the stream
+//     into messages (flight_sql_codec.h) to fill FlightInfo.schema and
+//     FlightData. Metadata-command results have fixed schemas the host
+//     writer cannot express (uint32, dense union, map) and are encoded here
+//     (flight_sql_arrow.h).
+// Codecs are in flight_sql_codec.{h,cpp}, flight_sql_arrow.{h,cpp}, and the
+// metadata commands in flight_sql_metadata.{h,cpp}.
 //
 // ============================================================================
-// SCOPE — v1 is ad-hoc statement query
+// SCOPE — statements, prepared statements and catalog metadata
 // ============================================================================
 //   GetFlightInfo(CMD = Any<CommandStatementQuery>)  -> FlightInfo with one
 //       endpoint whose ticket is Any<TicketStatementQuery{handle = SQL}>.
 //   DoGet(that ticket)                               -> schema + batches.
 //   GetSchema(CMD = Any<CommandStatementQuery>)      -> SchemaResult.
 //   Handshake                                        -> one empty response.
-//   ListFlights / ListActions                        -> empty streams.
+//   ListFlights                                      -> empty stream.
+//   ListActions                                      -> the two actions below.
 // The query executes at GetFlightInfo (to answer schema + total_records) and
 // again at DoGet: the ticket carries the statement, not a server-side
 // result handle, so there is no unbounded result cache to expire.
-// Everything else — prepared statements (DoAction CreatePreparedStatement),
-// catalog commands (CommandGetTables/GetSqlInfo/...), DoPut, DoExchange,
-// transactions — answers grpc-status UNIMPLEMENTED naming the command,
-// never a silently empty result.
+// G2ETL-66 adds:
+//   Metadata commands (GetFlightInfo/GetSchema, then DoGet on a ticket that
+//       is the command itself): CommandGetSqlInfo, GetCatalogs,
+//       GetDbSchemas, GetTables (incl. include_schema), GetTableTypes,
+//       GetPrimaryKeys, and GetExportedKeys/ImportedKeys/CrossReference,
+//       which are always empty because CatalogTable has no foreign keys.
+//       Result streams are encoded by flight_sql_arrow.h.
+//   Prepared statements: DoAction CreatePreparedStatement /
+//       ClosePreparedStatement, and CommandPreparedStatementQuery through
+//       GetFlightInfo/GetSchema. The handle IS the statement text behind a
+//       magic prefix — stateless like the statement ticket, so a client
+//       that never closes leaks nothing and any worker can serve any
+//       handle. Parameters are not supported (no parameter_schema, DoPut
+//       binding answers UNIMPLEMENTED). Create runs the query once to
+//       answer dataset_schema.
+// Everything else — CommandStatementUpdate / DoPut, GetXdbcTypeInfo,
+// DoExchange, transactions, Substrait — answers grpc-status UNIMPLEMENTED
+// naming the command, never a silently empty result.
 //
 // Compiled ONLY under BOLTAPI_WITH_FLIGHT_SQL (default OFF).
 #pragma once
@@ -90,6 +109,19 @@ struct QueryFailure {
 
 inline constexpr std::uint32_t kMaxQueryBytes = 64u * 1024u;
 
+// One table of the host's catalog, for the Flight SQL metadata commands.
+// Tables carry no catalog or database schema (both answer NULL): `name` is
+// exactly what the host's SQL accepts unqualified.
+inline constexpr std::uint32_t kMaxCatalogTables = 4096;
+inline constexpr std::uint16_t kMaxKeyColumns = 16;
+
+struct CatalogTable {
+    std::string_view name;
+    std::string_view table_type;                    // "TABLE", "VIEW", ...
+    std::uint16_t    n_key_columns = 0;
+    std::string_view key_columns[kMaxKeyColumns];   // primary key, key order
+};
+
 // The host's query engine. One instance per worker thread, created once at
 // start_background().
 class IQueryExecutor {
@@ -104,6 +136,27 @@ public:
     virtual bool execute(std::string_view sql, std::string* out_ipc,
                          std::int64_t* out_rows,
                          QueryFailure& out_failure) noexcept = 0;
+
+    // Catalog for CommandGetTables/GetTableTypes/GetPrimaryKeys/... When
+    // false those commands answer UNIMPLEMENTED; GetSqlInfo still works.
+    virtual bool has_catalog() const noexcept { return false; }
+    // Snapshots the table list and returns its size (<= kMaxCatalogTables).
+    virtual std::uint32_t catalog_tables() noexcept { return 0; }
+    // Entry i of the last snapshot; the views stay valid until the next
+    // catalog_tables() on this executor.
+    virtual bool catalog_table(std::uint32_t i, CatalogTable* out) noexcept {
+        (void)i; (void)out;
+        return false;
+    }
+    // An Arrow IPC stream whose leading Schema message is table i's schema
+    // as a query of it returns. Same failure contract as execute().
+    virtual bool catalog_table_schema(std::uint32_t i, std::string* out_ipc,
+                                      QueryFailure& out_failure) noexcept {
+        (void)i; (void)out_ipc;
+        out_failure.code = GrpcCode::kUnimplemented;
+        out_failure.message = "this host does not describe table schemas";
+        return false;
+    }
 };
 
 class IExecutorFactory {
@@ -142,6 +195,9 @@ struct Config {
     std::size_t   worker_stack_bytes = 32u * 1024u * 1024u;
     int           accept_poll_ms = 100;
     int           idle_timeout_ms = 300000;
+    // CommandGetSqlInfo FLIGHT_SQL_SERVER_NAME / _VERSION.
+    std::string   server_name = "boltapi Flight SQL";
+    std::string   server_version = "0.1.0";
 };
 
 class Listener;

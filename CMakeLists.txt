@@ -360,10 +360,12 @@ endif()
 # wire protocol; the define is PUBLIC for the same reason.
 if(BOLTAPI_WITH_FLIGHT_SQL)
     target_sources(boltapi PRIVATE
+        src/proto/flight_sql_arrow.cpp
         src/proto/flight_sql_codec.cpp
+        src/proto/flight_sql_metadata.cpp
         src/proto/flight_sql_server.cpp)
     target_compile_definitions(boltapi PUBLIC BOLTAPI_WITH_FLIGHT_SQL=1)
-    message(STATUS "Bolt API Arrow Flight SQL: ENABLED (h2c gRPC, statement query)")
+    message(STATUS "Bolt API Arrow Flight SQL: ENABLED (h2c gRPC, statements, prepared statements, metadata)")
 endif()
 
 # ---------------------------------------------------------------------------
