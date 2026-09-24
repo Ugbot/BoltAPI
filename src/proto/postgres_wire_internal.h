@@ -201,9 +201,26 @@ inline void send_error(int fd, MsgWriter& w, const char* sqlstate,
     else w.reset();   // an unsendable error is dropped, never sent unframed
 }
 
-inline void send_ready_for_query(int fd, MsgWriter& w) noexcept {
+// NoticeResponse at WARNING severity (e.g. BEGIN inside a block).
+inline void send_notice(int fd, MsgWriter& w, const char* sqlstate,
+                        std::string_view message) noexcept {
+    assert(sqlstate != nullptr);
+    w.reset();
+    w.begin('N');
+    w.put_u8('S'); w.put_cstring("WARNING");
+    w.put_u8('V'); w.put_cstring("WARNING");
+    w.put_u8('C'); w.put_cstring(sqlstate);
+    w.put_u8('M'); w.put_cstring(message);
+    w.put_u8(0);
+    if (w.finish()) (void)w.send(fd);
+    else w.reset();
+}
+
+// `status`: 'I' idle, 'T' in a transaction block, 'E' in a failed block.
+inline void send_ready_for_query(int fd, MsgWriter& w, char status) noexcept {
+    assert(status == 'I' || status == 'T' || status == 'E');
     w.begin('Z');
-    w.put_u8('I');   // always "idle" — this bridge has no real transactions
+    w.put_u8(static_cast<std::uint8_t>(status));
     if (w.finish()) (void)w.send(fd);
 }
 

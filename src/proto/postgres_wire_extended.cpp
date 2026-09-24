@@ -27,48 +27,6 @@ void set_name(char (&dst)[kMaxNameLen], std::string_view name) noexcept {
     dst[name.size()] = '\0';
 }
 
-bool ieq_prefix(std::string_view s, std::size_t at, const char* kw) noexcept {
-    const std::size_t n = std::strlen(kw);
-    if (at + n > s.size()) return false;
-    for (std::size_t i = 0; i < n; ++i) {
-        char c = s[at + i];
-        if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 32);
-        if (c != kw[i]) return false;
-    }
-    const std::size_t end = at + n;
-    if (end == s.size()) return true;
-    const char c = s[end];
-    return !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' ||
-             (c >= '0' && c <= '9'));
-}
-
-// Does the statement return rows? Decides whether Describe(statement) may
-// ask the executor for a shape (a read) or must answer NoData (a write that
-// must not run before Execute).
-bool is_query_shaped(std::string_view sql) noexcept {
-    std::size_t i = 0;
-    while (i < sql.size()) {                                    // bounded by sql.size()
-        const char c = sql[i];
-        if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '(') { ++i; continue; }
-        if (c == '-' && i + 1 < sql.size() && sql[i + 1] == '-') {
-            while (i < sql.size() && sql[i] != '\n') ++i;
-            continue;
-        }
-        if (c == '/' && i + 1 < sql.size() && sql[i + 1] == '*') {
-            const std::size_t e = sql.find("*/", i + 2);
-            i = e == std::string_view::npos ? sql.size() : e + 2;
-            continue;
-        }
-        break;
-    }
-    static constexpr const char* kReads[] = {"SELECT", "WITH", "VALUES", "TABLE",
-                                             "SHOW", "EXPLAIN"};
-    for (const char* kw : kReads) {
-        if (ieq_prefix(sql, i, kw)) return true;
-    }
-    return false;
-}
-
 bool binary_result_supported(std::int32_t t) noexcept {
     switch (t) {
         case oid::kBool: case oid::kInt2: case oid::kInt4: case oid::kInt8:
@@ -106,7 +64,91 @@ void ExtendedSession::reset() noexcept {
     pool_used_ = 0;
     current_ = -1;
     in_error_ = false;
+    tx_status_ = 'I';
+    tx_read_only_ = false;
+    tx_writes_ = 0;
     assert(stmts_.size() >= 1 && portals_.size() >= 1);
+}
+
+ExtendedSession::TxStep ExtendedSession::tx_end(bool rollback, const char*& tag,
+                                                QueryFailure& qf) noexcept {
+    assert(tx_status_ != 'I');
+    const bool failed = tx_status_ == 'E';
+    const std::uint32_t writes = tx_writes_;
+    tx_status_ = 'I';
+    tx_read_only_ = false;
+    tx_writes_ = 0;
+    for (std::size_t i = 1; i < portals_.size(); ++i) {         // bounded by slots
+        if (portals_[i].used) close_portal(static_cast<std::int32_t>(i));
+    }
+    if ((rollback || failed) && writes > 0) {
+        qf.sqlstate = "0A000";
+        qf.message  = "the transaction block ended but its writes were NOT rolled "
+                      "back: this endpoint has no transactions, every statement "
+                      "was applied when it ran";
+        return TxStep::Failed;
+    }
+    tag = (rollback || failed) ? "ROLLBACK" : "COMMIT";
+    assert(tx_status_ == 'I');
+    return TxStep::Tagged;
+}
+
+ExtendedSession::TxStep ExtendedSession::tx_statement(std::string_view sql, int fd,
+                                                      MsgWriter& w, const char*& tag,
+                                                      QueryFailure& qf) noexcept {
+    assert(tx_status_ == 'I' || tx_status_ == 'T' || tx_status_ == 'E');
+    bool read_only = false;
+    CodecError ce;
+    const TxCommand cmd = classify_transaction_command(sql, read_only, ce);
+    if (cmd == TxCommand::Refused) {
+        qf.sqlstate = ce.sqlstate;
+        qf.message  = ce.message;
+        return TxStep::Failed;
+    }
+    if (cmd == TxCommand::None) {
+        if (tx_status_ != 'E') return TxStep::Pass;
+        qf.sqlstate = "25P02";
+        qf.message  = "current transaction is aborted, commands ignored until "
+                      "end of transaction block";
+        return TxStep::Failed;
+    }
+    if (cmd == TxCommand::Begin) {
+        if (tx_status_ == 'E') {
+            qf.sqlstate = "25P02";
+            qf.message  = "current transaction is aborted, commands ignored until "
+                          "end of transaction block";
+            return TxStep::Failed;
+        }
+        if (tx_status_ == 'T') {
+            send_notice(fd, w, "25001", "there is already a transaction in progress");
+        } else {
+            tx_status_ = 'T';
+            tx_read_only_ = read_only;
+            tx_writes_ = 0;
+        }
+        tag = "BEGIN";
+        return TxStep::Tagged;
+    }
+    const bool rollback = cmd == TxCommand::Rollback;
+    if (tx_status_ == 'I') {
+        send_notice(fd, w, "25P01", "there is no transaction in progress");
+        tag = rollback ? "ROLLBACK" : "COMMIT";
+        return TxStep::Tagged;
+    }
+    return tx_end(rollback, tag, qf);
+}
+
+bool ExtendedSession::tx_admit(std::string_view sql, QueryFailure& qf) noexcept {
+    assert(tx_status_ != 'E');
+    if (tx_status_ != 'T' || is_query_shaped(sql)) return true;
+    if (tx_read_only_) {
+        qf.sqlstate = "25006";
+        qf.message  = "cannot execute a write in a read-only transaction";
+        return false;
+    }
+    ++tx_writes_;
+    assert(tx_writes_ > 0);
+    return true;
 }
 
 void ExtendedSession::on_simple_query() noexcept {
@@ -193,6 +235,7 @@ bool ExtendedSession::fail(int fd, MsgWriter& w, const char* sqlstate,
                            std::string_view msg) noexcept {
     assert(sqlstate != nullptr);
     in_error_ = true;
+    tx_on_error();
     send_error(fd, w, sqlstate, msg);
     return true;
 }
@@ -203,7 +246,7 @@ bool ExtendedSession::handle(char type, const std::uint8_t* body, std::size_t le
     if (type == 'S') {                           // Sync: end of the batch
         in_error_ = false;
         close_portal(0);
-        send_ready_for_query(fd, w);
+        send_ready_for_query(fd, w, tx_status_);
         return true;
     }
     if (type == 'H') return true;                // Flush: every reply is already sent
@@ -342,13 +385,21 @@ std::int16_t ExtendedSession::format_of(const Portal& p, std::uint32_t col) cons
     return col < p.n_formats ? p.formats[col] : 0;
 }
 
-bool ExtendedSession::materialize(std::int32_t pi, IQueryExecutor& exec,
-                                  FieldDesc* fields, QueryFailure& qf) noexcept {
+bool ExtendedSession::materialize(std::int32_t pi, int fd, MsgWriter& w,
+                                  IQueryExecutor& exec, FieldDesc* fields,
+                                  QueryFailure& qf) noexcept {
     assert(pi >= 0 && fields != nullptr);
     Portal& p = portals_[static_cast<std::size_t>(pi)];
     assert(p.used && !p.materialized);
     std::uint32_t count = 0;
     const std::string_view sql(portal_sql(pi), p.sql_len);
+    const TxStep ts = tx_statement(sql, fd, w, p.session_tag, qf);
+    if (ts == TxStep::Failed) return false;
+    if (ts == TxStep::Tagged) {
+        p.field_count  = 0;
+        p.materialized = true;
+        return true;
+    }
     CodecError ce;
     const SessionCommand sc = classify_session_command(sql, p.session_tag, ce);
     if (sc == SessionCommand::Refused) {
@@ -362,6 +413,7 @@ bool ExtendedSession::materialize(std::int32_t pi, IQueryExecutor& exec,
         return true;
     }
     p.session_tag = nullptr;
+    if (!tx_admit(sql, qf)) return false;
     current_ = -1;
     if (!exec.execute(sql, fields, kMaxFields, count, qf)) return false;
     if (p.n_formats > 1 && p.n_formats != count) {
@@ -401,6 +453,10 @@ bool ExtendedSession::describe_statement(const Statement& st, int fd, MsgWriter&
     if (!is_query_shaped(sql)) {
         w.begin('n');
         return w.finish() && w.send(fd);
+    }
+    if (tx_status_ == 'E') {
+        return fail(fd, w, "25P02", "current transaction is aborted, commands "
+                    "ignored until end of transaction block");
     }
     // Shape probe: bind every parameter to a type-appropriate placeholder
     // value (NULL for text-like/unknown) so the executor can plan it.
@@ -464,7 +520,7 @@ bool ExtendedSession::on_describe(BodyReader& r, int fd, MsgWriter& w,
     FieldDesc fields[kMaxFields];
     if (!p.materialized) {
         QueryFailure qf;
-        if (!materialize(pi, exec, fields, qf)) return fail(fd, w, qf.sqlstate, qf.message);
+        if (!materialize(pi, fd, w, exec, fields, qf)) return fail(fd, w, qf.sqlstate, qf.message);
     } else {
         for (std::uint32_t c = 0; c < p.field_count; ++c) {      // bounded by kMaxFields
             fields[c].name = p.names[c];
@@ -551,7 +607,7 @@ bool ExtendedSession::on_execute(BodyReader& r, int fd, MsgWriter& w,
     if (!p.materialized) {
         FieldDesc fields[kMaxFields];
         QueryFailure qf;
-        if (!materialize(pi, exec, fields, qf)) return fail(fd, w, qf.sqlstate, qf.message);
+        if (!materialize(pi, fd, w, exec, fields, qf)) return fail(fd, w, qf.sqlstate, qf.message);
     } else if (current_ != pi && p.session_tag == nullptr) {
         return fail(fd, w, "55000", "portal's result was displaced by another "
                     "portal on this connection");

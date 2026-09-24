@@ -29,6 +29,18 @@
 //     displaced by another portal's execution is refused (55000), not
 //     re-run.
 //
+// Transactions (G2ETL-64): there are none — every statement is applied when
+// it runs. The wire layer still answers BEGIN / START TRANSACTION / COMMIT /
+// END / ROLLBACK / ABORT itself and reports the block status ('I'/'T'/'E')
+// in ReadyForQuery, so drivers that toggle autocommit (pgJDBC, psycopg) and
+// cursor fetch over named portals work. It is honest about what it cannot
+// do: a write inside a READ ONLY block is refused (25006); after an error
+// the block refuses everything but COMMIT/ROLLBACK (25P02); ending a block
+// by ROLLBACK (or COMMIT of a failed block) after any write is an error
+// (0A000) saying the writes were NOT undone; savepoints, two-phase commit,
+// AND CHAIN and REPEATABLE READ/SERIALIZABLE are refused (0A000). Named
+// portals close when the block ends.
+//
 // Authentication is "trust" (no password) or cleartext password — no MD5,
 // no SCRAM-SHA-256. TLS negotiation is refused (`SSLRequest`/`GSSENCRequest`
 // answered with a single 'N', which is the protocol's own "not offered"
