@@ -31,6 +31,7 @@
 #include "boltapi/core/coro_task.h"
 #include "boltapi/http/dispatch_task.h"
 #include "boltapi/middleware.h"
+#include "boltapi/offload.h"
 #include "boltapi/request.h"
 #include "boltapi/response.h"
 #include "boltapi/router.h"
@@ -422,6 +423,15 @@ public:
     // own. Safe to call whether or not the server is running.
     bool stop_gracefully();
     bool is_running() const noexcept;
+
+    // Awaitable that runs `work` on a blocking worker and resumes the caller on
+    // the I/O thread (see offload.h for the async-chain requirement). Inline
+    // before the server exists.
+    Offload offload(std::function<void()> work) noexcept {
+        assert(work != nullptr);
+        return Offload(server_ ? server_->io_dispatcher() : nullptr,
+                       std::move(work));
+    }
 
     // Introspection.
     std::size_t route_count() const noexcept { return routes_.size(); }
