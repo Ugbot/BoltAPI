@@ -18,6 +18,7 @@
 #include "boltapi/net/io_dispatcher.h"
 
 #include <cassert>
+#include <cstdio>
 #include <coroutine>
 #include <functional>
 #include <utility>
@@ -44,9 +45,12 @@ public:
         // destructor, and completion is signalled by the post below.
         (void)io_->worker_pool()->submit_blocking([this, h]() {
             work_();
-            const bool posted = io_->post_to_io_thread(0, h);
-            assert(posted && "offload: resume post rejected");
-            (void)posted;
+            // Refused only when the dispatcher is stopping: the connection is
+            // being torn down, so report instead of resuming off-thread.
+            if (!io_->post_to_io_thread(0, h)) {
+                std::fprintf(stderr, "boltapi offload: resume dropped "
+                                     "(I/O thread not accepting posts)\n");
+            }
         });
     }
 
