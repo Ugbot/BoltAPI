@@ -602,3 +602,35 @@ if(BOLTAPI_WITH_NEO4J_BOLT)
                              PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
     endif()
 endif()
+
+# ---- Arrow Flight SQL (BOLTAPI_WITH_FLIGHT_SQL, G2ETL-26) ------------------
+# Codec units (no sockets) plus a synthetic-executor server that real Flight
+# SQL clients (pyarrow.flight, ADBC) are pointed at. The IPC fixtures come
+# from bolt's Arrow IPC writer, so both need bolt::ingest.
+if(BOLTAPI_WITH_FLIGHT_SQL AND TARGET bolt::ingest)
+    boltapi_add_test(boltapi_flight_sql_codec_test flight_sql_codec_test.cpp)
+    target_link_libraries(boltapi_flight_sql_codec_test PRIVATE bolt::ingest)
+
+    add_executable(boltapi_flight_sql_echo_server flight_sql_echo_server_main.cpp)
+    target_link_libraries(boltapi_flight_sql_echo_server PRIVATE boltapi::boltapi bolt::ingest)
+    if(WIN32)
+        target_link_libraries(boltapi_flight_sql_echo_server PRIVATE ws2_32 mswsock)
+    endif()
+    boltapi_apply_hardening(boltapi_flight_sql_echo_server)
+    boltapi_apply_sanitizers(boltapi_flight_sql_echo_server)
+
+    # SKIPs (77) with a printed reason when pyarrow.flight is not importable.
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    set(_flight_py "${Python3_EXECUTABLE}")
+    if(DEFINED ENV{BOLTAPI_FLIGHT_PYTHON})
+        set(_flight_py "$ENV{BOLTAPI_FLIGHT_PYTHON}")
+    endif()
+    if(_flight_py)
+        add_test(NAME boltapi_flight_sql_client_conformance
+                 COMMAND "${_flight_py}"
+                         "${CMAKE_CURRENT_SOURCE_DIR}/flight_sql_client_conformance.py"
+                         "$<TARGET_FILE:boltapi_flight_sql_echo_server>")
+        set_tests_properties(boltapi_flight_sql_client_conformance
+                             PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+    endif()
+endif()

@@ -48,6 +48,9 @@ option(BOLTAPI_WITH_NEO4J_BOLT "Enable the Neo4j Bolt client wire protocol" OFF)
 # only in v1 (see include/boltapi/proto/postgres_wire.h). OPTIONAL and default
 # OFF, same rationale as BOLTAPI_WITH_NEO4J_BOLT above.
 option(BOLTAPI_WITH_PG_WIRE "Enable the PostgreSQL wire protocol (v3, simple query)" OFF)
+# Arrow Flight SQL over gRPC/h2c (G2ETL-26). Hand-rolled HTTP/2 + gRPC +
+# protobuf, no external deps (see include/boltapi/proto/flight_sql.h).
+option(BOLTAPI_WITH_FLIGHT_SQL "Enable the Arrow Flight SQL endpoint (h2c gRPC)" OFF)
 option(BOLTAPI_USE_BOLT_ARENA "Use bolt::Arena for request buffers" OFF) # risk-gated
 
 # DELETED (2026-08-17), all four were declared and then never referenced again
@@ -108,7 +111,12 @@ else()
         # bolt::parse hosts fionn — Bolt's skip-aware JSON parser. It is the canonical
         # JSON path for Bolt API (include/boltapi/json.h wraps it). See docs/JSON.md.
         set(BOLT_BUILD_PARSE      ON  CACHE BOOL "" FORCE)
-        set(BOLT_BUILD_INGEST     OFF CACHE BOOL "" FORCE)
+        # The Flight SQL tests build Arrow IPC fixtures with bolt::ingest.
+        if(BOLTAPI_WITH_FLIGHT_SQL AND BOLTAPI_BUILD_TESTS)
+            set(BOLT_BUILD_INGEST ON  CACHE BOOL "" FORCE)
+        else()
+            set(BOLT_BUILD_INGEST OFF CACHE BOOL "" FORCE)
+        endif()
         # The reactor (event loop + async I/O) now lives in bolt::reactor (STATION-78).
         set(BOLT_BUILD_REACTOR    ON  CACHE BOOL "" FORCE)
         add_subdirectory(extern/bolt EXCLUDE_FROM_ALL)
@@ -346,6 +354,16 @@ if(BOLTAPI_WITH_PG_WIRE)
     message(STATUS "Bolt API Postgres-wire protocol: ENABLED (v3 startup + simple query)")
 endif()
 
+# Arrow Flight SQL (G2ETL-26): own listener + worker pool like the Postgres
+# wire protocol; the define is PUBLIC for the same reason.
+if(BOLTAPI_WITH_FLIGHT_SQL)
+    target_sources(boltapi PRIVATE
+        src/proto/flight_sql_codec.cpp
+        src/proto/flight_sql_server.cpp)
+    target_compile_definitions(boltapi PUBLIC BOLTAPI_WITH_FLIGHT_SQL=1)
+    message(STATUS "Bolt API Arrow Flight SQL: ENABLED (h2c gRPC, statement query)")
+endif()
+
 # ---------------------------------------------------------------------------
 # Bolt-native request body arena (risk-gated, opt-in). When ON, the request
 # body buffer is backed by a thread-local bolt::Arena (bump allocator, reset
@@ -558,4 +576,4 @@ endif()
 
 endif()  # BOLTAPI_INSTALL
 
-message(STATUS "Bolt API ${PROJECT_VERSION}: tests=${BOLTAPI_BUILD_TESTS} examples=${BOLTAPI_BUILD_EXAMPLES} benchmarks=${BOLTAPI_BUILD_BENCHMARKS} sanitize=${BOLTAPI_SANITIZE} install=${BOLTAPI_INSTALL} gzip=${BOLTAPI_HAVE_GZIP} http3=${BOLTAPI_WITH_HTTP3} webrtc=${BOLTAPI_WITH_WEBRTC} neo4j_bolt=${BOLTAPI_WITH_NEO4J_BOLT} pg_wire=${BOLTAPI_WITH_PG_WIRE}")
+message(STATUS "Bolt API ${PROJECT_VERSION}: tests=${BOLTAPI_BUILD_TESTS} examples=${BOLTAPI_BUILD_EXAMPLES} benchmarks=${BOLTAPI_BUILD_BENCHMARKS} sanitize=${BOLTAPI_SANITIZE} install=${BOLTAPI_INSTALL} gzip=${BOLTAPI_HAVE_GZIP} http3=${BOLTAPI_WITH_HTTP3} webrtc=${BOLTAPI_WITH_WEBRTC} neo4j_bolt=${BOLTAPI_WITH_NEO4J_BOLT} pg_wire=${BOLTAPI_WITH_PG_WIRE} flight_sql=${BOLTAPI_WITH_FLIGHT_SQL}")
