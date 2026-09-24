@@ -76,6 +76,10 @@ bool read_message_table(std::string_view meta, std::uint8_t* header_type,
 
 }  // namespace
 
+bool pb_read_varint(std::string_view buf, std::size_t* pos, std::uint64_t* out) noexcept {
+    return read_varint(buf, pos, out);
+}
+
 bool PbReader::next(PbField* out) noexcept {
     assert(out != nullptr);
     if (!ok_ || pos_ >= buf_.size()) return false;
