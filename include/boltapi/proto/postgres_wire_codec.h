@@ -1,0 +1,99 @@
+// boltapi/proto/postgres_wire_codec.h — pure, allocation-free value codecs
+// behind the Postgres wire Extended Query protocol (G2ETL-47).
+//
+// The wire layer is executor-agnostic: the host engine only ever sees plain
+// SQL text. A Bind's parameters are therefore rendered into the statement as
+// SQL literals here (the same approach PgBouncer-style proxies and every
+// client-side interpolating driver take), and results the client asked for
+// in BINARY format are encoded here from the executor's TEXT-format cells.
+//
+// Every function writes into a caller-owned bounded buffer and reports
+// overflow / malformed input as `false` + a SQLSTATE, never a short result.
+// Compiled ONLY under BOLTAPI_WITH_PG_WIRE.
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <string_view>
+
+namespace bolt::api::proto::pgwire {
+
+// Well-known pg_type OIDs this codec understands.
+namespace oid {
+inline constexpr std::int32_t kUnspecified = 0;
+inline constexpr std::int32_t kBool        = 16;
+inline constexpr std::int32_t kBytea       = 17;
+inline constexpr std::int32_t kName        = 19;
+inline constexpr std::int32_t kInt8        = 20;
+inline constexpr std::int32_t kInt2        = 21;
+inline constexpr std::int32_t kInt4        = 23;
+inline constexpr std::int32_t kText        = 25;
+inline constexpr std::int32_t kOid         = 26;
+inline constexpr std::int32_t kFloat4      = 700;
+inline constexpr std::int32_t kFloat8      = 701;
+inline constexpr std::int32_t kUnknown     = 705;
+inline constexpr std::int32_t kBpchar      = 1042;
+inline constexpr std::int32_t kVarchar     = 1043;
+inline constexpr std::int32_t kDate        = 1082;
+inline constexpr std::int32_t kNumeric     = 1700;
+}  // namespace oid
+
+// One bound parameter as it arrived in a Bind message.
+struct BoundParam {
+    std::string_view bytes;          // raw value bytes (text or binary form)
+    std::int32_t     type_oid = 0;   // from Parse; 0 = unspecified
+    bool             is_null  = false;
+    bool             binary   = false;
+};
+
+// Failure detail shared by every codec entry point.
+struct CodecError {
+    const char* sqlstate = "22P02";
+    const char* message  = "invalid parameter value";
+};
+
+// Decode a BINARY-format parameter to its TEXT form (int2/4/8, float4/8,
+// bool, text-like, date, numeric). `out_len` receives the byte count.
+bool binary_param_to_text(const BoundParam& p, char* out, std::size_t cap,
+                          std::size_t& out_len, CodecError& err) noexcept;
+
+// Render one TEXT-form value as a SQL literal for type `type_oid`: numerics
+// validated and emitted bare (negatives parenthesised), bool as TRUE/FALSE,
+// date as DATE '...', everything else as a standard-conforming quoted
+// string. NULL renders as NULL. Appends at `out[pos]`, advancing `pos`.
+bool render_literal(std::string_view text, bool is_null, std::int32_t type_oid,
+                    char* out, std::size_t cap, std::size_t& pos,
+                    CodecError& err) noexcept;
+
+// Replace every `$n` placeholder OUTSIDE string literals, quoted
+// identifiers, comments and dollar-quoted bodies with the rendered literal
+// for params[n-1]. Binary params are decoded first. `$n` past `n_params` is
+// refused (42P02).
+bool substitute_params(std::string_view sql, const BoundParam* params,
+                       std::uint32_t n_params, char* out, std::size_t cap,
+                       std::size_t& out_len, CodecError& err) noexcept;
+
+// Encode one TEXT-format result cell as the BINARY wire form of `type_oid`.
+// Types without a binary encoder here are refused (0A000) — never guessed.
+bool text_to_binary_result(std::string_view text, std::int32_t type_oid,
+                           std::uint8_t* out, std::size_t cap,
+                           std::size_t& out_len, CodecError& err) noexcept;
+
+// Session-parameter statements drivers issue while connecting (pgJDBC's
+// `SET extra_float_digits = 3` / `SET application_name = '...'`, psql's
+// `SET client_encoding`). Handled by the wire layer, never the engine.
+enum class SessionCommand : std::uint8_t {
+    NotSession = 0,   // not SET/RESET: hand it to the executor
+    Accepted   = 1,   // cosmetic, or already this server's value: tag "SET"/"RESET"
+    Refused    = 2,   // a setting this server cannot honour: named 0A000
+};
+
+// Classify `sql`. `tag` receives "SET" or "RESET" for Accepted.
+SessionCommand classify_session_command(std::string_view sql, const char*& tag,
+                                        CodecError& err) noexcept;
+
+// Largest `$n` referenced outside literals/comments (0 if none) — used to
+// infer the parameter count when Parse declares fewer types than it uses.
+std::uint32_t max_param_ref(std::string_view sql) noexcept;
+
+}  // namespace bolt::api::proto::pgwire

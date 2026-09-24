@@ -7,21 +7,27 @@
 // IQueryExecutor/IExecutorFactory, host supplies the engine.
 //
 // ============================================================================
-// SCOPE — v1 is the SIMPLE QUERY PROTOCOL, loudly not the extended one
+// SCOPE — Simple Query AND Extended Query (G2ETL-35 v1, G2ETL-47 v2)
 // ============================================================================
 // Postgres wire v3 has two ways to run a query:
 //   - Simple Query ('Q'): one SQL string in, RowDescription/DataRow*/
-//     CommandComplete out. This is what `psql` uses for plain statements and
-//     what a plain `libpq`/`psycopg2` `cursor.execute()` with no parameters
-//     sends by default. IMPLEMENTED here.
-//   - Extended Query (Parse/Bind/Describe/Execute/Sync, 'P'/'B'/'D'/'E'/'S'):
-//     prepared statements with typed parameters — most JDBC/ODBC drivers and
-//     parameterized psycopg2/asyncpg calls use this by default. NOT
-//     implemented in v1 (tracked follow-up G2ETL-35-EXT): a client that opens
-//     with it gets a named `ErrorResponse` (SQLSTATE 0A000
-//     feature_not_supported) on each such message rather than a dropped
-//     connection or a silently wrong answer, and the connection stays usable
-//     for Simple Query afterward.
+//     CommandComplete out. What `psql` uses for plain statements.
+//   - Extended Query (Parse/Bind/Describe/Execute/Close/Flush/Sync): prepared
+//     statements + portals with typed parameters — what JDBC, psycopg 3,
+//     asyncpg and most BI drivers use. Per-connection named/unnamed
+//     statements and portals live in fixed, pre-allocated slots
+//     (Config::max_prepared_statements / max_portals); overflow is a named
+//     ErrorResponse, never a silent eviction. The executor still only sees
+//     plain SQL: Bind renders each parameter as a typed SQL literal
+//     (postgres_wire_codec.h), outside quotes/comments/dollar-quotes. Text
+//     and binary parameter formats are accepted for bool/int2/int4/int8/
+//     float4/float8/numeric/date/text-like types; results may be requested
+//     in binary for the same set. Execute honours max_rows with
+//     PortalSuspended. After an error every message up to Sync is
+//     discarded, per the protocol. One portal's rows are buffered at a time
+//     (the executor owns one result): executing a portal whose rows were
+//     displaced by another portal's execution is refused (55000), not
+//     re-run.
 //
 // Authentication is "trust" (no password) or cleartext password — no MD5,
 // no SCRAM-SHA-256. TLS negotiation is refused (`SSLRequest`/`GSSENCRequest`
@@ -43,6 +49,7 @@
 
 #include "boltapi/net/sys_compat.h"
 #include "boltapi/core/result.h"
+#include "bolt/api/core/stacked_thread.h"
 
 #include <atomic>
 #include <cstddef>
@@ -112,6 +119,19 @@ public:
 
     virtual std::uint32_t row_count() const noexcept = 0;
 
+    // Result SHAPE of a query-shaped `sql` (SELECT/WITH/VALUES/...) for an
+    // Extended-Query Describe of a not-yet-bound statement, without the
+    // caller needing its rows. The default runs execute() — correct but
+    // pays for the rows; an engine that can plan without executing should
+    // override. Same field-lifetime contract as execute(), and it may
+    // discard whatever result execute() last buffered.
+    virtual bool describe(std::string_view sql, FieldDesc* out_fields,
+                          std::uint32_t fields_cap,
+                          std::uint32_t& out_field_count,
+                          QueryFailure& out_failure) noexcept {
+        return execute(sql, out_fields, fields_cap, out_field_count, out_failure);
+    }
+
     // CommandComplete tag, e.g. "SELECT 3". Called after a successful
     // execute(). `cap` >= 32.
     virtual void command_tag(char* out, std::size_t cap) const noexcept = 0;
@@ -164,9 +184,23 @@ struct Config {
     // than a handful of connections, so this defaults low.
     std::uint16_t max_connections = 16;
 
+    // Explicit worker stack. The host executor runs a whole SQL compile +
+    // execute on this thread; a platform-default secondary-thread stack
+    // (512 KiB on macOS) is overrun by a recursive planner, which kills the
+    // process with no diagnostic.
+    std::size_t worker_stack_bytes = core::kDefaultStackBytes;
+
     // Per-worker buffers, allocated once at start.
     std::uint32_t message_buffer_bytes = 1u << 20;  // largest inbound message
     std::uint32_t write_buffer_bytes   = 1u << 20;  // largest outbound message
+
+    // Extended Query state, per worker, allocated once at start. Prepared
+    // statement text shares one compacting pool; each portal slot holds one
+    // bound statement of at most max_statement_bytes.
+    std::uint16_t max_prepared_statements = 64;    // incl. the unnamed one
+    std::uint16_t max_portals             = 8;     // incl. the unnamed one
+    std::uint32_t max_statement_bytes     = 64u * 1024u;
+    std::uint32_t statement_pool_bytes    = 1u << 20;
 
     // Sent as the `server_version` ParameterStatus. Some clients parse this
     // to gate feature use, so it must look like a real Postgres version
@@ -241,7 +275,7 @@ private:
     TrustAuthenticator  default_auth_{};
 
     std::unique_ptr<Listener>       listener_;
-    std::vector<std::thread>        workers_;
+    std::vector<core::StackedThread> workers_;
     std::vector<IQueryExecutor*>    execs_;
     std::atomic<bool>               running_{false};
     std::atomic<bool>               stopping_{false};

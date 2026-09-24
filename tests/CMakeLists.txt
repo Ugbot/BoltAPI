@@ -562,6 +562,37 @@ if(BOLTAPI_WITH_WEBRTC)
     boltapi_apply_sanitizers(boltapi_webrtc_debug_server)
 endif()
 
+# ---- PostgreSQL WIRE PROTOCOL (BOLTAPI_WITH_PG_WIRE) ------------------------
+if(BOLTAPI_WITH_PG_WIRE)
+    # Codec units + the extended-query state machine over a raw socket.
+    boltapi_add_test(boltapi_pg_wire_test pg_wire_test.cpp)
+    target_include_directories(boltapi_pg_wire_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    if(WIN32)
+        target_link_libraries(boltapi_pg_wire_test PRIVATE ws2_32 mswsock)
+    endif()
+
+    # Standalone echo server real drivers (psycopg 3, pgJDBC) are pointed at.
+    add_executable(boltapi_pg_wire_echo_server pg_wire_echo_server_main.cpp)
+    target_link_libraries(boltapi_pg_wire_echo_server PRIVATE boltapi::boltapi)
+    target_include_directories(boltapi_pg_wire_echo_server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    if(WIN32)
+        target_link_libraries(boltapi_pg_wire_echo_server PRIVATE ws2_32 mswsock)
+    endif()
+    boltapi_apply_hardening(boltapi_pg_wire_echo_server)
+    boltapi_apply_sanitizers(boltapi_pg_wire_echo_server)
+
+    # Conformance-by-external-client. SKIPs (77) with a printed reason when
+    # psycopg is not importable -- never silently passes.
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_EXECUTABLE)
+        add_test(NAME boltapi_pg_wire_driver_conformance
+                 COMMAND "${Python3_EXECUTABLE}"
+                         "${CMAKE_CURRENT_SOURCE_DIR}/pg_wire_driver_conformance.py"
+                         "$<TARGET_FILE:boltapi_pg_wire_echo_server>")
+        set_tests_properties(boltapi_pg_wire_driver_conformance PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+endif()
+
 # ---- Neo4j Bolt CLIENT WIRE PROTOCOL (BOLTAPI_WITH_NEO4J_BOLT) --------------
 # "Bolt" here is Neo4j's wire protocol, not extern/bolt (our columnar core).
 # Registered only when the optional protocol is compiled in; a default configure
