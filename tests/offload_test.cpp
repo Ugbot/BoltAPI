@@ -28,6 +28,7 @@ std::atomic<bool>            g_slow_entered{false};
 std::atomic<bool>            g_same_thread{false};
 std::atomic<bool>            g_worker_thread_differs{false};
 std::atomic<int>             g_mw_after{0};
+std::atomic<bool>            g_inline_same_thread{false};
 
 struct Reply {
     int status = 0;
@@ -103,6 +104,16 @@ protected:
             g_same_thread.store(std::this_thread::get_id() == before);
             res.ok().text(body);
         });
+        app_->get_async("/inline", [app](api::Request&, api::Response& res)
+                                       -> api::core::coro_task<void> {
+            const std::thread::id before = std::this_thread::get_id();
+            std::string body;
+            co_await app->offload([&body, before]() {
+                g_inline_same_thread.store(std::this_thread::get_id() == before);
+                body = "INLINE";
+            });
+            res.ok().text(body);
+        });
         ASSERT_EQ(app_->start_background("127.0.0.1", kPort), 0);
         std::this_thread::sleep_for(std::chrono::milliseconds(350));
     }
@@ -145,6 +156,19 @@ TEST_F(Offload, OtherRequestsServedWhileWorkBlocks) {
     EXPECT_TRUE(g_worker_thread_differs.load());
     EXPECT_TRUE(g_same_thread.load());
     EXPECT_EQ(g_mw_after.load(), 2);
+}
+
+// dispatch_http3 must finish in one resume, so an offload under it runs its
+// work inline on the calling thread instead of suspending (G2ETL-59).
+TEST_F(Offload, SyncHttp3DispatchRunsWorkInline) {
+    api::http::CoroHttpRequest req{};
+    req.method = "GET";
+    req.path   = "/inline";
+    const api::http::CoroHttpResponse resp = app_->dispatch_http3(req);
+    EXPECT_EQ(resp.status, 200);
+    EXPECT_EQ(resp.body, "INLINE");
+    EXPECT_TRUE(g_inline_same_thread.load());
+    EXPECT_FALSE(api::detail::t_sync_dispatch);
 }
 
 }  // namespace

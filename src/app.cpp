@@ -330,9 +330,12 @@ http::CoroHttpResponse App::dispatch_http3(const http::CoroHttpRequest& req) {
     // destroy the frame deterministically (the task no longer owns it).
     auto handle = task.release();
     assert(handle && "dispatch coroutine has no handle");
+    const bool outer_sync = detail::t_sync_dispatch;
+    detail::t_sync_dispatch = true;   // App::offload runs its work inline
     if (!handle.done()) {
         handle.resume();  // sync chain runs to co_return in one resume
     }
+    detail::t_sync_dispatch = outer_sync;
     assert(handle.done() && "HTTP/3 dispatch did not complete synchronously");
 
     http::CoroHttpResponse resp = std::move(handle.promise().value());

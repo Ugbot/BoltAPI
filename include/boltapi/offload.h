@@ -12,7 +12,8 @@
 //
 // Every middleware between the dispatcher and the awaiting coroutine must be
 // async (App::use_async): a sync middleware's next() shim cannot survive a
-// genuine suspension. The synchronous HTTP/3 entry cannot either.
+// genuine suspension. The synchronous HTTP/3 entry (App::dispatch_http3)
+// cannot either, so it marks its thread and an offload there runs inline.
 #pragma once
 
 #include "boltapi/net/io_dispatcher.h"
@@ -24,6 +25,11 @@
 #include <utility>
 
 namespace bolt::api {
+
+namespace detail {
+// True while App::dispatch_http3 drives a dispatch to completion in one resume.
+inline thread_local bool t_sync_dispatch = false;
+}  // namespace detail
 
 class Offload {
 public:
@@ -58,6 +64,7 @@ public:
 
 private:
     bool can_offload() const noexcept {
+        if (detail::t_sync_dispatch) return false;
         if (io_ == nullptr || io_->worker_pool() == nullptr) return false;
         return io_->io_thread_count() == 1 || !io_->per_thread_engines();
     }
