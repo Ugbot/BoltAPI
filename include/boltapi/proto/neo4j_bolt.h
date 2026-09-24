@@ -45,6 +45,8 @@
 #include <string>
 #include <string_view>
 #include <thread>
+
+#include "bolt/api/core/stacked_thread.h"
 #include <vector>
 
 namespace bolt::api {
@@ -214,6 +216,11 @@ struct Config {
     // on the connection path.
     std::uint16_t max_connections = 8;
 
+    // Explicit worker stack. The host runs a whole recursive Cypher compile +
+    // execute on each worker; a platform-default secondary-thread stack
+    // (512 KiB on macOS) is exhausted by an ordinary query.
+    std::size_t worker_stack_bytes = core::kDefaultStackBytes;
+
     // Per-worker buffers, allocated once at serve() start.
     std::uint32_t message_buffer_bytes = 1u << 20;  // largest inbound message
     std::uint32_t write_buffer_bytes   = 1u << 20;  // largest outbound message
@@ -314,7 +321,7 @@ private:
 
     std::unique_ptr<Neo4jBoltListener> owned_listener_;
     std::thread                        serve_thread_;
-    std::vector<std::thread>           workers_;
+    std::vector<core::StackedThread>   workers_;
     std::atomic<bool>                  running_{false};
     std::atomic<bool>                  stopping_{false};
     std::atomic<std::uint16_t>         port_{0};
