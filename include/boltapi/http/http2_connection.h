@@ -91,9 +91,14 @@ struct Http2BufferPool {
     constexpr size_t buffer_size() const noexcept { return BufferSize; }
 };
 
-// Thread-local buffer pools (declared extern, defined in cpp)
-extern thread_local Http2BufferPool<H2_FRAME_BUFFER_SIZE, H2_FRAME_BUFFER_COUNT> t_h2_frame_pool;
-extern thread_local Http2BufferPool<H2_HEADER_BUFFER_SIZE, H2_HEADER_BUFFER_COUNT> t_h2_header_pool;
+using H2FramePool  = Http2BufferPool<H2_FRAME_BUFFER_SIZE, H2_FRAME_BUFFER_COUNT>;
+using H2HeaderPool = Http2BufferPool<H2_HEADER_BUFFER_SIZE, H2_HEADER_BUFFER_COUNT>;
+
+// Calling thread's pools, heap-allocated on first use and freed at thread
+// exit; only a pointer lives in static TLS (G2CHK-172). nullptr if that one
+// allocation fails.
+H2FramePool*  h2_frame_pool() noexcept;
+H2HeaderPool* h2_header_pool() noexcept;
 
 // ============================================================================
 // Pre-computed HPACK Response Headers
@@ -193,19 +198,21 @@ public:
     BufferPool() = default;
 
     uint8_t* acquire() noexcept {
-        // Use thread-local pool based on buffer size
         if constexpr (BufferSize >= 16384) {
-            return t_h2_frame_pool.acquire();
+            H2FramePool* p = h2_frame_pool();
+            return p != nullptr ? p->acquire() : nullptr;
         } else {
-            return t_h2_header_pool.acquire();
+            H2HeaderPool* p = h2_header_pool();
+            return p != nullptr ? p->acquire() : nullptr;
         }
     }
 
     void release(uint8_t* buffer) noexcept {
+        if (buffer == nullptr) return;
         if constexpr (BufferSize >= 16384) {
-            t_h2_frame_pool.release(buffer);
+            if (H2FramePool* p = h2_frame_pool()) p->release(buffer);
         } else {
-            t_h2_header_pool.release(buffer);
+            if (H2HeaderPool* p = h2_header_pool()) p->release(buffer);
         }
     }
 
