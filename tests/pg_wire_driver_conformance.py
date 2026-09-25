@@ -133,6 +133,40 @@ def main(server):
             cur.execute("select %s", ("after error",))
             check("usable after error", cur.fetchone()[0], "select 'after error'")
 
+        # G2ETL-84: SHOW is answered by the wire layer, never the executor.
+        with psycopg.connect(dsn, autocommit=True) as conn:
+            cur = conn.cursor()
+            cur.execute("show standard_conforming_strings")
+            check("show: extended", cur.fetchone()[0], "on")
+            check("show: column", cur.description[0].name, "standard_conforming_strings")
+            cur.execute("show transaction isolation level")
+            check("show: isolation", cur.fetchone()[0], "read committed")
+            ccur = psycopg.ClientCursor(conn)
+            ccur.execute("show TimeZone")
+            check("show: simple", ccur.fetchone()[0], "UTC")
+            try:
+                cur.execute("show search_path")
+                failures.append("unknown SHOW did not raise")
+            except psycopg.errors.UndefinedObject as e:
+                check("show: unknown", e.sqlstate, "42704")
+
+        # psycopg nests conn.transaction() inside a block as SAVEPOINT/RELEASE
+        # (TypeInfo.fetch does this while SQLAlchemy initialises).
+        with psycopg.connect(dsn) as conn:
+            cur = conn.cursor()
+            cur.execute("select %s", (1,))
+            with conn.transaction():
+                cur.execute("select %s", (2,))
+                check("savepoint: nested read", cur.fetchone()[0], "select 2")
+            try:
+                with conn.transaction():
+                    cur.execute("show search_path")
+            except psycopg.errors.UndefinedObject:
+                pass
+            cur.execute("select %s", (3,))
+            check("savepoint: block usable after rollback to", cur.fetchone()[0], "select 3")
+            conn.commit()
+
         # G2ETL-64: autocommit off -> the driver issues BEGIN; the wire layer
         # answers transaction control and reports the block in ReadyForQuery.
         with psycopg.connect(dsn) as conn:

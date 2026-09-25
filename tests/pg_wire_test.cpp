@@ -421,6 +421,54 @@ TEST(PgWireCodec, SessionCommands) {
     EXPECT_EQ(pg::classify_session_command("settings", tag, e), pg::SessionCommand::NotSession);
 }
 
+TEST(PgWireCodec, ShowCommands) {
+    pg::ShowAnswer a;
+    pg::CodecError e;
+    EXPECT_EQ(pg::classify_show_command("show standard_conforming_strings", "14.9", a, e),
+              pg::ShowCommand::Answered);
+    EXPECT_STREQ(a.column, "standard_conforming_strings");
+    EXPECT_EQ(a.value, "on");
+    EXPECT_EQ(pg::classify_show_command("show transaction isolation level", "14.9", a, e),
+              pg::ShowCommand::Answered);
+    EXPECT_STREQ(a.column, "transaction_isolation");
+    EXPECT_EQ(a.value, "read committed");
+    EXPECT_EQ(pg::classify_show_command("SHOW\tTIME  ZONE;", "14.9", a, e),
+              pg::ShowCommand::Answered);
+    EXPECT_STREQ(a.column, "TimeZone");
+    EXPECT_EQ(pg::classify_show_command("SHOW \"datestyle\"", "14.9", a, e),
+              pg::ShowCommand::Answered);
+    EXPECT_EQ(a.value, "ISO, MDY");
+    EXPECT_EQ(pg::classify_show_command("show server_version", "14.9", a, e),
+              pg::ShowCommand::Answered);
+    EXPECT_EQ(a.value, "14.9");
+    EXPECT_EQ(pg::classify_show_command("SHOW search_path", "14.9", a, e),
+              pg::ShowCommand::Refused);
+    EXPECT_STREQ(e.sqlstate, "42704");
+    EXPECT_EQ(pg::classify_show_command("SHOW ALL", "14.9", a, e), pg::ShowCommand::Refused);
+    EXPECT_STREQ(e.sqlstate, "0A000");
+    EXPECT_EQ(pg::classify_show_command("select 1", "14.9", a, e), pg::ShowCommand::NotShow);
+    EXPECT_EQ(pg::classify_show_command("showcase", "14.9", a, e), pg::ShowCommand::NotShow);
+}
+
+TEST_F(PgWire, ShowIsAnsweredByTheWireLayer) {
+    c_.msg('Q', std::string("show standard_conforming_strings\0", 33));
+    auto r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "TDCZ");
+    EXPECT_EQ(PgClient::col0(r[1]), "on");
+    c_.parse("", "SHOW transaction isolation level");
+    c_.bind("", "", {});
+    c_.describe('P', "");
+    c_.execute("");
+    c_.sync();
+    r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "12TDCZ");
+    EXPECT_EQ(PgClient::col0(r[3]), "read committed");
+    EXPECT_EQ(factory_.last->executes, 0);
+    c_.msg('Q', std::string("show nonsense\0", 14));
+    r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "EZ");
+}
+
 TEST_F(PgWire, SetIsAnsweredByTheWireLayer) {
     c_.parse("", "SET application_name = 'x'");
     c_.bind("", "", {});
@@ -456,9 +504,19 @@ TEST(PgWireCodec, TransactionCommands) {
     EXPECT_EQ(pg::classify_transaction_command("COMMIT AND NO CHAIN", ro, e), pg::TxCommand::Commit);
     EXPECT_EQ(pg::classify_transaction_command("ROLLBACK WORK", ro, e), pg::TxCommand::Rollback);
     EXPECT_EQ(pg::classify_transaction_command("abort", ro, e), pg::TxCommand::Rollback);
-    EXPECT_EQ(pg::classify_transaction_command("ROLLBACK TO SAVEPOINT s", ro, e),
-              pg::TxCommand::Refused);
-    EXPECT_EQ(pg::classify_transaction_command("SAVEPOINT s", ro, e), pg::TxCommand::Refused);
+    std::string_view sp;
+    EXPECT_EQ(pg::classify_transaction_command("ROLLBACK TO SAVEPOINT s", ro, e, &sp),
+              pg::TxCommand::RollbackTo);
+    EXPECT_EQ(sp, "s");
+    EXPECT_EQ(pg::classify_transaction_command("SAVEPOINT \"_pg3_1\"", ro, e, &sp),
+              pg::TxCommand::Savepoint);
+    EXPECT_EQ(sp, "\"_pg3_1\"");
+    EXPECT_EQ(pg::classify_transaction_command("release savepoint a", ro, e, &sp),
+              pg::TxCommand::Release);
+    EXPECT_EQ(pg::classify_transaction_command("RELEASE a", ro, e, &sp), pg::TxCommand::Release);
+    EXPECT_EQ(pg::classify_transaction_command("SAVEPOINT a b", ro, e), pg::TxCommand::Refused);
+    EXPECT_EQ(pg::classify_transaction_command("SAVEPOINT \"a\"\"b\"", ro, e),
+              pg::TxCommand::None);
     EXPECT_EQ(pg::classify_transaction_command("COMMIT AND CHAIN", ro, e), pg::TxCommand::Refused);
     EXPECT_EQ(pg::classify_transaction_command("PREPARE TRANSACTION 'x'", ro, e),
               pg::TxCommand::Refused);
@@ -469,7 +527,8 @@ TEST(PgWireCodec, TransactionCommands) {
               pg::TxCommand::None);
     EXPECT_EQ(pg::classify_transaction_command("COMMIT PREPARED 'x'", ro, e),
               pg::TxCommand::Refused);
-    EXPECT_EQ(pg::classify_transaction_command("ROLLBACK TO s", ro, e), pg::TxCommand::Refused);
+    EXPECT_EQ(pg::classify_transaction_command("ROLLBACK TO s", ro, e),
+              pg::TxCommand::RollbackTo);
 }
 
 namespace {
@@ -518,6 +577,42 @@ TEST_F(PgWire, FailedBlockRefusesUntilEnd) {
     ASSERT_EQ(PgClient::types(r), "CZ");
     EXPECT_EQ(r[0].body, std::string("ROLLBACK\0", 9));
     EXPECT_EQ(ready_status(r), 'I');
+}
+
+TEST_F(PgWire, SavepointsTrackTheBlockWithoutUndoingWrites) {
+    const auto q = [&](const char* sql) {
+        c_.msg('Q', std::string(sql, std::strlen(sql) + 1));
+        return c_.roundtrip();
+    };
+    auto r = q("SAVEPOINT a");                        // outside a block
+    ASSERT_EQ(PgClient::types(r), "EZ");
+    EXPECT_EQ(PgClient::sqlstate(r[0]), "25P01");
+    (void)q("BEGIN");
+    r = q("SAVEPOINT \"_pg3_1\"");
+    ASSERT_EQ(PgClient::types(r), "CZ");
+    EXPECT_EQ(r[0].body, std::string("SAVEPOINT\0", 10));
+    r = q("SET search_path = x");                     // fails the block
+    EXPECT_EQ(ready_status(r), 'E');
+    r = q("ROLLBACK TO \"_pg3_1\"");                   // no writes since: recovers
+    ASSERT_EQ(PgClient::types(r), "CZ");
+    EXPECT_EQ(r[0].body, std::string("ROLLBACK\0", 9));
+    EXPECT_EQ(ready_status(r), 'T');
+    r = q("RELEASE \"_pg3_1\"");
+    ASSERT_EQ(PgClient::types(r), "CZ");
+    EXPECT_EQ(r[0].body, std::string("RELEASE\0", 8));
+    r = q("RELEASE \"_pg3_1\"");
+    ASSERT_EQ(PgClient::types(r), "EZ");
+    EXPECT_EQ(PgClient::sqlstate(r[0]), "3B001");
+    (void)q("ROLLBACK");
+    (void)q("BEGIN");
+    (void)q("SAVEPOINT A");
+    (void)q("ddl insert");
+    r = q("rollback to savepoint a");                 // a write ran after it
+    ASSERT_EQ(PgClient::types(r), "EZ");
+    EXPECT_EQ(PgClient::sqlstate(r[0]), "0A000");
+    EXPECT_EQ(ready_status(r), 'E');
+    (void)q("ROLLBACK");
+    EXPECT_EQ(factory_.last->executes, 1);            // only the write reached the engine
 }
 
 TEST_F(PgWire, RollbackAfterWriteSaysNothingWasUndone) {

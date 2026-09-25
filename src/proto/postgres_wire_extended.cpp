@@ -31,6 +31,7 @@ void set_name(char (&dst)[kMaxNameLen], std::string_view name) noexcept {
 
 ExtendedSession::ExtendedSession(const Config& cfg) noexcept
     : max_stmt_bytes_(cfg.max_statement_bytes),
+      server_version_(cfg.server_version),
       stmts_(cfg.max_prepared_statements),
       portals_(cfg.max_portals),
       stmt_pool_(cfg.statement_pool_bytes),
@@ -50,6 +51,7 @@ void ExtendedSession::reset() noexcept {
     tx_status_ = 'I';
     tx_read_only_ = false;
     tx_writes_ = 0;
+    n_savepoints_ = 0;
     assert(stmts_.size() >= 1 && portals_.size() >= 1);
 }
 
@@ -61,6 +63,7 @@ ExtendedSession::TxStep ExtendedSession::tx_end(bool rollback, const char*& tag,
     tx_status_ = 'I';
     tx_read_only_ = false;
     tx_writes_ = 0;
+    n_savepoints_ = 0;
     for (std::size_t i = 1; i < portals_.size(); ++i) {         // bounded by slots
         if (portals_[i].used && !portals_[i].holdable) close_portal(static_cast<std::int32_t>(i));
     }
@@ -82,11 +85,16 @@ ExtendedSession::TxStep ExtendedSession::tx_statement(std::string_view sql, int 
     assert(tx_status_ == 'I' || tx_status_ == 'T' || tx_status_ == 'E');
     bool read_only = false;
     CodecError ce;
-    const TxCommand cmd = classify_transaction_command(sql, read_only, ce);
+    std::string_view sp;
+    const TxCommand cmd = classify_transaction_command(sql, read_only, ce, &sp);
     if (cmd == TxCommand::Refused) {
         qf.sqlstate = ce.sqlstate;
         qf.message  = ce.message;
         return TxStep::Failed;
+    }
+    if (cmd == TxCommand::Savepoint || cmd == TxCommand::Release ||
+        cmd == TxCommand::RollbackTo) {
+        return tx_savepoint(cmd, sp, tag, qf);
     }
     if (cmd == TxCommand::None) {
         if (tx_status_ != 'E') return TxStep::Pass;
@@ -119,6 +127,77 @@ ExtendedSession::TxStep ExtendedSession::tx_statement(std::string_view sql, int 
         return TxStep::Tagged;
     }
     return tx_end(rollback, tag, qf);
+}
+
+namespace {
+
+// Savepoint names fold to lower case unless double-quoted, as in Postgres.
+bool fold_savepoint(std::string_view word, char (&out)[kMaxNameLen]) noexcept {
+    const bool quoted = word.size() >= 2 && word.front() == '"';
+    if (quoted) word = word.substr(1, word.size() - 2);
+    if (word.empty() || word.size() >= kMaxNameLen) return false;
+    for (std::size_t i = 0; i < word.size(); ++i) {              // bounded by kMaxNameLen
+        const char c = word[i];
+        out[i] = (!quoted && c >= 'A' && c <= 'Z') ? static_cast<char>(c + 32) : c;
+    }
+    out[word.size()] = '\0';
+    assert(std::strlen(out) == word.size());
+    return true;
+}
+
+ExtendedSession::TxStep tx_fail(QueryFailure& qf, const char* sqlstate,
+                                const char* msg) noexcept {
+    qf.sqlstate = sqlstate;
+    qf.message  = msg;
+    return ExtendedSession::TxStep::Failed;
+}
+
+}  // namespace
+
+// Savepoints mark a point in the block's write count: nothing is undone, so
+// ROLLBACK TO succeeds only when no write ran after the savepoint.
+ExtendedSession::TxStep ExtendedSession::tx_savepoint(TxCommand cmd, std::string_view word,
+                                                      const char*& tag,
+                                                      QueryFailure& qf) noexcept {
+    assert(cmd == TxCommand::Savepoint || cmd == TxCommand::Release ||
+           cmd == TxCommand::RollbackTo);
+    assert(n_savepoints_ <= kMaxSavepoints);
+    if (tx_status_ == 'I') {
+        return tx_fail(qf, "25P01", "savepoints can only be used in transaction blocks");
+    }
+    if (tx_status_ == 'E' && cmd != TxCommand::RollbackTo) {
+        return tx_fail(qf, "25P02", "current transaction is aborted, commands "
+                       "ignored until end of transaction block");
+    }
+    char name[kMaxNameLen];
+    if (!fold_savepoint(word, name)) return tx_fail(qf, "42602", "invalid savepoint name");
+    if (cmd == TxCommand::Savepoint) {
+        if (n_savepoints_ == kMaxSavepoints) {
+            return tx_fail(qf, "54000", "too many savepoints in this transaction block");
+        }
+        Savepoint& s = savepoints_[n_savepoints_++];
+        std::memcpy(s.name, name, sizeof(name));
+        s.writes = tx_writes_;
+        tag = "SAVEPOINT";
+        return TxStep::Tagged;
+    }
+    std::uint32_t k = n_savepoints_;
+    while (k > 0 && std::strcmp(savepoints_[k - 1].name, name) != 0) --k;   // bounded
+    if (k == 0) return tx_fail(qf, "3B001", "savepoint does not exist");
+    if (cmd == TxCommand::Release) {
+        n_savepoints_ = k - 1;
+        tag = "RELEASE";
+        return TxStep::Tagged;
+    }
+    if (tx_writes_ > savepoints_[k - 1].writes) {
+        return tx_fail(qf, "0A000", "writes made after the savepoint were NOT rolled "
+                       "back: this endpoint has no transactions, every statement "
+                       "was applied when it ran");
+    }
+    n_savepoints_ = k;
+    tx_status_ = 'T';
+    tag = "ROLLBACK";
+    return TxStep::Tagged;
 }
 
 bool ExtendedSession::tx_admit(std::string_view sql, QueryFailure& qf) noexcept {
@@ -357,6 +436,7 @@ bool ExtendedSession::on_bind(BodyReader& r, int fd, MsgWriter& w) noexcept {
     p.materialized = false;
     p.done         = false;
     p.session_tag  = nullptr;
+    p.show         = false;
     p.cursor       = false;
     p.holdable     = false;
     p.fetch_from   = -1;
@@ -413,6 +493,22 @@ bool ExtendedSession::materialize(std::int32_t pi, int fd, MsgWriter& w,
         p.materialized = true;
         return true;
     }
+    ShowAnswer sa;
+    const ShowCommand sh = show_statement(sql, sa, qf);
+    if (sh == ShowCommand::Refused) return false;
+    if (sh == ShowCommand::Answered) {
+        p.session_tag  = "SHOW";
+        p.show         = true;
+        p.show_len     = static_cast<std::uint32_t>(sa.value.size());
+        std::memcpy(p.show_value, sa.value.data(), sa.value.size());
+        set_name(p.names[0], sa.column);
+        p.oids[0]      = oid::kText;
+        fields[0].name = p.names[0];
+        fields[0].type_oid = oid::kText;
+        p.field_count  = 1;
+        p.materialized = true;
+        return true;
+    }
     p.session_tag = nullptr;
     if (!tx_admit(sql, qf)) return false;
     current_ = -1;
@@ -452,6 +548,16 @@ bool ExtendedSession::describe_statement(const Statement& st, int fd, MsgWriter&
 
     const std::string_view sql = statement_sql(st);
     if (describe_fetch(sql, fd, w)) return true;
+    ShowAnswer sa;
+    QueryFailure sqf;
+    const ShowCommand sh = show_statement(sql, sa, sqf);
+    if (sh == ShowCommand::Refused) return fail(fd, w, sqf.sqlstate, sqf.message);
+    if (sh == ShowCommand::Answered) {
+        FieldDesc f;
+        f.name = sa.column;
+        f.type_oid = oid::kText;
+        return put_row_description(w, &f, 1, nullptr) && w.send(fd);
+    }
     if (!is_query_shaped(sql)) {
         w.begin('n');
         return w.finish() && w.send(fd);
@@ -544,6 +650,38 @@ bool ExtendedSession::on_describe(BodyReader& r, int fd, MsgWriter& w,
     return w.send(fd);
 }
 
+ShowCommand ExtendedSession::show_statement(std::string_view sql, ShowAnswer& out,
+                                            QueryFailure& qf) const noexcept {
+    CodecError ce;
+    const ShowCommand sh = classify_show_command(sql, server_version_, out, ce);
+    if (sh == ShowCommand::Answered && out.value.size() >= kMaxNameLen) {
+        qf.sqlstate = "54000";
+        qf.message  = "setting value is too long for this endpoint";
+        return ShowCommand::Refused;
+    }
+    if (sh == ShowCommand::Refused) {
+        qf.sqlstate = ce.sqlstate;
+        qf.message  = ce.message;
+    }
+    assert(sh != ShowCommand::Answered || out.column != nullptr);
+    return sh;
+}
+
+// One DataRow (text and binary text are the same bytes) + CommandComplete.
+bool ExtendedSession::send_show(Portal& p, int fd, MsgWriter& w) noexcept {
+    assert(p.show && p.field_count == 1);
+    assert(p.show_len < kMaxNameLen);
+    w.begin('D');
+    w.put_i16(1);
+    w.put_i32(static_cast<std::int32_t>(p.show_len));
+    w.put_bytes(p.show_value, p.show_len);
+    if (!w.finish() || !w.send(fd)) return false;
+    p.done = true;
+    w.begin('C');
+    w.put_cstring("SHOW");
+    return w.finish() && w.send(fd);
+}
+
 bool ExtendedSession::send_rows(Portal& p, std::int32_t max_rows, int fd,
                                 MsgWriter& w, IQueryExecutor& exec) noexcept {
     assert(p.materialized && p.fetch_from < 0);
@@ -597,6 +735,7 @@ bool ExtendedSession::on_execute(BodyReader& r, int fd, MsgWriter& w,
         w.put_cstring(tag);
         return w.finish() && w.send(fd);
     }
+    if (p.show) return send_show(p, fd, w);
     if (p.fetch_from > 0) return send_fetch(p, max_rows, fd, w, exec);
     return send_rows(p, max_rows, fd, w, exec);
 }

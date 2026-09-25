@@ -92,6 +92,23 @@ enum class SessionCommand : std::uint8_t {
 SessionCommand classify_session_command(std::string_view sql, const char*& tag,
                                         CodecError& err) noexcept;
 
+// SHOW <setting>: answered by the wire layer from the values it already
+// reports in ParameterStatus, as one text column named after the setting.
+enum class ShowCommand : std::uint8_t {
+    NotShow  = 0,   // not SHOW: hand it on
+    Answered = 1,   // `column`/`value` hold the single-row result
+    Refused  = 2,   // unknown setting (42704) or SHOW ALL (0A000)
+};
+
+struct ShowAnswer {
+    const char*      column = nullptr;   // canonical setting name
+    std::string_view value;              // static, or `server_version`
+};
+
+// Classify `sql`. `server_version` is this server's reported version.
+ShowCommand classify_show_command(std::string_view sql, std::string_view server_version,
+                                  ShowAnswer& out, CodecError& err) noexcept;
+
 // Transaction-control statements. There are no transactions behind this
 // wire layer (every statement is applied when it runs), so it answers these
 // itself and tracks only the block status clients read from ReadyForQuery.
@@ -100,12 +117,17 @@ enum class TxCommand : std::uint8_t {
     Begin    = 1,   // BEGIN / START TRANSACTION [modes]
     Commit   = 2,   // COMMIT / END
     Rollback = 3,   // ROLLBACK / ABORT
-    Refused  = 4,   // savepoints, two-phase, chaining, strict isolation
+    Refused  = 4,   // two-phase, chaining, strict isolation
+    Savepoint  = 5, // SAVEPOINT name
+    Release    = 6, // RELEASE [SAVEPOINT] name
+    RollbackTo = 7, // ROLLBACK [WORK|TRANSACTION] TO [SAVEPOINT] name
 };
 
-// Classify `sql`. `read_only` receives READ ONLY for Begin.
+// Classify `sql`. `read_only` receives READ ONLY for Begin; `savepoint`
+// the name word (double quotes kept) for the savepoint commands.
 TxCommand classify_transaction_command(std::string_view sql, bool& read_only,
-                                       CodecError& err) noexcept;
+                                       CodecError& err,
+                                       std::string_view* savepoint = nullptr) noexcept;
 
 // Does the statement read (SELECT/WITH/VALUES/TABLE/SHOW/EXPLAIN, after
 // leading whitespace, comments and parentheses)? Anything else is treated

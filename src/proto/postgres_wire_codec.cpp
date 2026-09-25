@@ -703,6 +703,65 @@ SessionCommand classify_session_command(std::string_view sql, const char*& tag,
 
 namespace {
 
+struct ShowSetting {
+    const char* name;    // canonical GUC name, also the result column
+    const char* value;   // nullptr = server_version from the config
+};
+
+// Must agree with the ParameterStatus values sent at startup.
+constexpr ShowSetting kShowSettings[] = {
+    {"client_encoding", "UTF8"},
+    {"server_encoding", "UTF8"},
+    {"DateStyle", "ISO, MDY"},
+    {"integer_datetimes", "on"},
+    {"standard_conforming_strings", "on"},
+    {"TimeZone", "UTC"},
+    {"IntervalStyle", "postgres"},
+    {"is_superuser", "off"},
+    {"server_version", nullptr},
+    {"transaction_isolation", "read committed"},
+    {"default_transaction_isolation", "read committed"},
+};
+
+}  // namespace
+
+ShowCommand classify_show_command(std::string_view sql, std::string_view server_version,
+                                  ShowAnswer& out, CodecError& err) noexcept {
+    std::string_view s = trim(sql);
+    if (!ieq(next_word(s), "SHOW")) return ShowCommand::NotShow;
+    std::string_view rest = trim(s);
+    std::string_view name = unquote(rest);
+    std::string_view t = rest;
+    const std::string_view w1 = next_word(t);
+    if (ieq(w1, "TRANSACTION")) {                    // SHOW TRANSACTION ISOLATION LEVEL
+        const std::string_view a = next_word(t);
+        const std::string_view b = next_word(t);
+        if (ieq(a, "ISOLATION") && ieq(b, "LEVEL") && trim(t).empty()) {
+            name = "transaction_isolation";
+        }
+    } else if (ieq(w1, "TIME")) {                    // SHOW TIME ZONE
+        if (ieq(next_word(t), "ZONE") && trim(t).empty()) name = "TimeZone";
+    }
+    assert(name.size() <= sql.size());
+    if (ieq(name, "ALL")) {
+        err.sqlstate = "0A000";
+        err.message  = "SHOW ALL is not supported: SHOW a named setting";
+        return ShowCommand::Refused;
+    }
+    for (const ShowSetting& st : kShowSettings) {    // bounded by the table
+        if (!ieq(name, st.name)) continue;
+        out.column = st.name;
+        out.value  = st.value != nullptr ? std::string_view(st.value) : server_version;
+        assert(out.column != nullptr);
+        return ShowCommand::Answered;
+    }
+    err.sqlstate = "42704";
+    err.message  = "unrecognized configuration parameter";
+    return ShowCommand::Refused;
+}
+
+namespace {
+
 constexpr std::uint32_t kMaxTxWords = 16;
 
 // Words of a transaction-control statement: identifier runs separated by
@@ -722,6 +781,17 @@ TxWords split_tx_words(std::string_view s) noexcept {
     while (i < s.size()) {                                  // bounded by s.size()
         const char c = s[i];
         if (is_space(c) || c == ',') { ++i; continue; }
+        if (c == '"') {                                     // quoted identifier
+            const std::size_t close = s.find('"', i + 1);
+            if (close == std::string_view::npos || close == i + 1 ||
+                (close + 1 < s.size() && s[close + 1] == '"') || out.n == kMaxTxWords) {
+                out.bad = true;
+                return out;
+            }
+            out.w[out.n++] = s.substr(i, close + 1 - i);
+            i = close + 1;
+            continue;
+        }
         if (!is_ident_char(c) || c == '$') { out.bad = true; return out; }
         const std::size_t start = i;
         while (i < s.size() && is_ident_char(s[i]) && s[i] != '$') ++i;
@@ -774,9 +844,16 @@ TxCommand parse_tx_modes(const TxWords& t, std::uint32_t k, bool& read_only,
 // Tail of COMMIT/END/ROLLBACK/ABORT from word `k`: [WORK|TRANSACTION]
 // [AND NO CHAIN].
 TxCommand parse_tx_end(const TxWords& t, std::uint32_t k, TxCommand cmd,
-                       CodecError& err) noexcept {
+                       CodecError& err, std::string_view* savepoint) noexcept {
     assert(cmd == TxCommand::Commit || cmd == TxCommand::Rollback);
     if (k < t.n && (ieq(t.w[k], "WORK") || ieq(t.w[k], "TRANSACTION"))) ++k;
+    if (cmd == TxCommand::Rollback && k < t.n && ieq(t.w[k], "TO")) {
+        ++k;
+        if (k + 1 < t.n && ieq(t.w[k], "SAVEPOINT")) ++k;
+        if (k + 1 != t.n) return tx_refuse(err, "42601", "ROLLBACK TO needs one savepoint name");
+        if (savepoint != nullptr) *savepoint = t.w[k];
+        return TxCommand::RollbackTo;
+    }
     if (k + 3 == t.n && ieq(t.w[k], "AND") && ieq(t.w[k + 1], "NO") &&
         ieq(t.w[k + 2], "CHAIN")) {
         k += 3;
@@ -801,7 +878,7 @@ bool ieq_prefix(std::string_view s, std::size_t at, const char* kw) noexcept {
 }  // namespace
 
 TxCommand classify_transaction_command(std::string_view sql, bool& read_only,
-                                       CodecError& err) noexcept {
+                                       CodecError& err, std::string_view* savepoint) noexcept {
     read_only = false;
     const TxWords t = split_tx_words(trim(sql));
     if (t.n == 0) return TxCommand::None;
@@ -820,12 +897,20 @@ TxCommand classify_transaction_command(std::string_view sql, bool& read_only,
         if (t.n < 2 || !ieq(t.w[1], "TRANSACTION")) return TxCommand::None;
         return parse_tx_modes(t, 2, read_only, err);
     }
-    if (ieq(v, "COMMIT") || ieq(v, "END")) return parse_tx_end(t, 1, TxCommand::Commit, err);
-    if (ieq(v, "ROLLBACK") || ieq(v, "ABORT")) {
-        return parse_tx_end(t, 1, TxCommand::Rollback, err);
+    if (ieq(v, "COMMIT") || ieq(v, "END")) {
+        return parse_tx_end(t, 1, TxCommand::Commit, err, savepoint);
     }
-    if (ieq(v, "SAVEPOINT") || (ieq(v, "RELEASE") && t.n >= 2)) {
-        return tx_refuse(err, "0A000", "savepoints are not supported");
+    if (ieq(v, "ROLLBACK") || ieq(v, "ABORT")) {
+        return parse_tx_end(t, 1, TxCommand::Rollback, err, savepoint);
+    }
+    const bool sp = ieq(v, "SAVEPOINT");
+    if (sp || (ieq(v, "RELEASE") && t.n >= 2)) {
+        std::uint32_t k = 1;
+        if (!sp && k + 1 < t.n && ieq(t.w[k], "SAVEPOINT")) ++k;
+        if (k + 1 != t.n) return tx_refuse(err, "42601", "expected one savepoint name");
+        if (savepoint != nullptr) *savepoint = t.w[k];
+        assert(!t.w[k].empty());
+        return sp ? TxCommand::Savepoint : TxCommand::Release;
     }
     return TxCommand::None;
 }
