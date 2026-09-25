@@ -51,6 +51,7 @@ void ExtendedSession::reset() noexcept {
     tx_status_ = 'I';
     tx_read_only_ = false;
     tx_writes_ = 0;
+    n_savepoints_ = 0;
     assert(stmts_.size() >= 1 && portals_.size() >= 1);
 }
 
@@ -62,6 +63,7 @@ ExtendedSession::TxStep ExtendedSession::tx_end(bool rollback, const char*& tag,
     tx_status_ = 'I';
     tx_read_only_ = false;
     tx_writes_ = 0;
+    n_savepoints_ = 0;
     for (std::size_t i = 1; i < portals_.size(); ++i) {         // bounded by slots
         if (portals_[i].used && !portals_[i].holdable) close_portal(static_cast<std::int32_t>(i));
     }
@@ -83,11 +85,16 @@ ExtendedSession::TxStep ExtendedSession::tx_statement(std::string_view sql, int 
     assert(tx_status_ == 'I' || tx_status_ == 'T' || tx_status_ == 'E');
     bool read_only = false;
     CodecError ce;
-    const TxCommand cmd = classify_transaction_command(sql, read_only, ce);
+    std::string_view sp;
+    const TxCommand cmd = classify_transaction_command(sql, read_only, ce, &sp);
     if (cmd == TxCommand::Refused) {
         qf.sqlstate = ce.sqlstate;
         qf.message  = ce.message;
         return TxStep::Failed;
+    }
+    if (cmd == TxCommand::Savepoint || cmd == TxCommand::Release ||
+        cmd == TxCommand::RollbackTo) {
+        return tx_savepoint(cmd, sp, tag, qf);
     }
     if (cmd == TxCommand::None) {
         if (tx_status_ != 'E') return TxStep::Pass;
@@ -120,6 +127,77 @@ ExtendedSession::TxStep ExtendedSession::tx_statement(std::string_view sql, int 
         return TxStep::Tagged;
     }
     return tx_end(rollback, tag, qf);
+}
+
+namespace {
+
+// Savepoint names fold to lower case unless double-quoted, as in Postgres.
+bool fold_savepoint(std::string_view word, char (&out)[kMaxNameLen]) noexcept {
+    const bool quoted = word.size() >= 2 && word.front() == '"';
+    if (quoted) word = word.substr(1, word.size() - 2);
+    if (word.empty() || word.size() >= kMaxNameLen) return false;
+    for (std::size_t i = 0; i < word.size(); ++i) {              // bounded by kMaxNameLen
+        const char c = word[i];
+        out[i] = (!quoted && c >= 'A' && c <= 'Z') ? static_cast<char>(c + 32) : c;
+    }
+    out[word.size()] = '\0';
+    assert(std::strlen(out) == word.size());
+    return true;
+}
+
+ExtendedSession::TxStep tx_fail(QueryFailure& qf, const char* sqlstate,
+                                const char* msg) noexcept {
+    qf.sqlstate = sqlstate;
+    qf.message  = msg;
+    return ExtendedSession::TxStep::Failed;
+}
+
+}  // namespace
+
+// Savepoints mark a point in the block's write count: nothing is undone, so
+// ROLLBACK TO succeeds only when no write ran after the savepoint.
+ExtendedSession::TxStep ExtendedSession::tx_savepoint(TxCommand cmd, std::string_view word,
+                                                      const char*& tag,
+                                                      QueryFailure& qf) noexcept {
+    assert(cmd == TxCommand::Savepoint || cmd == TxCommand::Release ||
+           cmd == TxCommand::RollbackTo);
+    assert(n_savepoints_ <= kMaxSavepoints);
+    if (tx_status_ == 'I') {
+        return tx_fail(qf, "25P01", "savepoints can only be used in transaction blocks");
+    }
+    if (tx_status_ == 'E' && cmd != TxCommand::RollbackTo) {
+        return tx_fail(qf, "25P02", "current transaction is aborted, commands "
+                       "ignored until end of transaction block");
+    }
+    char name[kMaxNameLen];
+    if (!fold_savepoint(word, name)) return tx_fail(qf, "42602", "invalid savepoint name");
+    if (cmd == TxCommand::Savepoint) {
+        if (n_savepoints_ == kMaxSavepoints) {
+            return tx_fail(qf, "54000", "too many savepoints in this transaction block");
+        }
+        Savepoint& s = savepoints_[n_savepoints_++];
+        std::memcpy(s.name, name, sizeof(name));
+        s.writes = tx_writes_;
+        tag = "SAVEPOINT";
+        return TxStep::Tagged;
+    }
+    std::uint32_t k = n_savepoints_;
+    while (k > 0 && std::strcmp(savepoints_[k - 1].name, name) != 0) --k;   // bounded
+    if (k == 0) return tx_fail(qf, "3B001", "savepoint does not exist");
+    if (cmd == TxCommand::Release) {
+        n_savepoints_ = k - 1;
+        tag = "RELEASE";
+        return TxStep::Tagged;
+    }
+    if (tx_writes_ > savepoints_[k - 1].writes) {
+        return tx_fail(qf, "0A000", "writes made after the savepoint were NOT rolled "
+                       "back: this endpoint has no transactions, every statement "
+                       "was applied when it ran");
+    }
+    n_savepoints_ = k;
+    tx_status_ = 'T';
+    tag = "ROLLBACK";
+    return TxStep::Tagged;
 }
 
 bool ExtendedSession::tx_admit(std::string_view sql, QueryFailure& qf) noexcept {

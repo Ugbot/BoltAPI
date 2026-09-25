@@ -117,12 +117,17 @@ enum class TxCommand : std::uint8_t {
     Begin    = 1,   // BEGIN / START TRANSACTION [modes]
     Commit   = 2,   // COMMIT / END
     Rollback = 3,   // ROLLBACK / ABORT
-    Refused  = 4,   // savepoints, two-phase, chaining, strict isolation
+    Refused  = 4,   // two-phase, chaining, strict isolation
+    Savepoint  = 5, // SAVEPOINT name
+    Release    = 6, // RELEASE [SAVEPOINT] name
+    RollbackTo = 7, // ROLLBACK [WORK|TRANSACTION] TO [SAVEPOINT] name
 };
 
-// Classify `sql`. `read_only` receives READ ONLY for Begin.
+// Classify `sql`. `read_only` receives READ ONLY for Begin; `savepoint`
+// the name word (double quotes kept) for the savepoint commands.
 TxCommand classify_transaction_command(std::string_view sql, bool& read_only,
-                                       CodecError& err) noexcept;
+                                       CodecError& err,
+                                       std::string_view* savepoint = nullptr) noexcept;
 
 // Does the statement read (SELECT/WITH/VALUES/TABLE/SHOW/EXPLAIN, after
 // leading whitespace, comments and parentheses)? Anything else is treated
