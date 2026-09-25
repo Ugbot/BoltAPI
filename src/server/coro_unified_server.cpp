@@ -15,6 +15,7 @@
 #include "boltapi/http/request_body_buffer.h"
 #include "boltapi/net/sys_compat.h"
 #include <algorithm>
+#include <cassert>
 #include <iostream>
 #include <cstring>
 #include <cctype>
@@ -564,6 +565,33 @@ core::coro_task<ssize_t> conn_read(net::IODispatcher& io, int fd,
     co_return co_await io.async_read(fd, data, len);
 }
 
+// Raw chunked framing may exceed the decoded size a little; the decoded body
+// is still checked against max_body_size once it is complete.
+template <typename Config>
+size_t chunked_buffer_limit(const Config& cfg) noexcept {
+    return cfg.max_header_size + cfg.max_body_size + (cfg.max_body_size >> 3) +
+           64u * 1024u;
+}
+
+// Grow the read buffer for a chunked body (x4 per step, bounded by `limit`).
+// Returns false when the limit is reached, so the caller answers 413.
+bool grow_chunked_buffer(RequestBodyBuffer& body_buf, uint8_t*& buf,
+                         size_t buf_len, size_t& buf_cap, size_t limit) {
+    assert(buf != nullptr);
+    assert(buf_len <= buf_cap);
+    if (buf_cap >= limit) return false;
+    size_t want = std::max<size_t>(buf_cap * 4, 64u * 1024u);
+    if (want > limit) want = limit;
+    RequestBodyBuffer grown;
+    if (!grown.reserve(want, limit)) return false;
+    grown.adopt(buf, buf_len);
+    body_buf = std::move(grown);
+    buf = body_buf.writable_data();
+    buf_cap = body_buf.capacity();
+    assert(buf_cap > buf_len);
+    return true;
+}
+
 // Fully write `len` bytes, looping over partial writes and yielding the I/O
 // thread between them. Used by the separate-body-write path (send_borrowed /
 // send_owned), where headers and body are two writes instead of one
@@ -1081,6 +1109,8 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
     size_t buf_len = 0;
     RequestBodyBuffer body_buf;   // RAII — auto-releases arena buffer on destruction
     bool body_detected = false;   // set when Content-Length found in headers
+    bool chunked_body = false;    // Transfer-Encoding: chunked, size unknown
+    bool continue_sent = false;   // "100 Continue" already written for this request
 
     HTTP1Parser parser;
 
@@ -1114,6 +1144,11 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
         while (parse_result < 0 && !stop_requested_.load(std::memory_order_relaxed)) {
             // Buffer full — need to grow or reject
             if (buf_len >= buf_cap) {
+                if (chunked_body && grow_chunked_buffer(
+                                        body_buf, buf, buf_len, buf_cap,
+                                        chunked_buffer_limit(config_))) {
+                    continue;
+                }
                 if (!body_detected) {
                     const char* r = "HTTP/1.1 431 Request Header Fields Too Large\r\n"
                         "Content-Length: 0\r\nConnection: close\r\n\r\n";
@@ -1172,13 +1207,26 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
                     }
                 }
 
-                // Chunked without Content-Length — not yet supported
-                if (!body_detected && parsed_req.chunked && !parsed_req.has_content_length) {
-                    const char* r = "HTTP/1.1 501 Not Implemented\r\n"
-                        "Content-Length: 0\r\nConnection: close\r\n\r\n";
-                    co_await conn_write(io, fd, tls,r, strlen(r));
-                    io.async_close(fd);
-                    co_return;
+                // Chunked: the size is unknown, so the buffer grows on demand
+                // (grow_chunked_buffer, bounded by max_body_size).
+                if (!body_detected && parsed_req.chunked) {
+                    body_detected = true;
+                    chunked_body = true;
+                }
+
+                // Headers are in and the body is not: a client that sent
+                // Expect: 100-continue is waiting for this before sending it.
+                if (body_detected && !continue_sent &&
+                    parsed_req.version == HTTP1Version::HTTP_1_1 &&
+                    HTTP1Parser::str_eq_ci(parsed_req.get_header("expect"),
+                                           "100-continue")) {
+                    continue_sent = true;
+                    static constexpr char kContinue[] = "HTTP/1.1 100 Continue\r\n\r\n";
+                    if (!co_await conn_write_all(io, fd, tls, kContinue,
+                                                 sizeof(kContinue) - 1)) {
+                        io.async_close(fd);
+                        co_return;
+                    }
                 }
 
                 // Timeout check
@@ -1233,6 +1281,16 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
                 co_await conn_write(io, fd, tls,too_large, strlen(too_large));
                 break;
             }
+        }
+
+        if (parsed_req.chunked) {
+            const size_t off = static_cast<size_t>(
+                reinterpret_cast<const uint8_t*>(parsed_req.body.data()) - buf);
+            assert(off + parsed_req.body.size() <= buf_len);
+            const size_t n = HTTP1Parser::dechunk_in_place(
+                buf + off, parsed_req.body.size());
+            parsed_req.body = std::string_view(
+                reinterpret_cast<const char*>(buf + off), n);
         }
 
         // Parse successful - convert to CoroHttpRequest (ZERO-COPY).
@@ -1358,6 +1416,10 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
                     buf_cap = STACK_BUF_SIZE;
                 }
                 body_detected = false;
+                chunked_body = false;
+                continue_sent = false;
+        chunked_body = false;
+        continue_sent = false;
 
                 // Reclaim the per-request bolt::Arena (no-op when the arena flag
                 // is OFF). Safe here: the response is fully written, req.body was
@@ -1686,6 +1748,8 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
             buf_cap = STACK_BUF_SIZE;
         }
         body_detected = false;
+        chunked_body = false;
+        continue_sent = false;
 
         // Reclaim the per-request bolt::Arena (no-op when the arena flag is
         // OFF). Safe here: the response is fully written, req.body / response

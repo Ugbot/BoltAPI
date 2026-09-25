@@ -152,6 +152,21 @@ public:
      * Reset parser state for new request.
      */
     void reset() noexcept;
+
+    /**
+     * Validate a Transfer-Encoding: chunked body starting at `data`.
+     * @return 0 with *out_raw_len = bytes through the trailer's empty line,
+     *         -1 if incomplete, 1 if malformed.
+     */
+    static int scan_chunked(const uint8_t* data, size_t len,
+                            size_t* out_raw_len) noexcept;
+
+    /**
+     * Decode a body scan_chunked() accepted, in place (the decoded bytes are
+     * never longer than the framing). Trailer fields are dropped.
+     * @return decoded length.
+     */
+    static size_t dechunk_in_place(uint8_t* data, size_t raw_len) noexcept;
     
     /**
      * Get current parser state.

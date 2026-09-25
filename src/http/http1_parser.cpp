@@ -1,4 +1,5 @@
 #include "boltapi/http/http1_parser.h"
+#include <cassert>
 #include <cctype>
 #include <cstring>
 #include <algorithm>
@@ -128,7 +129,27 @@ int HTTP1Parser::parse(
         out_request.upgrade_protocol = upgrade;
     }
 
-    // 5. Parse body if Content-Length is present
+    // 5. Chunked body: the raw framing is validated and handed back in
+    // out_request.body; the caller decodes it in place (dechunk_in_place).
+    if (out_request.chunked) {
+        // Both framings on one request is the classic smuggling vector
+        // (RFC 9112 6.3): refuse rather than pick one.
+        if (out_request.has_content_length) {
+            state_ = HTTP1State::ERROR;
+            return 1;
+        }
+        size_t raw_len = 0;
+        const int rc = scan_chunked(data + pos_, len - pos_, &raw_len);
+        if (rc != 0) {
+            if (rc > 0) state_ = HTTP1State::ERROR;
+            return rc;
+        }
+        out_request.body = std::string_view(
+            reinterpret_cast<const char*>(data + pos_), raw_len);
+        pos_ += raw_len;
+    }
+
+    // 6. Parse body if Content-Length is present
     if (out_request.has_content_length && out_request.content_length > 0) {
         size_t body_start = pos_;
         size_t body_available = len - pos_;
@@ -149,6 +170,97 @@ int HTTP1Parser::parse(
     state_ = HTTP1State::COMPLETE;
     out_consumed = pos_;
     return 0;
+}
+
+namespace {
+
+int hex_val(uint8_t c) noexcept {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+// One chunk-size line: hex size, optional ";ext", CRLF. Returns 0 and sets
+// *line_len / *size, -1 if the line is incomplete, 1 if malformed.
+int chunk_size_line(const uint8_t* p, size_t len, size_t* line_len,
+                    uint64_t* size) noexcept {
+    assert(p != nullptr || len == 0);
+    assert(line_len != nullptr && size != nullptr);
+    uint64_t v = 0;
+    size_t i = 0;
+    for (; i < len && i < 17; ++i) {
+        const int h = hex_val(p[i]);
+        if (h < 0) break;
+        v = (v << 4) | static_cast<uint64_t>(h);
+    }
+    if (i == len) return -1;
+    if (i == 0 || i > 16) return 1;
+    constexpr size_t kMaxLine = 4096;             // bounds chunk extensions
+    for (; i < len && i < kMaxLine; ++i) {
+        if (p[i] == '\n') return 1;             // bare LF
+        if (p[i] != '\r') continue;
+        if (i + 1 == len) return -1;
+        if (p[i + 1] != '\n') return 1;
+        *line_len = i + 2;
+        *size = v;
+        return 0;
+    }
+    return i == len ? -1 : 1;
+}
+
+}  // namespace
+
+int HTTP1Parser::scan_chunked(const uint8_t* data, size_t len,
+                              size_t* out_raw_len) noexcept {
+    assert(out_raw_len != nullptr);
+    assert(data != nullptr || len == 0);
+    size_t pos = 0;
+    // Every chunk costs at least 3 bytes, so len bounds the loop.
+    for (size_t guard = 0; guard <= len; ++guard) {
+        size_t line = 0;
+        uint64_t size = 0;
+        const int rc = chunk_size_line(data + pos, len - pos, &line, &size);
+        if (rc != 0) return rc;
+        pos += line;
+        if (size == 0) break;
+        if (size > len - pos) return -1;
+        if (len - pos - size < 2) return -1;
+        if (data[pos + size] != '\r' || data[pos + size + 1] != '\n') return 1;
+        pos += static_cast<size_t>(size) + 2;
+    }
+    // Trailer section: header lines until an empty line.
+    for (size_t guard = 0; guard <= len; ++guard) {
+        const size_t start = pos;
+        while (pos < len && data[pos] != '\n') ++pos;
+        if (pos == len) return -1;
+        if (pos == start || data[pos - 1] != '\r') return 1;
+        ++pos;
+        if (pos - start == 2) {
+            *out_raw_len = pos;
+            return 0;
+        }
+    }
+    return 1;
+}
+
+size_t HTTP1Parser::dechunk_in_place(uint8_t* data, size_t raw_len) noexcept {
+    assert(data != nullptr || raw_len == 0);
+    size_t rd = 0;
+    size_t wr = 0;
+    for (size_t guard = 0; guard <= raw_len; ++guard) {
+        size_t line = 0;
+        uint64_t size = 0;
+        const int rc = chunk_size_line(data + rd, raw_len - rd, &line, &size);
+        assert(rc == 0);                       // scan_chunked validated it
+        if (rc != 0 || size == 0) break;
+        rd += line;
+        std::memmove(data + wr, data + rd, static_cast<size_t>(size));
+        wr += static_cast<size_t>(size);
+        rd += static_cast<size_t>(size) + 2;
+    }
+    assert(wr <= raw_len);
+    return wr;
 }
 
 int HTTP1Parser::parse_method(
