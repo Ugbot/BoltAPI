@@ -40,10 +40,11 @@ bool Conn::bound_sql(Stream& s, std::string_view handle, std::string_view* sql) 
 
 // ActionCreatePreparedStatementResult{prepared_statement_handle=1,
 // dataset_schema=2, parameter_schema=3}. A parameterless query is run once
-// to describe it. A query with parameters is not: no stand-in value is safe
-// for every placeholder position, so it answers no dataset_schema. An
-// update is never run here either; its missing dataset_schema is how
-// clients tell updates from queries.
+// to describe it. A query with parameters is run once only when the host
+// types every placeholder, with a typed stand-in for each; otherwise no
+// stand-in is safe for every placeholder position and it answers no
+// dataset_schema. An update is never run here; its missing dataset_schema
+// is how clients tell updates from queries.
 void Conn::create_prepared(Stream& s, std::string_view sql) noexcept {
     std::uint32_t n = 0;
     if (sql.empty() || sql.size() > kMaxQueryBytes || !pm::count_placeholders(sql, &n)) {
@@ -62,8 +63,18 @@ void Conn::create_prepared(Stream& s, std::string_view sql) noexcept {
         cd::pb_put_bytes(&result, 2, schema.encapsulated);
     }
     if (n > 0) {
+        std::vector<ParamType> types(n, ParamType::kUnknown);
+        ipc_.clear();
+        if (!exec_.describe_parameters(sql, n, types.data(), &ipc_)) {
+            std::fill(types.begin(), types.end(), ParamType::kUnknown);
+            ipc_.clear();
+        }
+        if (exec_.is_query(sql)) {
+            if (ipc_.empty()) describe_typed(sql, types.data(), n);
+            put_leading_schema(&result);
+        }
         scratch_.clear();
-        arrow::write_parameter_schema(&scratch_, n);
+        arrow::write_parameter_schema(&scratch_, n, types.data());
         cd::pb_put_bytes(&result, 3, scratch_);
     }
     std::string wrapped;
@@ -72,6 +83,45 @@ void Conn::create_prepared(Stream& s, std::string_view sql) noexcept {
     cd::pb_put_bytes(&msg_, 1, wrapped);   // Result{body}
     if (!send_response_headers(s) || !send_message(s, msg_)) return;
     (void)send_trailers(s, GrpcCode::kOk, {}, false);
+}
+
+// Runs a query whose placeholders are all typed once, with typed
+// stand-ins, into ipc_. Best effort: any failure leaves ipc_ empty.
+void Conn::describe_typed(std::string_view sql, const ParamType* types,
+                          std::uint32_t n) noexcept {
+    assert(types != nullptr);
+    assert(n > 0 && n <= pm::kMaxParams);
+    ipc_.clear();
+    std::vector<pm::Value> stand_in(n);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        switch (types[i]) {
+            case ParamType::kInt64:   stand_in[i].kind = pm::Kind::kInt; break;
+            case ParamType::kFloat64: stand_in[i].kind = pm::Kind::kFloat; break;
+            case ParamType::kUtf8:    stand_in[i].kind = pm::Kind::kString; break;
+            case ParamType::kBool:    stand_in[i].kind = pm::Kind::kBool; break;
+            default: return;
+        }
+    }
+    const char* err = nullptr;
+    if (!pm::render(sql, stand_in.data(), n, kMaxQueryBytes, &bound_, &err)) return;
+    QueryFailure f;
+    std::int64_t rows = 0;
+    if (!exec_.execute(bound_, &ipc_, &rows, f)) ipc_.clear();
+}
+
+// dataset_schema (field 2) from ipc_'s leading Schema message, if any.
+void Conn::put_leading_schema(std::string* result) noexcept {
+    assert(result != nullptr);
+    if (ipc_.empty()) return;
+    std::size_t pos = 0;
+    bool bad = false;
+    cd::IpcMessage schema;
+    if (!cd::ipc_next_message(ipc_, &pos, &schema, &bad) ||
+        schema.header_type != cd::kIpcHeaderSchema) {
+        return;
+    }
+    assert(!schema.encapsulated.empty());
+    cd::pb_put_bytes(result, 2, schema.encapsulated);
 }
 
 bool Conn::send_put_result(Stream& s, std::string_view app_metadata) noexcept {

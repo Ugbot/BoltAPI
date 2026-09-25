@@ -20,6 +20,7 @@
 
 #include <bolt/api/core/stacked_thread.h>
 
+#include <algorithm>
 #include <cassert>
 #include <cstdio>
 #include <cstring>
@@ -371,6 +372,8 @@ private:
     void put_bind(Stream& s, std::string_view handle, std::string_view sql,
                   const pm::Rows& rows) noexcept;
     void create_prepared(Stream& s, std::string_view sql) noexcept;
+    void describe_typed(std::string_view sql, const ParamType* types, std::uint32_t n) noexcept;
+    void put_leading_schema(std::string* result) noexcept;
     bool bound_sql(Stream& s, std::string_view handle, std::string_view* sql) noexcept;
     bool put_update(Stream& s, std::string_view sql, const pm::Rows& rows,
                     const std::vector<pm::Value>& handle_row, bool bound) noexcept;

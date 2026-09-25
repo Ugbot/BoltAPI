@@ -11,6 +11,9 @@
 //   "UPDATES"      -> as "SELECT <updates run so far>" (proves an update ran
 //                     once, and that preparing it did not run it).
 // Updates (DoPut): "UPSERT <n>" affects n rows; "FAILU ..." fails.
+// Placeholder types: exactly "SELECT ?" and "UPSERT ?" type theirs bigint,
+// "ECHO ?" utf8 (and describes its result itself; "SELECT ?" is described
+// by the wire layer's stand-in run); every other `?` stays untyped.
 // Catalog: tables "orders" (pk id), "customers" (pk region, id) and view
 // "top_orders" (no pk), each with the "SELECT 0" schema.
 // Usage: flight_sql_echo_server [--port N] [--token T] [--tls-cert F --tls-key F]
@@ -106,6 +109,19 @@ public:
         return true;
     }
     bool supports_updates() const noexcept override { return true; }
+    bool describe_parameters(std::string_view sql, std::uint32_t n, fs::ParamType* out,
+                             std::string* dataset) noexcept override {
+        assert(out != nullptr && dataset != nullptr && n > 0);
+        if (sql == "SELECT ?" || sql == "UPSERT ?") {
+            out[0] = fs::ParamType::kInt64;
+        } else if (sql == "ECHO ?") {
+            out[0] = fs::ParamType::kUtf8;
+            if (!encode_echo("ECHO ''", dataset)) return false;   // host-described
+        } else {
+            return false;
+        }
+        return n == 1;
+    }
     bool is_query(std::string_view sql) noexcept override {
         return sql.substr(0, 6) != "UPSERT" && sql.substr(0, 5) != "FAILU";
     }

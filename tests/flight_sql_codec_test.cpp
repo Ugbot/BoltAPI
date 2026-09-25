@@ -290,10 +290,33 @@ TEST(FlightSqlParams, DecodesABoltWrittenBatchAndTheAdvertisedSchema) {
     EXPECT_FALSE(dec.batch(rb.metadata, rb.body.substr(0, 8), &rows, &err));   // short body
 
     std::string params;
-    bolt::api::proto::flightsql::arrow::write_parameter_schema(&params, 2);
+    bolt::api::proto::flightsql::arrow::write_parameter_schema(&params, 2, nullptr);
     pos = 0;
     ASSERT_TRUE(cd::ipc_next_message(params, &pos, &sch, &bad));
     pm::Decoder dec2;
     ASSERT_TRUE(dec2.schema(sch.metadata, &err)) << err;   // its own schema decodes
     EXPECT_FALSE(dec2.schema(rb.metadata, &err));          // a batch is not a schema
+
+    // Typed placeholders (G2ETL-85): the typed schema decodes, and binds the
+    // int64/float64 batch above column for column.
+    using PT = bolt::api::proto::flightsql::ParamType;
+    const PT types[2] = {PT::kInt64, PT::kFloat64};
+    std::string typed;
+    bolt::api::proto::flightsql::arrow::write_parameter_schema(&typed, 2, types);
+    EXPECT_NE(typed, params);
+    pos = 0;
+    ASSERT_TRUE(cd::ipc_next_message(typed, &pos, &sch, &bad));
+    pm::Decoder dec3;
+    ASSERT_TRUE(dec3.schema(sch.metadata, &err)) << err;
+    pm::Rows typed_rows;
+    ASSERT_TRUE(dec3.batch(rb.metadata, rb.body, &typed_rows, &err)) << err;
+    EXPECT_EQ(typed_rows.values[0].i, 7);
+    EXPECT_EQ(typed_rows.values[1].f, 0.5);
+    const PT all[4] = {PT::kUtf8, PT::kBool, PT::kUnknown, PT::kInt64};
+    std::string mixed;
+    bolt::api::proto::flightsql::arrow::write_parameter_schema(&mixed, 4, all);
+    pos = 0;
+    ASSERT_TRUE(cd::ipc_next_message(mixed, &pos, &sch, &bad));
+    pm::Decoder dec4;
+    EXPECT_TRUE(dec4.schema(sch.metadata, &err)) << err;
 }

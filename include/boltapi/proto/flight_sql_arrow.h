@@ -82,8 +82,9 @@ void write_foreign_keys_empty(std::string* out);
 void write_sql_info(std::string* out, const SqlInfoRow* rows, std::size_t n);
 
 // ActionCreatePreparedStatementResult.parameter_schema: an encapsulated
-// Schema message of `n` untyped (dense-union) parameters.
-void write_parameter_schema(std::string* out, std::size_t n);
+// Schema message of `n` nullable parameters, typed by `types[i]` (nullptr,
+// or kUnknown, advertises a dense union).
+void write_parameter_schema(std::string* out, std::size_t n, const ParamType* types);
 // CommandGetXdbcTypeInfo, rows already ordered by data_type, type_name.
 void write_xdbc_type_info(std::string* out, const XdbcTypeInfo* rows, std::size_t n);
 

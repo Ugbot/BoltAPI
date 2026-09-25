@@ -4,7 +4,10 @@
 // Options: "tls" connects with grpc+tls (certificate verification off: test
 // certificates are self-signed); "update=<sql>" and "prepared_update=<sql>"
 // report Statement.executeUpdate / PreparedStatement.executeUpdate (twice);
-// "java_client" drives the echo server through Arrow's Java FlightSqlClient.
+// "java_client" drives the echo server through Arrow's Java FlightSqlClient;
+// "bind_long=<sql>" / "bind_string=<sql>" prepare <sql>, bind its one `?`
+// with setLong(4) / setString("o'k") and report the parameter type, the
+// described column count and the result.
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.DriverManager;
@@ -115,16 +118,37 @@ public class FlightSqlJdbcProbe {
         }
     }
 
+    // PreparedStatement.setLong/setString through the advertised
+    // parameter_schema; a failure is reported as the fact's value.
+    static void bind(Connection c, String key, String sql, Object v) {
+        try (PreparedStatement p = c.prepareStatement(sql)) {
+            java.sql.ParameterMetaData params = p.getParameterMetaData();
+            fact(key + "_param_type",
+                 params.getParameterCount() > 0 ? params.getParameterTypeName(1) : "");
+            java.sql.ResultSetMetaData cols = p.getMetaData();
+            fact(key + "_result_cols", cols == null ? "none" : String.valueOf(cols.getColumnCount()));
+            if (v instanceof Long) p.setLong(1, (Long) v);
+            else p.setString(1, (String) v);
+            fact(key, table(p.executeQuery()));
+        } catch (Exception e) {
+            fact(key, "error: " + String.valueOf(e.getMessage()).replace('\n', ' '));
+        }
+    }
+
     public static void main(String[] args) throws Exception {
         boolean tls = false;
         boolean javaClient = false;
         String update = null;
         String preparedUpdate = null;
+        String bindLong = null;
+        String bindString = null;
         for (int i = 3; i < args.length; ++i) {
             if (args[i].equals("tls")) tls = true;
             else if (args[i].equals("java_client")) javaClient = true;
             else if (args[i].startsWith("update=")) update = args[i].substring(7);
             else if (args[i].startsWith("prepared_update=")) preparedUpdate = args[i].substring(16);
+            else if (args[i].startsWith("bind_long=")) bindLong = args[i].substring(10);
+            else if (args[i].startsWith("bind_string=")) bindString = args[i].substring(12);
         }
         String url = "jdbc:arrow-flight-sql://127.0.0.1:" + args[0] + (tls
                 ? "/?useEncryption=true&disableCertificateVerification=true"
@@ -160,6 +184,8 @@ public class FlightSqlJdbcProbe {
                     fact("prepared_update", p.executeUpdate() + "," + p.executeUpdate());
                 }
             }
+            if (bindLong != null) bind(c, "bind_long", bindLong, 4L);
+            if (bindString != null) bind(c, "bind_string", bindString, "o'k");
             try (Statement s = c.createStatement()) {
                 s.executeQuery("FAIL jdbc");
                 fact("error", "none");
