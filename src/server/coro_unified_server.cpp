@@ -1332,10 +1332,11 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
             
             if (response_size > 0) {
                 // Send the response
-                co_await conn_write(io, fd, tls,response_buffer, response_size);
-                
+                const bool wrote = co_await conn_write_all(
+                    io, fd, tls, reinterpret_cast<const char*>(response_buffer), response_size);
+
                 // Check keep-alive and continue loop
-                keep_alive = parsed_req.keep_alive;
+                keep_alive = parsed_req.keep_alive && wrote;
                 
                 // Shift buffer (remove consumed data)
                 if (consumed < buf_len) {
@@ -1604,10 +1605,10 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
 
         if (use_chunked) {
             // For chunked encoding, send headers first
-            co_await conn_write(io, fd, tls,resp_str.data(), resp_str.size());
+            bool wrote = co_await conn_write_all(io, fd, tls, resp_str.data(), resp_str.size());
 
             // Send body as chunk(s) if there is content
-            if (!out_body.empty()) {
+            if (wrote && !out_body.empty()) {
                 // Format: {size_hex}\r\n{data}\r\n
                 char size_buf[32];
                 int len = snprintf(size_buf, sizeof(size_buf), "%zx\r\n", out_body.size());
@@ -1616,12 +1617,12 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
                 chunk.append(size_buf, len);
                 chunk.append(out_body);
                 chunk.append("\r\n");
-                co_await conn_write(io, fd, tls,chunk.data(), chunk.size());
+                wrote = co_await conn_write_all(io, fd, tls, chunk.data(), chunk.size());
             }
 
             // Send final empty chunk: 0\r\n\r\n
-            const char* final_chunk = "0\r\n\r\n";
-            co_await conn_write(io, fd, tls,final_chunk, 5);
+            if (wrote) wrote = co_await conn_write_all(io, fd, tls, "0\r\n\r\n", 5);
+            if (!wrote) keep_alive = false;
         } else if (response.body_separate_write) {
             // Zero/one-copy body (send_borrowed / send_owned): headers and body
             // are two fully-drained writes instead of one concatenation, which
@@ -1633,14 +1634,23 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
             }
             if (!wrote) keep_alive = false;  // peer gone mid-body -> close
         } else {
-            // Non-chunked: send headers + body together (cleartext writes via the
-            // dispatcher awaitable directly — no conn_write coroutine frame).
+            // Non-chunked: send headers + body together. The first write goes
+            // through the dispatcher awaitable directly; only a short write
+            // (body larger than the socket send buffer) falls into the loop.
             resp_str += response.body;
+            bool wrote;
             if (tls) {
-                co_await conn_write(io, fd, tls, resp_str.data(), resp_str.size());
+                wrote = co_await conn_write_all(io, fd, tls, resp_str.data(), resp_str.size());
             } else {
-                co_await io.async_write(fd, resp_str.data(), resp_str.size());
+                const ssize_t n = co_await io.async_write(fd, resp_str.data(), resp_str.size());
+                wrote = n > 0;
+                if (wrote && static_cast<std::size_t>(n) < resp_str.size()) {
+                    wrote = co_await conn_write_all(io, fd, nullptr,
+                                                    resp_str.data() + n,
+                                                    resp_str.size() - static_cast<std::size_t>(n));
+                }
             }
+            if (!wrote) keep_alive = false;
         }
       }  // if (!streamed)
 
