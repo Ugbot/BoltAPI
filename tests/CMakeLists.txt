@@ -74,6 +74,13 @@ if(WIN32)
     target_link_libraries(boltapi_fixed_length_response_test PRIVATE ws2_32 mswsock)
 endif()
 
+# G2ETL-70: buffered bodies larger than the socket send buffer reach a slow
+# reader in full (partial writes are looped, not dropped).
+boltapi_add_test(boltapi_large_buffered_response_test large_buffered_response_test.cpp)
+if(WIN32)
+    target_link_libraries(boltapi_large_buffered_response_test PRIVATE ws2_32 mswsock)
+endif()
+
 # Regression gate for Request::query_param() on HTTP/1.1 — the H1 parser used
 # to strip '?...' before path capture, so query() returned empty. Same harness
 # pattern as app_integration_test: real App on loopback + raw client socket.
