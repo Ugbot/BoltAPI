@@ -80,6 +80,10 @@ public:
     Emit simple_fetch(std::int32_t cursor, std::uint32_t count, int fd, MsgWriter& w,
                       IQueryExecutor& exec, QueryFailure& qf) noexcept;
 
+    // SHOW <setting>, answered from this server's reported values.
+    ShowCommand show_statement(std::string_view sql, ShowAnswer& out,
+                               QueryFailure& qf) const noexcept;
+
     // The executor is about to replace its buffered result.
     void displace() noexcept { current_ = -1; }
 
@@ -104,6 +108,9 @@ private:
         bool          materialized = false;   // ran at least once
         bool          done         = false;
         const char*   session_tag  = nullptr;  // SET/RESET answered by the wire layer
+        bool          show         = false;    // SHOW answered by the wire layer
+        std::uint32_t show_len     = 0;
+        char          show_value[kMaxNameLen] = {};
         std::size_t   sql_len      = 0;
         bool          cursor       = false;   // opened by DECLARE
         bool          holdable     = false;   // WITH HOLD: survives the block
@@ -131,6 +138,7 @@ private:
     TxStep tx_end(bool rollback, const char*& tag, QueryFailure& qf) noexcept;
     bool describe_statement(const Statement& st, int fd, MsgWriter& w,
                             IQueryExecutor& exec) noexcept;
+    bool send_show(Portal& p, int fd, MsgWriter& w) noexcept;
     bool send_rows(Portal& p, std::int32_t max_rows, int fd, MsgWriter& w,
                    IQueryExecutor& exec) noexcept;
     Emit emit_rows(const Portal& fmt, std::uint32_t& next_row, std::uint64_t end_row,
@@ -158,6 +166,7 @@ private:
     char*        portal_sql(std::int32_t pi) noexcept;
 
     const std::uint32_t    max_stmt_bytes_;
+    const std::string_view server_version_;   // cfg outlives the session
     std::vector<Statement> stmts_;         // [0] = unnamed
     std::vector<Portal>    portals_;       // [0] = unnamed
     std::vector<char>      stmt_pool_;     // compacting text pool

@@ -703,6 +703,65 @@ SessionCommand classify_session_command(std::string_view sql, const char*& tag,
 
 namespace {
 
+struct ShowSetting {
+    const char* name;    // canonical GUC name, also the result column
+    const char* value;   // nullptr = server_version from the config
+};
+
+// Must agree with the ParameterStatus values sent at startup.
+constexpr ShowSetting kShowSettings[] = {
+    {"client_encoding", "UTF8"},
+    {"server_encoding", "UTF8"},
+    {"DateStyle", "ISO, MDY"},
+    {"integer_datetimes", "on"},
+    {"standard_conforming_strings", "on"},
+    {"TimeZone", "UTC"},
+    {"IntervalStyle", "postgres"},
+    {"is_superuser", "off"},
+    {"server_version", nullptr},
+    {"transaction_isolation", "read committed"},
+    {"default_transaction_isolation", "read committed"},
+};
+
+}  // namespace
+
+ShowCommand classify_show_command(std::string_view sql, std::string_view server_version,
+                                  ShowAnswer& out, CodecError& err) noexcept {
+    std::string_view s = trim(sql);
+    if (!ieq(next_word(s), "SHOW")) return ShowCommand::NotShow;
+    std::string_view rest = trim(s);
+    std::string_view name = unquote(rest);
+    std::string_view t = rest;
+    const std::string_view w1 = next_word(t);
+    if (ieq(w1, "TRANSACTION")) {                    // SHOW TRANSACTION ISOLATION LEVEL
+        const std::string_view a = next_word(t);
+        const std::string_view b = next_word(t);
+        if (ieq(a, "ISOLATION") && ieq(b, "LEVEL") && trim(t).empty()) {
+            name = "transaction_isolation";
+        }
+    } else if (ieq(w1, "TIME")) {                    // SHOW TIME ZONE
+        if (ieq(next_word(t), "ZONE") && trim(t).empty()) name = "TimeZone";
+    }
+    assert(name.size() <= sql.size());
+    if (ieq(name, "ALL")) {
+        err.sqlstate = "0A000";
+        err.message  = "SHOW ALL is not supported: SHOW a named setting";
+        return ShowCommand::Refused;
+    }
+    for (const ShowSetting& st : kShowSettings) {    // bounded by the table
+        if (!ieq(name, st.name)) continue;
+        out.column = st.name;
+        out.value  = st.value != nullptr ? std::string_view(st.value) : server_version;
+        assert(out.column != nullptr);
+        return ShowCommand::Answered;
+    }
+    err.sqlstate = "42704";
+    err.message  = "unrecognized configuration parameter";
+    return ShowCommand::Refused;
+}
+
+namespace {
+
 constexpr std::uint32_t kMaxTxWords = 16;
 
 // Words of a transaction-control statement: identifier runs separated by

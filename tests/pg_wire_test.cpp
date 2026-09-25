@@ -421,6 +421,54 @@ TEST(PgWireCodec, SessionCommands) {
     EXPECT_EQ(pg::classify_session_command("settings", tag, e), pg::SessionCommand::NotSession);
 }
 
+TEST(PgWireCodec, ShowCommands) {
+    pg::ShowAnswer a;
+    pg::CodecError e;
+    EXPECT_EQ(pg::classify_show_command("show standard_conforming_strings", "14.9", a, e),
+              pg::ShowCommand::Answered);
+    EXPECT_STREQ(a.column, "standard_conforming_strings");
+    EXPECT_EQ(a.value, "on");
+    EXPECT_EQ(pg::classify_show_command("show transaction isolation level", "14.9", a, e),
+              pg::ShowCommand::Answered);
+    EXPECT_STREQ(a.column, "transaction_isolation");
+    EXPECT_EQ(a.value, "read committed");
+    EXPECT_EQ(pg::classify_show_command("SHOW\tTIME  ZONE;", "14.9", a, e),
+              pg::ShowCommand::Answered);
+    EXPECT_STREQ(a.column, "TimeZone");
+    EXPECT_EQ(pg::classify_show_command("SHOW \"datestyle\"", "14.9", a, e),
+              pg::ShowCommand::Answered);
+    EXPECT_EQ(a.value, "ISO, MDY");
+    EXPECT_EQ(pg::classify_show_command("show server_version", "14.9", a, e),
+              pg::ShowCommand::Answered);
+    EXPECT_EQ(a.value, "14.9");
+    EXPECT_EQ(pg::classify_show_command("SHOW search_path", "14.9", a, e),
+              pg::ShowCommand::Refused);
+    EXPECT_STREQ(e.sqlstate, "42704");
+    EXPECT_EQ(pg::classify_show_command("SHOW ALL", "14.9", a, e), pg::ShowCommand::Refused);
+    EXPECT_STREQ(e.sqlstate, "0A000");
+    EXPECT_EQ(pg::classify_show_command("select 1", "14.9", a, e), pg::ShowCommand::NotShow);
+    EXPECT_EQ(pg::classify_show_command("showcase", "14.9", a, e), pg::ShowCommand::NotShow);
+}
+
+TEST_F(PgWire, ShowIsAnsweredByTheWireLayer) {
+    c_.msg('Q', std::string("show standard_conforming_strings\0", 33));
+    auto r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "TDCZ");
+    EXPECT_EQ(PgClient::col0(r[1]), "on");
+    c_.parse("", "SHOW transaction isolation level");
+    c_.bind("", "", {});
+    c_.describe('P', "");
+    c_.execute("");
+    c_.sync();
+    r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "12TDCZ");
+    EXPECT_EQ(PgClient::col0(r[3]), "read committed");
+    EXPECT_EQ(factory_.last->executes, 0);
+    c_.msg('Q', std::string("show nonsense\0", 14));
+    r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "EZ");
+}
+
 TEST_F(PgWire, SetIsAnsweredByTheWireLayer) {
     c_.parse("", "SET application_name = 'x'");
     c_.bind("", "", {});

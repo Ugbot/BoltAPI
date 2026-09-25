@@ -133,6 +133,23 @@ def main(server):
             cur.execute("select %s", ("after error",))
             check("usable after error", cur.fetchone()[0], "select 'after error'")
 
+        # G2ETL-84: SHOW is answered by the wire layer, never the executor.
+        with psycopg.connect(dsn, autocommit=True) as conn:
+            cur = conn.cursor()
+            cur.execute("show standard_conforming_strings")
+            check("show: extended", cur.fetchone()[0], "on")
+            check("show: column", cur.description[0].name, "standard_conforming_strings")
+            cur.execute("show transaction isolation level")
+            check("show: isolation", cur.fetchone()[0], "read committed")
+            ccur = psycopg.ClientCursor(conn)
+            ccur.execute("show TimeZone")
+            check("show: simple", ccur.fetchone()[0], "UTC")
+            try:
+                cur.execute("show search_path")
+                failures.append("unknown SHOW did not raise")
+            except psycopg.errors.UndefinedObject as e:
+                check("show: unknown", e.sqlstate, "42704")
+
         # G2ETL-64: autocommit off -> the driver issues BEGIN; the wire layer
         # answers transaction control and reports the block in ReadyForQuery.
         with psycopg.connect(dsn) as conn:

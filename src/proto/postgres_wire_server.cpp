@@ -70,6 +70,20 @@ void simple_tag(int fd, MsgWriter& w, ExtendedSession& ext, const char* tag) noe
     send_ready_for_query(fd, w, ext.tx_status());
 }
 
+void simple_show(int fd, MsgWriter& w, ExtendedSession& ext, const ShowAnswer& sa) noexcept {
+    assert(sa.column != nullptr);
+    FieldDesc f;
+    f.name = sa.column;
+    f.type_oid = oid::kText;
+    if (!put_row_description(w, &f, 1, nullptr) || !w.send(fd)) return;
+    w.begin('D');
+    w.put_i16(1);
+    w.put_i32(static_cast<std::int32_t>(sa.value.size()));
+    w.put_bytes(sa.value.data(), sa.value.size());
+    if (!w.finish() || !w.send(fd)) return;
+    simple_tag(fd, w, ext, "SHOW");
+}
+
 // One Simple-Query round trip: RowDescription (if any columns) + DataRow* +
 // CommandComplete, or ErrorResponse on failure — then ALWAYS ReadyForQuery,
 // which is what lets a client keep issuing queries on the same connection
@@ -121,6 +135,16 @@ void handle_simple_query(int fd, MsgWriter& w, ExtendedSession& ext,
         }
         if (sc == SessionCommand::Accepted) {
             simple_tag(fd, w, ext, tag);
+            return;
+        }
+        ShowAnswer sa;
+        const ShowCommand sh = ext.show_statement(sql, sa, qf);
+        if (sh == ShowCommand::Refused) {
+            simple_fail(fd, w, ext, qf.sqlstate, qf.message);
+            return;
+        }
+        if (sh == ShowCommand::Answered) {
+            simple_show(fd, w, ext, sa);
             return;
         }
         if (!ext.tx_admit(sql, qf)) {
