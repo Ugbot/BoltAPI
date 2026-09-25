@@ -549,10 +549,9 @@ void write_sql_info(std::string* out, const SqlInfoRow* rows, std::size_t n) {
     write_stream(out, kFields, 2, n, body);
 }
 
-// Each parameter: dense_union<string: utf8, bytes: binary, bigint: int64,
-// double: float64> — the Arrow C++ "unknown column type" convention, since
-// the host does not type its placeholders.
-void write_parameter_schema(std::string* out, std::size_t n) {
+// An untyped parameter is dense_union<string: utf8, bytes: binary, bigint:
+// int64, double: float64> — the Arrow C++ "unknown column type" convention.
+void write_parameter_schema(std::string* out, std::size_t n, const ParamType* types) {
     assert(out != nullptr && n > 0);
     static constexpr FieldDesc kArms[] = {
         utf8("string", true),
@@ -564,8 +563,26 @@ void write_parameter_schema(std::string* out, std::size_t n) {
     std::vector<FieldDesc> fields(n);
     for (std::size_t i = 0; i < n; ++i) {
         names[i] = "parameter_" + std::to_string(i + 1);
-        fields[i] = FieldDesc{names[i], true, Kind::kDenseUnion, 0, false, kArms, 4};
+        const ParamType t = types != nullptr ? types[i] : ParamType::kUnknown;
+        switch (t) {
+            case ParamType::kInt64:
+                fields[i] = FieldDesc{names[i], true, Kind::kInt, 64, true, nullptr, 0};
+                break;
+            case ParamType::kFloat64:
+                fields[i] = FieldDesc{names[i], true, Kind::kDouble, 0, false, nullptr, 0};
+                break;
+            case ParamType::kUtf8:
+                fields[i] = FieldDesc{names[i], true, Kind::kUtf8, 0, false, nullptr, 0};
+                break;
+            case ParamType::kBool:
+                fields[i] = FieldDesc{names[i], true, Kind::kBool, 0, false, nullptr, 0};
+                break;
+            default:
+                fields[i] = FieldDesc{names[i], true, Kind::kDenseUnion, 0, false, kArms, 4};
+                break;
+        }
     }
+    assert(fields.size() == n);
     write_schema_message(out, fields.data(), static_cast<std::uint32_t>(n));
 }
 

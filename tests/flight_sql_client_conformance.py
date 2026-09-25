@@ -425,12 +425,21 @@ def check_parameters(port, failures):
         if not cond:
             failures.append(what)
 
+    res = prepare(client, "ECHO ? ?")
+    expect(2 not in res, "a query with untyped parameters is not run to describe it")
+    psch = pa.ipc.read_schema(pa.py_buffer(res[3][0]))
+    expect(len(psch) == 2 and all(pa.types.is_union(f.type) and f.type.mode == "dense"
+                                  for f in psch), "untyped parameter_schema %s" % psch)
+
+    # The host types "SELECT ?" (G2ETL-85): an int64 parameter, and the
+    # query is described with a stand-in.
     res = prepare(client, "SELECT ?")
     handle = res[1][0]
-    expect(2 not in res, "a parameterised query is not run to describe it")
     psch = pa.ipc.read_schema(pa.py_buffer(res[3][0]))
-    expect(len(psch) == 1 and pa.types.is_union(psch[0].type) and
-           psch[0].type.mode == "dense", "parameter_schema %s" % psch)
+    expect(len(psch) == 1 and psch[0].type == pa.int64() and psch[0].nullable,
+           "typed parameter_schema %s" % psch)
+    expect(2 in res and pa.ipc.read_schema(pa.py_buffer(res[2][0])).names ==
+           ["id", "name", "score"], "typed query dataset_schema %s" % sorted(res))
     bound = bind(client, handle, pa.record_batch([pa.array([4], pa.int64())], names=["p"]))
     expect(bound != handle, "binding returned the unbound handle")
     info, t = prepared_rows(client, bound)
@@ -589,7 +598,8 @@ def run_jdbc_probe(port, query, table, *extra):
 
 def check_jdbc(port, failures):
     facts = run_jdbc_probe(port, "SELECT 3", "customers", "update=UPSERT 11",
-                           "prepared_update=UPSERT 3", "java_client")
+                           "prepared_update=UPSERT 3", "java_client",
+                           "bind_long=SELECT ?", "bind_string=ECHO ?")
     if facts is None:
         return
     rows3 = "id,name,score;0,row0,0.0;1,row1,0.5;2,row2,1.0"
@@ -604,6 +614,10 @@ def check_jdbc(port, failures):
         "java_type_info": "BIGINT,-5;DOUBLE,8;VARCHAR,12", "java_param_fields": "1",
         "java_bound": "0,row0;1,row1;2,row2;3,row3", "java_echo": "ECHO 'o''k'",
         "java_update": "5", "java_statement_update": "6",
+        "bind_long_param_type": "Int(64, true)", "bind_long_result_cols": "3",
+        "bind_long": "id,name,score;0,row0,0.0;1,row1,0.5;2,row2,1.0;3,row3,1.5",
+        "bind_string_param_type": "Utf8", "bind_string_result_cols": "1",
+        "bind_string": "sql;ECHO 'o''k'",
     }
     for k, v in want.items():
         if facts.get(k) != v:

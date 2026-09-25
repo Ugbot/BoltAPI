@@ -161,6 +161,11 @@ struct XdbcTypeInfo {
     std::int32_t     num_prec_radix = -1;
 };
 
+// The Arrow type a `?` placeholder is advertised with in
+// ActionCreatePreparedStatementResult.parameter_schema. kUnknown keeps the
+// dense_union<string, bytes, bigint, double> "any type" convention.
+enum class ParamType : std::uint8_t { kUnknown = 0, kInt64 = 1, kFloat64 = 2, kUtf8 = 3, kBool = 4 };
+
 // The host's query engine. One instance per worker thread, created once at
 // start_background().
 class IQueryExecutor {
@@ -195,6 +200,19 @@ public:
     virtual bool is_query(std::string_view sql) noexcept {
         (void)sql;
         return true;
+    }
+    // Types the `n` placeholders of `sql`, in order (out[0..n) arrive as
+    // kUnknown). Clients that bind through the advertised schema (the JDBC
+    // driver) cannot bind a union. For a query the host may also describe
+    // its result: an Arrow IPC stream whose leading Schema message becomes
+    // dataset_schema, in `*out_dataset_ipc` (arrives empty). Left empty
+    // with every placeholder typed, the wire layer describes the query by
+    // running it once with a stand-in per placeholder (0, 0.0, '', FALSE).
+    // False leaves every placeholder untyped and the query undescribed.
+    virtual bool describe_parameters(std::string_view sql, std::uint32_t n, ParamType* out,
+                                     std::string* out_dataset_ipc) noexcept {
+        (void)sql; (void)n; (void)out; (void)out_dataset_ipc;
+        return false;
     }
     // CommandGetXdbcTypeInfo rows, at most `cap`; 0 answers UNIMPLEMENTED.
     virtual std::uint32_t xdbc_type_info(XdbcTypeInfo* out, std::uint32_t cap) noexcept {
