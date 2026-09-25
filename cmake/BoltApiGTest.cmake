@@ -61,8 +61,10 @@ function(boltapi_add_test name)
     # misbehaving test (e.g. an external-client interop leg whose subprocess
     # wedges) can NEVER hang the suite — ctest kills it and reports a failure
     # instead of stalling. Per-test overrides may set a tighter TIMEOUT.
+    # Suites bind one fixed loopback port per binary, so discovered cases of the
+    # same binary must not overlap under ctest -j (EADDRINUSE otherwise).
     if(COMMAND gtest_discover_tests)
-        gtest_discover_tests(${name} PROPERTIES TIMEOUT 180)
+        gtest_discover_tests(${name} PROPERTIES TIMEOUT 180 RESOURCE_LOCK ${name})
     else()
         add_test(NAME ${name} COMMAND ${name})
         set_tests_properties(${name} PROPERTIES TIMEOUT 180)

@@ -88,6 +88,7 @@ void build_router(api::Router& r) {
 
 // A volatile sink prevents the optimizer from eliding match() / parse() calls.
 volatile std::uint32_t g_sink = 0;
+void* volatile g_ptr_sink = nullptr;
 
 }  // namespace
 
@@ -97,8 +98,10 @@ volatile std::uint32_t g_sink = 0;
 // ---------------------------------------------------------------------------
 TEST(NoAlloc, CounterObservesAllocation) {
     AllocGuard g;
-    // Force a heap allocation the optimizer cannot remove.
+    // A new/delete pair whose pointer never escapes may be elided
+    // ([expr.new]/10; clang -O2 does), so publish it through a volatile.
     auto* p = new std::uint64_t(0xDEADBEEF);
+    g_ptr_sink = p;
     g_sink ^= static_cast<std::uint32_t>(*p);
     delete p;
     EXPECT_GE(g.delta(), 1u) << "global operator new instrumentation is not active";

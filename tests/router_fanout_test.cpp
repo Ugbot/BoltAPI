@@ -79,7 +79,9 @@ TEST(RouterFanout, DeepInnerFanout) {
     }
     r.build();
     for (int i = 0; i < kN; ++i) {
-        auto m = r.match(Method::Get, "/api/v1/" + std::to_string(i) + "/xyz");
+        // params[].value views into the path, so it must outlive `m`.
+        const std::string req = "/api/v1/" + std::to_string(i) + "/xyz";
+        auto m = r.match(Method::Get, req);
         ASSERT_TRUE(m.matched()) << i;
         ASSERT_EQ(m.param_count, 1u);
         EXPECT_EQ(m.params[0].value, "xyz");
