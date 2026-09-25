@@ -140,6 +140,10 @@ boltapi_add_test(boltapi_ws_echo_test ws_echo_test.cpp)
 if(WIN32)
     target_link_libraries(boltapi_ws_echo_test PRIVATE ws2_32 mswsock)
 endif()
+boltapi_add_test(boltapi_ws_large_frame_test ws_large_frame_test.cpp)
+if(WIN32)
+    target_link_libraries(boltapi_ws_large_frame_test PRIVATE ws2_32 mswsock)
+endif()
 
 # M2: coroutine SSE end-to-end through App — text/event-stream content type and
 # ordered data:/event: frames parsed off the wire, bounded with a read timeout.

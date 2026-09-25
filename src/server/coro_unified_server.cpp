@@ -582,6 +582,30 @@ core::coro_task<bool> conn_write_all(net::IODispatcher& io, int fd,
     assert(off == len);
     co_return true;
 }
+
+// Writes every queued WebSocket frame in full. A frame is popped only once all
+// of its bytes are on the wire; on failure the queue is dropped so a
+// mis-framed stream is never continued.
+core::coro_task<bool> ws_drain_output(net::IODispatcher& io, int fd,
+                                      net::CoroTlsSocket* tls,
+                                      WebSocketConnection& ws_conn) {
+    assert(fd >= 0);
+    constexpr std::size_t kMaxFrames = 1u << 20;
+    for (std::size_t i = 0; i < kMaxFrames && ws_conn.has_pending_output(); ++i) {
+        const std::string* output = ws_conn.get_pending_output();
+        if (output != nullptr && !output->empty()) {
+            if (!co_await conn_write_all(io, fd, tls, output->data(), output->size())) {
+                for (std::size_t j = 0; j < kMaxFrames && ws_conn.has_pending_output(); ++j) {
+                    ws_conn.pop_pending_output();
+                }
+                co_return false;
+            }
+        }
+        ws_conn.pop_pending_output();
+    }
+    assert(!ws_conn.has_pending_output());
+    co_return true;
+}
 }  // namespace
 
 // =============================================================================
@@ -1416,7 +1440,10 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
                     }
                     ws_response += "\r\n";
 
-                    co_await conn_write(io, fd, tls,ws_response.data(), ws_response.size());
+                    if (!co_await conn_write_all(io, fd, tls, ws_response.data(), ws_response.size())) {
+                        io.async_close(fd);
+                        co_return;
+                    }
 
                     std::cout << "[CoroUnifiedServer] WebSocket upgrade for path: " << req.path << std::endl;
 
@@ -1886,17 +1913,9 @@ core::coro_task<void> CoroUnifiedServer::handle_websocket_connection(
 
     while (!stop_requested_.load(std::memory_order_relaxed) && ws_conn.is_open()) {
         // Send any pending output first
-        while (ws_conn.has_pending_output()) {
-            const std::string* output = ws_conn.get_pending_output();
-            if (output && !output->empty()) {
-                ssize_t written = co_await conn_write(io, fd, tls,output->data(), output->size());
-                if (written <= 0) {
-                    // Write failed - close connection
-                    ws_conn.close(1001, "write error");
-                    co_return;
-                }
-            }
-            ws_conn.pop_pending_output();
+        if (!co_await ws_drain_output(io, fd, tls, ws_conn)) {
+            ws_conn.close(1001, "write error");
+            co_return;
         }
 
         // Read incoming WebSocket frames
@@ -1939,28 +1958,15 @@ core::coro_task<void> CoroUnifiedServer::handle_websocket_connection(
             }
             
             // Send any responses queued by the handler immediately
-            while (ws_conn.has_pending_output()) {
-                const std::string* output = ws_conn.get_pending_output();
-                if (output && !output->empty()) {
-                    ssize_t written = co_await conn_write(io, fd, tls,output->data(), output->size());
-                    if (written <= 0) {
-                        ws_conn.close(1001, "write error");
-                        co_return;
-                    }
-                }
-                ws_conn.pop_pending_output();
+            if (!co_await ws_drain_output(io, fd, tls, ws_conn)) {
+                ws_conn.close(1001, "write error");
+                co_return;
             }
         }
     }
 
-    // Send any final pending output
-    while (ws_conn.has_pending_output()) {
-        const std::string* output = ws_conn.get_pending_output();
-        if (output && !output->empty()) {
-            co_await conn_write(io, fd, tls,output->data(), output->size());
-        }
-        ws_conn.pop_pending_output();
-    }
+    // Send any final pending output; the connection is closing either way.
+    (void)co_await ws_drain_output(io, fd, tls, ws_conn);
 }
 
 // =============================================================================
