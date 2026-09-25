@@ -669,6 +669,6 @@ if(BOLTAPI_WITH_FLIGHT_SQL AND TARGET bolt::ingest)
                          "${CMAKE_CURRENT_SOURCE_DIR}/flight_sql_client_conformance.py"
                          "$<TARGET_FILE:boltapi_flight_sql_echo_server>")
         set_tests_properties(boltapi_flight_sql_client_conformance
-                             PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+                             PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
     endif()
 endif()

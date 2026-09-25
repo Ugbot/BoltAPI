@@ -6,9 +6,14 @@
 //   "SELECT <n>"   -> n rows (default 3): id int64 = i, name utf8 = "row<i>",
 //                     score float64 = i * 0.5, in 8192-row batches.
 //   "FAIL ..."     -> INVALID_ARGUMENT naming the statement.
+//   "ECHO ..."     -> one row, sql utf8 = the statement as received (shows
+//                     what parameter binding substituted).
+//   "UPDATES"      -> as "SELECT <updates run so far>" (proves an update ran
+//                     once, and that preparing it did not run it).
+// Updates (DoPut): "UPSERT <n>" affects n rows; "FAILU ..." fails.
 // Catalog: tables "orders" (pk id), "customers" (pk region, id) and view
 // "top_orders" (no pk), each with the "SELECT 0" schema.
-// Usage: flight_sql_echo_server [--port N] [--token T]
+// Usage: flight_sql_echo_server [--port N] [--token T] [--tls-cert F --tls-key F]
 // Prints "PORT <n>" on stdout, then serves until SIGTERM/SIGINT. With
 // --token, only "Bearer T" (or Basic user:T) is accepted.
 
@@ -35,6 +40,7 @@ namespace fs = bolt::api::proto::flightsql;
 namespace {
 
 std::atomic<bool> g_stop{false};
+std::atomic<std::int64_t> g_updates{0};
 extern "C" void on_signal(int) { g_stop.store(true, std::memory_order_release); }
 
 constexpr std::int64_t kBatchRows = 8192;
@@ -64,8 +70,14 @@ public:
             f.message = fail_;
             return false;
         }
+        if (sql.substr(0, 4) == "ECHO") {
+            *rows = 1;
+            return encode_echo(sql, out);
+        }
         std::int64_t n = 3;
-        if (sql.size() > 7 && sql.substr(0, 7) == "SELECT ") {
+        if (sql == "UPDATES") {
+            n = g_updates.load(std::memory_order_acquire);
+        } else if (sql.size() > 7 && sql.substr(0, 7) == "SELECT ") {
             const std::string num(sql.substr(7));
             n = std::strtoll(num.c_str(), nullptr, 10);
         }
@@ -76,6 +88,46 @@ public:
         }
         *rows = n;
         return encode(n, out);
+    }
+
+    bool execute_update(std::string_view sql, std::int64_t* affected,
+                        fs::QueryFailure& f) noexcept override {
+        assert(affected != nullptr);
+        if (sql.substr(0, 7) != "UPSERT ") {
+            std::snprintf(fail_, sizeof(fail_), "echo executor refused update: %.*s",
+                          static_cast<int>(sql.size() < 200 ? sql.size() : 200), sql.data());
+            f.code = fs::GrpcCode::kInvalidArgument;
+            f.message = fail_;
+            return false;
+        }
+        const std::string num(sql.substr(7));
+        *affected = std::strtoll(num.c_str(), nullptr, 10);
+        g_updates.fetch_add(1, std::memory_order_acq_rel);
+        return true;
+    }
+    bool supports_updates() const noexcept override { return true; }
+    bool is_query(std::string_view sql) noexcept override {
+        return sql.substr(0, 6) != "UPSERT" && sql.substr(0, 5) != "FAILU";
+    }
+    std::uint32_t xdbc_type_info(fs::XdbcTypeInfo* out, std::uint32_t cap) noexcept override {
+        assert(out != nullptr && cap >= 3);
+        out[0].type_name = "VARCHAR";
+        out[0].data_type = 12;
+        out[0].literal_prefix = "'";
+        out[0].literal_suffix = "'";
+        out[0].case_sensitive = true;
+        out[1].type_name = "BIGINT";
+        out[1].data_type = -5;
+        out[1].column_size = 19;
+        out[1].unsigned_attribute = 0;
+        out[1].fixed_prec_scale = true;
+        out[1].num_prec_radix = 10;
+        out[2].type_name = "DOUBLE";
+        out[2].data_type = 8;
+        out[2].column_size = 15;
+        out[2].unsigned_attribute = 0;
+        out[2].num_prec_radix = 2;
+        return 3;
     }
 
     bool has_catalog() const noexcept override { return true; }
@@ -109,6 +161,53 @@ public:
     }
 
 private:
+    bool encode_echo(std::string_view sql, std::string* out) noexcept {
+        std::FILE* fp = std::tmpfile();
+        if (fp == nullptr) return false;
+        const bolt::BoltType types[1] = {bolt::BoltType::Utf8};
+        const char* names[1] = {"sql"};
+        echo_.assign(sql.data(), sql.size());
+        bolt::StringView sv{};
+        sv.length = static_cast<std::uint32_t>(echo_.size());
+        if (echo_.size() <= 12) {
+            std::memcpy(sv.prefix, echo_.data(), echo_.size() < 4 ? echo_.size() : 4);
+            if (echo_.size() > 4) std::memcpy(sv.inline_data, echo_.data() + 4, echo_.size() - 4);
+        } else {
+            std::memcpy(sv.prefix, echo_.data(), 4);
+            sv.ref.buf_idx = 0;
+            sv.ref.offset = 0;
+        }
+        bool ok = bolt::ingest::arrow_ipc_open(writer_, fp, types, names, 1);
+        bolt::Arena arena;
+        bolt::BoltBatch::init_empty(batch_);
+        ok = ok && bolt::BoltBatch::alloc_columns(batch_, &arena, 1);
+        if (ok) {
+            batch_->num_rows = 1;
+            batch_->num_cols = 1;
+            bolt::BoltColumn* col = batch_->columns[batch_->read_epoch];
+            col->type = bolt::BoltType::Utf8;
+            col->format = bolt::ColumnFormat::Flat;
+            col->length = 1;
+            col->validity = nullptr;
+            col->data = &sv;
+            col->type_size_bytes = 16;
+            col->str_overflow_base = echo_.data();
+            ok = bolt::ingest::arrow_ipc_write_batch(writer_, batch_);
+        }
+        return finish(fp, ok, out);
+    }
+
+    bool finish(std::FILE* fp, bool ok, std::string* out) noexcept {
+        const bool closed = bolt::ingest::arrow_ipc_close(writer_);
+        if (!ok || !closed || std::fflush(fp) != 0) { std::fclose(fp); return false; }
+        const long size = std::ftell(fp);
+        std::rewind(fp);
+        out->resize(static_cast<std::size_t>(size));
+        const std::size_t got = std::fread(out->data(), 1, out->size(), fp);
+        std::fclose(fp);
+        return got == out->size();
+    }
+
     bool encode(std::int64_t n, std::string* out) noexcept {
         std::FILE* fp = std::tmpfile();
         if (fp == nullptr) return false;
@@ -172,6 +271,7 @@ private:
     bolt::ingest::ArrowIpcWriter* writer_;
     bolt::BoltBatch*              batch_;
     char                          fail_[256] = {};
+    std::string                   echo_;
 };
 
 class EchoFactory final : public fs::IExecutorFactory {
@@ -198,11 +298,17 @@ private:
 int main(int argc, char** argv) {
     std::uint16_t port = 0;
     std::string token;
+    std::string tls_cert;
+    std::string tls_key;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             port = static_cast<std::uint16_t>(std::atoi(argv[++i]));
         } else if (std::strcmp(argv[i], "--token") == 0 && i + 1 < argc) {
             token = argv[++i];
+        } else if (std::strcmp(argv[i], "--tls-cert") == 0 && i + 1 < argc) {
+            tls_cert = argv[++i];
+        } else if (std::strcmp(argv[i], "--tls-key") == 0 && i + 1 < argc) {
+            tls_key = argv[++i];
         }
     }
     std::signal(SIGINT, on_signal);
@@ -215,6 +321,8 @@ int main(int argc, char** argv) {
     cfg.idle_timeout_ms = 30000;
     cfg.server_name = "boltapi-echo";
     cfg.server_version = "9.9.9";
+    cfg.tls_cert_file = tls_cert;
+    cfg.tls_key_file = tls_key;
     EchoFactory factory;
     TokenAuth auth(token);
     fs::Protocol proto(cfg, factory, &auth);

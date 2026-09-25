@@ -6,6 +6,7 @@
 
 #include <cassert>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace bolt::api::proto::flightsql::arrow {
@@ -106,10 +107,12 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// Schemas (Schema.fbs). Type union ids: Int 2, Binary 4, Utf8 5, Bool 6,
-// List 12, Struct_ 13, Union 14, Map 17.
+// Schemas (Schema.fbs). Type union ids: Int 2, FloatingPoint 3, Binary 4,
+// Utf8 5, Bool 6, List 12, Struct_ 13, Union 14, Map 17.
 // ---------------------------------------------------------------------------
-enum class Kind : std::uint8_t { kUtf8, kBinary, kBool, kInt, kList, kStruct, kMap, kDenseUnion };
+enum class Kind : std::uint8_t {
+    kUtf8, kBinary, kBool, kInt, kList, kStruct, kMap, kDenseUnion, kDouble
+};
 
 struct FieldDesc {
     std::string_view name;
@@ -131,6 +134,7 @@ std::uint8_t type_id(Kind k) noexcept {
         case Kind::kStruct:     return 13;
         case Kind::kMap:        return 17;
         case Kind::kDenseUnion: return 14;
+        case Kind::kDouble:     return 3;
     }
     return 0;
 }
@@ -142,6 +146,11 @@ std::size_t write_type(Fb& fb, const FieldDesc& f) {
         Table t(fb, 2);
         t.scalar<std::int32_t>(0, f.bit_width);
         t.scalar<std::uint8_t>(1, f.is_signed ? 1 : 0);
+        return t.finish();
+    }
+    if (f.kind == Kind::kDouble) {
+        Table t(fb, 1);
+        t.scalar<std::int16_t>(0, 2);   // Precision.DOUBLE
         return t.finish();
     }
     if (f.kind == Kind::kMap) {
@@ -239,6 +248,44 @@ struct Body {
         none();
         buf(bits.data(), bits.size());
     }
+    // A nullable fixed-width column; `valid[i] == 0` is NULL.
+    template <class T>
+    void opt_values(const T* v, const std::uint8_t* valid, std::size_t n) {
+        std::vector<std::uint8_t> bits((n + 7) / 8, 0);
+        std::size_t nulls = 0;
+        for (std::size_t i = 0; i < n; ++i) {
+            if (valid[i] != 0) bits[i / 8] = static_cast<std::uint8_t>(bits[i / 8] | (1u << (i % 8)));
+            else ++nulls;
+        }
+        node(n, nulls);
+        if (nulls != 0) buf(bits.data(), bits.size());
+        else none();
+        buf(v, n * sizeof(T));
+    }
+    void opt_bools(const std::uint8_t* v, const std::uint8_t* valid, std::size_t n) {
+        std::vector<std::uint8_t> bits((n + 7) / 8, 0);
+        std::vector<std::uint8_t> vbits((n + 7) / 8, 0);
+        std::size_t nulls = 0;
+        for (std::size_t i = 0; i < n; ++i) {
+            if (v[i] != 0) bits[i / 8] = static_cast<std::uint8_t>(bits[i / 8] | (1u << (i % 8)));
+            if (valid[i] != 0) vbits[i / 8] = static_cast<std::uint8_t>(vbits[i / 8] | (1u << (i % 8)));
+            else ++nulls;
+        }
+        node(n, nulls);
+        if (nulls != 0) buf(vbits.data(), vbits.size());
+        else none();
+        buf(bits.data(), bits.size());
+    }
+    // `n` NULL list<utf8> entries: all-zero validity and offsets, empty child.
+    void null_lists(std::size_t n) {
+        const std::vector<std::uint8_t> bits((n + 7) / 8, 0);
+        const std::vector<std::int32_t> offs(n + 1, 0);
+        node(n, n);
+        if (n != 0) buf(bits.data(), bits.size());
+        else none();
+        buf(offs.data(), offs.size() * sizeof(std::int32_t));
+        strings(nullptr, 0);
+    }
     // Zero-length list<T>: validity, offsets [0].
     void empty_list() {
         const std::int32_t zero = 0;
@@ -270,17 +317,12 @@ void write_message(std::string* out, std::uint8_t header_type, std::int64_t body
     out->append(fb.b);
 }
 
+void write_schema_message(std::string* out, const FieldDesc* fields, std::uint32_t n_fields);
+
 void write_stream(std::string* out, const FieldDesc* fields, std::uint32_t n_fields,
                   std::size_t rows, const Body& body) {
     assert(out != nullptr && body.bytes.size() % 8 == 0);
-    write_message(out, 1, 0, [&](Fb& fb) {
-        Table t(fb, 2);
-        t.scalar<std::int16_t>(0, 0);   // Endianness.Little
-        const std::size_t fs = t.ref(1);
-        const std::size_t at = t.finish();
-        fb.patch(fs, write_fields(fb, fields, n_fields));
-        return at;
-    });
+    write_schema_message(out, fields, n_fields);
     const auto body_len = static_cast<std::int64_t>(body.bytes.size());
     write_message(out, 3, body_len, [&](Fb& fb) {
         Table t(fb, 3);
@@ -303,6 +345,17 @@ void write_stream(std::string* out, const FieldDesc* fields, std::uint32_t n_fie
     out->append(body.bytes);
     const std::uint32_t eos[2] = {0xFFFFFFFFu, 0u};
     out->append(reinterpret_cast<const char*>(eos), sizeof(eos));
+}
+
+void write_schema_message(std::string* out, const FieldDesc* fields, std::uint32_t n_fields) {
+    write_message(out, 1, 0, [&](Fb& fb) {
+        Table t(fb, 2);
+        t.scalar<std::int16_t>(0, 0);   // Endianness.Little
+        const std::size_t fs = t.ref(1);
+        const std::size_t at = t.finish();
+        fb.patch(fs, write_fields(fb, fields, n_fields));
+        return at;
+    });
 }
 
 constexpr FieldDesc utf8(std::string_view name, bool nullable) {
@@ -494,6 +547,104 @@ void write_sql_info(std::string* out, const SqlInfoRow* rows, std::size_t n) {
     body.empty_list();                                 //     value
     body.values<std::int32_t>(nullptr, 0);             //       item
     write_stream(out, kFields, 2, n, body);
+}
+
+// Each parameter: dense_union<string: utf8, bytes: binary, bigint: int64,
+// double: float64> — the Arrow C++ "unknown column type" convention, since
+// the host does not type its placeholders.
+void write_parameter_schema(std::string* out, std::size_t n) {
+    assert(out != nullptr && n > 0);
+    static constexpr FieldDesc kArms[] = {
+        utf8("string", true),
+        FieldDesc{"bytes", true, Kind::kBinary, 0, false, nullptr, 0},
+        FieldDesc{"bigint", true, Kind::kInt, 64, true, nullptr, 0},
+        FieldDesc{"double", true, Kind::kDouble, 0, false, nullptr, 0},
+    };
+    std::vector<std::string> names(n);
+    std::vector<FieldDesc> fields(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        names[i] = "parameter_" + std::to_string(i + 1);
+        fields[i] = FieldDesc{names[i], true, Kind::kDenseUnion, 0, false, kArms, 4};
+    }
+    write_schema_message(out, fields.data(), static_cast<std::uint32_t>(n));
+}
+
+namespace {
+
+// A nullable int32 column; a negative value is NULL.
+template <class Get>
+void opt_ints(Body* body, const XdbcTypeInfo* rows, std::size_t n, Get get) {
+    std::vector<std::int32_t> v(n);
+    std::vector<std::uint8_t> ok(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        v[i] = get(rows[i]);
+        ok[i] = v[i] >= 0 ? 1 : 0;
+        if (v[i] < 0) v[i] = 0;
+    }
+    body->opt_values(v.data(), ok.data(), n);
+}
+
+}  // namespace
+
+void write_xdbc_type_info(std::string* out, const XdbcTypeInfo* rows, std::size_t n) {
+    assert(out != nullptr && (n == 0 || rows != nullptr));
+    static constexpr FieldDesc kItem[] = {utf8("item", false)};
+    auto opt_i32 = [](std::string_view name) {
+        return FieldDesc{name, true, Kind::kInt, 32, true, nullptr, 0};
+    };
+    auto boolean = [](std::string_view name, bool nullable) {
+        return FieldDesc{name, nullable, Kind::kBool, 0, false, nullptr, 0};
+    };
+    const FieldDesc fields[] = {
+        utf8("type_name", false), integer("data_type", 32, true), opt_i32("column_size"),
+        utf8("literal_prefix", true), utf8("literal_suffix", true),
+        FieldDesc{"create_params", true, Kind::kList, 0, false, kItem, 1},
+        integer("nullable", 32, true), boolean("case_sensitive", false),
+        integer("searchable", 32, true), boolean("unsigned_attribute", true),
+        boolean("fixed_prec_scale", false), boolean("auto_increment", true),
+        utf8("local_type_name", true), opt_i32("minimum_scale"), opt_i32("maximum_scale"),
+        integer("sql_data_type", 32, true), opt_i32("datetime_subcode"),
+        opt_i32("num_prec_radix"), opt_i32("interval_precision"),
+    };
+    static_assert(sizeof(fields) / sizeof(fields[0]) == 19);
+    auto str = [](std::string_view v) { return Str{v, !v.empty()}; };
+    std::vector<std::uint8_t> flags(n);
+    const std::vector<std::uint8_t> all(n, 1);
+    const std::vector<std::uint8_t> none(n, 0);
+    Body body;
+    body.strings(column(rows, n, [](const XdbcTypeInfo& r) { return Str{r.type_name, true}; }).data(), n);
+    std::vector<std::int32_t> dt(n);
+    for (std::size_t i = 0; i < n; ++i) dt[i] = rows[i].data_type;
+    body.values(dt.data(), n);
+    opt_ints(&body, rows, n, [](const XdbcTypeInfo& r) { return r.column_size; });
+    body.strings(column(rows, n, [&](const XdbcTypeInfo& r) { return str(r.literal_prefix); }).data(), n);
+    body.strings(column(rows, n, [&](const XdbcTypeInfo& r) { return str(r.literal_suffix); }).data(), n);
+    body.null_lists(n);
+    const std::vector<std::int32_t> nullable(n, 1);   // NULLABILITY_NULLABLE
+    body.values(nullable.data(), n);
+    for (std::size_t i = 0; i < n; ++i) flags[i] = rows[i].case_sensitive ? 1 : 0;
+    body.bools(flags.data(), n);
+    std::vector<std::int32_t> searchable(n);
+    for (std::size_t i = 0; i < n; ++i) searchable[i] = rows[i].searchable;
+    body.values(searchable.data(), n);
+    std::vector<std::uint8_t> uvalid(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        flags[i] = rows[i].unsigned_attribute == 1 ? 1 : 0;
+        uvalid[i] = rows[i].unsigned_attribute >= 0 ? 1 : 0;
+    }
+    body.opt_bools(flags.data(), uvalid.data(), n);
+    for (std::size_t i = 0; i < n; ++i) flags[i] = rows[i].fixed_prec_scale ? 1 : 0;
+    body.bools(flags.data(), n);
+    body.opt_bools(none.data(), all.data(), n);   // auto_increment false
+    body.strings(column(rows, n, [](const XdbcTypeInfo& r) { return Str{r.type_name, true}; }).data(), n);
+    opt_ints(&body, rows, n, [](const XdbcTypeInfo& r) { return r.minimum_scale; });
+    opt_ints(&body, rows, n, [](const XdbcTypeInfo& r) { return r.maximum_scale; });
+    body.values(dt.data(), n);                    // sql_data_type
+    const std::vector<std::int32_t> zeros(n, 0);
+    body.opt_values(zeros.data(), none.data(), n);   // datetime_subcode
+    opt_ints(&body, rows, n, [](const XdbcTypeInfo& r) { return r.num_prec_radix; });
+    body.opt_values(zeros.data(), none.data(), n);   // interval_precision
+    write_stream(out, fields, 19, n, body);
 }
 
 bool like_match(std::string_view pattern, std::string_view s) noexcept {

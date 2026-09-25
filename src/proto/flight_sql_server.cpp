@@ -12,8 +12,11 @@
 
 #include "boltapi/http/hpack.h"
 #include "boltapi/net/sys_compat.h"
+#include "boltapi/net/tls_context.h"
+#include "boltapi/proto/flight_sql_arrow.h"
 #include "boltapi/proto/flight_sql_codec.h"
 #include "boltapi/proto/flight_sql_metadata.h"
+#include "boltapi/proto/flight_sql_params.h"
 
 #include <bolt/api/core/stacked_thread.h>
 
@@ -29,6 +32,7 @@ namespace bolt::api::proto::flightsql {
 namespace {
 
 namespace cd = codec;
+namespace pm = params;
 
 // ---------------------------------------------------------------------------
 // HTTP/2 constants (RFC 9113).
@@ -75,12 +79,12 @@ constexpr std::string_view kServicePrefix = "/arrow.flight.protocol.FlightServic
 
 enum class Method : std::uint8_t {
     kUnknown, kHandshake, kListFlights, kGetFlightInfo, kGetSchema, kDoGet,
-    kListActions, kDoAction,
+    kListActions, kDoAction, kDoPut,
 };
 
 constexpr std::string_view kSqlPkg = "arrow.flight.protocol.sql.";
-// A prepared-statement handle is the statement behind this prefix.
-constexpr std::string_view kHandleMagic = "boltapi-fsql-ps1:";
+constexpr std::size_t kMaxPutMessages = 4096;
+constexpr int kMaxTlsRetries = 1024;
 
 Method method_for(std::string_view path) noexcept {
     if (path.substr(0, kServicePrefix.size()) != kServicePrefix) return Method::kUnknown;
@@ -92,6 +96,7 @@ Method method_for(std::string_view path) noexcept {
     if (m == "DoGet") return Method::kDoGet;
     if (m == "ListActions") return Method::kListActions;
     if (m == "DoAction") return Method::kDoAction;
+    if (m == "DoPut") return Method::kDoPut;
     return Method::kUnknown;
 }
 
@@ -153,6 +158,23 @@ void hpack_literal(std::string* out, std::string_view name, std::string_view val
     out->append(value.data(), value.size());
 }
 
+bool is_sql(std::string_view type_name, std::string_view short_name) noexcept {
+    return type_name.size() == kSqlPkg.size() + short_name.size() &&
+           type_name.substr(0, kSqlPkg.size()) == kSqlPkg &&
+           type_name.substr(kSqlPkg.size()) == short_name;
+}
+
+// A DoPut whose first FlightData names a CommandStatementUpdate: it binds
+// nothing, so the request is complete without the rest of the stream.
+bool is_statement_update_put(std::string_view first_message) noexcept {
+    cd::FlightDataMsg fd;
+    cd::Descriptor d;
+    cd::AnyMsg any;
+    return cd::decode_flight_data(first_message, &fd) && !fd.descriptor.empty() &&
+           cd::decode_descriptor(fd.descriptor, &d) && d.type == 2 &&
+           cd::decode_any(d.cmd, &any) && is_sql(any.type_name, "CommandStatementUpdate");
+}
+
 struct Stream {
     bool          in_use = false;
     bool          ready = false;       // request complete, awaiting dispatch
@@ -188,7 +210,7 @@ public:
         assert(frame_.size() == kOurMaxFrame);
     }
 
-    void serve(int fd) noexcept;
+    void serve(int fd, SSL* ssl) noexcept;
 
 private:
     // ---- I/O -------------------------------------------------------------
@@ -198,15 +220,17 @@ private:
         std::size_t got = 0;
         while (got < n) {                                  // bounded by n / idle budget
             if (stopping_.load(std::memory_order_acquire)) return false;
-            const int ready = wait_readable(fd_, cfg_.accept_poll_ms);
+            // Decrypted bytes already buffered by OpenSSL never wake select().
+            const int ready = (ssl_ != nullptr && SSL_pending(ssl_) > 0)
+                                  ? 1 : wait_readable(fd_, cfg_.accept_poll_ms);
             if (ready < 0) return false;
             if (ready == 0) {
                 idle_budget_ -= cfg_.accept_poll_ms;
                 if (idle_budget_ <= 0) return false;
                 continue;
             }
-            const ssize_t r = net::sys::recv_bytes(fd_, p + got, n - got);
-            if (r <= 0) return false;
+            const ssize_t r = recv_some(p + got, n - got);
+            if (r < 0) return false;
             got += static_cast<std::size_t>(r);
         }
         idle_budget_ = cfg_.idle_timeout_ms;
@@ -214,12 +238,43 @@ private:
         return true;
     }
 
+    // One read; 0 means "retry" (a TLS record not yet complete), < 0 fatal.
+    ssize_t recv_some(std::uint8_t* p, std::size_t n) noexcept {
+        assert(p != nullptr && n > 0);
+        if (ssl_ == nullptr) {
+            const ssize_t r = net::sys::recv_bytes(fd_, p, n);
+            return r <= 0 ? -1 : r;
+        }
+        const int cap = n > 0x40000000u ? 0x40000000 : static_cast<int>(n);
+        const int r = SSL_read(ssl_, p, cap);
+        if (r > 0) { tls_retries_ = 0; return r; }
+        const int e = SSL_get_error(ssl_, r);
+        if ((e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) &&
+            ++tls_retries_ < kMaxTlsRetries) {
+            return 0;
+        }
+        return -1;
+    }
+
     bool write_all(const void* src, std::size_t n) noexcept {
         assert(src != nullptr || n == 0);
         const auto* p = static_cast<const std::uint8_t*>(src);
         std::size_t sent = 0;
-        while (sent < n) {
-            const ssize_t w = net::sys::send_bytes(fd_, p + sent, n - sent);
+        for (int retries = 0; sent < n;) {
+            ssize_t w = 0;
+            if (ssl_ == nullptr) {
+                w = net::sys::send_bytes(fd_, p + sent, n - sent);
+            } else {
+                const std::size_t left = n - sent;
+                const int r = SSL_write(ssl_, p + sent,
+                                        left > 0x40000000u ? 0x40000000 : static_cast<int>(left));
+                const int e = r > 0 ? SSL_ERROR_NONE : SSL_get_error(ssl_, r);
+                if (r <= 0 && (e == SSL_ERROR_WANT_WRITE || e == SSL_ERROR_WANT_READ) &&
+                    ++retries < kMaxTlsRetries) {
+                    continue;
+                }
+                w = r;
+            }
             if (w <= 0) { dead_ = true; return false; }
             sent += static_cast<std::size_t>(w);
         }
@@ -311,6 +366,15 @@ private:
     void rpc_do_get(Stream& s, std::string_view msg) noexcept;
     void rpc_do_action(Stream& s, std::string_view msg) noexcept;
     void rpc_list_actions(Stream& s) noexcept;
+    void rpc_do_put(Stream& s) noexcept;
+    bool read_put(Stream& s, std::string_view* descriptor, pm::Rows* rows) noexcept;
+    void put_bind(Stream& s, std::string_view handle, std::string_view sql,
+                  const pm::Rows& rows) noexcept;
+    void create_prepared(Stream& s, std::string_view sql) noexcept;
+    bool bound_sql(Stream& s, std::string_view handle, std::string_view* sql) noexcept;
+    bool put_update(Stream& s, std::string_view sql, const pm::Rows& rows,
+                    const std::vector<pm::Value>& handle_row, bool bound) noexcept;
+    bool send_put_result(Stream& s, std::string_view app_metadata) noexcept;
 
     const Config&            cfg_;
     IQueryExecutor&          exec_;
@@ -318,6 +382,8 @@ private:
     const std::atomic<bool>& stopping_;
 
     int           fd_ = -1;
+    SSL*          ssl_ = nullptr;
+    int           tls_retries_ = 0;
     int           idle_budget_ = 0;
     bool          dead_ = false;
     std::uint32_t last_stream_id_ = 0;
@@ -340,12 +406,16 @@ private:
     std::string                    ipc_;
     std::string                    msg_;
     std::string                    scratch_;
+    std::string                    bound_;       // a prepared statement with its values
+    std::vector<pm::Value>         handle_row_;
     char                           fail_buf_[512] = {};
 };
 
-void Conn::serve(int fd) noexcept {
+void Conn::serve(int fd, SSL* ssl) noexcept {
     assert(fd >= 0);
     fd_ = fd;
+    ssl_ = ssl;
+    tls_retries_ = 0;
     dead_ = false;
     idle_budget_ = cfg_.idle_timeout_ms;
     last_stream_id_ = 0;
@@ -561,13 +631,14 @@ void Conn::handle_data(std::uint32_t sid, std::uint8_t flags, const std::uint8_t
         s->ready = true;
     } else {
         if (n > 0) window_update(sid, static_cast<std::uint32_t>(n));
-        // Handshake is bidirectional: the client may wait for our reply
-        // before half-closing, so one complete message is enough.
+        // Handshake is bidirectional, and Java's executeUpdate reads the
+        // PutResult before half-closing: one complete message is enough.
         std::string_view m;
         std::size_t used = 0;
-        if (s->method == Method::kHandshake &&
-            cd::grpc_unframe({reinterpret_cast<const char*>(s->body), s->body_len}, &m,
-                             &used) == cd::GrpcFrame::kOk) {
+        const bool one = cd::grpc_unframe({reinterpret_cast<const char*>(s->body), s->body_len},
+                                          &m, &used) == cd::GrpcFrame::kOk;
+        if (one && (s->method == Method::kHandshake ||
+                    (s->method == Method::kDoPut && is_statement_update_put(m)))) {
             s->ready = true;
         }
     }
@@ -711,6 +782,10 @@ void Conn::dispatch(Stream& s) noexcept {
         rpc_list_actions(s);
         return;
     }
+    if (s.method == Method::kDoPut) {
+        rpc_do_put(s);   // a client stream: several messages
+        return;
+    }
     std::string_view msg;
     std::size_t used = 0;
     const cd::GrpcFrame fr = cd::grpc_unframe(
@@ -741,17 +816,9 @@ void Conn::dispatch(Stream& s) noexcept {
     respond_error(s, GrpcCode::kInternal, "unrouted Flight method");
 }
 
-bool is_sql(std::string_view type_name, std::string_view short_name) noexcept {
-    return type_name.size() == kSqlPkg.size() + short_name.size() &&
-           type_name.substr(0, kSqlPkg.size()) == kSqlPkg &&
-           type_name.substr(kSqlPkg.size()) == short_name;
-}
-
-bool handle_sql(std::string_view handle, std::string_view* sql) noexcept {
-    assert(sql != nullptr);
-    if (handle.substr(0, kHandleMagic.size()) != kHandleMagic) return false;
-    *sql = handle.substr(kHandleMagic.size());
-    return true;
+bool is_update_command(std::string_view type_name) noexcept {
+    return is_sql(type_name, "CommandStatementUpdate") ||
+           is_sql(type_name, "CommandPreparedStatementUpdate");
 }
 
 bool Conn::command_from_descriptor(Stream& s, std::string_view msg,
@@ -803,11 +870,18 @@ bool Conn::produce(Stream& s, std::string_view any_bytes, bool from_ticket,
         }
     } else if (is_sql(any.type_name, "CommandPreparedStatementQuery")) {
         std::string_view handle;
-        if (!cd::decode_single_bytes(any.value, &handle) || !handle_sql(handle, &sql)) {
-            respond_error(s, GrpcCode::kInvalidArgument,
-                          "prepared_statement_handle was not issued by this endpoint");
+        if (!cd::decode_single_bytes(any.value, &handle)) {
+            respond_error(s, GrpcCode::kInvalidArgument, "malformed CommandPreparedStatementQuery");
             return false;
         }
+        if (!bound_sql(s, handle, &sql)) return false;
+    } else if (is_update_command(any.type_name) && !from_ticket) {
+        const std::string_view name = any.type_name.substr(kSqlPkg.size());
+        std::snprintf(fail_buf_, sizeof(fail_buf_),
+                      "%.*s is executed with DoPut (it returns an update count, not rows)",
+                      static_cast<int>(name.size()), name.data());
+        respond_error(s, GrpcCode::kInvalidArgument, fail_buf_);
+        return false;
     } else {
         QueryFailure f;
         switch (metadata::build(any.type_name, any.value, exec_, cfg_, &ipc_, rows, f,
@@ -923,6 +997,8 @@ void Conn::rpc_do_get(Stream& s, std::string_view msg) noexcept {
     (void)send_trailers(s, GrpcCode::kOk, {}, false);
 }
 
+#include "flight_sql_server_put.inc"
+
 // Action{type=1, body=2}; the Flight SQL action bodies are Any-wrapped.
 void Conn::rpc_do_action(Stream& s, std::string_view msg) noexcept {
     std::string_view type;
@@ -953,27 +1029,16 @@ void Conn::rpc_do_action(Stream& s, std::string_view msg) noexcept {
             respond_error(s, GrpcCode::kUnimplemented, "transactions are not supported");
             return;
         }
-        std::int64_t rows = 0;
-        cd::IpcMessage schema;
-        if (!run_query(s, sql, &rows, &schema)) return;
-        std::string handle(kHandleMagic);
-        handle.append(sql.data(), sql.size());
-        std::string result;
-        cd::pb_put_bytes(&result, 1, handle);
-        cd::pb_put_bytes(&result, 2, schema.encapsulated);
-        std::string wrapped;
-        cd::encode_any(&wrapped, "ActionCreatePreparedStatementResult", result);
-        msg_.clear();
-        cd::pb_put_bytes(&msg_, 1, wrapped);   // Result{body}
-        if (!send_response_headers(s) || !send_message(s, msg_)) return;
-        (void)send_trailers(s, GrpcCode::kOk, {}, false);
+        create_prepared(s, sql);
         return;
     }
     if (type == "ClosePreparedStatement") {
         std::string_view handle;
         std::string_view sql;
+        bool bound = false;
         if (!have_any || !is_sql(any.type_name, "ActionClosePreparedStatementRequest") ||
-            !cd::decode_single_bytes(any.value, &handle) || !handle_sql(handle, &sql)) {
+            !cd::decode_single_bytes(any.value, &handle) ||
+            !pm::decode_handle(handle, &sql, &bound, &handle_row_)) {
             respond_error(s, GrpcCode::kInvalidArgument,
                           "ClosePreparedStatement: handle was not issued by this endpoint");
             return;
@@ -991,8 +1056,8 @@ void Conn::rpc_do_action(Stream& s, std::string_view msg) noexcept {
 void Conn::rpc_list_actions(Stream& s) noexcept {
     static constexpr std::string_view kActions[2][2] = {
         {"CreatePreparedStatement",
-         "Creates a prepared statement (no parameters). Request: "
-         "Any<ActionCreatePreparedStatementRequest>"},
+         "Creates a prepared statement; `?` parameters are bound with DoPut. "
+         "Request: Any<ActionCreatePreparedStatementRequest>"},
         {"ClosePreparedStatement",
          "Closes a prepared statement handle. Request: "
          "Any<ActionClosePreparedStatementRequest>"},
@@ -1092,20 +1157,74 @@ std::uint16_t Protocol::local_port() const noexcept {
     return listener_ ? listener_->local_port() : 0;
 }
 
+namespace {
+
+// Server-side TLS handshake on a blocking socket, bounded by socket
+// timeouts. gRPC requires HTTP/2, so a connection that did not negotiate
+// ALPN "h2" is refused.
+SSL* tls_accept(SSL_CTX* ctx, int fd, int timeout_ms) noexcept {
+    assert(ctx != nullptr && fd >= 0);
+#if defined(_WIN32)
+    const DWORD tv = static_cast<DWORD>(timeout_ms);
+#else
+    timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+#endif
+    (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
+    (void)::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
+    SSL* ssl = SSL_new(ctx);
+    if (ssl == nullptr) return nullptr;
+    if (SSL_set_fd(ssl, fd) != 1 || SSL_accept(ssl) != 1) {
+        SSL_free(ssl);
+        return nullptr;
+    }
+    const unsigned char* proto = nullptr;
+    unsigned int len = 0;
+    SSL_get0_alpn_selected(ssl, &proto, &len);
+    if (len != 2 || std::memcmp(proto, "h2", 2) != 0) {
+        SSL_shutdown(ssl);
+        SSL_free(ssl);
+        return nullptr;
+    }
+    return ssl;
+}
+
+}  // namespace
+
 void Protocol::worker_loop(IQueryExecutor& exec, std::uint16_t worker_id) noexcept {
     assert(worker_id < cfg_.max_connections);
     IAuthenticator& a = auth_ != nullptr ? *auth_ : default_auth_;
     auto conn = std::make_unique<Conn>(cfg_, exec, a, stopping_);
+    SSL_CTX* ctx = tls_ != nullptr ? tls_->get_ssl_ctx() : nullptr;
     while (!stopping_.load(std::memory_order_acquire)) {
         const int fd = listener_->accept_one(cfg_.accept_poll_ms);
         if (fd < 0) continue;
-        conn->serve(fd);
+        SSL* ssl = ctx != nullptr ? tls_accept(ctx, fd, cfg_.idle_timeout_ms) : nullptr;
+        if (ctx == nullptr || ssl != nullptr) conn->serve(fd, ssl);
+        if (ssl != nullptr) {
+            (void)SSL_shutdown(ssl);
+            SSL_free(ssl);
+        }
         net::sys::close_socket(fd);
     }
 }
 
 Status Protocol::start_background() noexcept {
     if (listener_ != nullptr) return Status(core::error_code::invalid_state);
+    if (cfg_.tls_enabled()) {
+        net::TlsContextConfig tc;
+        tc.cert_file = cfg_.tls_cert_file;
+        tc.key_file = cfg_.tls_key_file;
+        tc.cert_data = cfg_.tls_cert_pem;
+        tc.key_data = cfg_.tls_key_pem;
+        tc.alpn_protocols = {"h2"};
+        tls_ = net::TlsContext::create_server(tc);
+        if (tls_ == nullptr || !tls_->is_valid()) {
+            tls_.reset();
+            return Status(core::error_code::invalid_state);
+        }
+    }
     listener_ = std::make_unique<Listener>(cfg_.host, cfg_.port);
     const Status s = listener_->start();
     if (s.is_err()) { listener_.reset(); return s; }
@@ -1140,6 +1259,7 @@ void Protocol::stop() noexcept {
     for (IQueryExecutor* e : execs_) factory_.destroy(e);
     execs_.clear();
     listener_.reset();
+    tls_.reset();
     running_.store(false, std::memory_order_release);
 }
 

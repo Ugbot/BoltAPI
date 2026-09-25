@@ -218,6 +218,20 @@ bool decode_single_bytes(std::string_view buf, std::string_view* out) noexcept {
     return r.ok();
 }
 
+bool decode_flight_data(std::string_view buf, FlightDataMsg* out) noexcept {
+    assert(out != nullptr);
+    *out = FlightDataMsg{};
+    PbReader r(buf);
+    PbField f;
+    for (std::size_t guard = 0; guard < 64 && r.next(&f); ++guard) {
+        if (f.wire != kWireBytes) continue;
+        if (f.number == 1) out->descriptor = f.bytes;
+        else if (f.number == 2) out->data_header = f.bytes;
+        else if (f.number == 1000) out->data_body = f.bytes;
+    }
+    return r.ok();
+}
+
 void encode_flight_info(std::string* out, std::string_view schema_ipc,
                         std::string_view descriptor_raw,
                         std::string_view ticket, std::int64_t total_records) {

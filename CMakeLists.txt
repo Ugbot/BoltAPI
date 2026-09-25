@@ -364,9 +364,10 @@ if(BOLTAPI_WITH_FLIGHT_SQL)
         src/proto/flight_sql_arrow.cpp
         src/proto/flight_sql_codec.cpp
         src/proto/flight_sql_metadata.cpp
+        src/proto/flight_sql_params.cpp
         src/proto/flight_sql_server.cpp)
     target_compile_definitions(boltapi PUBLIC BOLTAPI_WITH_FLIGHT_SQL=1)
-    message(STATUS "Bolt API Arrow Flight SQL: ENABLED (h2c gRPC, statements, prepared statements, metadata)")
+    message(STATUS "Bolt API Arrow Flight SQL: ENABLED (h2c/TLS gRPC, statements, updates, prepared statements with parameters, metadata)")
 endif()
 
 # ---------------------------------------------------------------------------
