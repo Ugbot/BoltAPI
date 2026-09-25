@@ -351,7 +351,8 @@ if(BOLTAPI_WITH_PG_WIRE)
     target_sources(boltapi PRIVATE
         src/proto/postgres_wire_server.cpp
         src/proto/postgres_wire_extended.cpp
-        src/proto/postgres_wire_codec.cpp)
+        src/proto/postgres_wire_codec.cpp
+        src/proto/postgres_wire_cursor.cpp)
     target_compile_definitions(boltapi PUBLIC BOLTAPI_WITH_PG_WIRE=1)
     message(STATUS "Bolt API Postgres-wire protocol: ENABLED (v3 startup + simple + extended query)")
 endif()

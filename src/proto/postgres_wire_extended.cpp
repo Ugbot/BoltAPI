@@ -27,23 +27,6 @@ void set_name(char (&dst)[kMaxNameLen], std::string_view name) noexcept {
     dst[name.size()] = '\0';
 }
 
-bool binary_result_supported(std::int32_t t) noexcept {
-    switch (t) {
-        case oid::kBool: case oid::kInt2: case oid::kInt4: case oid::kInt8:
-        case oid::kOid: case oid::kFloat4: case oid::kFloat8: case oid::kDate:
-        case oid::kNumeric: case oid::kText: case oid::kVarchar: case oid::kBpchar:
-        case oid::kName: case oid::kUnknown:
-            return true;
-        default:
-            return false;
-    }
-}
-
-bool is_text_like(std::int32_t t) noexcept {
-    return t == oid::kText || t == oid::kVarchar || t == oid::kBpchar ||
-           t == oid::kName || t == oid::kUnknown;
-}
-
 }  // namespace
 
 ExtendedSession::ExtendedSession(const Config& cfg) noexcept
@@ -79,7 +62,7 @@ ExtendedSession::TxStep ExtendedSession::tx_end(bool rollback, const char*& tag,
     tx_read_only_ = false;
     tx_writes_ = 0;
     for (std::size_t i = 1; i < portals_.size(); ++i) {         // bounded by slots
-        if (portals_[i].used) close_portal(static_cast<std::int32_t>(i));
+        if (portals_[i].used && !portals_[i].holdable) close_portal(static_cast<std::int32_t>(i));
     }
     if ((rollback || failed) && writes > 0) {
         qf.sqlstate = "0A000";
@@ -154,7 +137,6 @@ bool ExtendedSession::tx_admit(std::string_view sql, QueryFailure& qf) noexcept 
 void ExtendedSession::on_simple_query() noexcept {
     close_statement(0);
     close_portal(0);
-    current_ = -1;   // the simple query replaces whatever the executor held
     in_error_ = false;
 }
 
@@ -194,6 +176,10 @@ void ExtendedSession::close_portal(std::int32_t pi) noexcept {
     assert(pi >= 0 && static_cast<std::size_t>(pi) < portals_.size());
     portals_[static_cast<std::size_t>(pi)].used = false;
     if (current_ == pi) current_ = -1;
+    for (auto& p : portals_) {                                    // bounded by slots
+        if (p.used && p.fetch_from == pi) p.used = false;         // its FETCHes go too
+    }
+    assert(!portals_[static_cast<std::size_t>(pi)].used);
 }
 
 // Bump-allocate from the pool; when full, slide live statements down in
@@ -371,6 +357,9 @@ bool ExtendedSession::on_bind(BodyReader& r, int fd, MsgWriter& w) noexcept {
     p.materialized = false;
     p.done         = false;
     p.session_tag  = nullptr;
+    p.cursor       = false;
+    p.holdable     = false;
+    p.fetch_from   = -1;
     p.next_row     = 0;
     p.field_count  = 0;
     p.used         = true;
@@ -396,6 +385,18 @@ bool ExtendedSession::materialize(std::int32_t pi, int fd, MsgWriter& w,
     const TxStep ts = tx_statement(sql, fd, w, p.session_tag, qf);
     if (ts == TxStep::Failed) return false;
     if (ts == TxStep::Tagged) {
+        p.field_count  = 0;
+        p.materialized = true;
+        return true;
+    }
+    std::int32_t ci = -1;
+    std::uint32_t fetch_n = 0;
+    const CursorStep cs = cursor_statement(sql, exec, p.tag_buf, sizeof(p.tag_buf), ci,
+                                           fetch_n, qf);
+    if (cs == CursorStep::Failed) return false;
+    if (cs == CursorStep::Fetch) return bind_fetch(pi, ci, fetch_n, qf);
+    if (cs == CursorStep::Tagged) {
+        p.session_tag  = p.tag_buf;
         p.field_count  = 0;
         p.materialized = true;
         return true;
@@ -450,6 +451,7 @@ bool ExtendedSession::describe_statement(const Statement& st, int fd, MsgWriter&
     if (!w.finish() || !w.send(fd)) return false;
 
     const std::string_view sql = statement_sql(st);
+    if (describe_fetch(sql, fd, w)) return true;
     if (!is_query_shaped(sql)) {
         w.begin('n');
         return w.finish() && w.send(fd);
@@ -513,15 +515,18 @@ bool ExtendedSession::on_describe(BodyReader& r, int fd, MsgWriter& w,
         w.begin('n');
         return w.finish() && w.send(fd);
     }
-    if (p.materialized && current_ != pi && p.session_tag == nullptr) {
+    if (p.materialized && current_ != result_owner(p, pi) && p.session_tag == nullptr) {
         return fail(fd, w, "55000", "portal's result was displaced by another "
                     "portal on this connection");
     }
     FieldDesc fields[kMaxFields];
+    bool fresh = false;
     if (!p.materialized) {
         QueryFailure qf;
         if (!materialize(pi, fd, w, exec, fields, qf)) return fail(fd, w, qf.sqlstate, qf.message);
-    } else {
+        fresh = p.fetch_from < 0;
+    }
+    if (!fresh) {
         for (std::uint32_t c = 0; c < p.field_count; ++c) {      // bounded by kMaxFields
             fields[c].name = p.names[c];
             fields[c].type_oid = p.oids[c];
@@ -541,41 +546,12 @@ bool ExtendedSession::on_describe(BodyReader& r, int fd, MsgWriter& w,
 
 bool ExtendedSession::send_rows(Portal& p, std::int32_t max_rows, int fd,
                                 MsgWriter& w, IQueryExecutor& exec) noexcept {
-    assert(p.materialized);
-    const std::uint32_t total = exec.row_count();
-    std::string_view values[kMaxFields];
-    bool is_null[kMaxFields];
-    std::uint8_t cell[512];
-    std::uint32_t sent = 0;
-    while (p.next_row < total) {                                  // bounded by row_count()
-        if (max_rows > 0 && sent >= static_cast<std::uint32_t>(max_rows)) break;
-        if (!exec.row(p.next_row, values, is_null, p.field_count)) break;
-        w.begin('D');
-        w.put_i16(static_cast<std::int16_t>(p.field_count));
-        for (std::uint32_t c = 0; c < p.field_count; ++c) {       // bounded by kMaxFields
-            if (is_null[c]) { w.put_i32(-1); continue; }
-            if (format_of(p, c) == 0 || is_text_like(p.oids[c])) {
-                w.put_i32(static_cast<std::int32_t>(values[c].size()));
-                w.put_bytes(values[c].data(), values[c].size());
-                continue;
-            }
-            CodecError ce;
-            std::size_t n = 0;
-            if (!text_to_binary_result(values[c], p.oids[c], cell, sizeof(cell), n, ce)) {
-                return fail(fd, w, ce.sqlstate, ce.message);
-            }
-            w.put_i32(static_cast<std::int32_t>(n));
-            w.put_bytes(cell, n);
-        }
-        if (!w.finish()) {
-            return fail(fd, w, "54000", "a result row exceeded this endpoint's wire "
-                        "buffer and was refused rather than sent truncated");
-        }
-        if (!w.send(fd)) return false;
-        ++p.next_row;
-        ++sent;
-    }
-    if (p.next_row < total) {
+    assert(p.materialized && p.fetch_from < 0);
+    QueryFailure qf;
+    const Emit e = emit_rows(p, p.next_row, exec.row_count(), max_rows, fd, w, exec, qf);
+    if (e == Emit::Dead) return false;
+    if (e == Emit::Failed) return fail(fd, w, qf.sqlstate, qf.message);
+    if (e == Emit::Suspended) {
         w.begin('s');                                             // PortalSuspended
         return w.finish() && w.send(fd);
     }
@@ -608,7 +584,7 @@ bool ExtendedSession::on_execute(BodyReader& r, int fd, MsgWriter& w,
         FieldDesc fields[kMaxFields];
         QueryFailure qf;
         if (!materialize(pi, fd, w, exec, fields, qf)) return fail(fd, w, qf.sqlstate, qf.message);
-    } else if (current_ != pi && p.session_tag == nullptr) {
+    } else if (current_ != result_owner(p, pi) && p.session_tag == nullptr) {
         return fail(fd, w, "55000", "portal's result was displaced by another "
                     "portal on this connection");
     }
@@ -621,6 +597,7 @@ bool ExtendedSession::on_execute(BodyReader& r, int fd, MsgWriter& w,
         w.put_cstring(tag);
         return w.finish() && w.send(fd);
     }
+    if (p.fetch_from > 0) return send_fetch(p, max_rows, fd, w, exec);
     return send_rows(p, max_rows, fd, w, exec);
 }
 

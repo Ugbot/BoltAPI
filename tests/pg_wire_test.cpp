@@ -589,3 +589,176 @@ TEST_F(PgWire, ExtendedBeginThenCursorFetchAcrossSyncs) {
     ASSERT_EQ(PgClient::types(r), "EZ");
     EXPECT_EQ(PgClient::sqlstate(r[0]), "34000");
 }
+
+TEST(PgWireCodec, CursorCommands) {
+    pg::CursorCommand cc;
+    pg::CodecError e;
+    EXPECT_EQ(pg::classify_cursor_command("select 1", cc, e), pg::CursorVerb::None);
+    ASSERT_EQ(pg::classify_cursor_command(
+                  "DECLARE \"My\"\"C\" NO SCROLL CURSOR WITH HOLD FOR select rows 3;", cc, e),
+              pg::CursorVerb::Declare);
+    EXPECT_STREQ(cc.name, "My\"C");
+    EXPECT_TRUE(cc.hold);
+    EXPECT_EQ(cc.query, "select rows 3");
+    ASSERT_EQ(pg::classify_cursor_command("declare C1 cursor without hold for values (1)", cc, e),
+              pg::CursorVerb::Declare);
+    EXPECT_STREQ(cc.name, "c1");
+    EXPECT_FALSE(cc.hold);
+    EXPECT_EQ(pg::classify_cursor_command("DECLARE c SCROLL CURSOR FOR select 1", cc, e),
+              pg::CursorVerb::Refused);
+    EXPECT_STREQ(e.sqlstate, "0A000");
+    EXPECT_EQ(pg::classify_cursor_command("DECLARE c CURSOR FOR", cc, e), pg::CursorVerb::Refused);
+
+    ASSERT_EQ(pg::classify_cursor_command("FETCH FORWARD 10 FROM \"c1\"", cc, e),
+              pg::CursorVerb::Fetch);
+    EXPECT_EQ(cc.count, 10u);
+    EXPECT_STREQ(cc.name, "c1");
+    ASSERT_EQ(pg::classify_cursor_command("fetch all in c1", cc, e), pg::CursorVerb::Fetch);
+    EXPECT_TRUE(cc.all);
+    ASSERT_EQ(pg::classify_cursor_command("FETCH c1", cc, e), pg::CursorVerb::Fetch);
+    EXPECT_EQ(cc.count, 1u);
+    ASSERT_EQ(pg::classify_cursor_command("FETCH NEXT FROM c1", cc, e), pg::CursorVerb::Fetch);
+    EXPECT_EQ(cc.count, 1u);
+    EXPECT_EQ(pg::classify_cursor_command("FETCH BACKWARD 1 FROM c1", cc, e),
+              pg::CursorVerb::Refused);
+    EXPECT_STREQ(e.sqlstate, "55000");
+    EXPECT_EQ(pg::classify_cursor_command("FETCH -2 FROM c1", cc, e), pg::CursorVerb::Refused);
+    EXPECT_STREQ(e.sqlstate, "55000");
+    ASSERT_EQ(pg::classify_cursor_command("MOVE ABSOLUTE 4 FROM \"c1\"", cc, e),
+              pg::CursorVerb::Move);
+    EXPECT_TRUE(cc.absolute);
+    EXPECT_EQ(cc.count, 4u);
+    ASSERT_EQ(pg::classify_cursor_command("CLOSE ALL", cc, e), pg::CursorVerb::Close);
+    EXPECT_TRUE(cc.all);
+    ASSERT_EQ(pg::classify_cursor_command("CLOSE \"all\"", cc, e), pg::CursorVerb::Close);
+    EXPECT_FALSE(cc.all);
+    EXPECT_STREQ(cc.name, "all");
+}
+
+namespace {
+std::string q(const std::string& sql) { return sql + std::string(1, '\0'); }
+std::string tag(const Msg& m) { return m.body.substr(0, m.body.size() - 1); }
+}  // namespace
+
+// psql / psycopg text path: DECLARE, FETCH, MOVE, CLOSE over simple query.
+TEST_F(PgWire, SimpleQueryCursorLifecycle) {
+    c_.msg('Q', q("BEGIN"));
+    (void)c_.roundtrip();
+    c_.msg('Q', q("DECLARE c1 CURSOR FOR select rows 5"));
+    auto r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "CZ");
+    EXPECT_EQ(tag(r[0]), "DECLARE CURSOR");
+    EXPECT_EQ(ready_status(r), 'T');
+    c_.msg('Q', q("FETCH FORWARD 2 FROM c1"));
+    r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "TDDCZ");
+    EXPECT_EQ(PgClient::col0(r[1]), "1");
+    EXPECT_EQ(PgClient::col0(r[2]), "2");
+    EXPECT_EQ(tag(r[3]), "FETCH 2");
+    c_.msg('Q', q("MOVE 1 IN c1"));
+    r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "CZ");
+    EXPECT_EQ(tag(r[0]), "MOVE 1");
+    c_.msg('Q', q("FETCH ALL FROM \"c1\""));
+    r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "TDDCZ");
+    EXPECT_EQ(PgClient::col0(r[1]), "4");
+    EXPECT_EQ(tag(r[3]), "FETCH 2");
+    c_.msg('Q', q("FETCH c1"));
+    r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "TCZ");
+    EXPECT_EQ(tag(r[1]), "FETCH 0");
+    EXPECT_EQ(factory_.last->executes, 1);   // the query ran once, at DECLARE
+    c_.msg('Q', q("CLOSE c1"));
+    r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "CZ");
+    EXPECT_EQ(tag(r[0]), "CLOSE CURSOR");
+    c_.msg('Q', q("FETCH c1"));
+    r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "EZ");
+    EXPECT_EQ(PgClient::sqlstate(r[0]), "34000");
+    EXPECT_EQ(ready_status(r), 'E');
+    c_.msg('Q', q("ROLLBACK"));
+    r = c_.roundtrip();
+    EXPECT_EQ(ready_status(r), 'I');
+}
+
+TEST_F(PgWire, CursorNeedsBlockOrHoldAndIsDisplacedByOtherQueries) {
+    c_.msg('Q', q("DECLARE c1 CURSOR FOR select rows 3"));
+    auto r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "EZ");
+    EXPECT_EQ(PgClient::sqlstate(r[0]), "25P01");
+    EXPECT_EQ(factory_.last->executes, 0);
+    c_.msg('Q', q("DECLARE c1 CURSOR WITH HOLD FOR select rows 3"));
+    r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "CZ");
+    c_.msg('Q', q("BEGIN"));
+    (void)c_.roundtrip();
+    c_.msg('Q', q("COMMIT"));
+    (void)c_.roundtrip();
+    c_.msg('Q', q("FETCH 1 FROM c1"));   // WITH HOLD survives the block
+    r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "TDCZ");
+    c_.msg('Q', q("DECLARE c2 CURSOR WITH HOLD FOR select rows 3"));
+    r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "EZ");   // the fixture's single named-portal slot
+    EXPECT_EQ(PgClient::sqlstate(r[0]), "53000");
+    c_.msg('Q', q("select 1"));
+    (void)c_.roundtrip();
+    c_.msg('Q', q("FETCH 1 FROM c1"));
+    r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "EZ");
+    EXPECT_EQ(PgClient::sqlstate(r[0]), "55000");
+    c_.msg('Q', q("CLOSE ALL"));
+    r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "CZ");
+    c_.msg('Q', q("DECLARE c2 CURSOR WITH HOLD FOR ddl insert"));
+    r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "EZ");
+    EXPECT_EQ(PgClient::sqlstate(r[0]), "42601");
+}
+
+// psycopg ServerCursor: DECLARE over the extended protocol, Describe of the
+// cursor's portal, then FETCH (binary results over the extended protocol).
+TEST_F(PgWire, ExtendedDeclareDescribeFetch) {
+    c_.msg('Q', q("BEGIN"));
+    (void)c_.roundtrip();
+    c_.parse("", "DECLARE \"c1\" CURSOR FOR select rows 5");
+    c_.bind("", "", {});
+    c_.describe('P', "");
+    c_.execute("");
+    c_.sync();
+    auto r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "12nCZ");
+    EXPECT_EQ(tag(r[3]), "DECLARE CURSOR");
+    c_.describe('P', "c1");
+    c_.sync();
+    r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "TZ");
+    c_.parse("", "FETCH FORWARD 2 FROM \"c1\"");
+    c_.bind("", "", {}, 0, {1});
+    c_.describe('P', "");
+    c_.execute("");
+    c_.sync();
+    r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "12TDDCZ");
+    ASSERT_EQ(r[4].body.size(), 2u + 4u + 8u);   // one binary int8
+    EXPECT_EQ(static_cast<std::uint8_t>(r[4].body.back()), 2u);
+    EXPECT_EQ(tag(r[5]), "FETCH 2");
+    c_.parse("", "FETCH ALL FROM c1");
+    c_.bind("", "", {});
+    c_.execute("", 1);
+    c_.execute("", 0);
+    c_.sync();
+    r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "12DsDDCZ");
+    EXPECT_EQ(PgClient::col0(r[2]), "3");
+    EXPECT_EQ(tag(r[6]), "FETCH 3");
+    EXPECT_EQ(factory_.last->executes, 1);
+    c_.msg('Q', q("COMMIT"));
+    (void)c_.roundtrip();
+    c_.msg('Q', q("FETCH c1"));   // a WITHOUT HOLD cursor ends with its block
+    r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "EZ");
+    EXPECT_EQ(PgClient::sqlstate(r[0]), "34000");
+}

@@ -159,6 +159,33 @@ def main(server):
                 check("tx: read-only refuses writes", e.sqlstate, "25006")
             conn.rollback()
 
+        # G2ETL-67: psycopg named cursors -> DECLARE / FETCH / MOVE / CLOSE.
+        with psycopg.connect(dsn) as conn:
+            with conn.cursor(name="c1") as cur:
+                cur.itersize = 3
+                cur.execute("select rows 8")
+                check("cursor: description", cur.description[0].name, "n")
+                check("cursor: fetchone", cur.fetchone()[0], 1)
+                check("cursor: fetchmany", [r[0] for r in cur.fetchmany(2)], [2, 3])
+                cur.scroll(1)
+                check("cursor: iterate rest", [r[0] for r in cur], [5, 6, 7, 8])
+            with conn.cursor(name="Big Cursor", binary=True) as cur:
+                cur.execute("select rows 250")
+                check("cursor: binary fetchall", len(cur.fetchall()), 250)
+            check("cursor: in block", conn.info.transaction_status.name, "INTRANS")
+            conn.commit()
+        with psycopg.connect(dsn, autocommit=True) as conn:
+            try:
+                with conn.cursor(name="nohold") as cur:
+                    cur.execute("select rows 2")
+                    cur.fetchall()
+                failures.append("cursor outside a block without HOLD did not raise")
+            except psycopg.errors.NoActiveSqlTransaction as e:
+                check("cursor: needs a block", e.sqlstate, "25P01")
+            with conn.cursor(name="held", withhold=True) as cur:
+                cur.execute("select rows 4")
+                check("cursor: withhold", [r[0] for r in cur.fetchall()], [1, 2, 3, 4])
+
         failures.extend(run_jdbc(port, check))
         return 1 if failures else 0
     finally:
