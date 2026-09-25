@@ -92,6 +92,15 @@ void encode_flight_info(std::string* out, std::string_view schema_ipc,
                         std::string_view descriptor_raw,
                         std::string_view ticket, std::int64_t total_records);
 
+// FlightData{flight_descriptor=1, data_header=2, app_metadata=3,
+// data_body=1000}, as a DoPut stream sends it.
+struct FlightDataMsg {
+    std::string_view descriptor;    // raw FlightDescriptor, first message only
+    std::string_view data_header;   // an IPC Message flatbuffer, or empty
+    std::string_view data_body;
+};
+bool decode_flight_data(std::string_view buf, FlightDataMsg* out) noexcept;
+
 // FlightData{data_header=2, data_body=1000}.
 void encode_flight_data(std::string* out, std::string_view data_header,
                         std::string_view data_body);

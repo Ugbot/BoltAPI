@@ -94,7 +94,7 @@ constexpr std::uint32_t kServerName = 0, kServerVersion = 1, kServerArrowVersion
                         kCancel = 9, kBulkIngestion = 10, kIngestTransactions = 11,
                         kIdentifierQuoteChar = 504;
 
-std::vector<ar::SqlInfoRow> all_info(const Config& cfg) {
+std::vector<ar::SqlInfoRow> all_info(const Config& cfg, bool read_only) {
     auto str = [](std::uint32_t id, std::string_view s) {
         ar::SqlInfoRow r;
         r.id = id;
@@ -117,7 +117,7 @@ std::vector<ar::SqlInfoRow> all_info(const Config& cfg) {
         str(kServerName, cfg.server_name),
         str(kServerVersion, cfg.server_version),
         str(kServerArrowVersion, "arrow-ipc-v5"),
-        boolean(kReadOnly, true),
+        boolean(kReadOnly, read_only),
         boolean(kSql, true),
         boolean(kSubstrait, false),
         txn,
@@ -128,13 +128,13 @@ std::vector<ar::SqlInfoRow> all_info(const Config& cfg) {
     };
 }
 
-bool sql_info(std::string_view value, const Config& cfg, std::string* out,
+bool sql_info(std::string_view value, const Config& cfg, bool read_only, std::string* out,
               std::int64_t* rows, QueryFailure& f) {
     std::vector<std::uint32_t> ids;
     if (!parse_info_ids(value, &ids)) {
         return fail(f, GrpcCode::kInvalidArgument, "malformed CommandGetSqlInfo");
     }
-    const std::vector<ar::SqlInfoRow> all = all_info(cfg);
+    const std::vector<ar::SqlInfoRow> all = all_info(cfg, read_only);
     std::vector<ar::SqlInfoRow> pick;
     if (ids.empty()) {
         pick = all;
@@ -275,6 +275,45 @@ bool db_schemas(std::string_view value, std::string* out, std::int64_t* rows,
     return true;
 }
 
+// CommandGetXdbcTypeInfo{optional int32 data_type = 1}.
+bool xdbc_types(std::string_view value, IQueryExecutor& exec, std::string* out,
+                std::int64_t* rows, QueryFailure& f, char* fail_buf, std::size_t fail_cap) {
+    bool filtered = false;
+    std::int32_t want = 0;
+    cd::PbReader r(value);
+    cd::PbField fld;
+    std::size_t guard = 0;
+    for (; guard < kMaxFields && r.next(&fld); ++guard) {
+        if (fld.number == 1 && fld.wire == cd::kWireVarint) {
+            filtered = true;
+            want = static_cast<std::int32_t>(static_cast<std::uint32_t>(fld.varint));
+        }
+    }
+    if (!r.ok() || guard == kMaxFields) {
+        return fail(f, GrpcCode::kInvalidArgument, "malformed CommandGetXdbcTypeInfo");
+    }
+    std::vector<XdbcTypeInfo> all(kMaxXdbcTypes);
+    const std::uint32_t n = std::min(exec.xdbc_type_info(all.data(), kMaxXdbcTypes), kMaxXdbcTypes);
+    if (n == 0) {
+        std::snprintf(fail_buf, fail_cap,
+                      "Flight SQL command CommandGetXdbcTypeInfo: this host does not "
+                      "describe its types");
+        return fail(f, GrpcCode::kUnimplemented, fail_buf);
+    }
+    std::vector<XdbcTypeInfo> keep;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        if (!filtered || all[i].data_type == want) keep.push_back(all[i]);
+    }
+    std::sort(keep.begin(), keep.end(), [](const XdbcTypeInfo& a, const XdbcTypeInfo& b) {
+        return a.data_type < b.data_type ||
+               (a.data_type == b.data_type && a.type_name < b.type_name);
+    });
+    assert(keep.size() <= n);
+    ar::write_xdbc_type_info(out, keep.data(), keep.size());
+    *rows = static_cast<std::int64_t>(keep.size());
+    return true;
+}
+
 }  // namespace
 
 Outcome build(std::string_view type_name, std::string_view value, IQueryExecutor& exec,
@@ -289,7 +328,9 @@ Outcome build(std::string_view type_name, std::string_view value, IQueryExecutor
         cmd == "CommandGetTables" || cmd == "CommandGetTableTypes" ||
         cmd == "CommandGetPrimaryKeys" || cmd == "CommandGetExportedKeys" ||
         cmd == "CommandGetImportedKeys" || cmd == "CommandGetCrossReference";
-    if (!catalog_cmd && cmd != "CommandGetSqlInfo") return Outcome::kNotMetadata;
+    if (!catalog_cmd && cmd != "CommandGetSqlInfo" && cmd != "CommandGetXdbcTypeInfo") {
+        return Outcome::kNotMetadata;
+    }
     if (catalog_cmd && !exec.has_catalog()) {
         std::snprintf(fail_buf, fail_cap,
                       "Flight SQL command %.*s needs a catalog this host does not expose",
@@ -302,7 +343,9 @@ Outcome build(std::string_view type_name, std::string_view value, IQueryExecutor
     *out_rows = 0;
     bool ok = true;
     if (cmd == "CommandGetSqlInfo") {
-        ok = sql_info(value, cfg, out_ipc, out_rows, out_failure);
+        ok = sql_info(value, cfg, !exec.supports_updates(), out_ipc, out_rows, out_failure);
+    } else if (cmd == "CommandGetXdbcTypeInfo") {
+        ok = xdbc_types(value, exec, out_ipc, out_rows, out_failure, fail_buf, fail_cap);
     } else if (cmd == "CommandGetCatalogs") {
         ar::write_catalogs(out_ipc, nullptr, 0);
     } else if (cmd == "CommandGetDbSchemas") {

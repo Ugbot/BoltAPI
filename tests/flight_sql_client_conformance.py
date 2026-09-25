@@ -19,6 +19,7 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 
 SKIP = 77
 
@@ -150,10 +151,10 @@ def check_pyarrow(port, failures):
 
     try:
         client.get_flight_info(fl.FlightDescriptor.for_command(
-            any_cmd("CommandGetXdbcTypeInfo")))
-        failures.append("CommandGetXdbcTypeInfo did not raise")
+            any_cmd("CommandGetDbSchemasX")))
+        failures.append("an unknown command did not raise")
     except pa.ArrowNotImplementedError as e:
-        if "CommandGetXdbcTypeInfo" not in str(e):
+        if "CommandGetDbSchemasX" not in str(e):
             failures.append("unimplemented message lacks the command name: %s" % e)
 
     # Several calls on one channel exercise HPACK dynamic-table state.
@@ -193,13 +194,13 @@ def check_metadata(port, failures):
     expect(pa.types.is_union(info.schema.field("value").type), "value is a union")
     kv = dict(zip(info.column("info_name").to_pylist(), info.column("value").to_pylist()))
     expect(kv.get(0) == "boltapi-echo" and kv.get(1) == "9.9.9", "server name/version %s" % kv)
-    expect(kv.get(3) is True and kv.get(4) is True and kv.get(5) is False, "flags %s" % kv)
+    expect(kv.get(3) is False and kv.get(4) is True and kv.get(5) is False, "flags %s" % kv)
     expect(kv.get(8) == 0, "transactions NONE %s" % kv)
     packed = _bytes_field(1, _varint(1) + _varint(0) + _varint(99999))
     t = metadata(client, "CommandGetSqlInfo", packed)
     expect(t.column("info_name").to_pylist() == [1, 0], "requested ids in order: %s" % t)
     t = metadata(client, "CommandGetSqlInfo", _varint_field(1, 3))
-    expect(t.to_pylist() == [{"info_name": 3, "value": True}], "unpacked id: %s" % t)
+    expect(t.to_pylist() == [{"info_name": 3, "value": False}], "unpacked id: %s" % t)
 
     t = metadata(client, "CommandGetCatalogs")
     expect(t.num_rows == 0 and t.schema.names == ["catalog_name"], "catalogs %s" % t)
@@ -250,6 +251,29 @@ def check_metadata(port, failures):
     for cmd in ("CommandGetImportedKeys", "CommandGetExportedKeys"):
         t = metadata(client, cmd, _bytes_field(3, b"orders"))
         expect(t.num_rows == 0 and len(t.schema) == 13, "%s %s" % (cmd, t.schema))
+    t = metadata(client, "CommandGetXdbcTypeInfo")
+    expect(t.schema.names == [
+        "type_name", "data_type", "column_size", "literal_prefix", "literal_suffix",
+        "create_params", "nullable", "case_sensitive", "searchable", "unsigned_attribute",
+        "fixed_prec_scale", "auto_increment", "local_type_name", "minimum_scale",
+        "maximum_scale", "sql_data_type", "datetime_subcode", "num_prec_radix",
+        "interval_precision"], "xdbc schema %s" % t.schema.names)
+    expect(t.schema.field("create_params").type == pa.list_(pa.field("item", pa.string(), False)),
+           "create_params type %s" % t.schema.field("create_params").type)
+    rows = t.to_pylist()
+    expect([(r["type_name"], r["data_type"], r["column_size"], r["literal_prefix"],
+             r["unsigned_attribute"], r["num_prec_radix"], r["sql_data_type"],
+             r["create_params"], r["nullable"]) for r in rows] ==
+           [("BIGINT", -5, 19, None, False, 10, -5, None, 1),
+            ("DOUBLE", 8, 15, None, False, 2, 8, None, 1),
+            ("VARCHAR", 12, None, "'", None, None, 12, None, 1)], "xdbc rows %s" % rows)
+    t = metadata(client, "CommandGetXdbcTypeInfo", _varint_field(1, 12))
+    expect(t.column("type_name").to_pylist() == ["VARCHAR"], "xdbc filter %s" % t)
+    t = metadata(client, "CommandGetXdbcTypeInfo", _varint_field(1, (1 << 64) - 5))
+    expect(t.column("type_name").to_pylist() == ["BIGINT"], "xdbc negative filter %s" % t)
+    t = metadata(client, "CommandGetXdbcTypeInfo", _varint_field(1, 2003))
+    expect(t.num_rows == 0, "xdbc filter without a match %s" % t)
+
     t = metadata(client, "CommandGetCrossReference",
                  _bytes_field(3, b"orders") + _bytes_field(6, b"customers"))
     expect(t.num_rows == 0 and t.schema.field("update_rule").type == pa.uint8(),
@@ -314,6 +338,156 @@ def check_prepared(port, failures):
     client.close()
 
 
+def update_cmd(sql, txn=b""):
+    payload = _bytes_field(1, sql.encode()) + (_bytes_field(2, txn) if txn else b"")
+    return any_cmd("CommandStatementUpdate", payload)
+
+
+def do_put(client, cmd, batch=None, options=None):
+    """One DoPut; returns the PutResult app_metadata fields."""
+    desc = fl.FlightDescriptor.for_command(cmd)
+    schema = batch.schema if batch is not None else pa.schema([])
+    writer, reader = (client.do_put(desc, schema, options) if options
+                      else client.do_put(desc, schema))
+    if batch is not None:
+        writer.write_batch(batch)
+    writer.done_writing()
+    buf = reader.read()
+    writer.close()
+    return pb_fields(buf.to_pybytes())
+
+
+def updates_so_far(client):
+    return run_query(client, "UPDATES")[1].num_rows
+
+
+def prepare(client, sql):
+    create = fl.Action("CreatePreparedStatement", any_cmd(
+        "ActionCreatePreparedStatementRequest", _bytes_field(1, sql.encode())))
+    results = list(client.do_action(create))
+    assert len(results) == 1, results
+    return pb_fields(pb_fields(results[0].body.to_pybytes())[2][0])
+
+
+def bind(client, handle, batch):
+    cmd = any_cmd("CommandPreparedStatementQuery", _bytes_field(1, handle))
+    return do_put(client, cmd, batch)[1][0]
+
+
+def prepared_rows(client, handle):
+    cmd = any_cmd("CommandPreparedStatementQuery", _bytes_field(1, handle))
+    info = client.get_flight_info(fl.FlightDescriptor.for_command(cmd))
+    return info, client.do_get(info.endpoints[0].ticket).read_all()
+
+
+def expect_error(failures, what, exc, text, fn):
+    try:
+        fn()
+        failures.append("%s did not raise" % what)
+    except exc as e:
+        if text not in str(e):
+            failures.append("%s: message %r lacks %r" % (what, str(e), text))
+    except Exception as e:  # noqa: BLE001 -- wrong class is a finding
+        failures.append("%s raised %s: %s" % (what, type(e).__name__, e))
+
+
+def check_updates(port, failures):
+    """CommandStatementUpdate through DoPut: one execution, record_count."""
+    client = fl.FlightClient("grpc://127.0.0.1:%d" % port)
+    before = updates_so_far(client)
+    res = do_put(client, update_cmd("UPSERT 7"))
+    if res.get(1) != [7]:
+        failures.append("DoPutUpdateResult %s" % res)
+    if updates_so_far(client) != before + 1:
+        failures.append("an update ran %d times" % (updates_so_far(client) - before))
+    expect_error(failures, "failing update", pa.ArrowInvalid, "refused update",
+                 lambda: do_put(client, update_cmd("FAILU now")))
+    expect_error(failures, "update in a transaction", pa.ArrowNotImplementedError,
+                 "transactions", lambda: do_put(client, update_cmd("UPSERT 1", b"t1")))
+    expect_error(failures, "update via GetFlightInfo", pa.ArrowInvalid, "DoPut",
+                 lambda: client.get_flight_info(
+                     fl.FlightDescriptor.for_command(update_cmd("UPSERT 1"))))
+    expect_error(failures, "statement update with ?", pa.ArrowInvalid, "prepare",
+                 lambda: do_put(client, update_cmd("UPSERT ?")))
+    expect_error(failures, "DoPut of an ingest", pa.ArrowNotImplementedError,
+                 "CommandStatementIngest",
+                 lambda: do_put(client, any_cmd("CommandStatementIngest")))
+    if updates_so_far(client) != before + 1:
+        failures.append("a refused update ran")
+    client.close()
+
+
+def check_parameters(port, failures):
+    """`?` parameters: parameter_schema, DoPut binding, the bound handle."""
+    client = fl.FlightClient("grpc://127.0.0.1:%d" % port)
+
+    def expect(cond, what):
+        if not cond:
+            failures.append(what)
+
+    res = prepare(client, "SELECT ?")
+    handle = res[1][0]
+    expect(2 not in res, "a parameterised query is not run to describe it")
+    psch = pa.ipc.read_schema(pa.py_buffer(res[3][0]))
+    expect(len(psch) == 1 and pa.types.is_union(psch[0].type) and
+           psch[0].type.mode == "dense", "parameter_schema %s" % psch)
+    bound = bind(client, handle, pa.record_batch([pa.array([4], pa.int64())], names=["p"]))
+    expect(bound != handle, "binding returned the unbound handle")
+    info, t = prepared_rows(client, bound)
+    expect(t.to_pydict() == expected(4) and info.total_records == 4, "bound SELECT ? %s" % t)
+    bound = bind(client, handle, pa.record_batch([pa.array([2], pa.int64())], names=["p"]))
+    expect(prepared_rows(client, bound)[1].to_pydict() == expected(2), "rebinding")
+    expect_error(failures, "unbound handle", pa.ArrowInvalid, "none are bound",
+                 lambda: prepared_rows(client, handle))
+
+    sql = "ECHO ? '?' \"?\" ? ? ? ? /* ? */ ? -- ?\n?"
+    res = prepare(client, sql)
+    expect(len(pa.ipc.read_schema(pa.py_buffer(res[3][0]))) == 7, "7 parameters")
+    batch = pa.record_batch([
+        pa.array([-5], pa.int32()), pa.array(["it's"], pa.string()),
+        pa.array([2.5], pa.float64()), pa.array([None], pa.null()),
+        pa.array([True], pa.bool_()), pa.array([200], pa.uint8()),
+        pa.array([3.0], pa.float32())], names=list("abcdefg"))
+    got = prepared_rows(client, bind(client, res[1][0], batch))[1].column("sql").to_pylist()
+    expect(got == ["ECHO (-5) '?' \"?\" 'it''s' 2.5 NULL TRUE /* ? */ 200 -- ?\n3.0"],
+           "substitution %r" % got)
+
+    res = prepare(client, "ECHO ? ?")
+    union = pa.UnionArray.from_dense(pa.array([1], pa.int8()), pa.array([0], pa.int32()),
+                                     [pa.array(["s"]), pa.array([9], pa.int64())])
+    batch = pa.record_batch([pa.array(["x"], pa.large_string()), union], names=["a", "b"])
+    got = prepared_rows(client, bind(client, res[1][0], batch))[1].column("sql").to_pylist()
+    expect(got == ["ECHO 'x' 9"], "large_string + dense union %r" % got)
+    two = pa.record_batch([pa.array([1, 2]), pa.array([3, 4])], names=["a", "b"])
+    expect_error(failures, "two parameter sets for a query", pa.ArrowInvalid,
+                 "exactly one parameter set", lambda: bind(client, res[1][0], two))
+    expect_error(failures, "too few parameters", pa.ArrowInvalid, "exactly one parameter set",
+                 lambda: bind(client, res[1][0], pa.record_batch([pa.array([1])], names=["a"])))
+    expect_error(failures, "a date parameter", pa.ArrowNotImplementedError, "Date",
+                 lambda: bind(client, res[1][0], pa.record_batch(
+                     [pa.array([0], pa.date32()), pa.array([1])], names=["a", "b"])))
+    nan = pa.record_batch([pa.array([float("nan")]), pa.array([1])], names=["a", "b"])
+    expect_error(failures, "a NaN parameter", pa.ArrowInvalid, "NaN",
+                 lambda: prepared_rows(client, bind(client, res[1][0], nan)))
+
+    before = updates_so_far(client)
+    res = prepare(client, "UPSERT ?")
+    expect(2 not in res and 3 in res, "prepared update: no dataset_schema %s" % sorted(res))
+    expect(updates_so_far(client) == before, "preparing an update ran it")
+    cmd = any_cmd("CommandPreparedStatementUpdate", _bytes_field(1, res[1][0]))
+    got = do_put(client, cmd, pa.record_batch([pa.array([2, 3])], names=["n"]))
+    expect(got.get(1) == [5], "prepared update over two parameter sets %s" % got)
+    expect(updates_so_far(client) == before + 2, "one execution per parameter set")
+    expect_error(failures, "prepared update without parameters", pa.ArrowInvalid,
+                 "no parameter rows", lambda: do_put(client, cmd))
+    res = prepare(client, "UPSERT 11")
+    expect(2 not in res and 3 not in res, "parameterless update %s" % sorted(res))
+    cmd = any_cmd("CommandPreparedStatementUpdate", _bytes_field(1, res[1][0]))
+    expect(do_put(client, cmd).get(1) == [11], "parameterless prepared update")
+    expect(updates_so_far(client) == before + 3, "update count after prepared updates")
+    client.close()
+
+
 def check_auth(port, failures):
     client = fl.FlightClient("grpc://127.0.0.1:%d" % port)
     try:
@@ -367,10 +541,36 @@ def check_adbc(port, failures):
             table = cur.fetch_arrow_table()
         if table.to_pydict() != expected(6):
             failures.append("ADBC prepared values %s" % table.to_pydict())
+        check_adbc_writes(conn, failures)
     print("ADBC Flight SQL driver: OK")
 
 
-def run_jdbc_probe(port, query, table):
+def check_adbc_writes(conn, failures):
+    """ADBC's own statement paths: CommandStatementUpdate (unprepared
+    execute_update), prepared updates over parameter sets, and query
+    parameters bound through DoPut."""
+    import adbc_driver_manager
+
+    with adbc_driver_manager.AdbcStatement(conn.adbc_connection) as stmt:
+        stmt.set_sql_query("UPSERT 4")
+        n = stmt.execute_update()
+    if n != 4:
+        failures.append("ADBC execute_update %r" % (n,))
+    with conn.cursor() as cur:
+        cur.executemany("UPSERT ?", [(2,), (3,)])
+        if cur.rowcount != 5:
+            failures.append("ADBC executemany rowcount %r" % cur.rowcount)
+        cur.execute("SELECT ?", (4,))
+        t = cur.fetch_arrow_table()
+        if t.to_pydict() != expected(4):
+            failures.append("ADBC bound query %s" % t.to_pydict())
+        cur.execute("ECHO ? ? ? ?", ("it's", 2.5, None, -7))
+        got = cur.fetchall()
+        if got != [("ECHO 'it''s' 2.5 NULL (-7)",)]:
+            failures.append("ADBC bound values %r" % got)
+
+
+def run_jdbc_probe(port, query, table, *extra):
     """{key: value} printed by FlightSqlJdbcProbe.java, or None to skip."""
     jar = os.environ.get("FLIGHT_SQL_JDBC_JAR")
     java = shutil.which("java")
@@ -379,7 +579,7 @@ def run_jdbc_probe(port, query, table):
         return None
     probe = os.path.join(os.path.dirname(os.path.abspath(__file__)), "FlightSqlJdbcProbe.java")
     out = subprocess.run([java, "--add-opens=java.base/java.nio=ALL-UNNAMED", "-cp", jar,
-                          probe, str(port), query, table],
+                          probe, str(port), query, table] + list(extra),
                          capture_output=True, text=True, timeout=300)
     facts = dict(line.split("\t", 1) for line in out.stdout.splitlines() if "\t" in line)
     if facts.get("done") != "ok":
@@ -388,17 +588,22 @@ def run_jdbc_probe(port, query, table):
 
 
 def check_jdbc(port, failures):
-    facts = run_jdbc_probe(port, "SELECT 3", "customers")
+    facts = run_jdbc_probe(port, "SELECT 3", "customers", "update=UPSERT 11",
+                           "prepared_update=UPSERT 3", "java_client")
     if facts is None:
         return
     rows3 = "id,name,score;0,row0,0.0;1,row1,0.5;2,row2,1.0"
     want = {
-        "product": "boltapi-echo", "version": "9.9.9", "read_only": "true",
+        "product": "boltapi-echo", "version": "9.9.9", "read_only": "false",
         "table_types": "TABLE;VIEW", "catalogs": "", "schemas": "",
         "tables": "customers,TABLE;orders,TABLE;top_orders,VIEW",
         "columns": "id,BIGINT;name,VARCHAR;score,DOUBLE",
         "primary_keys": "region,1;id,2", "imported_keys": "",
         "statement": rows3, "prepared_1": rows3, "prepared_2": rows3,
+        "update": "11", "prepared_update": "3,3",
+        "java_type_info": "BIGINT,-5;DOUBLE,8;VARCHAR,12", "java_param_fields": "1",
+        "java_bound": "0,row0;1,row1;2,row2;3,row3", "java_echo": "ECHO 'o''k'",
+        "java_update": "5", "java_statement_update": "6",
     }
     for k, v in want.items():
         if facts.get(k) != v:
@@ -508,6 +713,55 @@ def check_flow_control(port, failures, window=1024, rows=20000):
                         (msgs, i, len(payload)))
 
 
+def make_cert(tmpdir):
+    """A self-signed localhost certificate (SAN DNS:localhost, IP:127.0.0.1),
+    or None when no `openssl` CLI is available."""
+    exe = shutil.which("openssl")
+    if not exe:
+        return None
+    cert, key = os.path.join(tmpdir, "cert.pem"), os.path.join(tmpdir, "key.pem")
+    r = subprocess.run([exe, "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                        "-keyout", key, "-out", cert, "-subj", "/CN=localhost",
+                        "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1"],
+                       capture_output=True, text=True, timeout=60)
+    return (cert, key) if r.returncode == 0 else None
+
+
+def check_tls(port, cert, failures):
+    """grpc+tls with ALPN h2, judged by pyarrow (grpc-core), ADBC (grpc-go)
+    and the JDBC driver (grpc-java/netty)."""
+    with open(cert, "rb") as f:
+        pem = f.read()
+    client = fl.FlightClient("grpc+tls://localhost:%d" % port, tls_root_certs=pem)
+    _, t = run_query(client, "SELECT 3")
+    if t.to_pydict() != expected(3):
+        failures.append("TLS values differ")
+    if do_put(client, update_cmd("UPSERT 2")).get(1) != [2]:
+        failures.append("TLS update")
+    client.close()
+    plain = fl.FlightClient("grpc://127.0.0.1:%d" % port)
+    try:
+        run_query(plain, "SELECT 1", fl.FlightCallOptions(timeout=5))
+        failures.append("a cleartext client was served on the TLS port")
+    except (fl.FlightError, pa.ArrowException):
+        pass
+    plain.close()
+    try:
+        import adbc_driver_flightsql.dbapi as fsql
+        kw = {"adbc.flight.sql.client_option.tls_root_certs": pem.decode()}
+        with fsql.connect("grpc+tls://localhost:%d" % port, db_kwargs=kw) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 5")
+                if cur.fetch_arrow_table().to_pydict() != expected(5):
+                    failures.append("ADBC over TLS values differ")
+    except ImportError:
+        pass
+    facts = run_jdbc_probe(port, "SELECT 3", "customers", "tls")
+    if facts is not None and facts.get("statement") != \
+            "id,name,score;0,row0,0.0;1,row1,0.5;2,row2,1.0":
+        failures.append("JDBC over TLS: %r" % facts.get("statement"))
+    print("grpc+tls: OK")
+
 def start(server, *extra):
     p = subprocess.Popen([server] + list(extra), stdout=subprocess.PIPE, text=True)
     line = p.stdout.readline().strip()
@@ -528,6 +782,8 @@ def main():
         check_flow_control(port, failures)
         check_metadata(port, failures)
         check_prepared(port, failures)
+        check_updates(port, failures)
+        check_parameters(port, failures)
         check_adbc(port, failures)
         check_jdbc(port, failures)
     finally:
@@ -539,6 +795,17 @@ def main():
     finally:
         p.terminate()
         p.wait(timeout=10)
+    with tempfile.TemporaryDirectory() as tmp:
+        pair = make_cert(tmp)
+        if pair is None:
+            print("note: no usable openssl CLI; grpc+tls leg skipped")
+        else:
+            p, port = start(sys.argv[1], "--tls-cert", pair[0], "--tls-key", pair[1])
+            try:
+                check_tls(port, pair[0], failures)
+            finally:
+                p.terminate()
+                p.wait(timeout=10)
     for f in failures:
         print("FAIL:", f)
     if failures:

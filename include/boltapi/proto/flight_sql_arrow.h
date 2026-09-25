@@ -17,6 +17,8 @@
 // Compiled ONLY under BOLTAPI_WITH_FLIGHT_SQL.
 #pragma once
 
+#include "boltapi/proto/flight_sql.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -78,6 +80,12 @@ void write_primary_keys(std::string* out, const PrimaryKeyRow* rows, std::size_t
 // Callers without foreign keys pass n == 0.
 void write_foreign_keys_empty(std::string* out);
 void write_sql_info(std::string* out, const SqlInfoRow* rows, std::size_t n);
+
+// ActionCreatePreparedStatementResult.parameter_schema: an encapsulated
+// Schema message of `n` untyped (dense-union) parameters.
+void write_parameter_schema(std::string* out, std::size_t n);
+// CommandGetXdbcTypeInfo, rows already ordered by data_type, type_name.
+void write_xdbc_type_info(std::string* out, const XdbcTypeInfo* rows, std::size_t n);
 
 // SQL LIKE with only `%` and `_` (FlightSql.proto filter patterns).
 bool like_match(std::string_view pattern, std::string_view s) noexcept;

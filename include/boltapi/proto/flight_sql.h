@@ -60,12 +60,28 @@
 //       GetFlightInfo/GetSchema. The handle IS the statement text behind a
 //       magic prefix — stateless like the statement ticket, so a client
 //       that never closes leaks nothing and any worker can serve any
-//       handle. Parameters are not supported (no parameter_schema, DoPut
-//       binding answers UNIMPLEMENTED). Create runs the query once to
-//       answer dataset_schema.
-// Everything else — CommandStatementUpdate / DoPut, GetXdbcTypeInfo,
-// DoExchange, transactions, Substrait — answers grpc-status UNIMPLEMENTED
-// naming the command, never a silently empty result.
+//       handle.
+// G2ETL-75 adds:
+//   Updates: DoPut(CommandStatementUpdate) and DoPut(CommandPreparedStatement-
+//       Update) run IQueryExecutor::execute_update exactly once (once per
+//       bound parameter set) and answer DoPutUpdateResult. Nothing re-runs
+//       an update: GetFlightInfo on an update command is refused, and
+//       CreatePreparedStatement never executes a statement is_query() calls
+//       an update (it answers no dataset_schema, which is how clients tell
+//       updates from queries).
+//   Parameters: `?` placeholders (flight_sql_params.h). Create answers a
+//       parameter_schema of untyped (dense-union) fields; DoPut of
+//       CommandPreparedStatementQuery with one parameter row answers
+//       DoPutPreparedStatementResult with a NEW handle carrying the bound
+//       values (still stateless: the values travel in the handle), which
+//       clients use for the following GetFlightInfo. Values are substituted
+//       as SQL literals before the executor sees the statement.
+//   CommandGetXdbcTypeInfo from IQueryExecutor::xdbc_type_info.
+//   grpc+tls: Config::tls_cert_* turns on TLS (ALPN h2) for every
+//       connection; OpenSSL is already a hard boltapi dependency.
+// Everything else — DoExchange, transactions, Substrait,
+// CommandStatementIngest — answers grpc-status UNIMPLEMENTED naming the
+// command, never a silently empty result.
 //
 // Compiled ONLY under BOLTAPI_WITH_FLIGHT_SQL (default OFF).
 #pragma once
@@ -81,6 +97,7 @@
 #include <vector>
 
 namespace bolt::api::core { class StackedThread; }
+namespace bolt::api::net { class TlsContext; }
 
 namespace bolt::api::proto::flightsql {
 
@@ -122,6 +139,28 @@ struct CatalogTable {
     std::string_view key_columns[kMaxKeyColumns];   // primary key, key order
 };
 
+// One row of CommandGetXdbcTypeInfo (JDBC DatabaseMetaData.getTypeInfo).
+// A negative int or an empty string answers NULL. The wire layer fills the
+// remaining columns: create_params NULL, nullable = NULLABILITY_NULLABLE,
+// auto_increment false, local_type_name = type_name, sql_data_type =
+// data_type, datetime_subcode and interval_precision NULL.
+inline constexpr std::uint32_t kMaxXdbcTypes = 64;
+
+struct XdbcTypeInfo {
+    std::string_view type_name;             // "BIGINT"
+    std::int32_t     data_type = 0;         // XdbcDataType (java.sql.Types)
+    std::int32_t     column_size = -1;
+    std::string_view literal_prefix;
+    std::string_view literal_suffix;
+    bool             case_sensitive = false;
+    std::int32_t     searchable = 3;        // SEARCHABLE_FULL
+    std::int8_t      unsigned_attribute = -1;   // -1 NULL, else 0/1
+    bool             fixed_prec_scale = false;
+    std::int32_t     minimum_scale = -1;
+    std::int32_t     maximum_scale = -1;
+    std::int32_t     num_prec_radix = -1;
+};
+
 // The host's query engine. One instance per worker thread, created once at
 // start_background().
 class IQueryExecutor {
@@ -136,6 +175,33 @@ public:
     virtual bool execute(std::string_view sql, std::string* out_ipc,
                          std::int64_t* out_rows,
                          QueryFailure& out_failure) noexcept = 0;
+
+    // DDL/DML for CommandStatementUpdate and CommandPreparedStatementUpdate
+    // (DoPut). Runs `sql` exactly once; `*out_affected` is the row count
+    // (-1 when unknown, 0 for DDL). Same failure contract as execute().
+    virtual bool execute_update(std::string_view sql, std::int64_t* out_affected,
+                                QueryFailure& out_failure) noexcept {
+        (void)sql;
+        *out_affected = 0;
+        out_failure.code = GrpcCode::kUnimplemented;
+        out_failure.message = "this host does not execute updates (CommandStatementUpdate)";
+        return false;
+    }
+    // True when execute_update() is implemented; GetSqlInfo reports the
+    // endpoint read-only otherwise.
+    virtual bool supports_updates() const noexcept { return false; }
+    // Whether `sql` returns a result set. CreatePreparedStatement runs a
+    // query once to describe it but never runs an update to do so.
+    virtual bool is_query(std::string_view sql) noexcept {
+        (void)sql;
+        return true;
+    }
+    // CommandGetXdbcTypeInfo rows, at most `cap`; 0 answers UNIMPLEMENTED.
+    virtual std::uint32_t xdbc_type_info(XdbcTypeInfo* out, std::uint32_t cap) noexcept {
+        (void)out;
+        (void)cap;
+        return 0;
+    }
 
     // Catalog for CommandGetTables/GetTableTypes/GetPrimaryKeys/... When
     // false those commands answer UNIMPLEMENTED; GetSqlInfo still works.
@@ -198,6 +264,16 @@ struct Config {
     // CommandGetSqlInfo FLIGHT_SQL_SERVER_NAME / _VERSION.
     std::string   server_name = "boltapi Flight SQL";
     std::string   server_version = "0.1.0";
+    // grpc+tls: a certificate (file or PEM) turns TLS on for every
+    // connection, negotiating ALPN h2; without one the endpoint is h2c.
+    std::string   tls_cert_file;
+    std::string   tls_key_file;
+    std::string   tls_cert_pem;
+    std::string   tls_key_pem;
+
+    bool tls_enabled() const noexcept {
+        return !tls_cert_file.empty() || !tls_cert_pem.empty();
+    }
 };
 
 class Listener;
@@ -225,6 +301,7 @@ private:
     IAuthenticator*        auth_;
     AllowAllAuthenticator  default_auth_{};
 
+    std::shared_ptr<net::TlsContext>                   tls_;
     std::unique_ptr<Listener>                          listener_;
     std::vector<std::unique_ptr<core::StackedThread>>  workers_;
     std::vector<IQueryExecutor*>                       execs_;
