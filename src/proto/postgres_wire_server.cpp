@@ -94,6 +94,25 @@ void handle_simple_query(int fd, MsgWriter& w, ExtendedSession& ext,
             simple_tag(fd, w, ext, tag);
             return;
         }
+        char cursor_tag[32];
+        std::int32_t cursor = -1;
+        std::uint32_t fetch_n = 0;
+        const ExtendedSession::CursorStep cs =
+            ext.cursor_statement(sql, exec, cursor_tag, sizeof(cursor_tag), cursor, fetch_n, qf);
+        if (cs == ExtendedSession::CursorStep::Failed) {
+            simple_fail(fd, w, ext, qf.sqlstate, qf.message);
+            return;
+        }
+        if (cs == ExtendedSession::CursorStep::Tagged) {
+            simple_tag(fd, w, ext, cursor_tag);
+            return;
+        }
+        if (cs == ExtendedSession::CursorStep::Fetch) {
+            const ExtendedSession::Emit e = ext.simple_fetch(cursor, fetch_n, fd, w, exec, qf);
+            if (e == ExtendedSession::Emit::Failed) simple_fail(fd, w, ext, qf.sqlstate, qf.message);
+            else if (e == ExtendedSession::Emit::Done) send_ready_for_query(fd, w, ext.tx_status());
+            return;
+        }
         CodecError ce;
         const SessionCommand sc = classify_session_command(sql, tag, ce);
         if (sc == SessionCommand::Refused) {
@@ -112,6 +131,7 @@ void handle_simple_query(int fd, MsgWriter& w, ExtendedSession& ext,
     FieldDesc fields[kMaxFields];
     std::uint32_t field_count = 0;
     QueryFailure failure;
+    ext.displace();
     const bool ok = exec.execute(sql, fields, kMaxFields, field_count, failure);
     if (!ok) {
         simple_fail(fd, w, ext, failure.sqlstate, failure.message);

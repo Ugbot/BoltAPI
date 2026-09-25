@@ -112,6 +112,34 @@ TxCommand classify_transaction_command(std::string_view sql, bool& read_only,
 // as a write.
 bool is_query_shaped(std::string_view sql) noexcept;
 
+// SQL-level cursors (psycopg named cursors, SQLAlchemy stream_results):
+// DECLARE / FETCH / MOVE / CLOSE, answered by the wire layer over its own
+// portals. Forward-only; the engine only ever sees the DECLAREd query.
+inline constexpr std::size_t kMaxCursorName = 64;   // incl. the NUL
+
+enum class CursorVerb : std::uint8_t {
+    None    = 0,   // not a cursor statement: hand it on
+    Declare = 1,
+    Fetch   = 2,
+    Move    = 3,
+    Close   = 4,
+    Refused = 5,   // a cursor statement this endpoint cannot honour
+};
+
+struct CursorCommand {
+    CursorVerb       verb     = CursorVerb::None;
+    char             name[kMaxCursorName] = {};   // case-folded unless quoted
+    std::uint32_t    count    = 1;       // rows (FETCH/MOVE); ABSOLUTE position
+    bool             all      = false;   // FETCH/MOVE ALL, CLOSE ALL
+    bool             absolute = false;   // MOVE ABSOLUTE n
+    bool             hold     = false;   // DECLARE ... WITH HOLD
+    std::string_view query;              // DECLARE ... FOR <query>
+};
+
+// Classify `sql`. Refused carries the SQLSTATE in `err`.
+CursorVerb classify_cursor_command(std::string_view sql, CursorCommand& out,
+                                   CodecError& err) noexcept;
+
 // Largest `$n` referenced outside literals/comments (0 if none) — used to
 // infer the parameter count when Parse declares fewer types than it uses.
 std::uint32_t max_param_ref(std::string_view sql) noexcept;
