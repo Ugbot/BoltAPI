@@ -85,6 +85,12 @@ if(WIN32)
     target_link_libraries(boltapi_large_buffered_response_test PRIVATE ws2_32 mswsock)
 endif()
 
+# G2ICE-215: Transfer-Encoding: chunked request bodies + Expect: 100-continue.
+boltapi_add_test(boltapi_chunked_request_body_test chunked_request_body_test.cpp)
+if(WIN32)
+    target_link_libraries(boltapi_chunked_request_body_test PRIVATE ws2_32 mswsock)
+endif()
+
 # Regression gate for Request::query_param() on HTTP/1.1 — the H1 parser used
 # to strip '?...' before path capture, so query() returned empty. Same harness
 # pattern as app_integration_test: real App on loopback + raw client socket.
