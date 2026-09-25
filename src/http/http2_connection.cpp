@@ -1,6 +1,10 @@
 #include "boltapi/http/http2_connection.h"
 #include "boltapi/core/logger.h"
+#include <cassert>
+#include <cstdint>
 #include <cstring>
+#include <new>
+#include <type_traits>
 #include <algorithm>
 #include <iostream>
 #include <cstdio>
@@ -8,9 +12,45 @@
 namespace bolt::api {
 namespace http2 {
 
-// Thread-local buffer pools for HTTP/2 (cache-line aligned, lock-free)
-thread_local Http2BufferPool<H2_FRAME_BUFFER_SIZE, H2_FRAME_BUFFER_COUNT> t_h2_frame_pool;
-thread_local Http2BufferPool<H2_HEADER_BUFFER_SIZE, H2_HEADER_BUFFER_COUNT> t_h2_header_pool;
+namespace {
+
+// glibc carves static TLS out of every thread's stack; 640 KiB of pools in
+// static TLS was stack every gestaltd thread gave up. Pools are over-aligned
+// (64), so this can't use bolt::tls_scratch.
+template <class Pool>
+struct TlsPoolHolder {
+    static_assert(std::is_trivially_destructible_v<Pool>,
+                  "pool is freed without running its destructor");
+    Pool* p = nullptr;
+    ~TlsPoolHolder() {
+        if (p != nullptr) ::operator delete(p, std::align_val_t{alignof(Pool)});
+    }
+};
+
+template <class Pool>
+Pool* tls_pool(TlsPoolHolder<Pool>* h) noexcept {
+    assert(h != nullptr);
+    if (h->p != nullptr) return h->p;
+    void* mem = ::operator new(sizeof(Pool), std::align_val_t{alignof(Pool)},
+                               std::nothrow);
+    if (mem == nullptr) return nullptr;
+    h->p = ::new (mem) Pool;
+    assert(!h->p->initialized);
+    assert(reinterpret_cast<std::uintptr_t>(h->p) % alignof(Pool) == 0u);
+    return h->p;
+}
+
+}  // namespace
+
+H2FramePool* h2_frame_pool() noexcept {
+    thread_local TlsPoolHolder<H2FramePool> h;
+    return tls_pool(&h);
+}
+
+H2HeaderPool* h2_header_pool() noexcept {
+    thread_local TlsPoolHolder<H2HeaderPool> h;
+    return tls_pool(&h);
+}
 
 // ============================================================================
 // CachedHpackHeaders Implementation

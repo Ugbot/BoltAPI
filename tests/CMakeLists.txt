@@ -27,6 +27,10 @@ boltapi_add_test(boltapi_router_fanout_test router_fanout_test.cpp)
 # other-stream churn, slot recycling, and iteration (update_initial_window_size).
 boltapi_add_test(boltapi_http2_stream_manager_test http2_stream_manager_test.cpp)
 
+# G2CHK-172: HTTP/2 buffer pools moved from static TLS to per-thread heap
+# blocks; acquire/exhaust/release and per-thread identity.
+boltapi_add_test(boltapi_http2_buffer_pool_test http2_buffer_pool_test.cpp)
+
 # G2CHK-85: CorsMiddleware's two unordered_set<string> lookup caches off,
 # replaced with a linear scan over the config vectors it already carries.
 # CorsMiddleware has no prior test (not wired into the live App path -- see
