@@ -9,7 +9,7 @@ fi
 opts=(--hq)
 case "$TESTCASE" in
     handshake|transfer|multiplexing|resumption|http3|chacha20|keyupdate) ;;
-    handshakeloss|transferloss|handshakecorruption|transfercorruption) ;;
+    multiconnect|handshakeloss|transferloss|handshakecorruption|transfercorruption) ;;
     retry) opts+=(--retry) ;;
     zerortt) opts+=(--early-data) ;;
     *) echo "boltapi: test case $TESTCASE not supported"; exit 127 ;;

@@ -52,6 +52,11 @@
       ::bolt::api::quic::kClosedStreamWindowMax,                                \
       ::bolt::api::quic::kClosedStreamWindowMax, nullptr, nullptr,              \
       "stream ids remembered past the lowest open one")                         \
+    X(quic_handshake_speedups, kInvariant, "resends",                          \
+      ::bolt::api::quic::kMaxHandshakeSpeedups,                                 \
+      ::bolt::api::quic::kMaxHandshakeSpeedups,                                 \
+      ::bolt::api::quic::kMaxHandshakeSpeedups, nullptr, nullptr,               \
+      "early handshake-flight resends per QUIC connection")                     \
     X(quic_pending_send_bytes, kInvariant, "bytes",                             \
       ::bolt::api::quic::kPendingSendBytesMax,                                  \
       ::bolt::api::quic::kPendingSendBytesMax,                                  \

@@ -22,4 +22,7 @@ inline constexpr std::uint64_t kClosedStreamWindowMax = 1024;
 // (large response bodies waiting for acknowledgements).
 inline constexpr std::uint64_t kPendingSendBytesMax = 1ull << 30;
 
+// Early handshake-flight resends (RFC 9002 §6.2.3) per connection.
+inline constexpr std::size_t kMaxHandshakeSpeedups = 8;
+
 }  // namespace bolt::api::quic

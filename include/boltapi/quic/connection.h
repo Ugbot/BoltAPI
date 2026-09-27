@@ -164,6 +164,12 @@ public:
         return true;
     }
 
+    // End of the contiguous bytes received so far.
+    std::size_t received_end() const noexcept {
+        assert(recv_cursor_ <= kMaxCryptoBuffer && "recv cursor overflow");
+        return recv_cursor_;
+    }
+
     // Number of contiguous, unconsumed bytes available from read_cursor_.
     std::size_t available() const noexcept {
         assert(read_cursor_ <= recv_cursor_ && "read past recv");
@@ -992,6 +998,10 @@ private:
 
         QTRACE("long pkt level=%d hdr_len=%zu length=%llu", (int)level, hdr_len,
                (unsigned long long)hdr.length);
+        if (discarded_[space_idx(level)]) {  // keys dropped: ignore (§4.9)
+            out_consumed = hdr_len + static_cast<std::size_t>(hdr.length);
+            return out_consumed <= len;
+        }
         PacketProtection* pp = read_protection(level);
         if (pp == nullptr || !pp->is_initialized()) {
             // Keys for this level not installed yet; cannot process. Treat the
@@ -1007,8 +1017,36 @@ private:
             QTRACE("  open_and_handle FAILED level=%d", (int)level);
             return false;
         }
+        // RFC 9001 §4.9.1: a server drops Initial keys on the first Handshake
+        // packet it opens.
+        if (is_server_ && level == TlsLevel::kHandshake)
+            discard_space(PacketNumberSpace::kInitial);
         out_consumed = pkt_len;
         return true;
+    }
+
+    // RFC 9001 §4.9: once a space's keys are discarded its packets leave
+    // flight and loss recovery, and nothing more is sent or accepted in it.
+    // Otherwise PTO keeps firing on packets the peer can no longer ACK, and
+    // the shared backoff starves 1-RTT retransmission.
+    void discard_space(PacketNumberSpace space) noexcept {
+        const std::size_t si = static_cast<std::size_t>(space);
+        assert(si < 2 && "only Initial/Handshake spaces are discarded");
+        if (discarded_[si]) return;
+        discarded_[si] = true;
+        SentPacketTracker& tr = sent_[si];
+        for (std::size_t i = 0; i < tr.count(); ++i) {
+            SentPacketInfo& sp = tr.at(i);
+            if (sp.in_flight) { sp.in_flight = false; cc_.on_packet_lost(sp.size); }
+            sp.acked = true;  // resolved: no PTO, no loss re-queue
+        }
+        ack_pending_[si] = false;
+        const std::size_t li = space == PacketNumberSpace::kInitial
+                                   ? static_cast<std::size_t>(TlsLevel::kInitial)
+                                   : static_cast<std::size_t>(TlsLevel::kHandshake);
+        crypto_sent_off_[li] = crypto_tx_[li].size();
+        pto_backoff_ = 0;
+        assert(discarded_[si] && "space not discarded");
     }
 
     // Handle a short-header 1-RTT packet. Its length runs to the end of the
@@ -1423,6 +1461,25 @@ private:
         if (any_lost) cc_.on_congestion_event(earliest_lost_sent, now);
     }
 
+    // Re-frame every unresolved Initial/Handshake packet (bounded per
+    // connection so a peer cannot use duplicates as an amplifier beyond §8.1).
+    void speed_up_handshake() noexcept {
+        if (handshake_confirmed_ || state_ == ConnState::kEstablished) return;
+        if (speedups_ >= kMaxHandshakeSpeedups) return;
+        ++speedups_;
+        for (std::size_t si = 0; si < 2; ++si) {
+            SentPacketTracker& tr = sent_[si];
+            for (std::size_t i = 0; i < tr.count(); ++i) {
+                SentPacketInfo& sp = tr.at(i);
+                if (sp.acked || sp.lost || !sp.ack_eliciting) continue;
+                requeue_lost(sp);
+                sp.lost = true;
+                if (sp.in_flight) { sp.in_flight = false; cc_.on_packet_lost(sp.size); }
+            }
+        }
+        assert(speedups_ <= kMaxHandshakeSpeedups && "speedup count overflow");
+    }
+
     // Acknowledged STREAM bytes leave their stream's send ring.
     void on_packet_acked_ranges(const SentPacketInfo& s) noexcept {
         assert(s.range_count <= kMaxFrameRangesPerPacket && "range overflow");
@@ -1520,6 +1577,11 @@ private:
             close(kCryptoBufferExceeded, false, "crypto buffer exceeded");
             return false;
         }
+        // RFC 9002 §6.2.3: a client Initial repeating CRYPTO we already hold
+        // means our flight was lost; resend it now rather than at PTO.
+        if (is_server_ && level == TlsLevel::kInitial && cf.length > 0 &&
+            cf.offset + cf.length <= crypto_rx_[li].received_end())
+            speed_up_handshake();
         if (!crypto_rx_[li].receive(cf.offset, cf.data,
                                     static_cast<std::size_t>(cf.length)))
             return false;
@@ -1777,6 +1839,7 @@ private:
     // flight can exceed one packet's payload budget), prepending an ACK to the
     // first packet. Loops bounded by the CRYPTO byte budget.
     void flush_level(TlsLevel level, PacketForm form) noexcept {
+        if (discarded_[space_idx(level)]) return;
         PacketProtection* pp = write_protection(level);
         if (pp == nullptr || !pp->is_initialized()) return;
         pull_pending_crypto(level);
@@ -2164,6 +2227,9 @@ private:
                           pp, level == TlsLevel::kInitial, /*short_header=*/false);
         record_sent(space_for(level), pn, wire, ack_eliciting, ranges,
                     range_count);
+        // RFC 9001 §4.9.1: a client drops Initial keys once it sends Handshake.
+        if (!is_server_ && level == TlsLevel::kHandshake && wire > 0)
+            discard_space(PacketNumberSpace::kInitial);
     }
 
     // Build a 1-RTT short-header packet, send it, and record it.
@@ -2600,6 +2666,7 @@ private:
         tls_.set_alpn(kAlpn, sizeof(kAlpn));
         tls_.set_transport_params(make_local_params());
         // Reset packet-number spaces, ACK state, sent trackers, crypto buffers.
+        discarded_[0] = discarded_[1] = false;
         spaces_ = PacketNumberSpaceManager{};
         for (std::size_t i = 0; i < kPacketNumberSpaceCount; ++i) {
             acks_[i] = AckRangeTracker{};
@@ -2683,6 +2750,10 @@ private:
             amp_.validate();          // handshake completion validates the path
             address_validated_ = true;
         }
+        // RFC 9001 §4.9.2: Handshake keys go once the handshake is confirmed
+        // (server: TLS complete; client: HANDSHAKE_DONE received).
+        if (keys && (is_server_ ? tls_.is_complete() : handshake_confirmed_))
+            discard_space(PacketNumberSpace::kHandshake);
         adopt_peer_flow_limits();
     }
 
@@ -3002,6 +3073,9 @@ private:
     ConnectionId retry_scid_;                            // server's Retry SCID
     ConnectionId odcid_;                                 // ODCID from the token
     ConnectionId first_dcid_;                            // DCID of the Retried Initial
+
+    std::size_t speedups_ = 0;  // handshake flight resends on duplicate Initials
+    bool discarded_[2] = {false, false};  // Initial / Handshake keys dropped
 
     // 0-RTT packets that arrived before TLS yielded the early keys.
     static constexpr std::size_t kEarlyHeldPackets = 4;

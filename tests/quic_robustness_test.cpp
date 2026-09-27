@@ -605,3 +605,39 @@ TEST(QuicRobustness, EarlyDataServerWaitsForClientFinished) {
     EXPECT_TRUE(server.tls().is_complete());
     EXPECT_TRUE(client.is_established() && server.is_established());
 }
+
+// ============================================================================
+// GATE (RFC 9001 §4.9): once the handshake is done the server has dropped its
+// Initial keys; a late duplicate client Initial is ignored, never answered or
+// retransmitted into (the peer can no longer ACK Initial packets, so they
+// would feed PTO backoff forever).
+// ============================================================================
+TEST(QuicRobustness, InitialKeysDiscardedAfterHandshake) {
+    std::vector<std::vector<std::uint8_t>> c2s, s2c;
+    q::QuicConnection client, server;
+    ASSERT_TRUE(client.init(false, [&](const std::uint8_t* d, std::size_t n) {
+        c2s.emplace_back(d, d + n);
+    }));
+    ASSERT_TRUE(server.init(true, [&](const std::uint8_t* d, std::size_t n) {
+        s2c.emplace_back(d, d + n);
+    }));
+    ASSERT_TRUE(client.start());
+    ASSERT_FALSE(c2s.empty());
+    const std::vector<std::uint8_t> first_initial = c2s.front();
+    for (int round = 0; round < 20 && !(client.is_established() && server.is_established());
+         ++round) {
+        auto to_server = std::move(c2s); c2s.clear();
+        for (auto& d : to_server) server.feed_datagram(d.data(), d.size());
+        auto to_client = std::move(s2c); s2c.clear();
+        for (auto& d : to_client) client.feed_datagram(d.data(), d.size());
+    }
+    ASSERT_TRUE(client.is_established() && server.is_established());
+    s2c.clear();
+    server.feed_datagram(first_initial.data(), first_initial.size());
+    server.tick();
+    for (const auto& d : s2c) {
+        const bool initial = (d[0] & 0x80) != 0 && ((d[0] >> 4) & 0x3) == 0;
+        EXPECT_FALSE(initial) << "server answered in the discarded Initial space";
+    }
+    EXPECT_TRUE(server.is_established());
+}
