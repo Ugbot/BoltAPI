@@ -29,9 +29,11 @@ namespace bolt::api {
 // ---------------------------------------------------------------------------
 Method method_from(std::string_view t) noexcept {
     // Length-then-first-char dispatch; case-sensitive (HTTP methods are upper).
-    assert(t.size() <= 16);  // sane upper bound for a method token
+    // The token comes from the peer (any length the parser accepts), so an
+    // unknown one is a value, not a programmer error.
     const size_t n = t.size();
-    assert(n == t.size());   // tautology guard (TigerStyle: >=2 asserts)
+    assert(n == t.size());
+    assert(t.data() != nullptr || n == 0);
     switch (n) {
         case 3:
             if (t == "GET") return Method::Get;

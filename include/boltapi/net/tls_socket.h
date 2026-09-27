@@ -259,6 +259,17 @@ private:
     // Write buffering for backpressure handling
     std::vector<uint8_t> write_buffer_;  // Plaintext data awaiting encryption/transmission
     size_t write_offset_ = 0;            // How much of write_buffer_ has been sent
+    std::vector<uint8_t> enc_out_;       // TLS records taken from wbio_, not yet sent
+    size_t enc_off_ = 0;
+
+    static constexpr size_t kTlsWriteChunk = 64 * 1024;  // plaintext per SSL_write
+    static constexpr size_t kEncChunk = 64 * 1024;       // records per send batch
+    static constexpr size_t kMaxFlushPasses = 1u << 20;
+#if defined(MSG_NOSIGNAL)
+    static constexpr int kSendFlags = MSG_NOSIGNAL;      // EPIPE, not SIGPIPE
+#else
+    static constexpr int kSendFlags = 0;                 // SO_NOSIGPIPE set on accept
+#endif
 };
 
 } // namespace net

@@ -24,7 +24,10 @@
 #include <charconv>
 #include <vector>
 #ifndef _WIN32
+#include <csignal>
+#include <pthread.h>
 #include <sys/select.h>
+#include <sys/socket.h>
 #endif
 
 namespace bolt::api {
@@ -58,6 +61,37 @@ inline bool contains_ci(std::string_view hay, std::string_view needle) noexcept 
     }
     return false;
 }
+// A peer that resets mid-response must cost one connection, not the process:
+// writing to a reset socket raises SIGPIPE, whose default action exits.
+// macOS/BSD: SO_NOSIGPIPE per socket. Linux has no such option, so the
+// server's threads are created with SIGPIPE blocked (threads inherit the
+// creator's mask) and a write to a reset peer fails with EPIPE instead.
+inline void socket_no_sigpipe(int fd) noexcept {
+#if defined(SO_NOSIGPIPE)
+    int one = 1;
+    (void)::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#else
+    (void)fd;
+#endif
+}
+
+#ifndef _WIN32
+inline sigset_t block_sigpipe() noexcept {
+    sigset_t set, old;
+    sigemptyset(&set);
+    sigaddset(&set, SIGPIPE);
+    const int rc = pthread_sigmask(SIG_BLOCK, &set, &old);
+    assert(rc == 0);
+    (void)rc;
+    return old;
+}
+inline void restore_sigmask(const sigset_t& old) noexcept {
+    const int rc = pthread_sigmask(SIG_SETMASK, &old, nullptr);
+    assert(rc == 0);
+    (void)rc;
+}
+#endif
+
 // Append an unsigned integer as decimal via to_chars (stack buffer, no alloc).
 inline void append_uint(std::string& out, std::uint64_t v) {
     char tmp[20];
@@ -677,6 +711,29 @@ WebSocketHandler* CoroUnifiedServer::get_websocket_handler(const std::string& pa
     return nullptr;
 }
 
+namespace {
+std::mutex g_sse_tls_mu;
+std::unordered_map<int, net::CoroTlsSocket*> g_sse_tls;  // live SSE-over-TLS connections
+}  // namespace
+
+void SSEWriter::register_tls(int fd, net::CoroTlsSocket* tls) noexcept {
+    assert(fd >= 0 && tls != nullptr);
+    std::lock_guard<std::mutex> lk(g_sse_tls_mu);
+    g_sse_tls[fd] = tls;
+}
+
+void SSEWriter::unregister_tls(int fd) noexcept {
+    std::lock_guard<std::mutex> lk(g_sse_tls_mu);
+    g_sse_tls.erase(fd);
+    assert(g_sse_tls.find(fd) == g_sse_tls.end());
+}
+
+net::CoroTlsSocket* SSEWriter::sse_tls_for_fd(int fd) noexcept {
+    std::lock_guard<std::mutex> lk(g_sse_tls_mu);
+    const auto it = g_sse_tls.find(fd);
+    return it == g_sse_tls.end() ? nullptr : it->second;
+}
+
 void CoroUnifiedServer::add_sse_handler(const std::string& path, CoroSSEHandler handler) {
     s_sse_handlers_[path] = std::move(handler);
     std::cout << "[CoroUnifiedServer] Registered SSE handler: " << path << std::endl;
@@ -754,6 +811,9 @@ int CoroUnifiedServer::start_background() {
     worker_config.blocking_workers =
         std::max<std::size_t>(worker_config.blocking_workers,
                               config_.num_streaming_workers);
+#ifndef _WIN32
+    const sigset_t caller_mask = block_sigpipe();  // inherited by every thread below
+#endif
     worker_pool_ = std::make_unique<core::WorkerThreadPool>(worker_config);
     worker_pool_->start();
 
@@ -768,6 +828,9 @@ int CoroUnifiedServer::start_background() {
     io_config.stack_size_bytes = config_.stack_size_bytes;
     io_dispatcher_ = std::make_unique<net::IODispatcher>(io_config);
     io_dispatcher_->start();
+#ifndef _WIN32
+    restore_sigmask(caller_mask);
+#endif
 
     // Initialize TLS context if TLS enabled
     if (config_.enable_tls) {
@@ -1057,6 +1120,7 @@ Http1Connection::UltraFastCallback CoroUnifiedServer::get_ultra_fast_callback() 
 
 core::coro_task<void> CoroUnifiedServer::handle_tls_connection(net::IODispatcher& io, int fd) {
     connections_accepted_.fetch_add(1, std::memory_order_relaxed);
+    socket_no_sigpipe(fd);
 
     // Check if we're accepting new connections (graceful shutdown support)
     if (!track_connection_open()) {
@@ -1110,6 +1174,7 @@ core::coro_task<void> CoroUnifiedServer::handle_cleartext_connection(net::IODisp
 
     // Set non-blocking
     net::sys::set_nonblocking(fd);
+    socket_no_sigpipe(fd);
 
     co_await handle_http1_connection(io, fd, nullptr);
 
@@ -1207,6 +1272,18 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
             }
             buf_len += n;
 
+            // h2c with prior knowledge: the connection opens with the HTTP/2
+            // preface, which is never a valid HTTP/1.1 request line.
+            if (is_first_request && tls == nullptr && config_.enable_h2c &&
+                buf_len <= STACK_BUF_SIZE &&
+                std::memcmp(buf, http2::CONNECTION_PREFACE,
+                            std::min(buf_len, http2::CONNECTION_PREFACE_LEN)) == 0) {
+                if (buf_len < http2::CONNECTION_PREFACE_LEN) continue;
+                requests_http2_.fetch_add(1, std::memory_order_relaxed);
+                co_await handle_http2_connection(io, fd, nullptr, buf, buf_len);
+                co_return;
+            }
+
             // Try parsing again
             parse_result = parser.parse(buf, buf_len, parsed_req, consumed);
 
@@ -1266,6 +1343,7 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
             }
         }
 
+        if (parse_result > 0 && parser.is_not_http()) break;  // not HTTP/1: just close
         if (parse_result > 0) {
             // Parse error - send 400 Bad Request
             const char* bad_request =
@@ -1548,12 +1626,18 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
                     "Access-Control-Allow-Origin: *\r\n"
                     "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
                     "\r\n";
-                co_await conn_write(io, fd, tls,sse_headers, strlen(sse_headers));
+                if (!co_await conn_write_all(io, fd, tls, sse_headers, strlen(sse_headers))) {
+                    io.async_close(fd);
+                    co_return;
+                }
 
                 std::cout << "[CoroUnifiedServer] SSE stream for path: " << req.path << std::endl;
 
-                // Call SSE handler (streams events until done or client disconnects)
+                // Call SSE handler (streams events until done or client
+                // disconnects). Its SSEWriter finds the TLS socket by fd.
+                if (tls != nullptr) SSEWriter::register_tls(fd, tls);
                 co_await (*sse_handler)(io, fd, req);
+                if (tls != nullptr) SSEWriter::unregister_tls(fd);
 
                 // SSE stream ended
                 io.async_close(fd);
@@ -1803,10 +1887,11 @@ struct PendingH2Request {
 };
 
 core::coro_task<void> CoroUnifiedServer::handle_http2_connection(
-    net::IODispatcher& io, int fd, net::CoroTlsSocket* tls) {
+    net::IODispatcher& io, int fd, net::CoroTlsSocket* tls,
+    const uint8_t* initial, size_t initial_len) {
 
-    // Create HTTP/2 connection
     http2::Http2Connection h2_conn(true);  // Server mode
+    h2_conn.set_max_request_body(config_.max_body_size);
 
     // Buffer for I/O
     static constexpr size_t BUFFER_SIZE = 16384;
@@ -1875,16 +1960,25 @@ core::coro_task<void> CoroUnifiedServer::handle_http2_connection(
             h2_conn.commit_output(static_cast<size_t>(written));
         }
 
-        // Read incoming data
-        ssize_t n = co_await conn_read(io, fd, tls,buffer, BUFFER_SIZE);
+        // Read incoming data (the first pass replays bytes the caller read).
+        ssize_t n = 0;
+        if (initial_len > 0) {
+            assert(initial != nullptr && initial_len <= BUFFER_SIZE);
+            std::memcpy(buffer, initial, initial_len);
+            n = static_cast<ssize_t>(initial_len);
+            initial_len = 0;
+        } else {
+            n = co_await conn_read(io, fd, tls, buffer, BUFFER_SIZE);
+        }
         if (n <= 0) {
             break;  // Connection closed or error
         }
 
-        // Process incoming data (this calls the callback for complete requests)
+        // Process incoming data (this calls the callback for complete requests).
+        // A connection error queues GOAWAY: flush it, then close.
         auto result = h2_conn.process_input(buffer, static_cast<size_t>(n));
         if (!result) {
-            // Protocol error
+            pending_requests.clear();
             break;
         }
 
@@ -1931,21 +2025,19 @@ core::coro_task<void> CoroUnifiedServer::handle_http2_connection(
         }
         pending_requests.clear();
 
-        // Check connection state
-        if (!h2_conn.is_active()) {
-            break;
-        }
+        if (h2_conn.wants_close()) break;
     }
 
-    // Send GOAWAY if we haven't already
+    // Graceful GOAWAY unless a connection error already queued one, then
+    // flush whatever is pending (bounded: output only shrinks here).
     if (h2_conn.is_active()) {
         h2_conn.send_goaway(http2::ErrorCode::NO_ERROR);
-
-        // Flush output
+    }
+    {
         const uint8_t* out_data = nullptr;
         size_t out_len = 0;
         while (h2_conn.get_output(&out_data, &out_len)) {
-            ssize_t written = co_await conn_write(io, fd, tls,out_data, out_len);
+            ssize_t written = co_await conn_write(io, fd, tls, out_data, out_len);
             if (written <= 0) break;
             h2_conn.commit_output(static_cast<size_t>(written));
         }

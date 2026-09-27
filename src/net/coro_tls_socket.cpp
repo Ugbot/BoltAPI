@@ -157,8 +157,13 @@ core::coro_task<ssize_t> CoroTlsSocket::write(const void* buffer, size_t len) {
         co_return -1;
     }
 
-    // Flush encrypted data to socket
+    // Flush encrypted data to socket; a dead socket ends the write rather
+    // than spinning on writability forever.
     while (!tls_socket_->flush()) {
+        if (tls_socket_->get_state() == TlsState::ERROR) {
+            error_message_ = "TLS flush error";
+            co_return -1;
+        }
         // Need to wait for socket to be writable
         ssize_t n = co_await io_.async_write(fd_, nullptr, 0);  // Just wait for writable
         if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
