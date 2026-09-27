@@ -742,7 +742,7 @@ void App::http3_feed_(net::UdpTransport* tp, const sockaddr* peer, int peer_len,
 void App::serve_http3_request(http3::H3Connection& h3,
                               const http3::H3Request& r) {
     assert(started_ && "serve_http3_request before start");
-    assert(r.method.size() <= 16 && "implausible HTTP method");
+    assert(r.path.data() != nullptr || r.path.empty());  // method length is peer input: method_from() bounds it
 
     http::CoroHttpRequest creq;
     creq.method = r.method;

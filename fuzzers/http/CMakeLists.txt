@@ -19,3 +19,5 @@ boltapi_add_fuzz_target(h2_frame SOURCE h2_frame.cpp
     INSTRUMENT ${_src}/http/http2_frame.cpp)
 boltapi_add_fuzz_target(h2_connection SOURCE h2_connection.cpp INSTRUMENT ${_h2_srcs})
 boltapi_add_fuzz_target(sse SOURCE sse.cpp INSTRUMENT ${_src}/http/sse.cpp)
+boltapi_add_fuzz_target(http1_server SOURCE http1_server.cpp
+    INSTRUMENT ${_src}/http/http1_parser.cpp)

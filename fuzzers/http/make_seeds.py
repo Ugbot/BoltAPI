@@ -120,6 +120,23 @@ def h2():
     put("h2_frame", "push", frame(5, 0x4, 1, struct.pack(">I", 2) + C3[0]))
 
 
+def server():
+    reqs = {
+        "echo": b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello",
+        "big": b"GET /big HTTP/1.1\r\nHost: x\r\n\r\n",
+        "chunked_resp": b"GET /chunked HTTP/1.1\r\nHost: x\r\n\r\n",
+        "chunked_req": b"POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n"
+                       b"Expect: 100-continue\r\n\r\n" + chunked(b"abcdefghij" * 20, 7),
+        "pipeline": REQUESTS["get_health"] + b"GET /big HTTP/1.1\r\nHost: x\r\n\r\n"
+                    + b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nabc",
+        "http10": b"GET / HTTP/1.0\r\n\r\n",
+        "bad": b"GET / HTTP/1.1\r\nHost : x\r\n\r\n",
+        "h2c": b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x00\x04\x00\x00\x00\x00\x00",
+    }
+    for name, r in reqs.items():
+        put("http1_server", name, b"\x03" + r)
+
+
 def sse():
     put("sse", "event", b"42\xffupdate\xffline one\nline two\xffkeep-alive")
     put("sse", "data_only", b"\xff\xff{\"a\":1}\xff")
@@ -128,6 +145,7 @@ def sse():
 
 if __name__ == "__main__":
     sse()
+    server()
     http1()
     hpack()
     h2()
