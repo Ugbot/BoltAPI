@@ -690,18 +690,35 @@ void Neo4jBoltProtocol::worker_loop(Neo4jBoltListener& listener, IQueryExecutor&
     while (!stopping_.load(std::memory_order_acquire)) {
         const int fd = listener.accept_one(cfg_.accept_poll_ms);
         if (fd < 0) continue;
-        {
-            PackArena arena(arena_mem.data(), arena_mem.size());
-            ChunkedIo io(fd, in.data(), in.size(), out.data(), out.size(),
-                         cfg_.accept_poll_ms, stopping_);
-            IAuthenticator& a = (auth_ != nullptr) ? *auth_ : default_auth_;
-            const std::uint64_t id = conn_seq_.fetch_add(1, std::memory_order_relaxed);
-            Connection conn(fd, cfg_, exec, a, io, arena, id, stopping_);
-            conn.run();
-        }
-        exec.discard();  // a dropped connection must not leak a live result set
+        serve_connection(fd, exec, in.data(), out.data(), arena_mem.data());
         net::sys::close_socket(fd);
     }
+}
+
+void Neo4jBoltProtocol::serve_socket(int fd, IQueryExecutor& exec) noexcept {
+    assert(fd >= 0);
+    assert(cfg_.message_buffer_bytes > 0 && cfg_.write_buffer_bytes > 0);
+    std::vector<std::uint8_t> in(cfg_.message_buffer_bytes);
+    std::vector<std::uint8_t> out(cfg_.write_buffer_bytes);
+    std::vector<std::uint8_t> arena_mem(cfg_.value_arena_bytes);
+    serve_connection(fd, exec, in.data(), out.data(), arena_mem.data());
+}
+
+// Buffers are sized by cfg_ (message/write/value arena bytes).
+void Neo4jBoltProtocol::serve_connection(int fd, IQueryExecutor& exec, std::uint8_t* in,
+                                         std::uint8_t* out, void* arena_mem) noexcept {
+    assert(fd >= 0);
+    assert(in != nullptr && out != nullptr);
+    {
+        PackArena arena(arena_mem, cfg_.value_arena_bytes);
+        ChunkedIo io(fd, in, cfg_.message_buffer_bytes, out, cfg_.write_buffer_bytes,
+                     cfg_.accept_poll_ms, stopping_);
+        IAuthenticator& a = (auth_ != nullptr) ? *auth_ : default_auth_;
+        const std::uint64_t id = conn_seq_.fetch_add(1, std::memory_order_relaxed);
+        Connection conn(fd, cfg_, exec, a, io, arena, id, stopping_);
+        conn.run();
+    }
+    exec.discard();  // a dropped connection must not leak a live result set
 }
 
 Status Neo4jBoltProtocol::serve(transport::ITransport& source) {

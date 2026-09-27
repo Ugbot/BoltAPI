@@ -33,3 +33,4 @@ testing/**/__pycache__/
 
 # Agent worktrees
 /.worktrees/
+/build-*/

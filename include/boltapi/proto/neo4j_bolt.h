@@ -309,9 +309,15 @@ public:
     std::uint16_t local_port() const noexcept { return port_.load(std::memory_order_acquire); }
     bool running() const noexcept { return running_.load(std::memory_order_acquire); }
 
+    // Serve one already-connected socket on the calling thread until the peer
+    // leaves (tests, fuzzing). Needs no listener; the caller closes `fd`.
+    void serve_socket(int fd, IQueryExecutor& exec) noexcept;
+
 private:
     void worker_loop(Neo4jBoltListener& listener, IQueryExecutor& exec,
                      std::uint16_t worker_id) noexcept;
+    void serve_connection(int fd, IQueryExecutor& exec, std::uint8_t* in,
+                          std::uint8_t* out, void* arena_mem) noexcept;
 
     Config              cfg_;
     IExecutorFactory&   factory_;

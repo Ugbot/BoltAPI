@@ -1077,6 +1077,13 @@ void Conn::rpc_list_actions(Stream& s) noexcept {
 
 }  // namespace
 
+namespace detail {
+struct DirectConn {
+    IQueryExecutor*       exec = nullptr;
+    std::unique_ptr<Conn> conn;
+};
+}  // namespace detail
+
 // ---------------------------------------------------------------------------
 // Listener
 // ---------------------------------------------------------------------------
@@ -1155,6 +1162,19 @@ Protocol::Protocol(const Config& cfg, IExecutorFactory& factory,
 }
 
 Protocol::~Protocol() { stop(); }
+
+void Protocol::serve_socket(int fd, IQueryExecutor& exec) noexcept {
+    assert(fd >= 0);
+    assert(!running_.load(std::memory_order_acquire));
+    if (direct_ == nullptr) direct_ = std::make_unique<detail::DirectConn>();
+    if (direct_->exec != &exec) {
+        IAuthenticator& a = auth_ != nullptr ? *auth_ : default_auth_;
+        direct_->conn = std::make_unique<Conn>(cfg_, exec, a, stopping_);
+        direct_->exec = &exec;
+    }
+    assert(direct_->conn != nullptr);
+    direct_->conn->serve(fd, nullptr);
+}
 
 std::uint16_t Protocol::local_port() const noexcept {
     return listener_ ? listener_->local_port() : 0;
