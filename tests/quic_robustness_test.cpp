@@ -539,3 +539,105 @@ TEST(QuicRobustness, EstablishedPathRobustToExtraFrames) {
     EXPECT_TRUE(echoed) << "stream echo did not complete on the robust path";
     p.stop();
 }
+
+// ============================================================================
+// GATE: a datagram above our advertised max_udp_payload_size (the transport
+// delivers up to 2 KiB) is dropped before it reaches the fixed 1500-byte open
+// buffers; the connection stays up.
+// ============================================================================
+TEST(QuicRobustness, OversizeDatagramDropped) {
+    Pair p;
+    ASSERT_TRUE(p.bind());
+    p.wire();
+    {
+        std::lock_guard<std::mutex> lk(p.client_mtx);
+        ASSERT_TRUE(p.client.start());
+    }
+    ASSERT_TRUE(p.drive_until([&] { return p.both_established(); },
+                             std::chrono::seconds(10)));
+    std::vector<std::uint8_t> dg(q::kMaxDatagramSize + 100, 0xA5);
+    {
+        std::lock_guard<std::mutex> lk(p.server_mtx);
+        const q::ConnectionId& cid = p.server.local_cid();
+        dg[0] = 0x43;  // short header, 4-byte PN
+        std::memcpy(dg.data() + 1, cid.data, cid.length);
+        p.server.feed_datagram(dg.data(), dg.size());
+        EXPECT_TRUE(p.server.is_established());
+    }
+    {
+        std::lock_guard<std::mutex> lk(p.client_mtx);
+        dg[0] = 0xC3;  // long header Initial
+        p.client.feed_datagram(dg.data(), dg.size());
+        EXPECT_TRUE(p.client.is_established());
+    }
+    p.stop();
+}
+
+// ============================================================================
+// GATE: with 0-RTT enabled OpenSSL returns from the server handshake once its
+// own flight is out; the server must still wait for the client's Finished
+// before it is complete (no early HANDSHAKE_DONE: quic-go drops its
+// Handshake keys on it and never sends Finished).
+// ============================================================================
+TEST(QuicRobustness, EarlyDataServerWaitsForClientFinished) {
+    std::vector<std::vector<std::uint8_t>> c2s, s2c;
+    q::QuicConnection client, server;
+    ASSERT_TRUE(client.init(false, [&](const std::uint8_t* d, std::size_t n) {
+        c2s.emplace_back(d, d + n);
+    }));
+    ASSERT_TRUE(server.init(true, [&](const std::uint8_t* d, std::size_t n) {
+        s2c.emplace_back(d, d + n);
+    }));
+    ASSERT_TRUE(server.tls().enable_early_data());
+    ASSERT_TRUE(client.start());
+    for (auto& d : c2s) server.feed_datagram(d.data(), d.size());
+    c2s.clear();
+    EXPECT_FALSE(server.tls().is_complete())
+        << "server complete before the client's Finished";
+    EXPECT_FALSE(server.is_established());
+    for (int round = 0; round < 20 && !(client.is_established() && server.is_established());
+         ++round) {
+        auto to_client = std::move(s2c); s2c.clear();
+        for (auto& d : to_client) client.feed_datagram(d.data(), d.size());
+        auto to_server = std::move(c2s); c2s.clear();
+        for (auto& d : to_server) server.feed_datagram(d.data(), d.size());
+    }
+    EXPECT_TRUE(server.tls().is_complete());
+    EXPECT_TRUE(client.is_established() && server.is_established());
+}
+
+// ============================================================================
+// GATE (RFC 9001 §4.9): once the handshake is done the server has dropped its
+// Initial keys; a late duplicate client Initial is ignored, never answered or
+// retransmitted into (the peer can no longer ACK Initial packets, so they
+// would feed PTO backoff forever).
+// ============================================================================
+TEST(QuicRobustness, InitialKeysDiscardedAfterHandshake) {
+    std::vector<std::vector<std::uint8_t>> c2s, s2c;
+    q::QuicConnection client, server;
+    ASSERT_TRUE(client.init(false, [&](const std::uint8_t* d, std::size_t n) {
+        c2s.emplace_back(d, d + n);
+    }));
+    ASSERT_TRUE(server.init(true, [&](const std::uint8_t* d, std::size_t n) {
+        s2c.emplace_back(d, d + n);
+    }));
+    ASSERT_TRUE(client.start());
+    ASSERT_FALSE(c2s.empty());
+    const std::vector<std::uint8_t> first_initial = c2s.front();
+    for (int round = 0; round < 20 && !(client.is_established() && server.is_established());
+         ++round) {
+        auto to_server = std::move(c2s); c2s.clear();
+        for (auto& d : to_server) server.feed_datagram(d.data(), d.size());
+        auto to_client = std::move(s2c); s2c.clear();
+        for (auto& d : to_client) client.feed_datagram(d.data(), d.size());
+    }
+    ASSERT_TRUE(client.is_established() && server.is_established());
+    s2c.clear();
+    server.feed_datagram(first_initial.data(), first_initial.size());
+    server.tick();
+    for (const auto& d : s2c) {
+        const bool initial = (d[0] & 0x80) != 0 && ((d[0] >> 4) & 0x3) == 0;
+        EXPECT_FALSE(initial) << "server answered in the discarded Initial space";
+    }
+    EXPECT_TRUE(server.is_established());
+}

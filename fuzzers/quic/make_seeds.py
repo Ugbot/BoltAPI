@@ -94,4 +94,12 @@ put("ws_parser", "frame", bytes([0]) + wsframe(1, b"hello") + wsframe(8, b""))
 put("ws_parser", "utf8", bytes([1]) + "héllo wörld €𝄞".encode())
 put("ws_parser", "close", bytes([2]) + struct.pack(">H", 1001) + b"going away")
 put("ws_parser", "subproto", bytes([3]) + b"chat, mqtt , superchat")
+# hq_stream target: [op][sel][chunk] ... op%8==6 pumps; sel: slot | 0x80 FIN
+def hq_get(slot, path, fin=True):
+    return bytes([0, (slot | (0x80 if fin else 0))]) + chunk(b"GET " + path + b"\r\n")
+put("hq_stream", "one_get", hq_get(0, b"/index.html") + bytes([6, 6, 6]))
+put("hq_stream", "split_line", bytes([0, 1]) + chunk(b"GET /a") + bytes([0, 0x81]) + chunk(b"bc\r\n") + bytes([6, 6]))
+put("hq_stream", "many", b"".join(hq_get(i, b"/f%d" % i) for i in range(12)) + bytes([6] * 8))
+put("hq_stream", "bad_method", hq_get(2, b"") .replace(b"GET ", b"PUT ") + bytes([6]))
+put("hq_stream", "big_body", hq_get(3, b"/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz") + bytes([6] * 20))
 print("seeds written to", os.path.normpath(ROOT))

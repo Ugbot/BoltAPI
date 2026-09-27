@@ -72,6 +72,7 @@ struct SentPacketInfo {
     bool in_flight = false;             // still counted in bytes_in_flight
     bool acked = false;
     bool lost = false;
+    std::uint8_t ctrl_flags = 0;        // control frames to re-issue on loss
     std::size_t range_count = 0;
     FrameRange ranges[kMaxFrameRangesPerPacket]{};
 };

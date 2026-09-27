@@ -33,6 +33,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -93,6 +94,14 @@ sockaddr_in loopback(std::uint16_t port) {
     a.sin_port = htons(port);
     ::inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
     return a;
+}
+
+// Position-dependent bytes: any dropped, duplicated or reordered span shows.
+std::string pattern_body(std::size_t n) {
+    std::string s(n, '\0');
+    for (std::size_t i = 0; i < n; ++i)
+        s[i] = static_cast<char>((i * 31u + (i >> 11)) & 0xFF);
+    return s;
 }
 
 std::string make_random_body(std::size_t n, std::uint32_t seed) {
@@ -180,9 +189,9 @@ struct H3Pair {
             if (hc >= 16) break;
             hdrs[hc].name = e.name; hdrs[hc].value = e.value; ++hc;
         }
-        const auto* body = reinterpret_cast<const std::uint8_t*>(resp.body.data());
-        server_h3.send_response(r.stream_id, resp.status, hdrs, hc, body,
-                                resp.body.size());
+        // Mirror App::serve_http3_request: an owned body is handed over.
+        server_h3.send_response_owned(r.stream_id, resp.status, hdrs, hc,
+                                      std::move(resp.body));
     }
 
     void drain() {
@@ -304,9 +313,9 @@ TEST(Http3App, ServesRequestsThroughAppRouter) {
         // Echo the request body back verbatim.
         res.status(200).content_type("application/octet-stream").send(req.body());
     });
-    // Larger than a stream's (non-reclaimed) send buffer.
+    // Larger than a stream's send ring: streamed as the client acknowledges.
     app.get("/big", [](api::Request&, api::Response& res) {
-        res.status(200).send(std::string(300 * 1024, 'x'));
+        res.status(200).send(pattern_body(512000));
     });
     // build_dispatch runs on start_background; we drive dispatch_http3 directly.
     const std::uint16_t port = pick_free_port();
@@ -341,14 +350,15 @@ TEST(Http3App, ServesRequestsThroughAppRouter) {
         EXPECT_EQ(body, payload) << "echo body not byte-exact";
     }
 
-    // ---- A body the stream cannot hold is a 500, never a truncated 200 ----
+    // ---- A body larger than the stream ring arrives whole (G2ETL-141) ----
     {
         std::uint16_t status = 0;
         std::string body;
         ASSERT_TRUE(round_trip(p, "GET", "/big", "", status, body))
             << "no HTTP/3 response for GET /big";
-        EXPECT_EQ(status, 500u);
-        EXPECT_TRUE(body.empty());
+        EXPECT_EQ(status, 200u);
+        ASSERT_EQ(body.size(), 512000u) << "512000-byte body truncated";
+        EXPECT_EQ(body, pattern_body(512000)) << "512000-byte body corrupted";
     }
 
     // ---- A 404 path proves routing (negative space) ----------------------
@@ -359,6 +369,95 @@ TEST(Http3App, ServesRequestsThroughAppRouter) {
         EXPECT_EQ(status, 404u);
     }
 
+    p.stop();
+    app.stop();
+}
+
+namespace {
+
+// Incremental HTTP/3 response reader for bodies larger than the client
+// H3Connection buffers: walks frame headers and checks DATA bytes in place.
+struct StreamingResponse {
+    std::uint64_t stream = UINT64_MAX;
+    std::uint64_t data_bytes = 0;
+    std::uint64_t mismatches = 0;
+    bool fin = false;
+    bool bad_framing = false;
+    std::string hdr;             // partial frame header bytes
+    std::uint64_t left = 0;      // payload bytes left in the current frame
+    bool in_data = false;
+
+    void feed(const std::uint8_t* d, std::size_t n) {
+        std::size_t i = 0;
+        while (i < n && !bad_framing) {
+            if (left > 0) {
+                const std::size_t take = static_cast<std::size_t>(
+                    std::min<std::uint64_t>(left, n - i));
+                if (in_data) check(d + i, take);
+                i += take;
+                left -= take;
+                continue;
+            }
+            hdr.push_back(static_cast<char>(d[i++]));
+            std::uint64_t type = 0, len = 0;
+            const auto* h = reinterpret_cast<const std::uint8_t*>(hdr.data());
+            const int a = q::varint_decode(h, hdr.size(), type);
+            if (a <= 0) continue;
+            const int b = q::varint_decode(h + a, hdr.size() - static_cast<std::size_t>(a), len);
+            if (b <= 0) continue;
+            in_data = type == static_cast<std::uint64_t>(h3::FrameType::kData);
+            if (!in_data && type != static_cast<std::uint64_t>(h3::FrameType::kHeaders))
+                bad_framing = true;
+            left = len;
+            hdr.clear();
+        }
+    }
+    void check(const std::uint8_t* d, std::size_t n) {
+        for (std::size_t k = 0; k < n; ++k, ++data_bytes) {
+            const std::uint64_t i = data_bytes;
+            if (d[k] != static_cast<std::uint8_t>((i * 31u + (i >> 11)) & 0xFF)) ++mismatches;
+        }
+    }
+};
+
+}  // namespace
+
+// ============================================================================
+// GATE (G2ETL-141): a 50 MB response streams through a 256 KiB stream ring,
+// flow-control and ACK paced, and arrives byte-exact with one FIN.
+// ============================================================================
+TEST(Http3App, StreamsFiftyMegabyteResponse) {
+    constexpr std::size_t kBig = 50u * 1024u * 1024u;
+    api::App app;
+    app.get("/huge", [](api::Request&, api::Response& res) {
+        res.status(200).send(pattern_body(kBig));
+    });
+    const std::uint16_t port = pick_free_port();
+    ASSERT_NE(port, 0) << "no free port";
+    ASSERT_EQ(app.start_background("127.0.0.1", port), 0);
+
+    auto p_owner = std::make_unique<H3Pair>();
+    H3Pair& p = *p_owner;
+    ASSERT_TRUE(p.setup(app));
+    ASSERT_TRUE(p.handshake(std::chrono::seconds(12)));
+
+    StreamingResponse rx;
+    p.client_qc.set_stream_data_handler(
+        [&rx](std::uint64_t id, const std::uint8_t* d, std::size_t n, bool fin) {
+            if (id != rx.stream) return;
+            rx.feed(d, n);
+            if (fin) rx.fin = true;
+        });
+    rx.stream = p.client_h3.send_request("GET", "/huge", "https", "localhost",
+                                         nullptr, 0, nullptr, 0);
+    ASSERT_NE(rx.stream, UINT64_MAX);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(240);
+    while (std::chrono::steady_clock::now() < deadline && !rx.fin) p.pump_once();
+
+    EXPECT_TRUE(rx.fin) << "no FIN after " << rx.data_bytes << " bytes";
+    EXPECT_FALSE(rx.bad_framing);
+    EXPECT_EQ(rx.data_bytes, kBig);
+    EXPECT_EQ(rx.mismatches, 0u);
     p.stop();
     app.stop();
 }

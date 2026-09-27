@@ -9,6 +9,7 @@
 
 #include "bolt/bolt_limits.h"
 #include "boltapi/proto/postgres_wire.h"
+#include "boltapi/quic/quic_limits.h"
 #include "boltapi/router.h"
 #include "boltapi/wire_limits.h"
 
@@ -32,7 +33,35 @@
       nullptr, "largest QPACK integer (QUIC varint range)")                     \
     X(http3_max_method_len, kInvariant, "bytes", ::bolt::api::kHttp3MaxMethodLen, \
       ::bolt::api::kHttp3MaxMethodLen, ::bolt::api::kHttp3MaxMethodLen, nullptr, \
-      nullptr, "HTTP/3 :method length routed; longer is a 400")
+      nullptr, "HTTP/3 :method length routed; longer is a 400")                \
+    X(hq_max_request_line, kInvariant, "bytes", ::bolt::api::kHqMaxRequestLine,   \
+      ::bolt::api::kHqMaxRequestLine, ::bolt::api::kHqMaxRequestLine, nullptr,   \
+      nullptr, "hq-interop (HTTP/0.9) request line; longer resets the stream")  \
+    X(quic_peer_bidi_streams, kInvariant, "streams",                            \
+      ::bolt::api::quic::kPeerBidiStreamsMax,                                   \
+      ::bolt::api::quic::kPeerBidiStreamsMax,                                   \
+      ::bolt::api::quic::kPeerBidiStreamsMax, nullptr, nullptr,                 \
+      "concurrent peer bidi QUIC streams per connection")                       \
+    X(quic_peer_uni_streams, kInvariant, "streams",                             \
+      ::bolt::api::quic::kPeerUniStreamsMax,                                    \
+      ::bolt::api::quic::kPeerUniStreamsMax,                                    \
+      ::bolt::api::quic::kPeerUniStreamsMax, nullptr, nullptr,                  \
+      "concurrent peer uni QUIC streams per connection")                        \
+    X(quic_closed_stream_window, kInvariant, "streams",                         \
+      ::bolt::api::quic::kClosedStreamWindowMax,                                \
+      ::bolt::api::quic::kClosedStreamWindowMax,                                \
+      ::bolt::api::quic::kClosedStreamWindowMax, nullptr, nullptr,              \
+      "stream ids remembered past the lowest open one")                         \
+    X(quic_handshake_speedups, kInvariant, "resends",                          \
+      ::bolt::api::quic::kMaxHandshakeSpeedups,                                 \
+      ::bolt::api::quic::kMaxHandshakeSpeedups,                                 \
+      ::bolt::api::quic::kMaxHandshakeSpeedups, nullptr, nullptr,               \
+      "early handshake-flight resends per QUIC connection")                     \
+    X(quic_pending_send_bytes, kInvariant, "bytes",                             \
+      ::bolt::api::quic::kPendingSendBytesMax,                                  \
+      ::bolt::api::quic::kPendingSendBytesMax,                                  \
+      ::bolt::api::quic::kPendingSendBytesMax, nullptr, nullptr,                \
+      "response bytes held per QUIC connection awaiting stream space")
 
 namespace bolt::api {
 

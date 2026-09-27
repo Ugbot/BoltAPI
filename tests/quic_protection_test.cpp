@@ -21,8 +21,11 @@
 #include "boltapi/quic/packet_protection.h"
 
 #include <gtest/gtest.h>
+#include <openssl/crypto.h>
 
 #include <array>
+#include <atomic>
+#include <cstdlib>
 #include <cstdint>
 #include <random>
 #include <string>
@@ -402,4 +405,47 @@ TEST(QuicProtection, RandomizedRoundTripAllSuites) {
                                     pt.data(), &n));
         }
     }
+}
+
+// ============================================================================
+// Re-deriving keys into a live PacketProtection (Initial keys after a Retry or
+// Version Negotiation) must free the previous cipher contexts. Counted through
+// OpenSSL's allocator hooks, installed before OpenSSL allocates anything.
+// ============================================================================
+namespace {
+std::atomic<long> g_ossl_live{0};
+void* count_malloc(size_t n, const char*, int) {
+    void* p = std::malloc(n + 16);
+    if (p == nullptr) return nullptr;
+    g_ossl_live.fetch_add(1);
+    return static_cast<char*>(p) + 16;
+}
+void* count_realloc(void* p, size_t n, const char*, int) {
+    if (p == nullptr) return count_malloc(n, nullptr, 0);
+    void* q = std::realloc(static_cast<char*>(p) - 16, n + 16);
+    return q == nullptr ? nullptr : static_cast<char*>(q) + 16;
+}
+void count_free(void* p, const char*, int) {
+    if (p == nullptr) return;
+    g_ossl_live.fetch_sub(1);
+    std::free(static_cast<char*>(p) - 16);
+}
+const bool g_hooks_installed =
+    CRYPTO_set_mem_functions(count_malloc, count_realloc, count_free) == 1;
+}  // namespace
+
+TEST(QuicProtection, ReinitializeFreesPreviousContexts) {
+    if (!g_hooks_installed) GTEST_SKIP() << "OpenSSL allocated before the hooks";
+    const std::uint8_t dcid[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    {
+        q::PacketProtection warm;  // lazy OpenSSL tables allocate once here
+        ASSERT_TRUE(q::derive_initial(dcid, sizeof(dcid), false, warm));
+    }
+    const long before = g_ossl_live.load();
+    {
+        q::PacketProtection pp;
+        for (int i = 0; i < 4; ++i)
+            ASSERT_TRUE(q::derive_initial(dcid, sizeof(dcid), i % 2 == 0, pp));
+    }
+    EXPECT_EQ(g_ossl_live.load(), before) << "cipher contexts leaked on re-initialize";
 }
