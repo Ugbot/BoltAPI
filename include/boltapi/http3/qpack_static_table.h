@@ -34,8 +34,8 @@ public:
 
     // Fetch entry by absolute static index. Returns nullptr when out of range.
     static const QpackStaticEntry* get(std::size_t index) noexcept {
-        assert(index <= kSize && "static index grossly out of range");
-        if (index >= kSize) {
+        assert(kSize > 0 && "static table empty");
+        if (index >= kSize) {  // peer-supplied index: runtime check
             return nullptr;
         }
         const QpackStaticEntry* entry = &kEntries[index];
@@ -45,8 +45,10 @@ public:
 
     // Exact (name,value) lookup. Returns index in [0,kSize) or kNotFound.
     static int find(std::string_view name, std::string_view value) noexcept {
-        assert(name.size() <= 64 && "header name implausibly long");
-        assert(value.size() <= 4096 && "header value implausibly long");
+        // Names/values are arbitrary header data (any length); a long one
+        // simply has no static entry.
+        assert(kSize > 0 && "static table empty");
+        assert(name.data() != nullptr || name.empty());
         for (std::size_t i = 0; i < kSize; ++i) {
             if (kEntries[i].name == name && kEntries[i].value == value) {
                 return static_cast<int>(i);
@@ -57,8 +59,8 @@ public:
 
     // Name-only lookup (first match). Returns index in [0,kSize) or kNotFound.
     static int find_name(std::string_view name) noexcept {
-        assert(!name.empty() && "name lookup with empty name");
-        assert(name.size() <= 64 && "header name implausibly long");
+        assert(kSize > 0 && "static table empty");
+        assert(name.data() != nullptr || name.empty());
         for (std::size_t i = 0; i < kSize; ++i) {
             if (kEntries[i].name == name) {
                 return static_cast<int>(i);

@@ -113,7 +113,11 @@ struct H3Stream {
 // ============================================================================
 // H3Connection — one HTTP/3 endpoint bound to a QuicConnection.
 // ============================================================================
+struct H3ConnectionTestAccess;  // defined only by test/fuzz harnesses
+
 class H3Connection {
+    friend struct H3ConnectionTestAccess;
+
 public:
     H3Connection() noexcept = default;
     H3Connection(const H3Connection&)            = delete;
@@ -293,7 +297,9 @@ private:
     void on_uni_data(std::uint64_t id, const std::uint8_t* d, std::size_t n) noexcept {
         assert((d != nullptr || n == 0) && "uni data null with n>0");
         assert(id <= quic::kVarIntMax && "uni id out of range");
-        UniStreamState& u = uni_state(id);
+        UniStreamState* up = uni_state(id);
+        if (up == nullptr) return;  // uni pool exhausted: ignore the stream
+        UniStreamState& u = *up;
         if (!u.typed) {
             std::uint64_t t = 0;
             const int tn = quic::varint_decode(d, n, t);
@@ -425,12 +431,14 @@ private:
     // QPACK-decode the field section into req's pseudo-headers + regular headers.
     bool decode_headers(const std::uint8_t* p, std::size_t n, H3Request& req) noexcept {
         assert((p != nullptr || n == 0) && "decode_headers null with n>0");
-        assert(n <= kH3MaxHeaderBytes && "header block too large");
+        assert(qc_ != nullptr && "decode_headers before attach");
+        if (n > kH3MaxHeaderBytes) return false;  // peer-sized: H3_EXCESSIVE_LOAD
         std::size_t cnt = 0;
         if (qpack_dec_.decode_field_section(p, n, decoded_, cnt) != 0) return false;
         std::size_t reg = 0;
         for (std::size_t i = 0; i < cnt; ++i) {
             const QpackHeader& h = decoded_[i];
+            if (h.name.empty()) return false;  // RFC 9114 §4.1.2: malformed
             if (!assign_pseudo(h, req)) {
                 regular_[reg++] = h;  // copy view-owning std::strings
             }
@@ -619,20 +627,24 @@ private:
     // Per-uni-stream classification state (small fixed pool keyed by id).
     struct UniStreamState { bool used = false; bool typed = false;
                             std::uint64_t id = 0; std::uint64_t type = 0; };
-    UniStreamState& uni_state(std::uint64_t id) noexcept {
+    // Returns nullptr once the pool is full: folding a new stream onto an old
+    // slot would make it inherit that stream's type (e.g. QPACK encoder).
+    UniStreamState* uni_state(std::uint64_t id) noexcept {
         assert(id <= quic::kVarIntMax && "uni id out of range");
+        assert(kH3MaxUni > 0 && "empty uni pool");
         for (std::size_t i = 0; i < kH3MaxUni; ++i) {
-            if (uni_[i].used && uni_[i].id == id) return uni_[i];
+            if (uni_[i].used && uni_[i].id == id) return &uni_[i];
         }
         for (std::size_t i = 0; i < kH3MaxUni; ++i) {
             if (!uni_[i].used) { uni_[i].used = true; uni_[i].id = id;
-                                 return uni_[i]; }
+                                 return &uni_[i]; }
         }
-        return uni_[0];  // bounded fallback (overflow folds onto slot 0)
+        return nullptr;
     }
 
     static std::uint16_t parse_status(std::string_view s) noexcept {
-        assert(s.size() <= 3 && "status code too long");
+        assert(s.size() <= kQpackMaxStringLen && "status longer than a QPACK string");
+        if (s.size() != 3) return 0;  // peer-supplied: RFC 9110 status is 3 digits
         std::uint16_t v = 0;
         for (std::size_t i = 0; i < s.size() && i < 3; ++i) {
             if (s[i] < '0' || s[i] > '9') return 0;

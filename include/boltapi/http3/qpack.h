@@ -31,6 +31,7 @@
 #include <utility>
 
 #include "boltapi/http3/qpack_huffman.h"
+#include "boltapi/wire_limits.h"
 #include "boltapi/http3/qpack_static_table.h"
 
 namespace bolt::api::http3 {
@@ -41,6 +42,7 @@ namespace bolt::api::http3 {
 inline constexpr std::size_t kQpackMaxHeaders = 256;     // per field section
 inline constexpr std::size_t kQpackMaxStringLen = 8192;  // per name/value
 inline constexpr std::size_t kQpackHuffmanScratch = kQpackMaxStringLen;
+using ::bolt::api::kQpackMaxIntValue;
 
 // A decoded header. Names/values are owned std::strings so the result outlives
 // the input buffer (decode may Huffman-expand into scratch).
@@ -118,7 +120,10 @@ inline bool qpack_decode_int(const uint8_t* in, std::size_t len,
             return false;  // overflow guard
         }
         byte = in[out_consumed++];
-        out_value += static_cast<uint64_t>(byte & 0x7F) << shift;
+        const uint64_t add = static_cast<uint64_t>(byte & 0x7F) << shift;
+        if ((add >> shift) != static_cast<uint64_t>(byte & 0x7F)) return false;
+        out_value += add;
+        if (out_value > kQpackMaxIntValue) return false;
         shift += 7;
     } while ((byte & 0x80) != 0);
     return true;
@@ -145,8 +150,8 @@ public:
     // Insert (name,value). Returns true on success; false if the entry is too
     // large for the table or eviction cannot make room.
     bool insert(std::string_view name, std::string_view value) noexcept {
-        assert(name.size() <= kEntryEntrySlot && "name too long for slot");
-        assert(value.size() <= kEntryEntrySlot && "value too long for slot");
+        assert(capacity_ <= (1u << 20) && "capacity implausible");
+        assert(count_ <= kMaxEntries && "count overran ring");
         const std::size_t entry_size = name.size() + value.size() + kRfcOverhead;
         if (entry_size > capacity_ || name.size() + value.size() > kEntryEntrySlot) {
             return false;
@@ -173,7 +178,7 @@ public:
     // entry has been evicted or never existed.
     bool get_absolute(uint64_t abs_index, std::string_view& name,
                       std::string_view& value) const noexcept {
-        assert(abs_index <= insert_count_ + 1 && "abs index wildly out of range");
+        assert(drop_count_ <= insert_count_ && "drop count past inserts");
         if (abs_index < drop_count_ || abs_index >= insert_count_) {
             return false;
         }
@@ -490,7 +495,7 @@ private:
 class QpackDecoder {
 public:
     explicit QpackDecoder(std::size_t max_table_capacity = 4096) noexcept
-        : dynamic_table_(max_table_capacity) {
+        : dynamic_table_(max_table_capacity), max_capacity_(max_table_capacity) {
         assert(max_table_capacity <= (1u << 20) && "capacity implausible");
         assert(kQpackMaxHeaders >= 1 && "header cap must be positive");
     }
@@ -523,6 +528,8 @@ public:
         }
         pos += used;
         while (pos < len && out_count < kQpackMaxHeaders) {
+            out_headers[out_count].name.clear();  // callers reuse their arrays
+            out_headers[out_count].value.clear();
             if (!decode_one_line(in, len, pos, out_headers[out_count])) {
                 return -1;
             }
@@ -661,7 +668,7 @@ private:
     // reference addresses the most-recently inreted entries; rel 0 == newest.
     bool resolve_dynamic_relative(uint64_t rel, std::string_view& name,
                                   std::string_view& value) const noexcept {
-        assert(rel <= dynamic_table_.insert_count() + 1 && "rel index huge");
+        assert(dynamic_table_.count() <= QpackDynamicTable::kMaxEntries && "table count");
         const uint64_t ic = dynamic_table_.insert_count();
         if (ic == 0 || rel >= ic) {
             return false;
@@ -760,7 +767,7 @@ private:
         if (!detail::qpack_decode_int(in + pos, len - pos, 5, cap, used)) {
             return false;
         }
-        if (cap > (1u << 20)) {
+        if (cap > max_capacity_) {  // RFC 9204 §4.3.1: above our advertised max
             return false;
         }
         dynamic_table_.set_capacity(static_cast<std::size_t>(cap));
@@ -769,6 +776,7 @@ private:
     }
 
     QpackDynamicTable dynamic_table_;
+    std::size_t max_capacity_;
     uint8_t scratch_[kQpackHuffmanScratch];
 };
 

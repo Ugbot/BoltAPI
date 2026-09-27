@@ -26,6 +26,7 @@
 #include "boltapi/app.h"
 #include "boltapi/http3/h3_connection.h"
 #include "boltapi/quic/connection.h"
+#include "boltapi/net/sys_compat.h"
 #include "boltapi/net/udp_transport.h"
 #include "boltapi/net/io_dispatcher.h"
 #include "boltapi/core/worker_pool.h"
@@ -49,6 +50,25 @@ namespace net  = bolt::api::net;
 namespace core = bolt::api::core;
 
 namespace {
+
+// App::start_background requires a real port; take a free loopback one.
+std::uint16_t pick_free_port() noexcept {
+    bolt::api::net::sys::startup();
+    const int s = static_cast<int>(::socket(AF_INET, SOCK_STREAM, 0));
+    if (s < 0) return 0;
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (::bind(s, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) {
+        bolt::api::net::sys::close_socket(s);
+        return 0;
+    }
+    socklen_t len = sizeof(a);
+    ::getsockname(s, reinterpret_cast<sockaddr*>(&a), &len);
+    const std::uint16_t p = ntohs(a.sin_port);
+    bolt::api::net::sys::close_socket(s);
+    return p;
+}
 
 struct EventLoop {
     std::unique_ptr<core::WorkerThreadPool> pool;
@@ -285,7 +305,9 @@ TEST(Http3App, ServesRequestsThroughAppRouter) {
         res.status(200).content_type("application/octet-stream").send(req.body());
     });
     // build_dispatch runs on start_background; we drive dispatch_http3 directly.
-    ASSERT_EQ(app.start_background("127.0.0.1", 0), 0);
+    const std::uint16_t port = pick_free_port();
+    ASSERT_NE(port, 0) << "no free port";
+    ASSERT_EQ(app.start_background("127.0.0.1", port), 0);
 
     auto p_owner = std::make_unique<H3Pair>();
     H3Pair& p = *p_owner;

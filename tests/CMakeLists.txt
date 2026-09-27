@@ -163,6 +163,10 @@ endif()
 # multiple messages on one connection, and a close frame.
 boltapi_add_test(boltapi_ws_subprotocol_test ws_subprotocol_test.cpp)
 
+# RFC 6455 receive rules + streaming of frames larger than the read buffer
+# (G2ETL-114; found by the ws_conn fuzz target).
+boltapi_add_test(boltapi_ws_frame_conformance_test ws_frame_conformance_test.cpp)
+
 boltapi_add_test(boltapi_ws_echo_test ws_echo_test.cpp)
 if(WIN32)
     target_link_libraries(boltapi_ws_echo_test PRIVATE ws2_32 mswsock)

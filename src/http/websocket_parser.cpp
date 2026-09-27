@@ -1,5 +1,6 @@
 #include "boltapi/http/websocket_parser.h"
 #include "boltapi/net/sys_compat.h"  // htons/ntohs (winsock on Windows, arpa/inet on POSIX)
+#include <cassert>
 #include <cstring>
 #include <openssl/sha.h>
 #include <openssl/bio.h>
@@ -22,14 +23,55 @@ static const char* WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 // FrameParser Implementation
 // ============================================================================
 
-FrameParser::FrameParser()
-    : state_(State::READING_HEADER),
-      bytes_needed_(2),
-      bytes_read_(0),
-      temp_buffer_pos_(0) {
-}
+FrameParser::FrameParser() = default;
 
 FrameParser::~FrameParser() = default;
+
+int FrameParser::parse_header(
+    const uint8_t* data,
+    size_t length,
+    FrameHeader& header,
+    size_t& header_length
+) {
+    assert((data != nullptr || length == 0) && "parse_header: null with length");
+    header_length = 0;
+    if (length < 2) return -1;
+    const uint8_t b0 = data[0];
+    const uint8_t b1 = data[1];
+    header.fin = (b0 & 0x80) != 0;
+    header.rsv1 = (b0 & 0x40) != 0;
+    header.rsv2 = (b0 & 0x20) != 0;
+    header.rsv3 = (b0 & 0x10) != 0;
+    header.opcode = static_cast<OpCode>(b0 & 0x0F);
+    header.mask = (b1 & 0x80) != 0;
+    const uint8_t len7 = b1 & 0x7F;
+    size_t pos = 2;
+    if (len7 < 126) {
+        header.payload_length = len7;
+    } else if (len7 == 126) {
+        if (length < pos + 2) return -1;
+        header.payload_length = (static_cast<uint64_t>(data[2]) << 8) | data[3];
+        pos += 2;
+    } else {
+        if (length < pos + 8) return -1;
+        uint64_t v = 0;
+        for (size_t i = 0; i < 8; ++i) v = (v << 8) | data[pos + i];
+        if ((v >> 63) != 0) return kErrorLength;  // RFC 6455 §5.2: MSB must be 0
+        header.payload_length = v;
+        pos += 8;
+    }
+    if (header.mask) {
+        if (length < pos + 4) return -1;
+        std::memcpy(header.masking_key, data + pos, 4);
+        pos += 4;
+    } else {
+        std::memset(header.masking_key, 0, 4);
+    }
+    header_length = pos;
+    assert(header_length <= kMaxHeaderLength && "header longer than 14 bytes");
+    assert(header_length <= length && "header past input");
+    return 0;
+}
 
 int FrameParser::parse_frame(
     const uint8_t* data,
@@ -39,131 +81,18 @@ int FrameParser::parse_frame(
     const uint8_t*& payload_start,
     size_t& payload_length
 ) {
+    // Stateless: succeeds only when the header AND the whole payload are in
+    // `data`; otherwise nothing is consumed and the caller retries with more.
     consumed = 0;
-    const uint8_t* ptr = data;
-    size_t remaining = length;
-    
-    while (remaining > 0 && state_ != State::COMPLETE && state_ != State::kError) {
-        switch (state_) {
-            case State::READING_HEADER: {
-                if (remaining < 2) {
-                    return -1;  // Need more data
-                }
-                
-                // Parse first two bytes
-                uint8_t byte0 = ptr[0];
-                uint8_t byte1 = ptr[1];
-                
-                current_header_.fin = (byte0 & 0x80) != 0;
-                current_header_.rsv1 = (byte0 & 0x40) != 0;
-                current_header_.rsv2 = (byte0 & 0x20) != 0;
-                current_header_.rsv3 = (byte0 & 0x10) != 0;
-                current_header_.opcode = static_cast<OpCode>(byte0 & 0x0F);
-                current_header_.mask = (byte1 & 0x80) != 0;
-                
-                uint8_t payload_len = byte1 & 0x7F;
-                
-                ptr += 2;
-                remaining -= 2;
-                consumed += 2;
-                
-                // Determine payload length
-                if (payload_len < 126) {
-                    current_header_.payload_length = payload_len;
-                    state_ = current_header_.mask ? State::READING_MASKING_KEY : State::READING_PAYLOAD;
-                } else if (payload_len == 126) {
-                    state_ = State::READING_PAYLOAD_LENGTH_16;
-                    bytes_needed_ = 2;
-                    temp_buffer_pos_ = 0;
-                } else {  // 127
-                    state_ = State::READING_PAYLOAD_LENGTH_64;
-                    bytes_needed_ = 8;
-                    temp_buffer_pos_ = 0;
-                }
-                break;
-            }
-            
-            case State::READING_PAYLOAD_LENGTH_16: {
-                size_t to_copy = std::min(bytes_needed_ - temp_buffer_pos_, remaining);
-                std::memcpy(temp_buffer_ + temp_buffer_pos_, ptr, to_copy);
-                temp_buffer_pos_ += to_copy;
-                ptr += to_copy;
-                remaining -= to_copy;
-                consumed += to_copy;
-                
-                if (temp_buffer_pos_ == bytes_needed_) {
-                    uint16_t len16;
-                    std::memcpy(&len16, temp_buffer_, 2);
-                    current_header_.payload_length = ntohs(len16);
-                    state_ = current_header_.mask ? State::READING_MASKING_KEY : State::READING_PAYLOAD;
-                    temp_buffer_pos_ = 0;
-                }
-                break;
-            }
-            
-            case State::READING_PAYLOAD_LENGTH_64: {
-                size_t to_copy = std::min(bytes_needed_ - temp_buffer_pos_, remaining);
-                std::memcpy(temp_buffer_ + temp_buffer_pos_, ptr, to_copy);
-                temp_buffer_pos_ += to_copy;
-                ptr += to_copy;
-                remaining -= to_copy;
-                consumed += to_copy;
-                
-                if (temp_buffer_pos_ == bytes_needed_) {
-                    uint64_t len64;
-                    std::memcpy(&len64, temp_buffer_, 8);
-                    current_header_.payload_length = be64toh(len64);
-                    state_ = current_header_.mask ? State::READING_MASKING_KEY : State::READING_PAYLOAD;
-                    temp_buffer_pos_ = 0;
-                }
-                break;
-            }
-            
-            case State::READING_MASKING_KEY: {
-                size_t to_copy = std::min(4 - temp_buffer_pos_, remaining);
-                std::memcpy(current_header_.masking_key + temp_buffer_pos_, ptr, to_copy);
-                temp_buffer_pos_ += to_copy;
-                ptr += to_copy;
-                remaining -= to_copy;
-                consumed += to_copy;
-                
-                if (temp_buffer_pos_ == 4) {
-                    state_ = State::READING_PAYLOAD;
-                    temp_buffer_pos_ = 0;
-                }
-                break;
-            }
-            
-            case State::READING_PAYLOAD: {
-                // Payload starts here
-                header = current_header_;
-                payload_start = ptr;
-                payload_length = std::min(current_header_.payload_length, static_cast<uint64_t>(remaining));
-                consumed += payload_length;
-                state_ = State::COMPLETE;
-                return 0;  // Success
-            }
-            
-            default:
-                return -2;  // Error
-        }
-    }
-    
-    if (state_ == State::COMPLETE) {
-        return 0;
-    }
-
-    // Handle zero-length payload case: we may have consumed all header/mask bytes
-    // but the while loop exits before entering READING_PAYLOAD when remaining=0
-    if (state_ == State::READING_PAYLOAD && current_header_.payload_length == 0) {
-        header = current_header_;
-        payload_start = nullptr;  // No payload
-        payload_length = 0;
-        state_ = State::COMPLETE;
-        return 0;
-    }
-
-    return -1;  // Need more data
+    size_t hlen = 0;
+    const int r = parse_header(data, length, header, hlen);
+    if (r != 0) return r;
+    if (header.payload_length > length - hlen) return -1;
+    payload_length = static_cast<size_t>(header.payload_length);
+    payload_start = payload_length > 0 ? data + hlen : nullptr;
+    consumed = hlen + payload_length;
+    assert(consumed <= length && "frame past input");
+    return 0;
 }
 
 void FrameParser::unmask(
@@ -172,33 +101,22 @@ void FrameParser::unmask(
     const uint8_t* masking_key,
     size_t offset
 ) {
-    // High-performance unmasking inspired by uWebSockets approach
-    // Process 8 bytes at a time when possible
+    assert((data != nullptr || length == 0) && "unmask: null data");
+    assert(masking_key != nullptr && "unmask: null key");
     size_t i = 0;
-    
-    // Align to 8-byte boundary
-    while (i < length && (i % 8) != 0) {
-        data[i] ^= masking_key[(offset + i) % 4];
-        i++;
-    }
-    
-    // Process 8 bytes at a time
+    // Word-at-a-time with the key rotated to `offset`; memcpy keeps it
+    // alignment-agnostic (payloads land at arbitrary buffer offsets).
+    uint8_t rot[8];
+    for (size_t j = 0; j < 8; ++j) rot[j] = masking_key[(offset + j) % 4];
     uint64_t mask64 = 0;
-    for (int j = 0; j < 8; j++) {
-        mask64 |= static_cast<uint64_t>(masking_key[(offset + i + j) % 4]) << (j * 8);
+    std::memcpy(&mask64, rot, 8);
+    for (; i + 8 <= length; i += 8) {
+        uint64_t w = 0;
+        std::memcpy(&w, data + i, 8);
+        w ^= mask64;
+        std::memcpy(data + i, &w, 8);
     }
-    
-    while (i + 8 <= length) {
-        uint64_t* data64 = reinterpret_cast<uint64_t*>(data + i);
-        *data64 ^= mask64;
-        i += 8;
-    }
-    
-    // Process remaining bytes
-    while (i < length) {
-        data[i] ^= masking_key[(offset + i) % 4];
-        i++;
-    }
+    for (; i < length; ++i) data[i] ^= masking_key[(offset + i) % 4];
 }
 
 int FrameParser::build_frame(
@@ -266,78 +184,66 @@ int FrameParser::parse_close_payload(
     CloseCode& code,
     std::string& reason
 ) {
+    assert((payload != nullptr || length == 0) && "close payload: null");
+    reason.clear();
     if (length == 0) {
         code = CloseCode::NO_STATUS;
         return 0;
     }
-    
     if (length < 2) {
-        return -1;  // Invalid close frame
+        code = CloseCode::PROTOCOL_ERROR;
+        return -1;  // RFC 6455 §5.5.1: a body carries at least the code
     }
-    
-    uint16_t code16;
-    std::memcpy(&code16, payload, 2);
-    code = static_cast<CloseCode>(ntohs(code16));
-    
-    if (length > 2) {
-        reason.assign(reinterpret_cast<const char*>(payload + 2), length - 2);
-        
-        // Validate UTF-8
-        if (!validate_utf8(payload + 2, length - 2)) {
-            return -1;
-        }
+    const uint16_t raw = static_cast<uint16_t>((payload[0] << 8) | payload[1]);
+    code = static_cast<CloseCode>(raw);
+    if (!is_valid_close_code(raw)) {
+        code = CloseCode::PROTOCOL_ERROR;
+        return -1;
     }
-    
+    if (!validate_utf8(payload + 2, length - 2)) {
+        code = CloseCode::INVALID_PAYLOAD;
+        return -1;
+    }
+    reason.assign(reinterpret_cast<const char*>(payload + 2), length - 2);
     return 0;
 }
 
+bool FrameParser::is_valid_close_code(uint16_t code) {
+    // RFC 6455 §7.4: 1000-1003, 1007-1011 defined for the wire; 1004-1006 and
+    // 1015 are reserved (never sent); 3000-4999 for libraries/applications.
+    if (code >= 3000 && code <= 4999) return true;
+    return (code >= 1000 && code <= 1003) || (code >= 1007 && code <= 1011);
+}
+
 bool FrameParser::validate_utf8(const uint8_t* data, size_t length) {
-    // UTF-8 validation (our own implementation)
+    // RFC 3629: rejects overlong forms, UTF-16 surrogates and > U+10FFFF.
+    assert((data != nullptr || length == 0) && "validate_utf8: null");
     size_t i = 0;
     while (i < length) {
-        uint8_t byte = data[i];
-        
-        if ((byte & 0x80) == 0) {
-            // Single-byte character (ASCII)
-            i++;
-        } else if ((byte & 0xE0) == 0xC0) {
-            // Two-byte character
-            if (i + 1 >= length || (data[i + 1] & 0xC0) != 0x80) {
-                return false;
-            }
-            i += 2;
-        } else if ((byte & 0xF0) == 0xE0) {
-            // Three-byte character
-            if (i + 2 >= length ||
-                (data[i + 1] & 0xC0) != 0x80 ||
-                (data[i + 2] & 0xC0) != 0x80) {
-                return false;
-            }
-            i += 3;
-        } else if ((byte & 0xF8) == 0xF0) {
-            // Four-byte character
-            if (i + 3 >= length ||
-                (data[i + 1] & 0xC0) != 0x80 ||
-                (data[i + 2] & 0xC0) != 0x80 ||
-                (data[i + 3] & 0xC0) != 0x80) {
-                return false;
-            }
-            i += 4;
-        } else {
-            return false;
-        }
+        const uint8_t c = data[i];
+        if (c < 0x80) { ++i; continue; }
+        size_t n = 0;
+        uint8_t lo = 0x80, hi = 0xBF;  // allowed range of the 2nd byte
+        if (c >= 0xC2 && c <= 0xDF) { n = 2; }
+        else if (c == 0xE0) { n = 3; lo = 0xA0; }
+        else if (c >= 0xE1 && c <= 0xEC) { n = 3; }
+        else if (c == 0xED) { n = 3; hi = 0x9F; }
+        else if (c >= 0xEE && c <= 0xEF) { n = 3; }
+        else if (c == 0xF0) { n = 4; lo = 0x90; }
+        else if (c >= 0xF1 && c <= 0xF3) { n = 4; }
+        else if (c == 0xF4) { n = 4; hi = 0x8F; }
+        else return false;
+        if (length - i < n) return false;
+        if (data[i + 1] < lo || data[i + 1] > hi) return false;
+        for (size_t k = 2; k < n; ++k)
+            if ((data[i + k] & 0xC0) != 0x80) return false;
+        i += n;
     }
-    
+    assert(i == length && "validate_utf8 overran");
     return true;
 }
 
-void FrameParser::reset() {
-    state_ = State::READING_HEADER;
-    bytes_needed_ = 2;
-    bytes_read_ = 0;
-    temp_buffer_pos_ = 0;
-    current_header_ = FrameHeader();
-}
+void FrameParser::reset() {}
 
 // ============================================================================
 // HandshakeUtils Implementation

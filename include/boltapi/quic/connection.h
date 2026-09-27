@@ -84,6 +84,7 @@ inline constexpr std::size_t kMaxPayloadSize = 1400;      // pre-AEAD frame budg
 inline constexpr std::uint8_t kLocalCidLen = 8;           // our SCID length
 inline constexpr std::size_t kCryptoChunk = 1024;         // CRYPTO bytes per frame
 inline constexpr std::size_t kInitialMinDatagram = 1200;  // RFC 9000 §14.1
+inline constexpr std::uint8_t kMinInitialDcidLen = 8;     // RFC 9000 §7.2
 
 // W5d robustness bounds (RFC 9000 §8/§10, RFC 9001 §6).
 inline constexpr std::uint64_t kDefaultIdleTimeoutMs = 30000;  // local default
@@ -92,6 +93,9 @@ inline constexpr std::uint64_t kKeyUpdateGuardPkts = 8;  // reorder window margi
 // QUIC transport error codes used by CONNECTION_CLOSE (RFC 9000 §20.1).
 inline constexpr std::uint64_t kNoError = 0x00;
 inline constexpr std::uint64_t kInternalError = 0x01;
+inline constexpr std::uint64_t kProtocolViolation = 0x0a;
+inline constexpr std::uint64_t kFrameEncodingError = 0x07;
+inline constexpr std::uint64_t kCryptoBufferExceeded = 0x0d;
 
 // Connection lifecycle (RFC 9000 §10 / §17.2 handshake progression).
 enum class ConnState : std::uint8_t {
@@ -134,7 +138,8 @@ public:
     bool receive(std::uint64_t offset, const std::uint8_t* data,
                  std::size_t len) noexcept {
         assert((data != nullptr || len == 0) && "CryptoReassembly: null data");
-        assert(offset <= kMaxCryptoBuffer && "CryptoReassembly: offset overflow");
+        assert(len <= kMaxCryptoBuffer && "CryptoReassembly: len above cap");
+        if (offset > kMaxCryptoBuffer) return false;  // peer offset: runtime check
         if (len == 0) return true;
         const std::uint64_t end = offset + len;
         if (end > kMaxCryptoBuffer) return false;
@@ -268,7 +273,11 @@ inline constexpr std::uint64_t kConnFlowChunk = 64 * 1024;
 // ============================================================================
 // QuicConnection — one endpoint (client or server) of a QUIC connection.
 // ============================================================================
+struct QuicConnectionTestAccess;  // defined only by test/fuzz harnesses
+
 class QuicConnection {
+    friend struct QuicConnectionTestAccess;
+
 public:
     QuicConnection() noexcept = default;
     ~QuicConnection() = default;
@@ -805,6 +814,9 @@ private:
         // first Initial. With require_retry_, an untokened/invalid first Initial
         // gets a Retry instead (RFC 9000 §8.1 address validation).
         if (is_server_ && is_initial && !server_initialized_) {
+            // RFC 9000 §7.2: a client's first Initial DCID is at least 8 bytes;
+            // anything shorter is discarded before any keying.
+            if (hdr.dest_cid.length < kMinInitialDcidLen) return false;
             if (require_retry_ && !address_validated_ &&
                 !server_check_token(hdr)) {
                 emit_retry(hdr);
@@ -824,8 +836,9 @@ private:
             out_consumed = hdr_len + static_cast<std::size_t>(hdr.length);
             return out_consumed <= len;
         }
+        if (hdr.length > len - hdr_len) return false;
         const std::size_t pkt_len = hdr_len + static_cast<std::size_t>(hdr.length);
-        if (pkt_len > len) return false;
+        if (pkt_len <= hdr_len) return false;  // Length 0: no packet number
         if (!open_and_handle(data, pkt_len, hdr_len, level)) {
             QTRACE("  open_and_handle FAILED level=%d", (int)level);
             return false;
@@ -849,6 +862,7 @@ private:
             kParseOk) {
             return false;
         }
+        if (hdr_len >= len) return false;  // no packet number bytes
         QTRACE("short pkt len=%zu hdr_len=%zu", len, hdr_len);
         if (!open_and_handle(data, len, hdr_len, TlsLevel::kApplication)) {
             QTRACE("  short open FAILED");
@@ -1114,6 +1128,17 @@ private:
         AckFrame ack;
         std::size_t c = 0;
         if (ack.parse(data + 1, len - 1, ecn, c) != kFrameOk) return false;
+        // RFC 9000 §19.3.1: a first range past the largest is malformed; §13.1:
+        // acknowledging a packet never sent is a PROTOCOL_VIOLATION.
+        if (ack.first_ack_range > ack.largest_acked) {
+            close(kFrameEncodingError, false, "ack range underflow");
+            return false;
+        }
+        if (ack.largest_acked >=
+            spaces_[space_for(level)].peek_next_packet_number()) {
+            close(kProtocolViolation, false, "ack of unsent packet");
+            return false;
+        }
         spaces_[space_for(level)].on_largest_acked(ack.largest_acked);
         process_ack(level, ack);  // RFC 9002 §A.7: RTT, free acked, detect loss
         out_consumed = 1 + c;
@@ -1156,25 +1181,25 @@ private:
                    std::uint64_t largest, std::uint64_t now,
                    bool& acked_largest) noexcept {
         assert(lo <= hi && "ack range inverted");
-        // Iterate inclusive [lo,hi]. Use a do/while-style guard so pn never wraps
-        // below 0 (lo can be 0). A not-found pn is simply already-acked/evicted.
-        for (std::uint64_t pn = lo;; ++pn) {
-            SentPacketInfo* s = tr.find_unacked(pn);
-            if (s != nullptr) {
-                s->acked = true;
-                if (s->in_flight) {
-                    s->in_flight = false;
-                    cc_.on_packet_acked(s->size, s->time_sent_us);
-                }
-                if (pn == largest) {
-                    time_largest_acked_sent_ = s->time_sent_us;
-                    if (s->ack_eliciting) {
-                        rtt_sample_us_ = now - s->time_sent_us;
-                        acked_largest = true;
-                    }
+        assert(tr.count() <= kMaxSentPackets && "tracker overflow");
+        // Cost is bounded by the tracker (kMaxSentPackets), not by the width
+        // of the peer-supplied range, which may span 2^62 packet numbers.
+        for (std::size_t i = 0; i < tr.count(); ++i) {
+            SentPacketInfo& s = tr.at(i);
+            if (s.packet_number < lo || s.packet_number > hi) continue;
+            if (s.acked || s.lost) continue;
+            s.acked = true;
+            if (s.in_flight) {
+                s.in_flight = false;
+                cc_.on_packet_acked(s.size, s.time_sent_us);
+            }
+            if (s.packet_number == largest) {
+                time_largest_acked_sent_ = s.time_sent_us;
+                if (s.ack_eliciting) {
+                    rtt_sample_us_ = now - s.time_sent_us;
+                    acked_largest = true;
                 }
             }
-            if (pn == hi) break;  // inclusive upper bound reached
         }
     }
 
@@ -1293,6 +1318,10 @@ private:
         const std::size_t li = static_cast<std::size_t>(level);
         QTRACE("  CRYPTO level=%d off=%llu len=%llu", (int)level,
                (unsigned long long)cf.offset, (unsigned long long)cf.length);
+        if (cf.offset + cf.length > kMaxCryptoBuffer) {
+            close(kCryptoBufferExceeded, false, "crypto buffer exceeded");
+            return false;
+        }
         if (!crypto_rx_[li].receive(cf.offset, cf.data,
                                     static_cast<std::size_t>(cf.length)))
             return false;

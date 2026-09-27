@@ -137,7 +137,9 @@ inline bool retry_integrity_tag(const ConnectionId& odcid,
                                 std::uint8_t* out_tag) noexcept {
     assert(retry_wo_tag != nullptr && "retry_tag: null retry");
     assert(out_tag != nullptr && "retry_tag: null out");
-    assert(retry_wo_tag_len <= kMaxRetryPacketLen && "retry_tag: oversize");
+    // Received Retries are peer input: an oversize one is rejected, never
+    // copied into the fixed AAD buffer below.
+    if (retry_wo_tag_len > kMaxRetryPacketLen) return false;
 
     std::uint8_t aad[1 + kMaxConnectionIdLen + kMaxRetryPacketLen];
     std::size_t alen = 0;

@@ -2085,39 +2085,22 @@ core::coro_task<void> CoroUnifiedServer::handle_websocket_connection(
         }
         buffer_len += static_cast<size_t>(n);
 
-        // Process all complete frames in buffer
-        while (buffer_len > 0 && ws_conn.is_open()) {
-            size_t consumed = 0;
-            int result = ws_conn.handle_frame(buffer, buffer_len, consumed);
-            
-            if (result < 0) {
-                // Need more data - keep buffer and read more
-                break;
-            } else if (result > 0) {
-                // Frame processing error
-                if (ws_conn.on_error) {
-                    ws_conn.on_error("frame processing error");
-                }
-                co_return;
-            }
-            
-            // result == 0: frame processed successfully
-            // Remove consumed bytes from buffer
-            if (consumed > 0 && consumed <= buffer_len) {
-                if (consumed < buffer_len) {
-                    memmove(buffer, buffer + consumed, buffer_len - consumed);
-                }
-                buffer_len -= consumed;
-            } else {
-                // No bytes consumed but success - shouldn't happen, but prevent infinite loop
-                break;
-            }
-            
-            // Send any responses queued by the handler immediately
-            if (!co_await ws_drain_output(io, fd, tls, ws_conn)) {
-                ws_conn.close(1001, "write error");
-                co_return;
-            }
+        // Consume every complete header / payload run; a partial header
+        // (< 14 bytes) stays buffered for the next read. Payload streams
+        // through, so frames larger than this buffer are fine.
+        const size_t consumed = ws_conn.feed(buffer, buffer_len);
+        assert(consumed <= buffer_len && "ws feed overran buffer");
+        if (consumed < buffer_len) {
+            memmove(buffer, buffer + consumed, buffer_len - consumed);
+        }
+        buffer_len -= consumed;
+        assert(buffer_len < websocket::FrameParser::kMaxHeaderLength ||
+               !ws_conn.is_open());
+
+        // Send any responses queued by the handler immediately
+        if (!co_await ws_drain_output(io, fd, tls, ws_conn)) {
+            ws_conn.close(1001, "write error");
+            co_return;
         }
     }
 

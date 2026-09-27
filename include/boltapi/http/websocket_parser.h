@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include "boltapi/wire_limits.h"
 #include <cstddef>
 #include <string>
 #include <string_view>
@@ -79,16 +80,26 @@ public:
     FrameParser();
     ~FrameParser();
     
+    static constexpr int kErrorLength = 2;          // 64-bit length with MSB set
+    static constexpr size_t kMaxHeaderLength = kWsMaxFrameHeader;
+
     /**
-     * Parse WebSocket frame data.
-     * 
-     * @param data Input buffer
-     * @param length Buffer length
-     * @param consumed Number of bytes consumed (output)
-     * @param header Frame header (output)
-     * @param payload_start Pointer to payload start (output)
-     * @param payload_length Payload length (output)
-     * @return 0 on success, -1 if more data needed, error code otherwise
+     * Parse one frame header. Stateless: returns 0 with `header_length` set
+     * when the whole header is in `data`, -1 when more bytes are needed
+     * (nothing consumed), or kErrorLength for an invalid 64-bit length.
+     */
+    static int parse_header(
+        const uint8_t* data,
+        size_t length,
+        FrameHeader& header,
+        size_t& header_length
+    );
+
+    /**
+     * Parse one complete frame. Stateless: returns 0 only when the header and
+     * the entire payload are in `data` (`consumed` = header + payload);
+     * -1 when more data is needed (consumed = 0); >0 on a malformed header.
+     * The payload is returned still masked.
      */
     int parse_frame(
         const uint8_t* data,
@@ -98,7 +109,7 @@ public:
         const uint8_t*& payload_start,
         size_t& payload_length
     );
-    
+
     /**
      * Unmask payload data in-place.
      * Uses optimized 8-byte chunk processing.
@@ -173,33 +184,12 @@ public:
      * @return true if valid UTF-8, false otherwise
      */
     static bool validate_utf8(const uint8_t* data, size_t length);
+
+    /** RFC 6455 §7.4: may `code` appear in a received close frame? */
+    static bool is_valid_close_code(uint16_t code);
     
-    /**
-     * Reset parser state.
-     */
+    /** No-op; the parser is stateless (kept for API compatibility). */
     void reset();
-    
-private:
-    enum class State {
-        READING_HEADER,
-        READING_PAYLOAD_LENGTH_16,
-        READING_PAYLOAD_LENGTH_64,
-        READING_MASKING_KEY,
-        READING_PAYLOAD,
-        COMPLETE,
-        // Renamed from ERROR — Windows headers (`wingdi.h`) `#define ERROR 0`,
-        // which corrupts this enum the moment any user transitively pulls
-        // <windows.h> before this header. Using `kError` keeps the enum
-        // Windows-clean.
-        kError
-    };
-    
-    State state_;
-    FrameHeader current_header_;
-    size_t bytes_needed_;
-    size_t bytes_read_;
-    uint8_t temp_buffer_[14];  // Max header size
-    size_t temp_buffer_pos_;
 };
 
 /**
