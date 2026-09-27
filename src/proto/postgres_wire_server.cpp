@@ -99,7 +99,7 @@ void handle_simple_query(int fd, MsgWriter& w, ExtendedSession& ext,
     {
         const char* tag = nullptr;
         QueryFailure qf;
-        const ExtendedSession::TxStep ts = ext.tx_statement(sql, fd, w, tag, qf);
+        const ExtendedSession::TxStep ts = ext.tx_statement(sql, fd, w, tag, qf, exec);
         if (ts == ExtendedSession::TxStep::Failed) {
             simple_fail(fd, w, ext, qf.sqlstate, qf.message);
             return;
@@ -147,8 +147,13 @@ void handle_simple_query(int fd, MsgWriter& w, ExtendedSession& ext,
             simple_show(fd, w, ext, sa);
             return;
         }
-        if (!ext.tx_admit(sql, qf)) {
+        const ExtendedSession::Admit ad = ext.tx_admit(sql, qf);
+        if (ad == ExtendedSession::Admit::Failed) {
             simple_fail(fd, w, ext, qf.sqlstate, qf.message);
+            return;
+        }
+        if (ad == ExtendedSession::Admit::Deferred) {
+            simple_tag(fd, w, ext, "OK");
             return;
         }
     }

@@ -29,17 +29,25 @@
 //     displaced by another portal's execution is refused (55000), not
 //     re-run.
 //
-// Transactions (G2ETL-64): there are none — every statement is applied when
-// it runs. The wire layer still answers BEGIN / START TRANSACTION / COMMIT /
-// END / ROLLBACK / ABORT itself and reports the block status ('I'/'T'/'E')
-// in ReadyForQuery, so drivers that toggle autocommit (pgJDBC, psycopg) and
-// cursor fetch over named portals work. It is honest about what it cannot
-// do: a write inside a READ ONLY block is refused (25006); after an error
-// the block refuses everything but COMMIT/ROLLBACK (25P02); ending a block
-// by ROLLBACK (or COMMIT of a failed block) after any write is an error
-// (0A000) saying the writes were NOT undone; savepoints, two-phase commit,
-// AND CHAIN and REPEATABLE READ/SERIALIZABLE are refused (0A000). Named
-// portals close when the block ends.
+// Transactions (G2ETL-64, G2ETL-105): the wire layer answers BEGIN / START
+// TRANSACTION / COMMIT / END / ROLLBACK / ABORT / SAVEPOINT / RELEASE /
+// ROLLBACK TO itself and reports the block status ('I'/'T'/'E') in
+// ReadyForQuery. The engine has no transactions, so a write inside a block
+// is not run: it is queued (bounded by Config::tx_pending_bytes /
+// max_tx_pending_writes) and answered "OK" (row count unknown). COMMIT runs
+// the queue in order; ROLLBACK, COMMIT of a failed block, a dropped
+// connection and ROLLBACK TO discard it (back to the savepoint), so nothing
+// the client rolled back ever reaches storage. Consequences, refused rather
+// than answered wrongly: a read (or DECLARE) after a queued write in the
+// same block is refused (0A000) because it could not see that write; a
+// write in a READ ONLY block is refused (25006); after an error the block
+// refuses everything but COMMIT/ROLLBACK (25P02). A queued write's own
+// error surfaces at COMMIT: if the first queued write fails nothing was
+// applied (its SQLSTATE is reported); if a later one fails the earlier ones
+// stay applied and COMMIT fails with 0A000 naming how many. Other sessions
+// can observe a multi-write COMMIT part-way. Two-phase commit, AND CHAIN and
+// REPEATABLE READ/SERIALIZABLE are refused (0A000). Named portals close when
+// the block ends.
 //
 // Authentication is "trust" (no password) or cleartext password — no MD5,
 // no SCRAM-SHA-256. TLS negotiation is refused (`SSLRequest`/`GSSENCRequest`
@@ -213,6 +221,11 @@ struct Config {
     std::uint16_t max_portals             = 8;     // incl. the unnamed one
     std::uint32_t max_statement_bytes     = 64u * 1024u;
     std::uint32_t statement_pool_bytes    = 1u << 20;
+
+    // Writes of an open transaction block are queued as SQL text and run at
+    // COMMIT; a block whose writes exceed either bound is aborted.
+    std::uint32_t tx_pending_bytes      = 1u << 20;
+    std::uint32_t max_tx_pending_writes = 1024;
 
     // Sent as the `server_version` ParameterStatus. Some clients parse this
     // to gate feature use, so it must look like a real Postgres version

@@ -18,11 +18,13 @@ namespace bolt::api::proto::pgwire::detail {
 inline constexpr std::uint32_t kMaxParams  = 256;   // per statement
 inline constexpr std::size_t   kMaxNameLen = 64;    // statement/portal names
 inline constexpr std::uint32_t kMaxSavepoints = 32; // per transaction block
+inline constexpr std::uint32_t kTxBlockedMsgLen = 512;
 
 inline bool binary_result_supported(std::int32_t t) noexcept {
     switch (t) {
         case oid::kBool: case oid::kInt2: case oid::kInt4: case oid::kInt8:
         case oid::kOid: case oid::kFloat4: case oid::kFloat8: case oid::kDate:
+        case oid::kTimestamp:
         case oid::kNumeric: case oid::kText: case oid::kVarchar: case oid::kBpchar:
         case oid::kName: case oid::kUnknown:
             return true;
@@ -59,12 +61,20 @@ public:
     // Answer transaction control here, and refuse everything else in a
     // failed block. Tagged: `tag` is the CommandComplete tag. Failed: `qf`
     // holds the error for the caller to send.
+    // COMMIT applies the block's deferred writes through `exec`.
     TxStep tx_statement(std::string_view sql, int fd, MsgWriter& w,
-                        const char*& tag, QueryFailure& qf) noexcept;
+                        const char*& tag, QueryFailure& qf,
+                        IQueryExecutor& exec) noexcept;
 
-    // An engine statement about to run: refused if it writes inside a READ
-    // ONLY block, otherwise counted when it writes inside a block.
-    bool tx_admit(std::string_view sql, QueryFailure& qf) noexcept;
+    enum class Admit : std::uint8_t { Run, Deferred, Failed };
+
+    // An engine statement about to run. Outside a block: Run. Inside one a
+    // write is queued until COMMIT (Deferred; the caller answers "OK"), and
+    // a read after a queued write is refused, since it could not see it.
+    Admit tx_admit(std::string_view sql, QueryFailure& qf) noexcept;
+
+    // A read inside a block that already queued writes: refused (0A000).
+    bool tx_read_blocked(QueryFailure& qf) const noexcept;
 
     enum class CursorStep : std::uint8_t { Pass, Tagged, Fetch, Failed };
 
@@ -136,7 +146,10 @@ private:
     bool fail(int fd, MsgWriter& w, const char* sqlstate, std::string_view msg) noexcept;
     bool materialize(std::int32_t pi, int fd, MsgWriter& w, IQueryExecutor& exec,
                      FieldDesc* fields, QueryFailure& qf) noexcept;
-    TxStep tx_end(bool rollback, const char*& tag, QueryFailure& qf) noexcept;
+    TxStep tx_end(bool rollback, const char*& tag, QueryFailure& qf,
+                  IQueryExecutor& exec) noexcept;
+    bool   tx_apply(IQueryExecutor& exec, QueryFailure& qf) noexcept;
+    void   tx_discard(std::uint32_t keep) noexcept;
     TxStep tx_savepoint(TxCommand cmd, std::string_view word, const char*& tag,
                         QueryFailure& qf) noexcept;
     bool describe_statement(const Statement& st, int fd, MsgWriter& w,
@@ -180,10 +193,18 @@ private:
     bool                   in_error_ = false;
     char                   tx_status_ = 'I';
     bool                   tx_read_only_ = false;
-    std::uint32_t          tx_writes_ = 0;   // applied inside the open block
+    // Writes of the open block, queued as SQL text until COMMIT.
+    struct PendingWrite {
+        std::uint32_t off = 0;
+        std::uint32_t len = 0;
+    };
+    std::vector<char>         tx_pool_;
+    std::vector<PendingWrite> tx_pending_;
+    std::uint32_t             n_pending_ = 0;
+    char                      tx_msg_[kTxBlockedMsgLen] = {};
     struct Savepoint {
         char          name[kMaxNameLen] = {};   // case-folded unless quoted
-        std::uint32_t writes = 0;               // tx_writes_ when it was set
+        std::uint32_t pending = 0;              // n_pending_ when it was set
     };
     Savepoint              savepoints_[kMaxSavepoints];
     std::uint32_t          n_savepoints_ = 0;

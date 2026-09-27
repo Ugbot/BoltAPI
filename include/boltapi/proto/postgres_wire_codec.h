@@ -35,6 +35,7 @@ inline constexpr std::int32_t kUnknown     = 705;
 inline constexpr std::int32_t kBpchar      = 1042;
 inline constexpr std::int32_t kVarchar     = 1043;
 inline constexpr std::int32_t kDate        = 1082;
+inline constexpr std::int32_t kTimestamp   = 1114;
 inline constexpr std::int32_t kNumeric     = 1700;
 }  // namespace oid
 

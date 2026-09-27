@@ -140,6 +140,33 @@ bool parse_date_text(std::string_view s, std::int64_t& pg_days) noexcept {
     return true;
 }
 
+// "YYYY-MM-DD HH:MM:SS[.ffffff]" -> microseconds since 2000-01-01.
+bool parse_timestamp_text(std::string_view s, std::int64_t& pg_us) noexcept {
+    std::int64_t days = 0;
+    if (s.size() < 19 || !parse_date_text(s.substr(0, 10), days)) return false;
+    if ((s[10] != ' ' && s[10] != 'T') || s[13] != ':' || s[16] != ':') return false;
+    unsigned f[3] = {};
+    for (std::size_t k = 0; k < 3; ++k) {
+        const char a = s[11 + 3 * k], b = s[12 + 3 * k];
+        if (!is_digit(a) || !is_digit(b)) return false;
+        f[k] = static_cast<unsigned>((a - '0') * 10 + (b - '0'));
+    }
+    if (f[0] > 23 || f[1] > 59 || f[2] > 60) return false;
+    std::int64_t frac = 0;
+    if (s.size() > 19) {
+        if (s[19] != '.' || s.size() == 20 || s.size() > 26) return false;
+        std::size_t i = 20;
+        for (; i < s.size(); ++i) {                      // bounded: <= 6 digits
+            if (!is_digit(s[i])) return false;
+            frac = frac * 10 + (s[i] - '0');
+        }
+        for (; i < 26; ++i) frac *= 10;
+    }
+    pg_us = ((days * 24 + f[0]) * 60 + f[1]) * 60 * 1000000LL + f[2] * 1000000LL + frac;
+    assert(frac >= 0 && frac < 1000000);
+    return true;
+}
+
 bool is_numeric_oid(std::int32_t t) noexcept {
     return t == oid::kInt2 || t == oid::kInt4 || t == oid::kInt8 ||
            t == oid::kOid || t == oid::kFloat4 || t == oid::kFloat8 ||
@@ -584,6 +611,14 @@ bool text_to_binary_result(std::string_view text, std::int32_t type_oid,
             if (cap < 4) return small();
             put_be(out, static_cast<std::uint32_t>(static_cast<std::int32_t>(days)), 4);
             out_len = 4;
+            return true;
+        }
+        case oid::kTimestamp: {
+            std::int64_t us = 0;
+            if (!parse_timestamp_text(text, us)) return bad();
+            if (cap < 8) return small();
+            put_be(out, static_cast<std::uint64_t>(us), 8);
+            out_len = 8;
             return true;
         }
         case oid::kNumeric:
