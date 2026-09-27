@@ -26,6 +26,7 @@
 #include "boltapi/app.h"
 #include "boltapi/http3/h3_connection.h"
 #include "boltapi/quic/connection.h"
+#include "boltapi/net/sys_compat.h"
 #include "boltapi/net/udp_transport.h"
 #include "boltapi/net/io_dispatcher.h"
 #include "boltapi/core/worker_pool.h"
@@ -49,6 +50,25 @@ namespace net  = bolt::api::net;
 namespace core = bolt::api::core;
 
 namespace {
+
+// App::start_background requires a real port; take a free loopback one.
+std::uint16_t pick_free_port() noexcept {
+    bolt::api::net::sys::startup();
+    const int s = static_cast<int>(::socket(AF_INET, SOCK_STREAM, 0));
+    if (s < 0) return 0;
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (::bind(s, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) {
+        bolt::api::net::sys::close_socket(s);
+        return 0;
+    }
+    socklen_t len = sizeof(a);
+    ::getsockname(s, reinterpret_cast<sockaddr*>(&a), &len);
+    const std::uint16_t p = ntohs(a.sin_port);
+    bolt::api::net::sys::close_socket(s);
+    return p;
+}
 
 struct EventLoop {
     std::unique_ptr<core::WorkerThreadPool> pool;
@@ -284,8 +304,14 @@ TEST(Http3App, ServesRequestsThroughAppRouter) {
         // Echo the request body back verbatim.
         res.status(200).content_type("application/octet-stream").send(req.body());
     });
+    // Larger than a stream's (non-reclaimed) send buffer.
+    app.get("/big", [](api::Request&, api::Response& res) {
+        res.status(200).send(std::string(300 * 1024, 'x'));
+    });
     // build_dispatch runs on start_background; we drive dispatch_http3 directly.
-    ASSERT_EQ(app.start_background("127.0.0.1", 0), 0);
+    const std::uint16_t port = pick_free_port();
+    ASSERT_NE(port, 0) << "no free port";
+    ASSERT_EQ(app.start_background("127.0.0.1", port), 0);
 
     auto p_owner = std::make_unique<H3Pair>();
     H3Pair& p = *p_owner;
@@ -313,6 +339,16 @@ TEST(Http3App, ServesRequestsThroughAppRouter) {
         EXPECT_EQ(status, 200u);
         ASSERT_EQ(body.size(), payload.size()) << "echo body length mismatch";
         EXPECT_EQ(body, payload) << "echo body not byte-exact";
+    }
+
+    // ---- A body the stream cannot hold is a 500, never a truncated 200 ----
+    {
+        std::uint16_t status = 0;
+        std::string body;
+        ASSERT_TRUE(round_trip(p, "GET", "/big", "", status, body))
+            << "no HTTP/3 response for GET /big";
+        EXPECT_EQ(status, 500u);
+        EXPECT_TRUE(body.empty());
     }
 
     // ---- A 404 path proves routing (negative space) ----------------------

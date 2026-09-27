@@ -742,7 +742,13 @@ void App::http3_feed_(net::UdpTransport* tp, const sockaddr* peer, int peer_len,
 void App::serve_http3_request(http3::H3Connection& h3,
                               const http3::H3Request& r) {
     assert(started_ && "serve_http3_request before start");
-    assert(r.path.data() != nullptr || r.path.empty());  // method length is peer input: method_from() bounds it
+    assert(r.stream_id <= quic::kVarIntMax && "stream id out of range");
+    // The method is peer input: an absent or implausible one is a 400, not an
+    // assertion (RFC 9114 §4.3.1 requires :method).
+    if (r.method.empty() || r.method.size() > kHttp3MaxMethodLen) {
+        (void)h3.send_response(r.stream_id, 400, nullptr, 0, nullptr, 0);
+        return;
+    }
 
     http::CoroHttpRequest creq;
     creq.method = r.method;

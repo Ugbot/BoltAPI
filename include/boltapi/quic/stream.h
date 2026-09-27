@@ -140,9 +140,19 @@ public:
         std::size_t space = kStreamBufferSize - send_buf_len_;
         std::size_t n = (len < space) ? len : space;
         if (n > 0) { std::memcpy(send_buf_ + send_buf_len_, data, n); send_buf_len_ += n; }
-        if (fin) want_fin_ = true;
-        if (send_st_ == SendState::kReady && (n > 0 || fin)) send_st_ = SendState::kSend;
+        // FIN only once every byte is queued: a short write must not end the
+        // stream on a truncated body.
+        if (fin && n == len) want_fin_ = true;
+        if (send_st_ == SendState::kReady && (n > 0 || want_fin_)) send_st_ = SendState::kSend;
+        assert(n <= len && send_buf_len_ <= kStreamBufferSize);
         return n;
+    }
+
+    // Bytes write() can still accept. The buffer is not reclaimed on ACK, so
+    // this bounds the whole stream's send side.
+    std::size_t send_space() const noexcept {
+        assert(send_buf_len_ <= kStreamBufferSize && "send buffer overrun");
+        return kStreamBufferSize - send_buf_len_;
     }
 
     // Bytes still queued and unsent (above send_acked_/send_sent_ frontier).

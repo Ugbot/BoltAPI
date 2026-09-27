@@ -2,7 +2,7 @@
 //
 // Run:   boltapi_ws_echo [port]   (default 8080)
 // Then connect a WebSocket client to ws://127.0.0.1:<port>/ws and send text
-// frames; the server echoes each text message straight back.
+// or binary frames; the server echoes each message straight back.
 //
 // The handler is invoked once per upgraded connection. We wire on_text_message
 // to echo via send_text() (which enqueues an unmasked server text frame the
@@ -37,6 +37,9 @@ int main(int argc, char** argv) {
     app.websocket("/ws", [](api::http::WebSocketConnection& ws) {
         ws.on_text_message = [&ws](const std::string& msg) {
             ws.send_text(msg);  // echo
+        };
+        ws.on_binary_message = [&ws](const uint8_t* data, size_t len) {
+            ws.send_binary(data, len);
         };
         ws.on_close = [](uint16_t code, const char* reason) {
             std::printf("[ws] closed code=%u reason=%s\n", code,

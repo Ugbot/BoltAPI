@@ -163,6 +163,10 @@ endif()
 # multiple messages on one connection, and a close frame.
 boltapi_add_test(boltapi_ws_subprotocol_test ws_subprotocol_test.cpp)
 
+# RFC 6455 receive rules + streaming of frames larger than the read buffer
+# (G2ETL-114; found by the ws_conn fuzz target).
+boltapi_add_test(boltapi_ws_frame_conformance_test ws_frame_conformance_test.cpp)
+
 boltapi_add_test(boltapi_ws_echo_test ws_echo_test.cpp)
 if(WIN32)
     target_link_libraries(boltapi_ws_echo_test PRIVATE ws2_32 mswsock)
@@ -728,4 +732,16 @@ if(Python3_EXECUTABLE)
                      "${CMAKE_CURRENT_SOURCE_DIR}/h2spec_conformance.py"
                      "$<TARGET_FILE:boltapi_h2spec_server>")
     set_tests_properties(boltapi_h2spec_conformance PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+endif()
+
+# ---- Autobahn|Testsuite (G2ETL-114) -------------------------------------------
+# RFC 6455 conformance judged by the Autobahn fuzzingclient (docker
+# crossbario/autobahn-testsuite) against the ws_echo example. SKIPs (77)
+# without docker. Failing cases must be listed with their ticket.
+if(Python3_EXECUTABLE AND TARGET boltapi_ws_echo)
+    add_test(NAME boltapi_autobahn_conformance
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/autobahn_conformance.py"
+                     "$<TARGET_FILE:boltapi_ws_echo>")
+    set_tests_properties(boltapi_autobahn_conformance PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 endif()

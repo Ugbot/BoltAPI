@@ -446,6 +446,14 @@ if(BOLTAPI_BUILD_EXAMPLES)
     endif()
     boltapi_apply_hardening(boltapi_http3_server)
 
+    # quic-interop-runner server endpoint (testing/quic-interop/).
+    add_executable(boltapi_quic_interop_server examples/quic_interop_server.cpp)
+    target_link_libraries(boltapi_quic_interop_server PRIVATE boltapi::boltapi)
+    if(WIN32)
+        target_link_libraries(boltapi_quic_interop_server PRIVATE ws2_32 mswsock iphlpapi)
+    endif()
+    boltapi_apply_hardening(boltapi_quic_interop_server)
+
     # All-four-protocols demo for the Docker/browser story (H1 + H2 + H3 + WebRTC).
     add_executable(boltapi_docker_demo examples/docker_demo.cpp)
     target_link_libraries(boltapi_docker_demo PRIVATE boltapi::boltapi)

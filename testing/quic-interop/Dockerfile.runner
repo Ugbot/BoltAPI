@@ -1,0 +1,16 @@
+# Container that runs quic-interop-runner itself (tshark + docker CLI), driving
+# the host daemon through /var/run/docker.sock. See run_interop.sh.
+FROM debian:trixie-slim
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        tshark python3 python3-pip python3-venv git ca-certificates openssl \
+        docker-cli curl
+# The runner's compose file needs interface_name (compose >= 2.36).
+ARG COMPOSE_VERSION=v2.39.4
+RUN arch=$(uname -m) && mkdir -p /usr/local/lib/docker/cli-plugins \
+    && curl -fsSL "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-${arch}" \
+        -o /usr/local/lib/docker/cli-plugins/docker-compose \
+    && chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+RUN python3 -m venv /venv && /venv/bin/pip install --no-cache-dir \
+        pycryptodome random-slugs termcolor prettytable pyshark
+ENV PATH=/venv/bin:$PATH

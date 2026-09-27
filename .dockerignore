@@ -16,3 +16,5 @@ testing/_*.txt
 testing/srv.*
 demo_server.log
 demo_server.out
+build-*/
+/tmp/

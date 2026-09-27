@@ -107,23 +107,21 @@ public:
     int close(uint16_t code = 1000, const char* reason = nullptr);
     
     /**
-     * Handle incoming frame data.
-     *
-     * Called by server when data is received.
-     *
-     * @param data Frame data
-     * @param length Data length
-     * @return 0 on success, -1 if more data needed, positive error code otherwise
+     * Feed received bytes: processes every complete header / payload run in
+     * `data` and returns how many bytes were consumed. Unconsumed bytes are a
+     * partial frame header; keep them and call again with more appended.
+     * Frames of any size stream through (payload is not buffered here beyond
+     * the bounded message assembly). Protocol errors close the connection.
      */
+    size_t feed(const uint8_t* data, size_t length);
+
+    /** feed() and report whether all input was consumed (0) or not (-1). */
     int handle_frame(const uint8_t* data, size_t length);
 
     /**
-     * Handle incoming frame data with consumed bytes output.
-     *
-     * @param data Frame data
-     * @param length Data length
-     * @param consumed Output: number of bytes consumed
-     * @return 0 on success, -1 if more data needed, positive error code otherwise
+     * One incremental step: consumes one frame header or one run of payload.
+     * @return 0 on progress (`consumed` > 0), -1 if more data is needed
+     *         (`consumed` == 0).
      */
     int handle_frame(const uint8_t* data, size_t length, size_t& consumed);
 
@@ -221,12 +219,26 @@ private:
     std::atomic<uint64_t> bytes_sent_{0};
     std::atomic<uint64_t> bytes_received_{0};
     
-    websocket::FrameParser parser_;
-    
-    // Fragmented message assembly
+    // Incremental frame state (a frame streams through the caller's buffer).
+    static constexpr size_t kMaxControlPayload = kWsMaxControlPayload;
+    websocket::FrameHeader frame_;
+    bool in_frame_{false};
+    uint64_t frame_remaining_{0};
+    uint64_t frame_offset_{0};  // payload bytes seen (mask key rotation)
+    uint8_t ctrl_buf_[kMaxControlPayload];
+    size_t ctrl_len_{0};
+
+    // Message assembly (single-frame and fragmented), bounded by
+    // config_.max_message_size before any payload byte is buffered.
     std::vector<uint8_t> fragment_buffer_;
     OpCode fragment_opcode_;
     bool in_fragment_{false};
+
+    static bool is_control(OpCode op) noexcept;
+    uint16_t check_header(const websocket::FrameHeader& h) const noexcept;
+    int begin_frame(const uint8_t* data, size_t length, size_t& consumed_out);
+    void finish_frame();
+    void fail(uint16_t code, const char* reason);
     
     /**
      * Send frame.

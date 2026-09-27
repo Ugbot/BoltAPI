@@ -2,3 +2,5 @@
 # (default). One subdirectory per protocol area; see cmake/BoltApiFuzz.cmake.
 add_subdirectory(http)
 add_subdirectory(wire)
+
+add_subdirectory(quic)
