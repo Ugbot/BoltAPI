@@ -92,6 +92,19 @@ TEST(PgWireCodec, BinaryResults) {
     const std::uint8_t want[] = {0, 2, 0, 0, 0x40, 0, 0, 4, 0, 12, 0x0d, 0x7a};
     ASSERT_EQ(n, sizeof(want));
     EXPECT_EQ(std::memcmp(out, want, n), 0);
+    ASSERT_TRUE(pg::text_to_binary_result("2024-02-29 01:02:03.5", pg::oid::kTimestamp,
+                                          out, sizeof(out), n, e));
+    ASSERT_EQ(n, 8u);
+    std::uint64_t us = 0;
+    for (int i = 0; i < 8; ++i) us = (us << 8) | out[i];
+    EXPECT_EQ(static_cast<std::int64_t>(us), 8825LL * 86400000000LL + 3723500000LL);
+    ASSERT_TRUE(pg::text_to_binary_result("1999-12-31 23:59:59", pg::oid::kTimestamp,
+                                          out, sizeof(out), n, e));
+    us = 0;
+    for (int i = 0; i < 8; ++i) us = (us << 8) | out[i];
+    EXPECT_EQ(static_cast<std::int64_t>(us), -1000000LL);
+    EXPECT_FALSE(pg::text_to_binary_result("2024-02-29 1:02:03", pg::oid::kTimestamp,
+                                           out, sizeof(out), n, e));
     EXPECT_FALSE(pg::text_to_binary_result("abc", pg::oid::kInt4, out, sizeof(out), n, e));
     EXPECT_FALSE(pg::text_to_binary_result("{}", 3802, out, sizeof(out), n, e));   // jsonb
     EXPECT_STREQ(e.sqlstate, "0A000");
@@ -579,7 +592,7 @@ TEST_F(PgWire, FailedBlockRefusesUntilEnd) {
     EXPECT_EQ(ready_status(r), 'I');
 }
 
-TEST_F(PgWire, SavepointsTrackTheBlockWithoutUndoingWrites) {
+TEST_F(PgWire, SavepointsDiscardQueuedWrites) {
     const auto q = [&](const char* sql) {
         c_.msg('Q', std::string(sql, std::strlen(sql) + 1));
         return c_.roundtrip();
@@ -593,7 +606,7 @@ TEST_F(PgWire, SavepointsTrackTheBlockWithoutUndoingWrites) {
     EXPECT_EQ(r[0].body, std::string("SAVEPOINT\0", 10));
     r = q("SET search_path = x");                     // fails the block
     EXPECT_EQ(ready_status(r), 'E');
-    r = q("ROLLBACK TO \"_pg3_1\"");                   // no writes since: recovers
+    r = q("ROLLBACK TO \"_pg3_1\"");
     ASSERT_EQ(PgClient::types(r), "CZ");
     EXPECT_EQ(r[0].body, std::string("ROLLBACK\0", 9));
     EXPECT_EQ(ready_status(r), 'T');
@@ -605,38 +618,144 @@ TEST_F(PgWire, SavepointsTrackTheBlockWithoutUndoingWrites) {
     EXPECT_EQ(PgClient::sqlstate(r[0]), "3B001");
     (void)q("ROLLBACK");
     (void)q("BEGIN");
+    (void)q("ddl keep1");
     (void)q("SAVEPOINT A");
-    (void)q("ddl insert");
-    r = q("rollback to savepoint a");                 // a write ran after it
+    r = q("ddl undo1");
+    ASSERT_EQ(PgClient::types(r), "CZ");
+    EXPECT_EQ(r[0].body, std::string("OK\0", 3));
+    (void)q("SAVEPOINT b");
+    (void)q("ddl undo2");
+    r = q("rollback to savepoint a");
+    ASSERT_EQ(PgClient::types(r), "CZ");
+    EXPECT_EQ(r[0].body, std::string("ROLLBACK\0", 9));
+    EXPECT_EQ(ready_status(r), 'T');
+    r = q("ROLLBACK TO b");                           // released by rolling back to a
+    ASSERT_EQ(PgClient::types(r), "EZ");
+    EXPECT_EQ(PgClient::sqlstate(r[0]), "3B001");
+    (void)q("ROLLBACK TO a");
+    (void)q("ddl keep2");
+    r = q("COMMIT");
+    ASSERT_EQ(PgClient::types(r), "CZ");
+    EXPECT_EQ(r[0].body, std::string("COMMIT\0", 7));
+    EXPECT_EQ(ready_status(r), 'I');
+    EXPECT_EQ(factory_.last->applied, "ddl keep1;ddl keep2;");
+}
+
+TEST_F(PgWire, RollbackDiscardsQueuedWrites) {
+    const auto q = [&](const char* sql) {
+        c_.msg('Q', std::string(sql, std::strlen(sql) + 1));
+        return c_.roundtrip();
+    };
+    (void)q("BEGIN");
+    auto r = q("ddl insert");
+    ASSERT_EQ(PgClient::types(r), "CZ");
+    EXPECT_EQ(ready_status(r), 'T');
+    EXPECT_EQ(factory_.last->executes, 0);   // queued, not run
+    r = q("ROLLBACK");
+    ASSERT_EQ(PgClient::types(r), "CZ");
+    EXPECT_EQ(r[0].body, std::string("ROLLBACK\0", 9));
+    EXPECT_EQ(ready_status(r), 'I');
+    EXPECT_EQ(factory_.last->executes, 0);
+    (void)q("BEGIN");
+    (void)q("ddl a");
+    (void)q("SET search_path = x");         // fails the block
+    r = q("COMMIT");                        // a failed block commits as ROLLBACK
+    ASSERT_EQ(PgClient::types(r), "CZ");
+    EXPECT_EQ(r[0].body, std::string("ROLLBACK\0", 9));
+    EXPECT_EQ(factory_.last->executes, 0);
+    (void)q("BEGIN READ ONLY");
+    r = q("ddl insert");
+    ASSERT_EQ(PgClient::types(r), "EZ");
+    EXPECT_EQ(PgClient::sqlstate(r[0]), "25006");
+    r = q("ROLLBACK");
+    ASSERT_EQ(PgClient::types(r), "CZ");
+    EXPECT_EQ(ready_status(r), 'I');
+    EXPECT_EQ(factory_.last->executes, 0);
+    EXPECT_EQ(factory_.last->applied, "");
+}
+
+TEST_F(PgWire, CommitRunsQueuedWritesInOrder) {
+    const auto q = [&](const char* sql) {
+        c_.msg('Q', std::string(sql, std::strlen(sql) + 1));
+        return c_.roundtrip();
+    };
+    (void)q("BEGIN");
+    auto r = q("select 1");                  // a read before any write runs
+    ASSERT_EQ(PgClient::types(r), "TDCZ");
+    (void)q("ddl one");
+    (void)q("ddl two");
+    r = q("select 2");                       // could not see the queued writes
     ASSERT_EQ(PgClient::types(r), "EZ");
     EXPECT_EQ(PgClient::sqlstate(r[0]), "0A000");
     EXPECT_EQ(ready_status(r), 'E');
-    (void)q("ROLLBACK");
-    EXPECT_EQ(factory_.last->executes, 1);            // only the write reached the engine
-}
-
-TEST_F(PgWire, RollbackAfterWriteSaysNothingWasUndone) {
-    c_.msg('Q', std::string("BEGIN\0", 6));
-    (void)c_.roundtrip();
-    c_.msg('Q', std::string("ddl insert\0", 11));
-    auto r = c_.roundtrip();
-    ASSERT_EQ(PgClient::types(r), "CZ");
-    c_.msg('Q', std::string("ROLLBACK\0", 9));
-    r = c_.roundtrip();
+    r = q("COMMIT");
+    EXPECT_EQ(r[0].body, std::string("ROLLBACK\0", 9));
+    EXPECT_EQ(factory_.last->applied, "");
+    (void)q("BEGIN");
+    (void)q("ddl one");
+    (void)q("ddl two");
+    r = q("DECLARE c CURSOR FOR select rows 3");
     ASSERT_EQ(PgClient::types(r), "EZ");
     EXPECT_EQ(PgClient::sqlstate(r[0]), "0A000");
-    EXPECT_EQ(ready_status(r), 'I');   // the block is over either way
-    c_.msg('Q', std::string("BEGIN READ ONLY\0", 16));
-    (void)c_.roundtrip();
-    c_.msg('Q', std::string("ddl insert\0", 11));
-    r = c_.roundtrip();
-    ASSERT_EQ(PgClient::types(r), "EZ");
-    EXPECT_EQ(PgClient::sqlstate(r[0]), "25006");
-    EXPECT_EQ(factory_.last->executes, 1);   // the read-only refusal never ran it
-    c_.msg('Q', std::string("ROLLBACK\0", 9));
-    r = c_.roundtrip();
+    (void)q("ROLLBACK");
+    (void)q("BEGIN");
+    (void)q("ddl one");
+    (void)q("ddl two");
+    r = q("COMMIT");
     ASSERT_EQ(PgClient::types(r), "CZ");
+    EXPECT_EQ(r[0].body, std::string("COMMIT\0", 7));
+    EXPECT_EQ(factory_.last->applied, "ddl one;ddl two;");
+    r = q("select 3");                       // the connection is usable afterwards
+    ASSERT_EQ(PgClient::types(r), "TDCZ");
     EXPECT_EQ(ready_status(r), 'I');
+}
+
+TEST_F(PgWire, CommitReportsAQueuedWriteThatFails) {
+    const auto q = [&](const char* sql) {
+        c_.msg('Q', std::string(sql, std::strlen(sql) + 1));
+        return c_.roundtrip();
+    };
+    (void)q("BEGIN");
+    (void)q("fail first");
+    (void)q("ddl never");
+    auto r = q("COMMIT");                    // nothing applied: the engine's error
+    ASSERT_EQ(PgClient::types(r), "EZ");
+    EXPECT_EQ(PgClient::sqlstate(r[0]), "42601");
+    EXPECT_EQ(ready_status(r), 'I');
+    EXPECT_EQ(factory_.last->applied, "");
+    (void)q("BEGIN");
+    (void)q("ddl first");
+    (void)q("fail second");
+    (void)q("ddl never");
+    r = q("COMMIT");                         // part-applied: named, never silent
+    ASSERT_EQ(PgClient::types(r), "EZ");
+    EXPECT_EQ(PgClient::sqlstate(r[0]), "0A000");
+    EXPECT_NE(r[0].body.find("first 1 writes WERE applied"), std::string::npos);
+    EXPECT_EQ(ready_status(r), 'I');
+    EXPECT_EQ(factory_.last->applied, "ddl first;");
+}
+
+TEST_F(PgWire, ExtendedWritesQueueUntilCommit) {
+    c_.parse("", "BEGIN");
+    c_.bind("", "", {});
+    c_.execute("", 0);
+    c_.parse("", "ddl ext");
+    c_.bind("", "", {});
+    c_.execute("", 0);
+    c_.sync();
+    auto r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "12C12CZ");
+    EXPECT_EQ(r[5].body, std::string("OK\0", 3));
+    EXPECT_EQ(ready_status(r), 'T');
+    EXPECT_EQ(factory_.last->applied, "");
+    c_.parse("", "COMMIT");
+    c_.bind("", "", {});
+    c_.execute("", 0);
+    c_.sync();
+    r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "12CZ");
+    EXPECT_EQ(ready_status(r), 'I');
+    EXPECT_EQ(factory_.last->applied, "ddl ext;");
 }
 
 // pgJDBC with autocommit off and a fetch size: BEGIN rides in the same
@@ -654,7 +773,7 @@ TEST_F(PgWire, ExtendedBeginThenCursorFetchAcrossSyncs) {
     EXPECT_EQ(r[2].body, std::string("BEGIN\0", 6));
     EXPECT_EQ(ready_status(r), 'T');
 
-    c_.parse("", "rows 5");
+    c_.parse("", "select rows 5");
     c_.bind("C_1", "", {});
     c_.execute("C_1", 2);
     c_.sync();

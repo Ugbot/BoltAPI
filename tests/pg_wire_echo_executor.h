@@ -4,7 +4,7 @@
 //   "fail..."    -> ErrorResponse 42601
 //   "rows N"     -> one int8 column "n", values 1..N ("select rows N" too)
 //   "types"      -> one row: int8, float8, text, date, numeric, bool, NULL text
-//   "ddl..."     -> no columns, tag "OK"
+//   "ddl..."     -> no columns, tag "OK"; appended to `applied`
 //   anything else -> one text column "sql" holding the SQL it received, so a
 //                    test can assert exactly what parameter binding produced.
 #pragma once
@@ -39,6 +39,7 @@ public:
         }
         if (starts(sql, "ddl")) {
             mode_ = Mode::Ddl;
+            applied += sql_ + ";";
         } else if (starts(sql, "rows ")) {
             mode_ = Mode::Rows;
             rows_ = static_cast<std::uint32_t>(std::atoi(sql_.c_str() + 5));
@@ -106,6 +107,7 @@ public:
 
     int executes = 0;
     int describes = 0;
+    std::string applied;   // every "ddl..." statement run, ';'-terminated
 
 private:
     enum class Mode { Echo, Rows, Types, Ddl };

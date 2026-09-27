@@ -277,6 +277,7 @@ ExtendedSession::CursorStep ExtendedSession::cursor_declare(
         qf.message  = "DECLARE CURSOR can only be used in transaction blocks";
         return CursorStep::Failed;
     }
+    if (tx_read_blocked(qf)) return CursorStep::Failed;
     if (!is_query_shaped(cc.query)) {
         qf.sqlstate = "42601";
         qf.message  = "DECLARE CURSOR needs a SELECT / VALUES / TABLE query";

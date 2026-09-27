@@ -29,7 +29,7 @@ public class PgWireJdbcTx {
             try (Statement st = c.createStatement()) {
                 st.setFetchSize(4);
                 int n = 0;
-                try (ResultSet rs = st.executeQuery("rows 10")) { while (rs.next()) n++; }
+                try (ResultSet rs = st.executeQuery("select rows 10")) { while (rs.next()) n++; }
                 System.out.println("fetch " + n);
             }
             c.commit();
@@ -46,6 +46,8 @@ public class PgWireJdbcTx {
             c.rollback();
             c.setReadOnly(false);
             try (Statement st = c.createStatement()) { st.executeUpdate("ddl insert"); }
+            try (Statement st = c.createStatement()) { st.executeQuery("select 1"); System.out.println("readback ALLOWED"); }
+            catch (SQLException e) { System.out.println("readback " + e.getSQLState()); }
             try { c.rollback(); System.out.println("rollback ALLOWED"); }
             catch (SQLException e) { System.out.println("rollback " + e.getSQLState()); }
             c.setAutoCommit(true);
@@ -75,7 +77,7 @@ def run_jdbc(port, check):
     print(f"pgJDBC ({os.path.basename(jars[-1])}):\n" + out)
     failed = []
     for label, want in [("fetch", "10"), ("param", "select 9"), ("readonly", "25006"),
-                        ("rollback", "0A000"), ("autocommit", "select 1")]:
+                        ("readback", "0A000"), ("rollback", "ALLOWED"), ("autocommit", "select 1")]:
         got = next((ln[len(label) + 1:] for ln in r.stdout.splitlines()
                     if ln.startswith(label + " ")), None)
         check(f"jdbc {label}", got, want)
@@ -175,16 +177,29 @@ def main(server):
             check("tx: in block after first statement", conn.info.transaction_status.name, "INTRANS")
             conn.commit()
             check("tx: idle after commit", conn.info.transaction_status.name, "IDLE")
-            cur.execute("rows 7")
+            cur.execute("select rows 7")
             check("tx: rows inside a block", len(cur.fetchall()), 7)
-            conn.commit()   # the echo "rows" is not SELECT-shaped, so it counts as a write
+            conn.commit()
+            # G2ETL-105: a write inside a block is queued until COMMIT, so
+            # ROLLBACK really discards it and a read after it is refused.
+            cur.execute("ddl insert")
+            check("tx: queued write tag", cur.statusmessage, "OK")
+            conn.rollback()
+            check("tx: idle after rollback", conn.info.transaction_status.name, "IDLE")
             cur.execute("ddl insert")
             try:
-                conn.rollback()
-                failures.append("rollback after a write did not raise")
+                cur.execute("select 1")
+                failures.append("read after a queued write did not raise")
             except psycopg.errors.FeatureNotSupported as e:
-                check("tx: rollback after write refused", e.sqlstate, "0A000")
-            check("tx: idle after refused rollback", conn.info.transaction_status.name, "IDLE")
+                check("tx: read after queued write refused", e.sqlstate, "0A000")
+            conn.rollback()
+            cur.execute("fail at commit")
+            try:
+                conn.commit()
+                failures.append("a failing queued write committed silently")
+            except psycopg.errors.SyntaxError as e:
+                check("tx: queued write error surfaces at commit", e.sqlstate, "42601")
+            check("tx: idle after failed commit", conn.info.transaction_status.name, "IDLE")
             conn.read_only = True
             try:
                 cur.execute("ddl insert")

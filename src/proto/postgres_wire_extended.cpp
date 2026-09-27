@@ -36,8 +36,11 @@ ExtendedSession::ExtendedSession(const Config& cfg) noexcept
       portals_(cfg.max_portals),
       stmt_pool_(cfg.statement_pool_bytes),
       portal_sql_(static_cast<std::size_t>(cfg.max_portals) * cfg.max_statement_bytes),
-      describe_sql_(cfg.max_statement_bytes) {
+      describe_sql_(cfg.max_statement_bytes),
+      tx_pool_(cfg.tx_pending_bytes),
+      tx_pending_(cfg.max_tx_pending_writes) {
     assert(cfg.max_prepared_statements >= 1 && cfg.max_portals >= 1);
+    assert(cfg.tx_pending_bytes >= 1 && cfg.max_tx_pending_writes >= 1);
     assert(cfg.max_statement_bytes >= 1024 &&
            cfg.statement_pool_bytes >= cfg.max_statement_bytes);
 }
@@ -50,38 +53,81 @@ void ExtendedSession::reset() noexcept {
     in_error_ = false;
     tx_status_ = 'I';
     tx_read_only_ = false;
-    tx_writes_ = 0;
+    tx_discard(0);
     n_savepoints_ = 0;
     assert(stmts_.size() >= 1 && portals_.size() >= 1);
 }
 
+void ExtendedSession::tx_discard(std::uint32_t keep) noexcept {
+    assert(keep <= n_pending_);
+    n_pending_ = keep;
+    assert(n_pending_ <= tx_pending_.size());
+}
+
+bool ExtendedSession::tx_read_blocked(QueryFailure& qf) const noexcept {
+    if (tx_status_ != 'T' || n_pending_ == 0) return false;
+    qf.sqlstate = "0A000";
+    qf.message  = "this transaction block has uncommitted writes and this "
+                  "endpoint cannot read them back: COMMIT or ROLLBACK before "
+                  "reading";
+    return true;
+}
+
+// Runs the queued writes in order. Nothing is undone if one fails.
+bool ExtendedSession::tx_apply(IQueryExecutor& exec, QueryFailure& qf) noexcept {
+    assert(n_pending_ <= tx_pending_.size());
+    const std::uint32_t n = n_pending_;
+    for (std::uint32_t i = 0; i < n; ++i) {                     // bounded by n_pending_
+        const PendingWrite& pw = tx_pending_[i];
+        assert(static_cast<std::size_t>(pw.off) + pw.len <= tx_pool_.size());
+        FieldDesc fields[kMaxFields];
+        std::uint32_t count = 0;
+        QueryFailure f;
+        current_ = -1;
+        if (exec.execute(std::string_view(tx_pool_.data() + pw.off, pw.len), fields,
+                         kMaxFields, count, f)) {
+            continue;
+        }
+        if (i == 0) {
+            std::snprintf(tx_msg_, sizeof(tx_msg_), "COMMIT failed and applied no "
+                          "write: %s", f.message);
+            qf.sqlstate = f.sqlstate;
+        } else {
+            std::snprintf(tx_msg_, sizeof(tx_msg_), "COMMIT failed at write %u of %u; "
+                          "the first %u writes WERE applied and are not undone: %s",
+                          i + 1, n, i, f.message);
+            qf.sqlstate = "0A000";
+        }
+        qf.message = tx_msg_;
+        return false;
+    }
+    assert(current_ == -1 || n == 0);
+    return true;
+}
+
 ExtendedSession::TxStep ExtendedSession::tx_end(bool rollback, const char*& tag,
-                                                QueryFailure& qf) noexcept {
+                                                QueryFailure& qf,
+                                                IQueryExecutor& exec) noexcept {
     assert(tx_status_ != 'I');
     const bool failed = tx_status_ == 'E';
-    const std::uint32_t writes = tx_writes_;
+    const bool ok = rollback || failed || tx_apply(exec, qf);
     tx_status_ = 'I';
     tx_read_only_ = false;
-    tx_writes_ = 0;
+    tx_discard(0);
     n_savepoints_ = 0;
     for (std::size_t i = 1; i < portals_.size(); ++i) {         // bounded by slots
         if (portals_[i].used && !portals_[i].holdable) close_portal(static_cast<std::int32_t>(i));
     }
-    if ((rollback || failed) && writes > 0) {
-        qf.sqlstate = "0A000";
-        qf.message  = "the transaction block ended but its writes were NOT rolled "
-                      "back: this endpoint has no transactions, every statement "
-                      "was applied when it ran";
-        return TxStep::Failed;
-    }
+    if (!ok) return TxStep::Failed;
     tag = (rollback || failed) ? "ROLLBACK" : "COMMIT";
-    assert(tx_status_ == 'I');
+    assert(tx_status_ == 'I' && n_pending_ == 0);
     return TxStep::Tagged;
 }
 
 ExtendedSession::TxStep ExtendedSession::tx_statement(std::string_view sql, int fd,
                                                       MsgWriter& w, const char*& tag,
-                                                      QueryFailure& qf) noexcept {
+                                                      QueryFailure& qf,
+                                                      IQueryExecutor& exec) noexcept {
     assert(tx_status_ == 'I' || tx_status_ == 'T' || tx_status_ == 'E');
     bool read_only = false;
     CodecError ce;
@@ -115,7 +161,7 @@ ExtendedSession::TxStep ExtendedSession::tx_statement(std::string_view sql, int 
         } else {
             tx_status_ = 'T';
             tx_read_only_ = read_only;
-            tx_writes_ = 0;
+            tx_discard(0);
         }
         tag = "BEGIN";
         return TxStep::Tagged;
@@ -126,7 +172,7 @@ ExtendedSession::TxStep ExtendedSession::tx_statement(std::string_view sql, int 
         tag = rollback ? "ROLLBACK" : "COMMIT";
         return TxStep::Tagged;
     }
-    return tx_end(rollback, tag, qf);
+    return tx_end(rollback, tag, qf, exec);
 }
 
 namespace {
@@ -154,8 +200,8 @@ ExtendedSession::TxStep tx_fail(QueryFailure& qf, const char* sqlstate,
 
 }  // namespace
 
-// Savepoints mark a point in the block's write count: nothing is undone, so
-// ROLLBACK TO succeeds only when no write ran after the savepoint.
+// A savepoint marks a length of the block's write queue; ROLLBACK TO cuts
+// the queue back to it.
 ExtendedSession::TxStep ExtendedSession::tx_savepoint(TxCommand cmd, std::string_view word,
                                                       const char*& tag,
                                                       QueryFailure& qf) noexcept {
@@ -177,7 +223,7 @@ ExtendedSession::TxStep ExtendedSession::tx_savepoint(TxCommand cmd, std::string
         }
         Savepoint& s = savepoints_[n_savepoints_++];
         std::memcpy(s.name, name, sizeof(name));
-        s.writes = tx_writes_;
+        s.pending = n_pending_;
         tag = "SAVEPOINT";
         return TxStep::Tagged;
     }
@@ -189,28 +235,37 @@ ExtendedSession::TxStep ExtendedSession::tx_savepoint(TxCommand cmd, std::string
         tag = "RELEASE";
         return TxStep::Tagged;
     }
-    if (tx_writes_ > savepoints_[k - 1].writes) {
-        return tx_fail(qf, "0A000", "writes made after the savepoint were NOT rolled "
-                       "back: this endpoint has no transactions, every statement "
-                       "was applied when it ran");
-    }
+    tx_discard(savepoints_[k - 1].pending);
     n_savepoints_ = k;
     tx_status_ = 'T';
     tag = "ROLLBACK";
     return TxStep::Tagged;
 }
 
-bool ExtendedSession::tx_admit(std::string_view sql, QueryFailure& qf) noexcept {
+ExtendedSession::Admit ExtendedSession::tx_admit(std::string_view sql,
+                                                 QueryFailure& qf) noexcept {
     assert(tx_status_ != 'E');
-    if (tx_status_ != 'T' || is_query_shaped(sql)) return true;
+    if (tx_status_ != 'T') return Admit::Run;
+    if (is_query_shaped(sql)) return tx_read_blocked(qf) ? Admit::Failed : Admit::Run;
     if (tx_read_only_) {
         qf.sqlstate = "25006";
         qf.message  = "cannot execute a write in a read-only transaction";
-        return false;
+        return Admit::Failed;
     }
-    ++tx_writes_;
-    assert(tx_writes_ > 0);
-    return true;
+    const std::size_t used = n_pending_ == 0 ? 0
+        : static_cast<std::size_t>(tx_pending_[n_pending_ - 1].off) + tx_pending_[n_pending_ - 1].len;
+    if (n_pending_ == tx_pending_.size() || sql.size() > tx_pool_.size() - used) {
+        qf.sqlstate = "54000";
+        qf.message  = "this transaction block's queued writes exceed this endpoint's "
+                      "capacity; the block is aborted and nothing was applied";
+        return Admit::Failed;
+    }
+    std::memcpy(tx_pool_.data() + used, sql.data(), sql.size());
+    tx_pending_[n_pending_].off = static_cast<std::uint32_t>(used);
+    tx_pending_[n_pending_].len = static_cast<std::uint32_t>(sql.size());
+    ++n_pending_;
+    assert(n_pending_ <= tx_pending_.size());
+    return Admit::Deferred;
 }
 
 void ExtendedSession::on_simple_query() noexcept {
@@ -462,7 +517,7 @@ bool ExtendedSession::materialize(std::int32_t pi, int fd, MsgWriter& w,
     assert(p.used && !p.materialized);
     std::uint32_t count = 0;
     const std::string_view sql(portal_sql(pi), p.sql_len);
-    const TxStep ts = tx_statement(sql, fd, w, p.session_tag, qf);
+    const TxStep ts = tx_statement(sql, fd, w, p.session_tag, qf, exec);
     if (ts == TxStep::Failed) return false;
     if (ts == TxStep::Tagged) {
         p.field_count  = 0;
@@ -510,7 +565,14 @@ bool ExtendedSession::materialize(std::int32_t pi, int fd, MsgWriter& w,
         return true;
     }
     p.session_tag = nullptr;
-    if (!tx_admit(sql, qf)) return false;
+    const Admit ad = tx_admit(sql, qf);
+    if (ad == Admit::Failed) return false;
+    if (ad == Admit::Deferred) {
+        p.session_tag  = "OK";
+        p.field_count  = 0;
+        p.materialized = true;
+        return true;
+    }
     current_ = -1;
     if (!exec.execute(sql, fields, kMaxFields, count, qf)) return false;
     if (p.n_formats > 1 && p.n_formats != count) {
