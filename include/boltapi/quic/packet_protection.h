@@ -347,9 +347,16 @@ public:
     }
 
     // Bind the derived keys + select ciphers. Returns true on success.
+    // Re-initializing (Initial keys re-derived after Retry / VN) frees the
+    // previous contexts first.
     bool initialize(const PacketProtectionKeys& keys) noexcept {
         assert(keys.key_len == aead_key_length(keys.algorithm) && "key_len mismatch");
         assert(keys.hp_len == hp_key_length(keys.algorithm) && "hp_len mismatch");
+        if (encrypt_ctx_ != nullptr) EVP_CIPHER_CTX_free(encrypt_ctx_);
+        if (decrypt_ctx_ != nullptr) EVP_CIPHER_CTX_free(decrypt_ctx_);
+        if (hp_ctx_ != nullptr) EVP_CIPHER_CTX_free(hp_ctx_);
+        encrypt_ctx_ = decrypt_ctx_ = hp_ctx_ = nullptr;
+        initialized_ = false;
         keys_ = keys;
 
         const EVP_CIPHER* cipher = nullptr;

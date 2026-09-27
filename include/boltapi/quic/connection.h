@@ -1622,6 +1622,9 @@ private:
     // consuming `avail` would reach the FIN offset), or on a FIN-only frame.
     void deliver_stream(Stream& s) noexcept {
         const std::uint64_t id = s.id();
+        // The callback may write, reset and flush; the sweep that flush runs
+        // must not release the stream we are still delivering from.
+        delivering_ = &s;
         // The ring may wrap: at most two contiguous spans.
         for (std::size_t span = 0; span < 2; ++span) {
             const std::size_t n = s.recv_contiguous();
@@ -1632,6 +1635,7 @@ private:
             if ((n > 0 || fin) && on_stream_data_) on_stream_data_(id, p, n, fin);
             if (!more) break;
         }
+        delivering_ = nullptr;
         assert(s.in_use() && s.id() == id && "stream freed during delivery");
         if (s.needs_window_update(kConnFlowChunk / 2)) {
             s.grow_recv_window(kConnFlowChunk);
@@ -2596,6 +2600,7 @@ private:
             Stream& s = streams_[i];
             if (!s.in_use()) continue;
             s.refill();
+            if (&s == delivering_) continue;
             const std::uint64_t id = s.id();
             if (has_send_side(id) && !s.send_done()) continue;
             if (has_recv_side(id) && !s.recv_done()) continue;
@@ -2984,6 +2989,7 @@ private:
     std::uint64_t local_bidi_credit_ = 0;  // peer's MAX_STREAMS for our streams
     std::uint64_t local_uni_credit_ = 0;
     std::size_t rr_next_ = 0;  // round-robin start for STREAM framing
+    Stream* delivering_ = nullptr;  // stream whose data callback is running
 
     bolt::Arena stream_arena_;
 
