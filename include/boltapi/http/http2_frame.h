@@ -194,7 +194,7 @@ result<void> parse_headers_frame(
  * @param payload Frame payload (must be 5 bytes)
  * @return Priority spec or error
  */
-result<PrioritySpec> parse_priority_frame(const uint8_t* payload);
+result<PrioritySpec> parse_priority_frame(const uint8_t* payload, size_t payload_len);
 
 /**
  * Parse RST_STREAM frame payload (RFC 7540 Section 6.4)
@@ -202,7 +202,7 @@ result<PrioritySpec> parse_priority_frame(const uint8_t* payload);
  * @param payload Frame payload (must be 4 bytes)
  * @return Error code or error
  */
-result<ErrorCode> parse_rst_stream_frame(const uint8_t* payload);
+result<ErrorCode> parse_rst_stream_frame(const uint8_t* payload, size_t payload_len);
 
 /**
  * Parse SETTINGS frame payload (RFC 7540 Section 6.5)
@@ -224,7 +224,7 @@ result<std::vector<SettingsParameter>> parse_settings_frame(
  * @param payload Frame payload (must be 8 bytes)
  * @return 8-byte opaque data or error
  */
-result<uint64_t> parse_ping_frame(const uint8_t* payload);
+result<uint64_t> parse_ping_frame(const uint8_t* payload, size_t payload_len);
 
 /**
  * Parse GOAWAY frame payload (RFC 7540 Section 6.8)
@@ -250,7 +250,7 @@ result<void> parse_goaway_frame(
  * @param payload Frame payload (must be 4 bytes)
  * @return Window size increment or error
  */
-result<uint32_t> parse_window_update_frame(const uint8_t* payload);
+result<uint32_t> parse_window_update_frame(const uint8_t* payload, size_t payload_len);
 
 /**
  * Parse PUSH_PROMISE frame payload (RFC 7540 Section 6.6)

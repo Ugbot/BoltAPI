@@ -92,6 +92,16 @@ if(WIN32)
     target_link_libraries(boltapi_large_buffered_response_test PRIVATE ws2_32 mswsock)
 endif()
 
+# G2ETL-130: HPACK RFC 7541 Appendix C vectors + table/size-update regressions.
+boltapi_add_test(boltapi_hpack_test hpack_test.cpp)
+
+# G2ETL-114: TLS partial writes, peer reset (SIGPIPE), HTTP/2 framing and
+# flow control for large responses, over h2c and TLS.
+boltapi_add_test(boltapi_transport_robustness_test transport_robustness_test.cpp)
+if(WIN32)
+    target_link_libraries(boltapi_transport_robustness_test PRIVATE ws2_32 mswsock)
+endif()
+
 # G2ICE-215: Transfer-Encoding: chunked request bodies + Expect: 100-continue.
 boltapi_add_test(boltapi_chunked_request_body_test chunked_request_body_test.cpp)
 if(WIN32)
@@ -702,3 +712,20 @@ add_test(NAME boltapi_limits_lint
                  --baseline-dir scripts/limits_lint_baseline)
 add_test(NAME boltapi_limits_lint_selftest
          COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/limits_lint.py --self-test)
+
+# ---- h2spec (G2ETL-114) ------------------------------------------------------
+# HTTP/2 conformance judged by h2spec (docker summerwind/h2spec) against a real
+# server over h2c and TLS. SKIPs (77) without docker. Every failing case must
+# be listed, with its ticket, in h2spec_conformance.py.
+add_executable(boltapi_h2spec_server h2spec_server_main.cpp)
+target_link_libraries(boltapi_h2spec_server PRIVATE boltapi::boltapi)
+boltapi_apply_hardening(boltapi_h2spec_server)
+boltapi_apply_sanitizers(boltapi_h2spec_server)
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_EXECUTABLE)
+    add_test(NAME boltapi_h2spec_conformance
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/h2spec_conformance.py"
+                     "$<TARGET_FILE:boltapi_h2spec_server>")
+    set_tests_properties(boltapi_h2spec_conformance PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+endif()

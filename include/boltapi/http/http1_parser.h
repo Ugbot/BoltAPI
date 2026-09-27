@@ -182,9 +182,16 @@ public:
      * Check if parser is in error state.
      */
     bool has_error() const noexcept { return state_ == HTTP1State::ERROR; }
+
+    /**
+     * The last error was a request line whose version is not HTTP/ at all:
+     * the peer speaks another protocol, so no HTTP/1.1 400 is owed.
+     */
+    bool is_not_http() const noexcept { return not_http_; }
     
 private:
     HTTP1State state_;
+    bool not_http_{false};
     size_t pos_;  // Current position in buffer
     
     // Temporary state for multi-step parsing
@@ -235,6 +242,12 @@ private:
         HTTP1Request& req
     ) noexcept;
     
+    /**
+     * Content-Length / Transfer-Encoding / Connection / Upgrade from the
+     * parsed fields. 0 ok, 1 when the framing is ambiguous or malformed.
+     */
+    static int extract_framing(HTTP1Request& req) noexcept;
+
     /**
      * Parse URL components (path, query, fragment).
      */

@@ -29,6 +29,7 @@
 #include "boltapi/http/http1_connection.h"
 #include "boltapi/http/http2_connection.h"
 #include "boltapi/http/response_headers.h"
+#include "boltapi/http/sse.h"
 #include "boltapi/http/websocket.h"
 #include "boltapi/http/websocket_parser.h"
 #include <atomic>
@@ -282,15 +283,13 @@ using CoroSSEHandler = std::function<core::coro_task<void>(
  */
 class SSEWriter {
 public:
-    SSEWriter(net::IODispatcher& io, int fd) : io_(io), fd_(fd) {}
+    // A writer for the SSE connection on `fd`; over TLS it writes through the
+    // connection's TLS socket (the server registers it for the handler's life).
+    SSEWriter(net::IODispatcher& io, int fd) : io_(io), fd_(fd), tls_(sse_tls_for_fd(fd)) {}
 
     /**
-     * Send an SSE event with optional event type and ID.
-     * 
-     * @param event_type Event type (e.g., "message", "update")
-     * @param data Event data
-     * @param id Optional event ID
-     * @return Task that completes when data is sent
+     * Send an event. False if the event type or id holds a line break or NUL
+     * (it would split into forged fields), or the client went away.
      */
     core::coro_task<bool> send_event(
         const std::string& event_type,
@@ -298,57 +297,55 @@ public:
         const std::string& id = ""
     ) {
         std::string message;
-        if (!id.empty()) {
-            message += "id: " + id + "\n";
-        }
-        if (!event_type.empty()) {
-            message += "event: " + event_type + "\n";
-        }
-        
-        // Handle multi-line data
-        size_t pos = 0;
-        size_t prev = 0;
-        while ((pos = data.find('\n', prev)) != std::string::npos) {
-            message += "data: " + data.substr(prev, pos - prev) + "\n";
-            prev = pos + 1;
-        }
-        message += "data: " + data.substr(prev) + "\n";
-        message += "\n";  // End of event
-        
-        ssize_t result = co_await io_.async_write(fd_, message.data(), message.size());
-        co_return result > 0;
+        if (!sse_format_event(message, event_type, data, id)) co_return false;
+        co_return co_await write_all(message);
     }
 
-    /**
-     * Send a simple data-only event.
-     */
+    /** Send a data-only event. */
     core::coro_task<bool> send_data(const std::string& data) {
-        std::string message = "data: " + data + "\n\n";
-        ssize_t result = co_await io_.async_write(fd_, message.data(), message.size());
-        co_return result > 0;
+        std::string message;
+        sse_format_event(message, {}, data);
+        co_return co_await write_all(message);
     }
 
-    /**
-     * Send a comment (keep-alive).
-     */
+    /** Send a comment (keep-alive). */
     core::coro_task<bool> send_comment(const std::string& comment = "") {
-        std::string message = ": " + comment + "\n\n";
-        ssize_t result = co_await io_.async_write(fd_, message.data(), message.size());
-        co_return result > 0;
+        std::string message;
+        sse_format_comment(message, comment);
+        co_return co_await write_all(message);
     }
 
-    /**
-     * Send a retry interval hint to the client.
-     */
+    /** Send a retry interval hint to the client. */
     core::coro_task<bool> send_retry(int retry_ms) {
-        std::string message = "retry: " + std::to_string(retry_ms) + "\n\n";
-        ssize_t result = co_await io_.async_write(fd_, message.data(), message.size());
-        co_return result > 0;
+        std::string message;
+        if (!sse_format_retry(message, retry_ms)) co_return false;
+        co_return co_await write_all(message);
     }
+
+    // Server side: the TLS socket for an SSE connection's fd (nullptr = cleartext).
+    static void register_tls(int fd, net::CoroTlsSocket* tls) noexcept;
+    static void unregister_tls(int fd) noexcept;
 
 private:
+    static net::CoroTlsSocket* sse_tls_for_fd(int fd) noexcept;
+
+    // One write(2) may take only part of an event (G2ETL-70): loop until the
+    // whole event is out or the peer is gone.
+    core::coro_task<bool> write_all(const std::string& m) {
+        std::size_t off = 0;
+        for (std::size_t guard = 0; off < m.size() && guard <= m.size(); ++guard) {
+            const ssize_t n = tls_ != nullptr
+                ? co_await tls_->write(m.data() + off, m.size() - off)
+                : co_await io_.async_write(fd_, m.data() + off, m.size() - off);
+            if (n <= 0) co_return false;
+            off += static_cast<std::size_t>(n);
+        }
+        co_return off == m.size();
+    }
+
     net::IODispatcher& io_;
     int fd_;
+    net::CoroTlsSocket* tls_;
 };
 
 /**
@@ -411,6 +408,10 @@ struct CoroUnifiedServerConfig {
     // Body size limits
     size_t max_body_size = 10 * 1024 * 1024;  // Max request body size (10MB default)
     size_t max_header_size = 8192;            // Max header size (8KB default)
+
+    // HTTP/2 with prior knowledge on the cleartext port (RFC 9113 3.3): a
+    // connection opening with the h2 preface is served as HTTP/2.
+    bool enable_h2c = true;
 
     // Graceful shutdown configuration
     uint32_t shutdown_timeout_ms = 30000;   // Max time to wait for connections to drain (30s)
@@ -666,7 +667,10 @@ private:
     core::coro_task<void> handle_http1_connection(net::IODispatcher& io, int fd, net::CoroTlsSocket* tls);
 
     // HTTP/2 request handling loop
-    core::coro_task<void> handle_http2_connection(net::IODispatcher& io, int fd, net::CoroTlsSocket* tls);
+    // `initial` holds bytes already read from the socket (the h2c preface).
+    core::coro_task<void> handle_http2_connection(net::IODispatcher& io, int fd, net::CoroTlsSocket* tls,
+                                                  const uint8_t* initial = nullptr,
+                                                  size_t initial_len = 0);
 
     // WebSocket connection handler coroutine
     core::coro_task<void> handle_websocket_connection(

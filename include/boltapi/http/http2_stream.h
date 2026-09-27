@@ -303,6 +303,20 @@ class Http2Stream {
 public:
     // Allow StreamManager to access private members
     friend class StreamManager;
+    friend class Http2Connection;
+
+    // Connection-owned per-stream state (request validation + response pacing).
+    struct Io {
+        std::string send_buf;         // response body not yet framed
+        size_t send_off{0};
+        bool send_pending{false};     // headers out; body / END_STREAM outstanding
+        bool is_head{false};
+        bool has_content_length{false};
+        uint64_t content_length{0};
+        uint64_t body_received{0};
+        bool request_complete{false};
+    };
+    Io io;
 
     /**
      * Create stream.
