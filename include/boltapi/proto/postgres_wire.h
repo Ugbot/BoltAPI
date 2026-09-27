@@ -90,6 +90,10 @@ inline Status ok_status() noexcept { return Status(); }
 // A named failure, reported to the client as an ErrorResponse ('E'). `sqlstate`
 // is a 5-character PostgreSQL error code (see Appendix A of the Postgres
 // protocol docs); `message` is the human-readable detail.
+// SQLSTATE class 54 "program_limit_exceeded": the code a resource_exhausted
+// refusal maps to (a budget, a capacity, a statement-size bound).
+inline constexpr const char* kSqlStateProgramLimitExceeded = "54000";
+
 struct QueryFailure {
     const char* sqlstate = "XX000";               // internal_error, generic
     const char* message  = "query execution failed";

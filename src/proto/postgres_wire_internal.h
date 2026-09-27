@@ -5,6 +5,7 @@
 
 #include "boltapi/proto/postgres_wire.h"
 #include "boltapi/net/sys_compat.h"
+#include "bolt/bolt_resource.h"
 
 #include <atomic>
 #include <cassert>
@@ -272,7 +273,9 @@ inline bool put_row_description(MsgWriter& w, const FieldDesc* fields,
                                 std::uint32_t count,
                                 const std::int16_t* formats) noexcept {
     assert(fields != nullptr || count == 0);
-    assert(count <= kMaxFields);
+    // Release-enforced: the i16 count and the executor's field array are
+    // both bounded by kMaxFields; an executor reporting more is refused.
+    BOLT_BOUND_CHECK(count <= kMaxFields, false);
     w.begin('T');
     w.put_i16(static_cast<std::int16_t>(count));
     for (std::uint32_t c = 0; c < count; ++c) {   // bounded by kMaxFields

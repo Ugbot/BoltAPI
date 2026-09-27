@@ -21,6 +21,13 @@ boltapi_add_test(boltapi_util_fuzz_test util_fuzz_test.cpp)
 # have OOB'd the old fixed [16] per-node child array).
 boltapi_add_test(boltapi_router_fanout_test router_fanout_test.cpp)
 
+# G2CHK-330 (limits L2): resource_exhausted error code, 413/507 reason
+# phrases, SQLSTATE 54000, release-enforced RowDescription bound, limits table.
+boltapi_add_test(boltapi_limits_resource_exhausted_test limits_resource_exhausted_test.cpp)
+if(WIN32)
+    target_link_libraries(boltapi_limits_resource_exhausted_test PRIVATE ws2_32 mswsock)
+endif()
+
 # G2CHK-85: StreamManager (stream_id -> Http2Stream) off std::unordered_map
 # onto bolt::SwissTableGrowable + a stable-address pool. No prior test touched
 # StreamManager at all; this covers create/get/remove, pointer stability across
@@ -686,3 +693,12 @@ if(BOLTAPI_WITH_FLIGHT_SQL AND TARGET bolt::ingest)
                              PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
     endif()
 endif()
+
+# G2CHK-330 (limits L2): stack-array lint + literal-cap ratchet (same script
+# as bolt); the baselines in scripts/limits_lint_baseline only shrink.
+add_test(NAME boltapi_limits_lint
+         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/limits_lint.py
+                 --root ${CMAKE_CURRENT_SOURCE_DIR}/.. --src include --src src
+                 --baseline-dir scripts/limits_lint_baseline)
+add_test(NAME boltapi_limits_lint_selftest
+         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/limits_lint.py --self-test)
