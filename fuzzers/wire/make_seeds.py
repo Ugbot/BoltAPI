@@ -492,7 +492,34 @@ def webrtc_seeds():
         rec(7, struct.pack(">HHI", 1, 3, 0x00000100) + b"\x20\x03\x04\x04\x04\0\0\0"))
 
 
+def dtls_seeds():
+    """A real DTLS 1.2 ClientHello captured from `openssl s_client` (skipped
+    when openssl is absent)."""
+    import shutil
+    import socket
+    import subprocess
+    if shutil.which("openssl") is None:
+        return
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("127.0.0.1", 0))
+    s.settimeout(5)
+    p = subprocess.Popen(["openssl", "s_client", "-dtls1_2", "-connect",
+                          "127.0.0.1:%d" % s.getsockname()[1], "-use_srtp",
+                          "SRTP_AES128_CM_SHA1_80"], stdin=subprocess.PIPE,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        d, _ = s.recvfrom(4096)
+    except socket.timeout:
+        return
+    finally:
+        p.kill()
+    rec = lambda peer: bytes([peer]) + struct.pack(">H", len(d)) + d
+    put("dtls", "client_hello", b"\0" + rec(1) + rec(2) + rec(1))
+    put("dtls", "client_hello_fp", b"\1" + rec(1) + rec(2) + rec(1))
+
+
 def main():
+    dtls_seeds()
     pg_seeds()
     neo4j_seeds()
     flight_seeds()

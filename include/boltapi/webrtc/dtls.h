@@ -322,17 +322,23 @@ private:
         sockaddr_storage             addr{};
         int                          addr_len = 0;
         bool                         used = false;
+        std::uint64_t                seq = 0;   // creation order, for eviction
         std::unique_ptr<DtlsSession> session;
     };
 
     Entry* lookup(const sockaddr* peer, int peer_len) noexcept;
+    // A free slot, else the oldest slot whose session is not Established
+    // (strangers can churn handshakes, never displace a connected peer).
+    Entry* claim_slot() noexcept;
+    void release(Entry& e) noexcept;
 
     const DtlsContext* ctx_       = nullptr;  // borrowed
     net::UdpTransport* transport_ = nullptr;  // borrowed
     std::string        offer_fingerprint_;
 
-    Entry       entries_[kMaxPeers]{};
-    std::size_t count_ = 0;
+    Entry         entries_[kMaxPeers]{};
+    std::size_t   count_ = 0;
+    std::uint64_t next_seq_ = 0;
 };
 
 }  // namespace webrtc
