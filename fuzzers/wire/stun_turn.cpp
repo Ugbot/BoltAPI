@@ -206,5 +206,6 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
                 break;
         }
     }
+    boltapi_fuzz::check_fd_leak();
     return 0;
 }

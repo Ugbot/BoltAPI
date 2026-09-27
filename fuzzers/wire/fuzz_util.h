@@ -10,6 +10,10 @@
 #include <thread>
 
 #if !defined(_WIN32)
+#include <fcntl.h>
+#endif
+
+#if !defined(_WIN32)
 #include <signal.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -59,6 +63,36 @@ struct Input {
 };
 
 #if !defined(_WIN32)
+// Open descriptors below `cap` (the fuzz lock caps RLIMIT_NOFILE at 1024).
+inline int count_open_fds(int cap = 1024) noexcept {
+    assert(cap > 0 && cap <= 65536);
+    int n = 0;
+    for (int fd = 0; fd < cap; ++fd) {
+        if (::fcntl(fd, F_GETFD) != -1) ++n;
+    }
+    assert(n <= cap);
+    return n;
+}
+
+// Leak self-check: call once per input. The baseline is taken after warm-up
+// (statics open their sockets on the first inputs); every 256 inputs the
+// descriptor count must not have grown past it.
+inline void check_fd_leak() noexcept {
+    static unsigned long calls = 0;
+    static int baseline = -1;
+    ++calls;
+    if (calls == 64) baseline = count_open_fds();
+    if (baseline < 0 || calls % 256 != 0) return;
+    const int now = count_open_fds();
+    if (now > baseline + 8) {
+        std::fprintf(stderr, "FUZZ_CHECK failed: fd leak %d -> %d after %lu inputs\n",
+                     baseline, now, calls);
+        std::abort();
+    }
+}
+#endif
+
+#if !defined(_WIN32)
 // Serve `data` as one client connection: `serve(fd)` runs on this thread
 // against a socketpair whose peer writes the input, half-closes, and drains
 // every reply until the server side closes.
@@ -95,6 +129,7 @@ void run_session(const std::uint8_t* data, std::size_t size, Serve&& serve) {
     writer.join();
     reader.join();
     ::close(client);
+    check_fd_leak();
 }
 #endif
 

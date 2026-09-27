@@ -68,5 +68,6 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     const auto* fa = reinterpret_cast<const sockaddr*>(&fresh);
     mgr->feed(fa, sizeof(fresh), kHello, sizeof(kHello));
     FUZZ_CHECK(mgr->find(fa, sizeof(fresh)) != nullptr);
+    boltapi_fuzz::check_fd_leak();
     return 0;
 }
