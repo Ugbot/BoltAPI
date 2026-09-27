@@ -304,6 +304,10 @@ TEST(Http3App, ServesRequestsThroughAppRouter) {
         // Echo the request body back verbatim.
         res.status(200).content_type("application/octet-stream").send(req.body());
     });
+    // Larger than a stream's (non-reclaimed) send buffer.
+    app.get("/big", [](api::Request&, api::Response& res) {
+        res.status(200).send(std::string(300 * 1024, 'x'));
+    });
     // build_dispatch runs on start_background; we drive dispatch_http3 directly.
     const std::uint16_t port = pick_free_port();
     ASSERT_NE(port, 0) << "no free port";
@@ -335,6 +339,16 @@ TEST(Http3App, ServesRequestsThroughAppRouter) {
         EXPECT_EQ(status, 200u);
         ASSERT_EQ(body.size(), payload.size()) << "echo body length mismatch";
         EXPECT_EQ(body, payload) << "echo body not byte-exact";
+    }
+
+    // ---- A body the stream cannot hold is a 500, never a truncated 200 ----
+    {
+        std::uint16_t status = 0;
+        std::string body;
+        ASSERT_TRUE(round_trip(p, "GET", "/big", "", status, body))
+            << "no HTTP/3 response for GET /big";
+        EXPECT_EQ(status, 500u);
+        EXPECT_TRUE(body.empty());
     }
 
     // ---- A 404 path proves routing (negative space) ----------------------

@@ -540,6 +540,13 @@ public:
         return n;
     }
 
+    // Bytes stream_write() can still queue on `id` (0 if the pool is full).
+    std::size_t stream_send_space(std::uint64_t id) noexcept {
+        assert(id <= kVarIntMax && "stream id out of range");
+        const Stream* s = get_or_create_stream(id);
+        return s == nullptr ? 0 : s->send_space();
+    }
+
     NewRenoCongestion& congestion() noexcept { return cc_; }
     const NewRenoCongestion& congestion() const noexcept { return cc_; }
     const RttEstimator& rtt() const noexcept { return rtt_; }

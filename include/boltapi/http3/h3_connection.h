@@ -200,6 +200,15 @@ public:
         assert(qc_ != nullptr && "send_response before attach");
         assert(status >= 100 && status < 600 && "implausible HTTP status");
         const bool no_body = (body == nullptr || body_len == 0);
+        // The stream's send buffer is bounded and not reclaimed on ACK; a body
+        // that cannot fit is refused with a 500, never sent truncated.
+        const std::size_t need = kH3MaxHeaderBytes + 2 * kFrameHeaderMaxBytes + body_len;
+        if (!no_body && (body_len > kH3MaxBodyBytes ||
+                         need > qc_->stream_send_space(stream_id))) {
+            (void)write_headers(stream_id, /*is_response=*/true, 500, {}, {}, {}, {},
+                                nullptr, 0, /*fin=*/true);
+            return false;
+        }
         if (!write_headers(stream_id, /*is_response=*/true, status, {}, {}, {}, {},
                            headers, header_count, no_body)) {
             return false;
@@ -531,15 +540,16 @@ private:
         const std::size_t hn = frame_write_header(
             static_cast<std::uint64_t>(FrameType::kData), len, hdr, sizeof(hdr));
         if (hn == 0) return false;
-        qc_->stream_write(sid, hdr, hn, /*fin=*/false);
+        if (qc_->stream_write(sid, hdr, hn, /*fin=*/false) != hn) return false;
         std::size_t off = 0;
         for (std::size_t i = 0; off < len && i < (kH3MaxBodyBytes /
              kH3WriteChunk) + 2; ++i) {
             const std::size_t chunk = (len - off < kH3WriteChunk) ? (len - off)
                                                                   : kH3WriteChunk;
             const bool last = (off + chunk == len);
-            qc_->stream_write(sid, body + off, chunk, last && fin);
-            off += chunk;
+            const std::size_t w = qc_->stream_write(sid, body + off, chunk, last && fin);
+            off += w;
+            if (w != chunk) break;  // buffer full: fail, never FIN a short body
         }
         return off == len;
     }
@@ -555,9 +565,8 @@ private:
         const std::size_t hn = frame_write_header(static_cast<std::uint64_t>(type),
                                                   plen, hdr, sizeof(hdr));
         if (hn == 0) return false;
-        qc_->stream_write(sid, hdr, hn, /*fin=*/false);
-        qc_->stream_write(sid, payload, plen, fin);
-        return true;
+        if (qc_->stream_write(sid, hdr, hn, /*fin=*/false) != hn) return false;
+        return qc_->stream_write(sid, payload, plen, fin) == plen;
     }
 
     void send_uni_prefix(std::uint64_t sid, UniStreamType type) noexcept {
