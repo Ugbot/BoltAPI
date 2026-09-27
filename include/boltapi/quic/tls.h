@@ -40,6 +40,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <vector>
 
 #include <openssl/core_dispatch.h>
@@ -227,6 +228,32 @@ inline void trace_server_cert_info() noexcept {
 #endif
 }
 
+// ----------------------------------------------------------------------------
+// Server identity from PEM files (e.g. an operator or interop-runner cert).
+// Set before the first server handshake; later calls have no effect because
+// the shared server context is built once.
+// ----------------------------------------------------------------------------
+struct ServerIdentityFiles {
+    char cert[512] = {};
+    char key[512] = {};
+};
+inline ServerIdentityFiles& server_identity_files() noexcept {
+    static ServerIdentityFiles files;
+    return files;
+}
+inline bool set_server_identity_files(const char* cert_pem,
+                                      const char* key_pem) noexcept {
+    assert(cert_pem != nullptr && key_pem != nullptr && "identity files: null");
+    ServerIdentityFiles& f = server_identity_files();
+    const std::size_t cl = std::strlen(cert_pem);
+    const std::size_t kl = std::strlen(key_pem);
+    if (cl == 0 || kl == 0 || cl >= sizeof(f.cert) || kl >= sizeof(f.key)) return false;
+    std::memcpy(f.cert, cert_pem, cl + 1);
+    std::memcpy(f.key, key_pem, kl + 1);
+    assert(f.cert[cl] == 0 && f.key[kl] == 0 && "identity paths unterminated");
+    return true;
+}
+
 // ============================================================================
 // QuicTls — drives one side (client or server) of the TLS 1.3 QUIC handshake
 // via the OpenSSL QUIC-TLS callbacks, buffering CRYPTO data per level and
@@ -239,6 +266,37 @@ public:
     ~QuicTls() {
         if (ssl_ != nullptr) SSL_free(ssl_);
         if (owns_ctx_ && ctx_ != nullptr) SSL_CTX_free(ctx_);
+    }
+
+    // Server: ALPN protocols accepted, in preference order (wire format).
+    bool set_server_alpn(const std::uint8_t* protos, std::size_t len) noexcept {
+        assert(is_server_ && "set_server_alpn: client role");
+        assert(protos != nullptr && "set_server_alpn: null list");
+        if (len == 0 || len > sizeof(server_alpn_)) return false;
+        std::memcpy(server_alpn_, protos, len);
+        server_alpn_len_ = len;
+        return true;
+    }
+
+    // Server: called with the ALPN the moment it is selected (ClientHello
+    // processing, before EncryptedExtensions carry our transport params).
+    void set_alpn_hook(std::function<void(const std::uint8_t*, std::size_t)> fn) noexcept {
+        assert(is_server_ && "alpn hook: client role");
+        alpn_hook_ = std::move(fn);
+    }
+
+    // Server: accept 0-RTT on resumed connections (RFC 9001 §4.6).
+    bool enable_early_data() noexcept {
+        assert(ssl_ != nullptr && "enable_early_data before init");
+        assert(is_server_ && "enable_early_data: client role");
+        // QUIC tickets allow unlimited early data (RFC 9001 §4.6.1).
+        return SSL_set_max_early_data(ssl_, 0xffffffffu) == 1 &&
+               SSL_set_quic_tls_early_data_enabled(ssl_, 1) == 1;
+    }
+    // True once TLS accepted the client's early data.
+    bool early_data_accepted() const noexcept {
+        return ssl_ != nullptr &&
+               SSL_get_early_data_status(ssl_) == SSL_EARLY_DATA_ACCEPTED;
     }
 
     QuicTls(const QuicTls&) = delete;
@@ -284,37 +342,76 @@ public:
     bool configure_ctx_common() noexcept {
         assert(ctx_ != nullptr && "configure_ctx_common: null ctx");
         assert(owns_ctx_ && "configure_ctx_common: ctx not owned");
-        SSL_CTX_set_min_proto_version(ctx_, TLS1_3_VERSION);
-        SSL_CTX_set_max_proto_version(ctx_, TLS1_3_VERSION);
-        // Honour OUR order (server preference) and put the SHA-256 suite first so
-        // the negotiated suite is stable across OpenSSL default-order changes.
-        SSL_CTX_set_options(ctx_, SSL_OP_CIPHER_SERVER_PREFERENCE);
-        return SSL_CTX_set_ciphersuites(
-                   ctx_,
-                   "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:"
-                   "TLS_CHACHA20_POLY1305_SHA256") == 1;
+        return configure_ctx(ctx_);
     }
 
+    static bool configure_ctx(SSL_CTX* ctx) noexcept {
+        assert(ctx != nullptr && "configure_ctx: null ctx");
+        SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
+        SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
+        // Honour OUR order (server preference) and put the SHA-256 suite first so
+        // the negotiated suite is stable across OpenSSL default-order changes.
+        SSL_CTX_set_options(ctx, SSL_OP_CIPHER_SERVER_PREFERENCE);
+        const bool ok = SSL_CTX_set_ciphersuites(
+                            ctx,
+                            "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:"
+                            "TLS_CHACHA20_POLY1305_SHA256") == 1;
+        assert(SSL_CTX_get_min_proto_version(ctx) == TLS1_3_VERSION && "tls13 only");
+        return ok;
+    }
+
+    // Every server connection shares one SSL_CTX so session tickets issued on
+    // one connection decrypt on the next (resumption, RFC 8446 §2.2).
     bool init_server() noexcept {
         is_server_ = true;
-        ctx_ = SSL_CTX_new(TLS_method());
+        ctx_ = shared_server_ctx();
         if (ctx_ == nullptr) return false;
-        owns_ctx_ = true;
-        if (!configure_ctx_common()) return false;
+        owns_ctx_ = false;
+        return finish_init();
+    }
 
-        // Use the PROCESS-STABLE identity so every connection presents the same
-        // cert (a WebTransport client pins its hash via serverCertificateHashes).
-        // Borrowed pointers — SSL_CTX_use_* take their own refs; do NOT free here.
+    static SSL_CTX* shared_server_ctx() noexcept {
+        static SSL_CTX* const ctx = build_server_ctx();
+        return ctx;
+    }
+
+    static SSL_CTX* build_server_ctx() noexcept {
+        SSL_CTX* ctx = SSL_CTX_new(TLS_method());
+        if (ctx == nullptr) return nullptr;
+        if (!configure_ctx(ctx) || !load_server_identity(ctx)) {
+            SSL_CTX_free(ctx);
+            return nullptr;
+        }
+        // No early data unless a connection opts in (enable_early_data): a
+        // ticket that advertises it invites 0-RTT we would then reject.
+        SSL_CTX_set_max_early_data(ctx, 0);
+        // Stateless tickets: OpenSSL's anti-replay would switch to stateful
+        // tickets. 0-RTT requests are replayable; the App only enables early
+        // data by explicit opt-in (idempotent routes).
+        SSL_CTX_set_options(ctx, SSL_OP_NO_ANTI_REPLAY);
+        SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_SERVER);
+        SSL_CTX_set_alpn_select_cb(ctx, &QuicTls::alpn_select_cb, nullptr);
+        assert(SSL_CTX_get_max_early_data(ctx) == 0 && "early data off by default");
+        return ctx;
+    }
+
+    // Configured PEM files, else the PROCESS-STABLE self-signed identity (a
+    // WebTransport client pins its hash via serverCertificateHashes).
+    static bool load_server_identity(SSL_CTX* ctx) noexcept {
+        assert(ctx != nullptr && "load_server_identity: null ctx");
+        const ServerIdentityFiles& f = server_identity_files();
+        if (f.cert[0] != 0 && f.key[0] != 0) {
+            return SSL_CTX_use_certificate_chain_file(ctx, f.cert) == 1 &&
+                   SSL_CTX_use_PrivateKey_file(ctx, f.key, SSL_FILETYPE_PEM) == 1 &&
+                   SSL_CTX_check_private_key(ctx) == 1;
+        }
+        // Borrowed pointers — SSL_CTX_use_* take their own refs.
         X509* cert = nullptr;
         EVP_PKEY* key = nullptr;
         if (!shared_server_identity(&cert, &key)) return false;
-        const bool loaded = SSL_CTX_use_certificate(ctx_, cert) == 1 &&
-                            SSL_CTX_use_PrivateKey(ctx_, key) == 1 &&
-                            SSL_CTX_check_private_key(ctx_) == 1;
-        if (!loaded) return false;
-
-        SSL_CTX_set_alpn_select_cb(ctx_, &QuicTls::alpn_select_cb, this);
-        return finish_init();
+        return SSL_CTX_use_certificate(ctx, cert) == 1 &&
+               SSL_CTX_use_PrivateKey(ctx, key) == 1 &&
+               SSL_CTX_check_private_key(ctx) == 1;
     }
 
     bool init_client() noexcept {
@@ -429,7 +526,12 @@ public:
         }
         const int rc = SSL_do_handshake(ssl_);
         if (rc == 1) {
-            complete_ = true;
+            // A server accepting early data returns 1 once its own flight is
+            // out; the handshake completes only with the client's Finished,
+            // which is what yields the 1-RTT read secret (RFC 9001 §4.1.2).
+            complete_ = !is_server_ ||
+                        levels_[static_cast<std::size_t>(TlsLevel::kApplication)]
+                                .read_secret_len > 0;
             return true;
         }
         const int err = SSL_get_error(ssl_, rc);
@@ -527,12 +629,7 @@ public:
         if (ssl_ == nullptr) return AeadAlgorithm::kAes128Gcm;
         const SSL_CIPHER* c = SSL_get_current_cipher(ssl_);
         if (c == nullptr) return AeadAlgorithm::kAes128Gcm;
-        switch (SSL_CIPHER_get_id(c) & 0xFFFF) {
-            case 0x1302: return AeadAlgorithm::kAes256Gcm;
-            case 0x1303: return AeadAlgorithm::kChaCha20Poly1305;
-            case 0x1301:
-            default: return AeadAlgorithm::kAes128Gcm;
-        }
+        return aead_from_cipher_id(SSL_CIPHER_get_id(c));
     }
 
     SSL* ssl() const noexcept { return ssl_; }
@@ -542,6 +639,7 @@ private:
     bool finish_init() noexcept {
         ssl_ = SSL_new(ctx_);
         if (ssl_ == nullptr) return false;
+        SSL_set_app_data(ssl_, this);  // alpn_select_cb finds our preferences
         if (is_server_) {
             SSL_set_accept_state(ssl_);
         } else {
@@ -561,7 +659,27 @@ private:
     // (RFC 9001 §5.2); other levels follow the negotiated cipher.
     AeadAlgorithm aead_for_level(TlsLevel level) const noexcept {
         if (level == TlsLevel::kInitial) return AeadAlgorithm::kAes128Gcm;
+        if (level == TlsLevel::kEarlyData) return early_aead_algorithm();
         return aead_algorithm();
+    }
+
+    // 0-RTT keys follow the resumed session's suite (the handshake has not
+    // negotiated one yet when they are yielded).
+    AeadAlgorithm early_aead_algorithm() const noexcept {
+        assert(ssl_ != nullptr && "early aead before init");
+        const SSL_SESSION* sess = SSL_get_session(ssl_);
+        const SSL_CIPHER* c = sess != nullptr ? SSL_SESSION_get0_cipher(sess) : nullptr;
+        if (c == nullptr) c = SSL_get_current_cipher(ssl_);
+        if (c == nullptr) return AeadAlgorithm::kAes128Gcm;
+        return aead_from_cipher_id(SSL_CIPHER_get_id(c));
+    }
+
+    static AeadAlgorithm aead_from_cipher_id(unsigned long id) noexcept {
+        switch (id & 0xFFFF) {
+            case 0x1302: return AeadAlgorithm::kAes256Gcm;
+            case 0x1303: return AeadAlgorithm::kChaCha20Poly1305;
+            default: return AeadAlgorithm::kAes128Gcm;
+        }
     }
 
     // Derive + initialize a PacketProtection from a freshly yielded secret.
@@ -657,14 +775,16 @@ private:
         const std::size_t copy =
             secret_len <= kMaxSecretLength ? secret_len : kMaxSecretLength;
         const bool is_read = (direction == kQuicTlsDirRead);
+        // 0-RTT carries no CRYPTO: its secret never moves the CRYPTO level.
+        const bool early = (level == TlsLevel::kEarlyData);
         if (is_read) {
             std::memcpy(ls.read_secret.data(), secret, copy);
             ls.read_secret_len = copy;
-            self->read_level_idx_ = idx;  // we now read at this level
+            if (!early) self->read_level_idx_ = idx;  // we now read at this level
         } else {
             std::memcpy(ls.write_secret.data(), secret, copy);
             ls.write_secret_len = copy;
-            self->write_level_idx_ = idx;  // we now write at this level
+            if (!early) self->write_level_idx_ = idx;  // we now write at this level
         }
         // Drive wave-2 packet protection from the secret. Both SHA-256 (32B)
         // and SHA-384 (48B, TLS_AES_256_GCM_SHA384) suites are wired — the hash
@@ -697,24 +817,50 @@ private:
         return 1;
     }
 
-    // Server-side ALPN selection: prefer "h3".
-    static int alpn_select_cb(SSL* /*ssl*/, const unsigned char** out,
+    // Server-side ALPN selection: the first of OUR preferences the client
+    // offered (default "h3").
+    static int alpn_select_cb(SSL* ssl, const unsigned char** out,
                               unsigned char* outlen, const unsigned char* in,
                               unsigned int inlen, void* /*arg*/) noexcept {
-        static const unsigned char kH3[] = {'h', '3'};
-        const unsigned char* p = in;
-        const unsigned char* end = in + inlen;
-        while (p < end) {
-            const unsigned int l = *p++;
-            if (p + l > end) break;
-            if (l == sizeof(kH3) && std::memcmp(p, kH3, sizeof(kH3)) == 0) {
-                *out = p;
-                *outlen = static_cast<unsigned char>(l);
+        assert(out != nullptr && outlen != nullptr && "alpn cb: null out");
+        auto* self = static_cast<QuicTls*>(SSL_get_app_data(ssl));
+        static const unsigned char kH3[] = {2, 'h', '3'};
+        const unsigned char* pref = kH3;
+        std::size_t pref_len = sizeof(kH3);
+        if (self != nullptr && self->server_alpn_len_ > 0) {
+            pref = self->server_alpn_;
+            pref_len = self->server_alpn_len_;
+        }
+        const unsigned char* q = pref;
+        for (std::size_t i = 0; i < pref_len && q < pref + pref_len; ++i) {
+            const unsigned int ql = *q++;
+            if (q + ql > pref + pref_len) break;
+            const unsigned char* sel = alpn_find(in, inlen, q, ql);
+            if (sel != nullptr) {
+                *out = sel;
+                *outlen = static_cast<unsigned char>(ql);
+                if (self != nullptr && self->alpn_hook_) self->alpn_hook_(sel, ql);
                 return SSL_TLSEXT_ERR_OK;
             }
-            p += l;
+            q += ql;
         }
         return SSL_TLSEXT_ERR_NOACK;  // tolerate no-ALPN in the self-test
+    }
+
+    // Find protocol `p` (length `pl`) in a client's wire-format ALPN list.
+    static const unsigned char* alpn_find(const unsigned char* in, unsigned int inlen,
+                                          const unsigned char* p,
+                                          unsigned int pl) noexcept {
+        assert(p != nullptr && "alpn_find: null proto");
+        const unsigned char* c = in;
+        const unsigned char* end = in + inlen;
+        for (unsigned int i = 0; i < inlen && c < end; ++i) {
+            const unsigned int l = *c++;
+            if (c + l > end) return nullptr;
+            if (l == pl && std::memcmp(c, p, l) == 0) return c;
+            c += l;
+        }
+        return nullptr;
     }
 
     // The dispatch table (static, shared). function_id ordering is irrelevant;
@@ -761,6 +907,11 @@ private:
     // SSL_set_quic_tls_transport_params).
     std::uint8_t local_tp_[kMaxTransportParamsBytes] = {};
     std::size_t local_tp_len_ = 0;
+
+    // Server ALPN preference list (wire format); empty = {"h3"}.
+    std::uint8_t server_alpn_[64] = {};
+    std::size_t server_alpn_len_ = 0;
+    std::function<void(const std::uint8_t*, std::size_t)> alpn_hook_;
 };
 
 }  // namespace bolt::api::quic

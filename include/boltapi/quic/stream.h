@@ -24,6 +24,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <string>
+#include <utility>
 
 #include "boltapi/quic/frames.h"
 #include "boltapi/quic/varint.h"
@@ -34,9 +36,9 @@ namespace bolt::api::quic {
 // Named bounds (Tiger Style).
 // ----------------------------------------------------------------------------
 
-// Per-stream send + receive buffer. The gate transfers a multi-KB message; this
-// comfortably holds it without regrowth (no std::vector). Bounded to keep the
-// Stream object a fixed size.
+// Per-stream send + receive ring. Acknowledged send bytes and read receive
+// bytes leave it, so a stream carries any length; this bounds what is in
+// flight / buffered at once (the receive window never exceeds it).
 inline constexpr std::size_t kStreamBufferSize = 256 * 1024;
 
 // Max distinct out-of-order extents we track on the receive side before the gap
@@ -44,11 +46,10 @@ inline constexpr std::size_t kStreamBufferSize = 256 * 1024;
 // the lossy variant never approach this.
 inline constexpr std::size_t kMaxRecvExtents = 32;
 
-// Max concurrently live streams per connection (fixed pool; SwissTable maps
-// id -> index). The gate uses one; H3 will raise this in wave 5b. The pool is
-// arena-allocated (each Stream carries large fixed buffers), so this bounds the
-// arena footprint, not the connection object size.
-inline constexpr std::size_t kMaxStreams = 16;
+// Max concurrently live streams per connection (fixed pool, slots reused once
+// both directions finish). A slot's two rings are allocated the first time it
+// is used, so memory follows peak concurrency (<= 2 * kStreamBufferSize each).
+inline constexpr std::size_t kMaxStreams = 64;
 
 // Stream-id helpers (RFC 9000 §2.1).
 inline constexpr std::uint64_t kStreamInitiatorBit = 0x1;  // 0 client / 1 server
@@ -110,17 +111,48 @@ class Stream {
 public:
     Stream() noexcept = default;
 
+    // The rings live outside the Stream (the connection allocates them the
+    // first time a pool slot is used and keeps them across reuse).
+    void attach_buffers(std::uint8_t* send_ring, std::uint8_t* recv_ring) noexcept {
+        assert(send_ring != nullptr && recv_ring != nullptr && "null stream ring");
+        assert(!in_use_ && "attach on a live stream");
+        send_buf_ = send_ring;
+        recv_buf_ = recv_ring;
+    }
+    bool has_buffers() const noexcept { return send_buf_ != nullptr; }
+
     void open(std::uint64_t id, std::uint64_t init_send_max,
               std::uint64_t init_recv_max) noexcept {
         assert(id <= kVarIntMax && "stream id overflow");
+        assert(has_buffers() && "open without rings");
         assert(init_recv_max <= kStreamBufferSize && "recv window > buffer");
+        assert(!in_use_ && "open on a live stream");
         id_ = id;
         in_use_ = true;
         send_st_ = SendState::kReady;
         recv_st_ = RecvState::kRecv;
+        flow_ = StreamFlow{};
         flow_.send_max = init_send_max;
         flow_.recv_max = init_recv_max;
         bidi_ = stream_is_bidi(id);
+    }
+
+    // Return the slot to the pool: drop queued/pending bytes, reset cursors.
+    // Buffers are left as-is (never read below the reset cursors).
+    void release() noexcept {
+        assert(in_use_ && "release of a free stream");
+        std::string().swap(pending_);
+        id_ = 0; in_use_ = false; bidi_ = true;
+        send_st_ = SendState::kReady; recv_st_ = RecvState::kRecv;
+        flow_ = StreamFlow{};
+        send_base_ = send_end_ = send_sent_ = flow_counted_ = 0;
+        ack_ext_.count = 0;
+        want_fin_ = fin_sent_ = fin_acked_ = false;
+        pending_off_ = 0; pending_fin_ = false;
+        recv_cursor_ = read_cursor_ = fin_off_ = 0;
+        have_fin_ = fin_notified_ = window_dirty_ = recv_reset_ = false;
+        recv_ext_.count = 0;
+        assert(!in_use_ && pending_.empty() && "release left the slot live");
     }
 
     bool in_use() const noexcept { return in_use_; }
@@ -132,84 +164,170 @@ public:
     const StreamFlow& flow() const noexcept { return flow_; }
 
     // ---- send side -------------------------------------------------------
-    // Queue application bytes; mark FIN if requested. Bounded by the buffer.
-    // Returns bytes queued (may be < len if the buffer is near full).
+    // The send buffer is a ring over absolute offsets [send_base_, send_end_):
+    // bytes leave it once acknowledged, so a stream carries any length.
+
+    // Queue bytes; FIN only once every byte is queued. Returns bytes queued.
     std::size_t write(const std::uint8_t* data, std::size_t len, bool fin) noexcept {
         assert((data != nullptr || len == 0) && "stream write null");
         assert(send_st_ != SendState::kResetSent && "write after reset");
-        std::size_t space = kStreamBufferSize - send_buf_len_;
-        std::size_t n = (len < space) ? len : space;
-        if (n > 0) { std::memcpy(send_buf_ + send_buf_len_, data, n); send_buf_len_ += n; }
-        // FIN only once every byte is queued: a short write must not end the
-        // stream on a truncated body.
+        if (!pending_empty()) return 0;  // order: pending bytes go first
+        const std::size_t n = ring_put(data, len);
         if (fin && n == len) want_fin_ = true;
         if (send_st_ == SendState::kReady && (n > 0 || want_fin_)) send_st_ = SendState::kSend;
-        assert(n <= len && send_buf_len_ <= kStreamBufferSize);
+        assert(n <= len && send_end_ - send_base_ <= kStreamBufferSize);
         return n;
     }
 
-    // Bytes write() can still accept. The buffer is not reclaimed on ACK, so
-    // this bounds the whole stream's send side.
-    std::size_t send_space() const noexcept {
-        assert(send_buf_len_ <= kStreamBufferSize && "send buffer overrun");
-        return kStreamBufferSize - send_buf_len_;
+    // Queue ALL of `body` (+FIN): what fits goes to the ring now, the rest is
+    // held and moved in as acknowledgements free ring space.
+    void write_owned(std::string&& body, bool fin) noexcept {
+        assert(send_st_ != SendState::kResetSent && "write after reset");
+        assert(pending_empty() && "write_owned over pending bytes");
+        pending_ = std::move(body);
+        pending_off_ = 0;
+        pending_fin_ = fin;
+        if (send_st_ == SendState::kReady) send_st_ = SendState::kSend;
+        refill();
+        assert(pending_off_ <= pending_.size() && "pending cursor overrun");
     }
 
-    // Bytes still queued and unsent (above send_acked_/send_sent_ frontier).
+    bool pending_empty() const noexcept {
+        return pending_off_ >= pending_.size() && !pending_fin_;
+    }
+    std::size_t pending_bytes() const noexcept {
+        assert(pending_off_ <= pending_.size() && "pending cursor overrun");
+        return pending_.size() - pending_off_;
+    }
+
+    // Move held bytes into freed ring space. Returns bytes moved.
+    std::size_t refill() noexcept {
+        if (pending_empty()) return 0;
+        const std::size_t left = pending_.size() - pending_off_;
+        const std::size_t n = ring_put(
+            reinterpret_cast<const std::uint8_t*>(pending_.data()) + pending_off_, left);
+        pending_off_ += n;
+        if (pending_off_ == pending_.size()) {
+            if (pending_fin_) want_fin_ = true;
+            pending_fin_ = false;
+            std::string().swap(pending_);
+            pending_off_ = 0;
+        }
+        assert(pending_off_ <= pending_.size() && "refill overran");
+        return n;
+    }
+
+    // Bytes write() can accept now.
+    std::size_t send_space() const noexcept {
+        assert(send_end_ - send_base_ <= kStreamBufferSize && "send ring overrun");
+        if (!pending_empty()) return 0;
+        return kStreamBufferSize - static_cast<std::size_t>(send_end_ - send_base_);
+    }
+
     std::size_t unsent() const noexcept {
-        assert(send_sent_ <= send_buf_len_ && "sent past buffered");
-        return send_buf_len_ - send_sent_;
+        assert(send_sent_ <= send_end_ && "sent past buffered");
+        return static_cast<std::size_t>(send_end_ - send_sent_);
     }
     bool fin_pending() const noexcept { return want_fin_ && !fin_sent_; }
     bool has_send_work() const noexcept { return unsent() > 0 || fin_pending(); }
 
-    // Peek the next unsent chunk for framing. Returns offset/ptr/len; sets
-    // out_fin if this chunk reaches the FIN. Does not advance the frontier.
+    // Next unsent chunk (contiguous in the ring). Does not advance the frontier.
     bool peek_unsent(std::uint64_t& off, const std::uint8_t*& ptr,
                      std::size_t& len, bool& out_fin, std::size_t cap) noexcept {
         assert(cap > 0 && "peek cap zero");
-        const std::size_t avail = unsent();
+        const std::size_t pos = static_cast<std::size_t>(send_sent_ % kStreamBufferSize);
+        std::size_t avail = unsent();
+        if (avail > kStreamBufferSize - pos) avail = kStreamBufferSize - pos;
         len = (avail < cap) ? avail : cap;
         off = send_sent_;
-        ptr = send_buf_ + send_sent_;
-        out_fin = want_fin_ && (send_sent_ + len == send_buf_len_);
+        ptr = send_buf_ + pos;
+        out_fin = want_fin_ && (send_sent_ + len == send_end_);
+        assert(pos + len <= kStreamBufferSize && "peek past ring end");
         return len > 0 || (want_fin_ && !fin_sent_);
     }
 
-    // Advance the sent frontier after a chunk was framed into a packet. Returns
-    // the number of NEW bytes (those past the high-water mark) so connection-
-    // level flow control counts unique stream bytes, not retransmits.
+    // Advance the sent frontier. Returns the NEW bytes (past the high-water
+    // mark) so connection flow control counts unique bytes, not retransmits.
     std::size_t mark_sent(std::size_t len, bool fin) noexcept {
-        assert(send_sent_ + len <= send_buf_len_ && "mark_sent overruns buffer");
+        assert(send_sent_ + len <= send_end_ && "mark_sent overruns buffer");
         const std::uint64_t new_end = send_sent_ + len;
         std::size_t fresh = 0;
         if (new_end > flow_counted_) {
             fresh = static_cast<std::size_t>(new_end - flow_counted_);
             flow_counted_ = new_end;
         }
-        send_sent_ += len;
-        flow_.send_off = send_sent_;
+        send_sent_ = new_end;
+        if (send_sent_ > flow_.send_off) flow_.send_off = send_sent_;
         if (fin) { fin_sent_ = true; send_st_ = SendState::kDataSent; }
         return fresh;
     }
 
-    // Rewind the sent frontier to `off` so loss recovery re-frames from there.
+    // Rewind the frontier to `off` so loss recovery re-frames from there.
+    // Bytes below send_base_ are acknowledged and gone.
     void rewind_sent(std::uint64_t off, bool fin_was_sent) noexcept {
-        assert(off <= send_buf_len_ && "rewind past buffer");
-        if (off < send_sent_) send_sent_ = static_cast<std::size_t>(off);
-        if (fin_was_sent) fin_sent_ = false;  // re-send the FIN too
-        if (send_st_ == SendState::kDataSent) send_st_ = SendState::kSend;
+        assert(send_base_ <= send_end_ && "ring base past end");
+        if (off < send_base_) off = send_base_;
+        if (off > send_end_) off = send_end_;
+        if (off < send_sent_) send_sent_ = off;
+        if (fin_was_sent && !fin_acked_) fin_sent_ = false;
+        if (send_st_ == SendState::kDataSent && !fin_acked_) send_st_ = SendState::kSend;
     }
 
-    // ---- receive side: ordered reassembly --------------------------------
-    // Accept STREAM bytes at `offset`. Buffers + advances the contiguous cursor.
-    // Returns false on flow-control violation / overflow.
+    // Peer acknowledged [off, off+len) (+FIN). Frees the acked ring prefix.
+    void on_acked(std::uint64_t off, std::uint64_t len, bool fin) noexcept {
+        assert(off + len >= off && "ack range wraps");
+        if (fin && off + len == send_end_ && want_fin_) fin_acked_ = true;
+        const std::uint64_t end = off + len;
+        if (len > 0 && end > send_base_) {
+            if (off <= send_base_) {
+                send_base_ = end;
+            } else if (!ack_ext_.add(off, end)) {
+                // Tracking full: force this span to be resent; its ACK then
+                // lands on the contiguous prefix instead.
+                rewind_sent(off, false);
+            }
+            send_base_ = ack_ext_.absorb(send_base_);
+        }
+        if (send_base_ > send_end_) send_base_ = send_end_;
+        if (send_sent_ < send_base_) send_sent_ = send_base_;
+        assert(send_base_ <= send_end_ && "ack past queued bytes");
+    }
+
+    std::uint64_t send_acked_offset() const noexcept { return send_base_; }
+    std::uint64_t queued_end() const noexcept { return send_end_; }
+    bool fin_acked() const noexcept { return fin_acked_; }
+
+    // Abandon the send side (STOP_SENDING / reset): nothing more is sent.
+    void abandon_send() noexcept {
+        assert(in_use_ && "abandon on a free stream");
+        std::string().swap(pending_);
+        pending_off_ = 0;
+        pending_fin_ = false;
+        send_base_ = send_end_;
+        send_sent_ = send_end_;
+        want_fin_ = false;
+        send_st_ = SendState::kResetSent;
+        assert(!has_send_work() && "abandoned stream still has work");
+    }
+
+    // Every byte (and the FIN) the send side will ever carry is acknowledged.
+    bool send_done() const noexcept {
+        return send_st_ == SendState::kResetSent ||
+               (fin_acked_ && send_base_ == send_end_ && pending_empty());
+    }
+
+    // ---- receive side: ordered reassembly over a ring ------------------------
+    // Accept STREAM bytes at `offset`. False on a flow-control violation or a
+    // final-size change (RFC 9000 §4.5).
     bool receive(std::uint64_t offset, const std::uint8_t* data, std::size_t len,
                  bool fin) noexcept {
         assert((data != nullptr || len == 0) && "stream recv null");
+        if (offset > kVarIntMax || len > kVarIntMax - offset) return false;
         const std::uint64_t end = offset + len;
-        if (end > kStreamBufferSize) return false;            // window/buffer cap
         if (!flow_.recv_ok(end)) return false;                // §4.1 violation
+        if (have_fin_ && (end > fin_off_ || (fin && end != fin_off_))) return false;
+        if (fin && end < flow_.recv_high) return false;       // §4.5 final size
+        if (end > read_cursor_ + kStreamBufferSize) return false;
         if (end > flow_.recv_high) flow_.recv_high = end;
         if (fin) { fin_off_ = end; have_fin_ = true; if (recv_st_ == RecvState::kRecv) recv_st_ = RecvState::kSizeKnown; }
         if (len > 0 && !store(offset, data, len)) return false;
@@ -222,45 +340,126 @@ public:
         assert(read_cursor_ <= recv_cursor_ && "read past recv");
         return static_cast<std::size_t>(recv_cursor_ - read_cursor_);
     }
+    // Readable bytes up to the ring's physical end (recv_peek() spans these).
+    std::size_t recv_contiguous() const noexcept {
+        const std::size_t pos = static_cast<std::size_t>(read_cursor_ % kStreamBufferSize);
+        const std::size_t avail = recv_available();
+        assert(pos < kStreamBufferSize && "read cursor oob");
+        return (avail < kStreamBufferSize - pos) ? avail : kStreamBufferSize - pos;
+    }
     const std::uint8_t* recv_peek() const noexcept {
-        assert(read_cursor_ <= kStreamBufferSize && "read cursor oob");
-        return recv_buf_ + read_cursor_;
+        const std::size_t pos = static_cast<std::size_t>(read_cursor_ % kStreamBufferSize);
+        assert(pos < kStreamBufferSize && "read cursor oob");
+        return recv_buf_ + pos;
     }
     void recv_consume(std::size_t n) noexcept {
         assert(read_cursor_ + n <= recv_cursor_ && "consume past contiguous");
+        assert(n <= kStreamBufferSize && "consume larger than ring");
         read_cursor_ += n;
-    }
-    // Pointer to the `n` bytes most recently consumed (the prefix ending at the
-    // current read cursor). Valid until the next receive() into the same region.
-    const std::uint8_t* recv_peek_consumed(std::size_t n) const noexcept {
-        assert(n <= read_cursor_ && "peek_consumed underflow");
-        return recv_buf_ + (read_cursor_ - n);
     }
     bool recv_finished() const noexcept {
         return have_fin_ && read_cursor_ >= fin_off_;
     }
     bool fin_received() const noexcept { return have_fin_; }
 
+    // True exactly once, when the final byte has been read.
+    bool take_fin_notice() noexcept {
+        if (!recv_finished() || fin_notified_) return false;
+        fin_notified_ = true;
+        assert(have_fin_ && "fin notice without a FIN");
+        return true;
+    }
+
+    // Our MAX_STREAM_DATA for this stream must be (re)sent.
+    void mark_window_dirty() noexcept { window_dirty_ = true; }
+    void clear_window_dirty() noexcept { window_dirty_ = false; }
+    bool window_dirty() const noexcept { return window_dirty_; }
+
+    // The peer reset its send side: nothing more will be read.
+    void on_peer_reset() noexcept {
+        assert(in_use_ && "reset on a free stream");
+        recv_reset_ = true;
+        recv_st_ = RecvState::kResetRecvd;
+    }
+    bool recv_done() const noexcept { return recv_reset_ || recv_finished(); }
+
     // Whether our advertised recv window should be bumped (consumed enough).
     bool needs_window_update(std::uint64_t bump_threshold) const noexcept {
         assert(bump_threshold > 0 && "zero threshold");
         return (flow_.recv_max - read_cursor_) < bump_threshold &&
-               !recv_finished();
+               !recv_finished() && !recv_reset_;
     }
     std::uint64_t grow_recv_window(std::uint64_t add) noexcept {
         assert(add > 0 && "zero window grow");
-        std::uint64_t next = read_cursor_ + add;
-        if (next > kStreamBufferSize) next = kStreamBufferSize;
+        if (add > kStreamBufferSize) add = kStreamBufferSize;
+        const std::uint64_t next = read_cursor_ + add;
         if (next > flow_.recv_max) flow_.recv_max = next;
+        assert(flow_.recv_max <= read_cursor_ + kStreamBufferSize && "window > ring");
         return flow_.recv_max;
     }
 
 private:
-    // Store bytes into the receive buffer, advancing the contiguous cursor over
-    // any now-filled prefix (bounded out-of-order extent tracking).
+    // Bounded set of disjoint [start,end) extents above a contiguous cursor.
+    struct ExtentSet {
+        struct Extent { std::uint64_t start = 0; std::uint64_t end = 0; };
+        Extent ext[kMaxRecvExtents]{};
+        std::size_t count = 0;
+
+        // Record [s,e); merges overlaps. False when the set is full.
+        bool add(std::uint64_t s, std::uint64_t e) noexcept {
+            assert(s < e && "empty extent");
+            assert(count <= kMaxRecvExtents && "extent set overflow");
+            for (std::size_t i = 0; i < count; ++i) {
+                if (s <= ext[i].end && e >= ext[i].start) {
+                    if (s < ext[i].start) ext[i].start = s;
+                    if (e > ext[i].end) ext[i].end = e;
+                    return true;
+                }
+            }
+            if (count >= kMaxRecvExtents) return false;
+            ext[count].start = s;
+            ext[count].end = e;
+            ++count;
+            return true;
+        }
+        // Advance `cursor` over extents it now reaches; drop consumed ones.
+        std::uint64_t absorb(std::uint64_t cursor) noexcept {
+            for (std::size_t round = 0; round <= kMaxRecvExtents; ++round) {
+                bool progressed = false;
+                for (std::size_t i = 0; i < count; ++i) {
+                    if (ext[i].start <= cursor) {
+                        if (ext[i].end > cursor) cursor = ext[i].end;
+                        ext[i] = ext[--count];
+                        progressed = true;
+                        break;
+                    }
+                }
+                if (!progressed) break;
+            }
+            assert(count <= kMaxRecvExtents && "extent set overflow");
+            return cursor;
+        }
+    };
+
+    // Copy into the send ring (wrapping). Returns bytes stored.
+    std::size_t ring_put(const std::uint8_t* data, std::size_t len) noexcept {
+        assert(send_end_ - send_base_ <= kStreamBufferSize && "send ring overrun");
+        const std::size_t space =
+            kStreamBufferSize - static_cast<std::size_t>(send_end_ - send_base_);
+        const std::size_t n = (len < space) ? len : space;
+        const std::size_t pos = static_cast<std::size_t>(send_end_ % kStreamBufferSize);
+        const std::size_t first = (n < kStreamBufferSize - pos) ? n : kStreamBufferSize - pos;
+        if (first > 0) std::memcpy(send_buf_ + pos, data, first);
+        if (n > first) std::memcpy(send_buf_, data + first, n - first);
+        send_end_ += n;
+        assert(send_end_ - send_base_ <= kStreamBufferSize && "ring_put overflow");
+        return n;
+    }
+
+    // Store bytes into the receive ring, advancing the contiguous cursor.
     bool store(std::uint64_t offset, const std::uint8_t* data,
                std::size_t len) noexcept {
-        assert(offset + len <= kStreamBufferSize && "store overflow");
+        assert(offset + len <= read_cursor_ + kStreamBufferSize && "store overflow");
         std::size_t from = 0;
         std::uint64_t at = offset;
         if (offset < recv_cursor_) {
@@ -270,44 +469,19 @@ private:
             at = recv_cursor_;
         }
         const std::size_t n = len - from;
-        std::memcpy(recv_buf_ + at, data + from, n);
-        return mark_filled(static_cast<std::uint64_t>(at), n);
-    }
-
-    // Track [start,start+n) as present; advance recv_cursor_ over filled prefix.
-    bool mark_filled(std::uint64_t start, std::size_t n) noexcept {
-        assert(start + n <= kStreamBufferSize && "mark_filled overflow");
-        if (start <= recv_cursor_ && start + n > recv_cursor_) {
-            recv_cursor_ = start + n;
-        } else if (start > recv_cursor_) {
-            if (ext_count_ >= kMaxRecvExtents) return false;  // too much reorder
-            extents_[ext_count_].start = start;
-            extents_[ext_count_].end = start + n;
-            ++ext_count_;
+        const std::size_t pos = static_cast<std::size_t>(at % kStreamBufferSize);
+        const std::size_t first = (n < kStreamBufferSize - pos) ? n : kStreamBufferSize - pos;
+        std::memcpy(recv_buf_ + pos, data + from, first);
+        if (n > first) std::memcpy(recv_buf_, data + from + first, n - first);
+        if (at == recv_cursor_) {
+            recv_cursor_ = at + n;
+        } else if (!recv_ext_.add(at, at + n)) {
+            return false;  // too much reorder
         }
-        // Absorb any buffered extents now made contiguous (bounded sweep).
-        bool progressed = true;
-        while (progressed) {
-            progressed = false;
-            for (std::size_t i = 0; i < ext_count_; ++i) {
-                if (extents_[i].start <= recv_cursor_ && extents_[i].end > recv_cursor_) {
-                    recv_cursor_ = extents_[i].end;
-                    extents_[i] = extents_[--ext_count_];
-                    progressed = true;
-                    break;
-                }
-                if (extents_[i].end <= recv_cursor_) {  // fully consumed
-                    extents_[i] = extents_[--ext_count_];
-                    progressed = true;
-                    break;
-                }
-            }
-        }
-        assert(recv_cursor_ <= kStreamBufferSize && "cursor oob");
+        recv_cursor_ = recv_ext_.absorb(recv_cursor_);
+        assert(recv_cursor_ <= read_cursor_ + kStreamBufferSize && "cursor oob");
         return true;
     }
-
-    struct Extent { std::uint64_t start = 0; std::uint64_t end = 0; };
 
     std::uint64_t id_ = 0;
     bool in_use_ = false;
@@ -316,22 +490,30 @@ private:
     RecvState recv_st_ = RecvState::kRecv;
     StreamFlow flow_{};
 
-    // send side
-    std::uint8_t send_buf_[kStreamBufferSize]{};
-    std::size_t send_buf_len_ = 0;   // total queued
-    std::size_t send_sent_ = 0;      // frontier framed into packets
+    // send side (absolute offsets; ring index = offset % kStreamBufferSize)
+    std::uint8_t* send_buf_ = nullptr;  // kStreamBufferSize ring (owner-supplied)
+    std::uint64_t send_base_ = 0;    // lowest unacknowledged byte
+    std::uint64_t send_end_ = 0;     // total queued
+    std::uint64_t send_sent_ = 0;    // frontier framed into packets
     std::uint64_t flow_counted_ = 0; // high-water counted toward conn flow ctrl
+    ExtentSet ack_ext_{};            // acked spans above send_base_
     bool want_fin_ = false;
     bool fin_sent_ = false;
+    bool fin_acked_ = false;
+    std::string pending_;            // bytes waiting for ring space
+    std::size_t pending_off_ = 0;
+    bool pending_fin_ = false;
 
     // receive side
-    std::uint8_t recv_buf_[kStreamBufferSize]{};
+    std::uint8_t* recv_buf_ = nullptr;  // kStreamBufferSize ring (owner-supplied)
     std::uint64_t recv_cursor_ = 0;  // highest contiguous offset received
     std::uint64_t read_cursor_ = 0;  // delivered to the app
     std::uint64_t fin_off_ = 0;
     bool have_fin_ = false;
-    Extent extents_[kMaxRecvExtents]{};
-    std::size_t ext_count_ = 0;
+    bool fin_notified_ = false;
+    bool window_dirty_ = false;
+    bool recv_reset_ = false;
+    ExtentSet recv_ext_{};
 };
 
 // ============================================================================

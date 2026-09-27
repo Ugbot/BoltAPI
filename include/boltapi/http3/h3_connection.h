@@ -48,9 +48,8 @@ namespace bolt::api::http3 {
 // ----------------------------------------------------------------------------
 inline constexpr std::size_t kH3MaxStreams      = 8;        // concurrent requests
 inline constexpr std::size_t kH3MaxHeaderBytes  = 16 * 1024;  // QPACK block cap
-inline constexpr std::size_t kH3MaxBodyBytes    = 1 << 20;  // 1 MiB body cap
+inline constexpr std::size_t kH3MaxBodyBytes    = 1 << 20;  // 1 MiB received-body cap
 inline constexpr std::size_t kH3MaxRespHeaders  = 16;       // headers per response
-inline constexpr std::size_t kH3WriteChunk      = 4096;     // DATA send chunk
 inline constexpr std::size_t kH3MaxFramesPerMsg = 64;      // HEADERS + DATA frames
 
 // ----------------------------------------------------------------------------
@@ -194,29 +193,52 @@ public:
     // ------------------------------------------------------------------------
     // Server: send a response on `stream_id` (HEADERS(:status,...) + DATA, FIN).
     // ------------------------------------------------------------------------
+    // The body is streamed: the QUIC stream sends as the peer acknowledges,
+    // so its size is bounded only by the connection's held-bytes budget. A
+    // body the connection cannot hold is refused with a 500, never truncated.
     bool send_response(std::uint64_t stream_id, std::uint16_t status,
                        const H3ResponseHeader* headers, std::size_t header_count,
                        const std::uint8_t* body, std::size_t body_len) noexcept {
         assert(qc_ != nullptr && "send_response before attach");
         assert(status >= 100 && status < 600 && "implausible HTTP status");
         const bool no_body = (body == nullptr || body_len == 0);
-        // The stream's send buffer is bounded and not reclaimed on ACK; a body
-        // that cannot fit is refused with a 500, never sent truncated.
-        const std::size_t need = kH3MaxHeaderBytes + 2 * kFrameHeaderMaxBytes + body_len;
-        if (!no_body && (body_len > kH3MaxBodyBytes ||
-                         need > qc_->stream_send_space(stream_id))) {
-            (void)write_headers(stream_id, /*is_response=*/true, 500, {}, {}, {}, {},
-                                nullptr, 0, /*fin=*/true);
-            return false;
-        }
+        if (!no_body && body_len > quic::kPendingSendBytesMax) return refuse_500(stream_id);
         if (!write_headers(stream_id, /*is_response=*/true, status, {}, {}, {}, {},
                            headers, header_count, no_body)) {
             return false;
         }
-        if (!no_body) {
-            if (!write_data(stream_id, body, body_len, /*fin=*/true)) return false;
+        if (no_body) return true;
+        return write_data(stream_id, body, body_len, /*fin=*/true);
+    }
+
+    // As send_response, taking ownership of the body (no copy of a large one).
+    bool send_response_owned(std::uint64_t stream_id, std::uint16_t status,
+                             const H3ResponseHeader* headers, std::size_t header_count,
+                             std::string&& body) noexcept {
+        assert(qc_ != nullptr && "send_response before attach");
+        assert(status >= 100 && status < 600 && "implausible HTTP status");
+        if (body.empty())
+            return send_response(stream_id, status, headers, header_count, nullptr, 0);
+        if (body.size() > quic::kPendingSendBytesMax) return refuse_500(stream_id);
+        if (!write_headers(stream_id, /*is_response=*/true, status, {}, {}, {}, {},
+                           headers, header_count, /*fin=*/false)) {
+            return false;
         }
-        return true;
+        std::uint8_t hdr[kFrameHeaderMaxBytes];
+        const std::size_t hn = frame_write_header(
+            static_cast<std::uint64_t>(FrameType::kData), body.size(), hdr, sizeof(hdr));
+        if (hn == 0 || qc_->stream_write(stream_id, hdr, hn, /*fin=*/false) != hn)
+            return false;
+        return qc_->stream_write_owned(stream_id, std::move(body), /*fin=*/true);
+    }
+
+    // HEADERS(:status 500) + FIN; returns false (the response failed).
+    bool refuse_500(std::uint64_t stream_id) noexcept {
+        assert(qc_ != nullptr && "refuse before attach");
+        assert(stream_id <= quic::kVarIntMax && "refuse: id out of range");
+        (void)write_headers(stream_id, /*is_response=*/true, 500, {}, {}, {}, {},
+                            nullptr, 0, /*fin=*/true);
+        return false;
     }
 
     // Pump: forward to the underlying connection's tick (drives sends/acks).
@@ -224,6 +246,13 @@ public:
         assert(qc_ != nullptr && "tick before attach");
         assert(control_id_ == UINT64_MAX || setup_done_);  // ids set => settings done
         qc_->tick();
+    }
+
+    // QUIC stream data for this connection, when the owner routes it (the App
+    // multiplexes h3 and hq-interop on one handler).
+    void handle_stream_data(std::uint64_t id, const std::uint8_t* d, std::size_t n,
+                            bool fin) noexcept {
+        on_stream_data(id, d, n, fin);
     }
 
     quic::QuicConnection& quic() noexcept {
@@ -531,27 +560,18 @@ private:
         return frame_and_send(sid, FrameType::kHeaders, hdr_block_, blk, fin);
     }
 
-    // Send a DATA frame (chunked under kH3WriteChunk to respect flow control).
+    // Send one DATA frame. Bytes beyond the stream's free ring space are held
+    // by the QUIC stream and sent as the peer acknowledges (never truncated).
     bool write_data(std::uint64_t sid, const std::uint8_t* body, std::size_t len,
                     bool fin) noexcept {
         assert((body != nullptr || len == 0) && "write_data null with len>0");
-        assert(len <= kH3MaxBodyBytes && "body too large to frame");
+        assert(qc_ != nullptr && "write_data before attach");
         std::uint8_t hdr[kFrameHeaderMaxBytes];
         const std::size_t hn = frame_write_header(
             static_cast<std::uint64_t>(FrameType::kData), len, hdr, sizeof(hdr));
         if (hn == 0) return false;
         if (qc_->stream_write(sid, hdr, hn, /*fin=*/false) != hn) return false;
-        std::size_t off = 0;
-        for (std::size_t i = 0; off < len && i < (kH3MaxBodyBytes /
-             kH3WriteChunk) + 2; ++i) {
-            const std::size_t chunk = (len - off < kH3WriteChunk) ? (len - off)
-                                                                  : kH3WriteChunk;
-            const bool last = (off + chunk == len);
-            const std::size_t w = qc_->stream_write(sid, body + off, chunk, last && fin);
-            off += w;
-            if (w != chunk) break;  // buffer full: fail, never FIN a short body
-        }
-        return off == len;
+        return qc_->stream_write_all(sid, body, len, fin);
     }
 
     // Prepend the frame header to `payload` and stream_write both (one logical

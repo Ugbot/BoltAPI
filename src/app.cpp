@@ -14,9 +14,18 @@
 #endif
 
 #include <cassert>
+#include <chrono>
 #include <cstdio>
 #include <string>
+#include <thread>
 #include <utility>
+
+#if defined(BOLTAPI_WITH_HTTP3)
+namespace {
+// Timer granularity for QUIC PTO / idle / held-body pacing.
+constexpr int kHttp3TickMs = 2;
+}  // namespace
+#endif
 
 // M3 seam: the protocol registry header is always available (header-only,
 // inert). The stub factories (register_http3/register_webrtc) are only declared
@@ -598,7 +607,7 @@ void App::init_protocol_seams() {
 // ---------------------------------------------------------------------------
 void App::start_http3() {
     assert(config_.enable_http3 && "start_http3 without enable_http3");
-    assert(http3_conn_ == nullptr && "start_http3 called twice");
+    assert(http3_transport_ == nullptr && "start_http3 called twice");
 
     const uint16_t udp_port = config_.http3_port != 0 ? config_.http3_port
                                                       : config_.server.http1_port;
@@ -609,6 +618,13 @@ void App::start_http3() {
             "H1/H2 unaffected.\n", static_cast<unsigned>(udp_port));
         http3_transport_.reset();
         return;
+    }
+
+    if (!config_.http3_cert_file.empty() &&
+        !quic::set_server_identity_files(config_.http3_cert_file.c_str(),
+                                         config_.http3_key_file.c_str())) {
+        std::fprintf(stderr, "[boltapi] HTTP/3: certificate path too long; "
+                             "using the self-signed identity.\n");
     }
 
     // #42 — connections are created on demand per peer (no pre-created singleton).
@@ -622,6 +638,17 @@ void App::start_http3() {
             self->http3_feed_(tp, p, plen, d, n);
         });
     http3_transport_->start();
+
+    // Timers: PTO retransmits, idle close and held-body pacing need a clock,
+    // not just inbound datagrams.
+    http3_ticking_.store(true, std::memory_order_release);
+    http3_ticker_ = std::thread([self] {
+        while (self->http3_ticking_.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(kHttp3TickMs));
+            std::lock_guard<std::mutex> lk(self->http3_mtx_);
+            self->http3_tick_all_();
+        }
+    });
 
     std::fprintf(stderr,
         "[boltapi] HTTP/3: QUIC server up on UDP :%u (ALPN h3); requests bridge "
@@ -656,7 +683,48 @@ bool h3_addr_eq(const sockaddr_storage& a, int alen,
     }
     return false;
 }
+
+// Destination CID of a QUIC packet (ours are kLocalCidLen bytes on short
+// headers). False if the header is too short to carry one.
+bool h3_packet_dcid(const std::uint8_t* d, std::size_t n, const std::uint8_t** cid,
+                    std::size_t* cid_len) noexcept {
+    assert(d != nullptr && cid != nullptr && cid_len != nullptr);
+    if (n < 1) return false;
+    if (!quic::is_long_header(d[0])) {
+        if (n < 1 + quic::kLocalCidLen) return false;
+        *cid = d + 1;
+        *cid_len = quic::kLocalCidLen;
+        return true;
+    }
+    if (n < 6) return false;
+    const std::size_t l = d[5];
+    if (l > quic::kMaxConnectionIdLen || n < 6 + l) return false;
+    *cid = d + 6;
+    *cid_len = l;
+    return true;
+}
 }  // namespace
+
+namespace {
+// A long-header Initial (RFC 9000 §17.2.2, type bits 00) may open a connection.
+bool h3_is_initial(const std::uint8_t* d, std::size_t n) noexcept {
+    assert(d != nullptr || n == 0);
+    return n >= 5 && quic::is_long_header(d[0]) && ((d[0] >> 4) & 0x3) == 0 &&
+           (d[1] | d[2] | d[3] | d[4]) != 0;
+}
+}  // namespace
+
+App::Http3Peer* App::http3_route_(const std::uint8_t* data, std::size_t len) noexcept {
+    assert(data != nullptr && len > 0 && "http3_route_: empty datagram");
+    const std::uint8_t* cid = nullptr;
+    std::size_t cid_len = 0;
+    if (!h3_packet_dcid(data, len, &cid, &cid_len)) return nullptr;
+    for (std::size_t i = 0; i < kMaxHttp3Peers; ++i) {
+        Http3Peer& s = http3_peers_[i];
+        if (s.used && s.quic && s.quic->matches_dcid(cid, cid_len)) return &s;
+    }
+    return nullptr;
+}
 
 App::Http3Peer* App::http3_lookup_(const sockaddr* peer, int peer_len) noexcept {
     assert(peer != nullptr && peer_len > 0 && "http3_lookup_: bad peer");
@@ -667,6 +735,24 @@ App::Http3Peer* App::http3_lookup_(const sockaddr* peer, int peer_len) noexcept 
     return nullptr;
 }
 
+void App::http3_release_slot_(Http3Peer& s) noexcept {
+    assert(s.used && "release of a free slot");
+    assert(http3_peer_count_ > 0 && "http3 peer count underflow");
+    s.hq.reset(); s.h3.reset(); s.quic.reset();
+    s.used = false; s.addr_len = 0;
+    --http3_peer_count_;
+}
+
+void App::http3_tick_all_() noexcept {
+    for (std::size_t i = 0; i < kMaxHttp3Peers; ++i) {
+        Http3Peer& s = http3_peers_[i];
+        if (!s.used || !s.quic) continue;
+        if (s.quic->is_closed()) { http3_release_slot_(s); continue; }
+        s.quic->tick();
+    }
+    assert(http3_peer_count_ <= kMaxHttp3Peers && "http3 peer count overflow");
+}
+
 App::Http3Peer* App::http3_obtain_(net::UdpTransport* tp, const sockaddr* peer,
                                    int peer_len) {
     assert(tp != nullptr && "http3_obtain_: null transport");
@@ -674,21 +760,23 @@ App::Http3Peer* App::http3_obtain_(net::UdpTransport* tp, const sockaddr* peer,
     assert(peer_len > 0 &&
            peer_len <= static_cast<int>(sizeof(sockaddr_storage)) &&
            "http3_obtain_: bad peer_len");
-    if (Http3Peer* existing = http3_lookup_(peer, peer_len)) return existing;
 
     // Find a free slot, reclaiming any closed/draining connection first.
     Http3Peer* slot = nullptr;
-    for (std::size_t i = 0; i < kMaxHttp3Peers; ++i) {
+    for (std::size_t i = 0; i < kMaxHttp3Peers && slot == nullptr; ++i)
+        if (!http3_peers_[i].used) slot = &http3_peers_[i];
+    for (std::size_t i = 0; i < kMaxHttp3Peers && slot == nullptr; ++i) {
         Http3Peer& s = http3_peers_[i];
-        if (!s.used) { slot = &s; break; }
         if (s.quic && (s.quic->is_closed() || s.quic->is_draining())) {
-            s.h3.reset(); s.quic.reset(); s.used = false; slot = &s; break;
+            http3_release_slot_(s);
+            slot = &s;
         }
     }
     if (slot == nullptr) return nullptr;  // pool full of live conns: shed
 
     slot->quic = std::make_unique<quic::QuicConnection>();
     slot->h3   = std::make_unique<http3::H3Connection>();
+    slot->hq   = std::make_unique<http3::HqConnection>();
     std::memcpy(&slot->addr, peer, static_cast<std::size_t>(peer_len));
     slot->addr_len = peer_len;
     // The send fn targets THIS slot's fixed address (the slot lives in the pool
@@ -698,17 +786,30 @@ App::Http3Peer* App::http3_obtain_(net::UdpTransport* tp, const sockaddr* peer,
         if (sp->addr_len <= 0) return;
         tp->send(reinterpret_cast<const sockaddr*>(&sp->addr), sp->addr_len, d, n);
     };
-    if (!slot->quic->init(/*is_server=*/true, send_fn)) {
+    if (!slot->quic->init(/*is_server=*/true, send_fn) || !http3_configure_(*slot->quic)) {
         std::fprintf(stderr, "[boltapi] HTTP/3: QUIC init failed.\n");
-        slot->h3.reset(); slot->quic.reset(); slot->addr_len = 0;
+        slot->hq.reset(); slot->h3.reset(); slot->quic.reset(); slot->addr_len = 0;
         return nullptr;
     }
     slot->h3->attach(*slot->quic, /*is_server=*/true);
+    slot->hq->attach(*slot->quic);
     App* self = this;
     http3::H3Connection* h3 = slot->h3.get();
+    http3::HqConnection* hq = slot->hq.get();
+    quic::QuicConnection* qc = slot->quic.get();
     slot->h3->set_request_handler([self, h3](const http3::H3Request& r) {
         self->serve_http3_request(*h3, r);
     });
+    slot->hq->set_request_handler([self, qc](const http3::HqRequest& r) {
+        self->serve_hq_request(*qc, r);
+    });
+    // ALPN picks the application protocol per connection (0-RTT data can
+    // arrive before the handshake completes, so decide per delivery).
+    qc->set_stream_data_handler(
+        [h3, hq, qc](std::uint64_t id, const std::uint8_t* d, std::size_t n, bool fin) {
+            if (qc->alpn_is("hq-interop")) hq->on_stream_data(id, d, n, fin);
+            else h3->handle_stream_data(id, d, n, fin);
+        });
     slot->used = true;
     ++http3_peer_count_;
     assert(http3_peer_count_ <= kMaxHttp3Peers && "http3 peer count overflow");
@@ -719,17 +820,40 @@ void App::http3_feed_(net::UdpTransport* tp, const sockaddr* peer, int peer_len,
                       const std::uint8_t* data, std::size_t len) {
     assert(tp != nullptr && "http3_feed_: null transport");
     if (peer == nullptr || peer_len <= 0 || data == nullptr || len == 0) return;
-    Http3Peer* s = http3_lookup_(peer, peer_len);
+    if (peer_len > static_cast<int>(sizeof(sockaddr_storage))) return;
+    Http3Peer* s = http3_route_(data, len);
     if (s == nullptr) {
-        // Only a long-header Initial from an unknown peer starts a connection;
-        // stray short-header / non-Initial datagrams are dropped (no wedge).
-        if (!quic::is_long_header(data[0])) return;
+        // Only an Initial with an unknown DCID starts a connection; stray
+        // short-header / non-Initial datagrams are dropped (no wedge).
+        if (!h3_is_initial(data, len)) return;
         s = http3_obtain_(tp, peer, peer_len);
         if (s == nullptr) return;  // pool full: shed
     }
-    assert(s->quic && s->h3 && "http3_feed_: slot half-built");
+    assert(s->quic && s->h3 && s->hq && "http3_feed_: slot half-built");
     s->quic->feed_datagram(data, len);
-    if (s->quic->one_rtt_keys_ready()) s->h3->send_settings();
+    if (s->quic->one_rtt_keys_ready() && s->quic->alpn_is("h3")) s->h3->send_settings();
+}
+
+// Apply App-level QUIC options to a fresh server connection.
+bool App::http3_configure_(quic::QuicConnection& qc) noexcept {
+    assert(qc.is_server() && "http3_configure_: client connection");
+    static const std::uint8_t kH3Only[] = {2, 'h', '3'};
+    static const std::uint8_t kH3Hq[] = {2, 'h', '3', 10, 'h', 'q', '-', 'i', 'n',
+                                         't', 'e', 'r', 'o', 'p'};
+    const bool alpn_ok = config_.http3_hq_interop
+                             ? qc.set_server_alpn(kH3Hq, sizeof(kH3Hq))
+                             : qc.set_server_alpn(kH3Only, sizeof(kH3Only));
+    if (!alpn_ok) return false;
+    // HTTP/0.9 streams are cheap (no per-request H3 assembly slot): grant the
+    // pool's full bidi credit so a client's many parallel GETs (0-RTT
+    // included) are not throttled to the h3 default.
+    if (config_.http3_hq_interop &&
+        !qc.set_alpn_bidi_streams("hq-interop", quic::kPeerBidiStreamsMax))
+        return false;
+    qc.set_require_retry(config_.http3_require_retry);
+    if (config_.http3_early_data && !qc.tls().enable_early_data()) return false;
+    assert(qc.state() == quic::ConnState::kNew && "configure after start");
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -801,10 +925,53 @@ void App::serve_http3_request(http3::H3Connection& h3,
     // caller-owned bytes for a send_borrowed one — going through it is what
     // keeps a zero-copy body from being serialized as empty here.
     const std::string_view out_body = resp.body_bytes();
+    if (resp.borrowed_data == nullptr) {  // owned: hand it over, no copy
+        (void)h3.send_response_owned(r.stream_id, resp.status, hdrs, hc,
+                                     std::move(resp.body));
+        return;
+    }
     const std::uint8_t* body =
         reinterpret_cast<const std::uint8_t*>(out_body.data());
     (void)h3.send_response(r.stream_id, resp.status, hdrs, hc, body,
                            out_body.size());
+}
+
+// ---------------------------------------------------------------------------
+// serve_hq_request — hq-interop (HTTP/0.9 over QUIC): route "GET path" through
+// the same dispatch path, answer with the raw body + FIN. HTTP/0.9 has no
+// status line, so anything but 200 resets the stream rather than passing an
+// error page off as the file.
+// ---------------------------------------------------------------------------
+void App::serve_hq_request(quic::QuicConnection& qc, const http3::HqRequest& r) {
+    assert(started_ && "serve_hq_request before start");
+    assert(!r.path.empty() && r.path[0] == '/' && "hq path shape");
+    http::CoroHttpRequest creq;
+    creq.method = "GET";
+    creq.path = r.path;
+    const auto qpos = r.path.find('?');
+    creq.query = qpos == std::string_view::npos ? std::string_view{}
+                                                : r.path.substr(qpos + 1);
+    http::CoroHttpResponse resp = dispatch_http3(creq);
+    if (resp.stream_producer) {
+        std::string acc;
+        resp.stream_producer([&acc](std::string_view v) { acc.append(v.data(), v.size()); });
+        resp.body = std::move(acc);
+        resp.borrowed_data = nullptr;
+    }
+    if (resp.status != 200) {
+        (void)qc.reset_stream(r.stream_id, http3::kHqRequestRejected);
+        return;
+    }
+    bool ok = false;
+    if (resp.borrowed_data == nullptr) {
+        ok = qc.stream_write_owned(r.stream_id, std::move(resp.body), /*fin=*/true);
+    } else {
+        const std::string_view b = resp.body_bytes();
+        ok = qc.stream_write_all(r.stream_id,
+                                 reinterpret_cast<const std::uint8_t*>(b.data()),
+                                 b.size(), /*fin=*/true);
+    }
+    if (!ok) (void)qc.reset_stream(r.stream_id, http3::kHqRequestRejected);
 }
 #endif  // BOLTAPI_WITH_HTTP3
 
@@ -1205,6 +1372,9 @@ int App::start_background(std::string_view host, uint16_t port) {
 // before this split existed as two near-duplicate bodies).
 void App::teardown_transports_() noexcept {
 #if defined(BOLTAPI_WITH_HTTP3)
+    // The ticker touches the connections: stop and join it first.
+    http3_ticking_.store(false, std::memory_order_release);
+    if (http3_ticker_.joinable()) http3_ticker_.join();
     // Stop the HTTP/3 receive loop + close the UDP socket BEFORE freeing the
     // QUIC/H3 state (the connection's send fn uses the transport). Idempotent.
     if (http3_transport_) {
@@ -1213,6 +1383,7 @@ void App::teardown_transports_() noexcept {
     // #42 — tear down every per-peer connection (bridge borrows the QUIC conn, so
     // reset h3 before quic) before freeing the transport their send fns target.
     for (std::size_t i = 0; i < kMaxHttp3Peers; ++i) {
+        http3_peers_[i].hq.reset();
         http3_peers_[i].h3.reset();
         http3_peers_[i].quic.reset();
         http3_peers_[i].used = false;

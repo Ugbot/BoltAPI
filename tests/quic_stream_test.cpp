@@ -27,7 +27,9 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
+#include <string>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -283,14 +285,18 @@ TEST(QuicCongestionUnit, NewRenoTransitions) {
 TEST(QuicStreamUnit, OrderedReassembly) {
     using namespace q;
     Stream s;
+    std::vector<std::uint8_t> rings(2 * kStreamBufferSize);
+    s.attach_buffers(rings.data(), rings.data() + kStreamBufferSize);
     s.open(/*id=*/0, /*send_max=*/0, /*recv_max=*/64 * 1024);
     const std::uint8_t a[] = {1, 2, 3, 4};
     const std::uint8_t b[] = {5, 6, 7, 8};
-    // Deliver second chunk first (out of order): nothing contiguous yet.
-    EXPECT_TRUE(s.receive(4, b, 4, false));
+    // Deliver the final chunk first (out of order): nothing contiguous yet.
+    EXPECT_TRUE(s.receive(4, b, 4, true));
     EXPECT_EQ(s.recv_available(), 0u);
+    // A FIN below bytes already received is a final-size error (§4.5).
+    EXPECT_FALSE(s.receive(0, a, 4, true));
     // Now the first chunk fills the gap: all 8 bytes become contiguous.
-    EXPECT_TRUE(s.receive(0, a, 4, true));
+    EXPECT_TRUE(s.receive(0, a, 4, false));
     EXPECT_EQ(s.recv_available(), 8u);
     const std::uint8_t* p = s.recv_peek();
     for (std::uint8_t i = 0; i < 8; ++i) EXPECT_EQ(p[i], i + 1);
@@ -504,5 +510,176 @@ TEST(QuicStream, FlowControlNoDeadlock) {
     ASSERT_EQ(server_rx.size(), kMsg) << "flow-controlled transfer deadlocked/incomplete";
     EXPECT_EQ(0, std::memcmp(server_rx.data(), payload.data(), kMsg));
     EXPECT_TRUE(server_saw_fin);
+    p.stop();
+}
+
+// ============================================================================
+// UNIT: the send ring releases acknowledged bytes, so a stream carries more
+// than its buffer; out-of-order ACKs only free the contiguous prefix.
+// ============================================================================
+TEST(QuicStreamUnit, SendRingReclaimsOnAck) {
+    using namespace q;
+    auto s_owner = std::make_unique<Stream>();
+    Stream& s = *s_owner;
+    std::vector<std::uint8_t> rings(2 * kStreamBufferSize);
+    s.attach_buffers(rings.data(), rings.data() + kStreamBufferSize);
+    s.open(/*id=*/1, /*send_max=*/UINT64_MAX >> 2, /*recv_max=*/0);
+    const std::size_t total = 3 * kStreamBufferSize + 777;
+    const auto body = make_payload(total, 0xA11CE);
+    s.write_owned(std::string(body.begin(), body.end()), /*fin=*/true);
+    EXPECT_EQ(s.send_space(), 0u) << "held bytes must block plain writes";
+
+    std::vector<std::uint8_t> wire;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> held;  // unacked chunks
+    bool fin_seen = false;
+    for (int guard = 0; guard < 100000 && !s.send_done(); ++guard) {
+        s.refill();
+        std::uint64_t off = 0; const std::uint8_t* ptr = nullptr;
+        std::size_t len = 0; bool fin = false;
+        if (s.peek_unsent(off, ptr, len, fin, 1200)) {
+            ASSERT_EQ(off, wire.size());
+            wire.insert(wire.end(), ptr, ptr + len);
+            s.mark_sent(len, fin);
+            if (fin) fin_seen = true;
+            held.emplace_back(off, len);
+        }
+        // ACK every second chunk late: the gap must hold the ring base back.
+        if (held.size() >= 2 || (fin_seen && !held.empty())) {
+            const auto back = held.back();
+            s.on_acked(back.first, back.second, fin && back.first + back.second == s.queued_end());
+            const std::uint64_t base = s.send_acked_offset();
+            EXPECT_LE(base, held.front().first) << "ring freed an unacked span";
+            s.on_acked(held.front().first, held.front().second, false);
+            held.clear();
+        }
+    }
+    ASSERT_TRUE(s.send_done()) << "stream never completed";
+    ASSERT_EQ(wire.size(), total);
+    EXPECT_EQ(0, std::memcmp(wire.data(), body.data(), total));
+    EXPECT_TRUE(fin_seen);
+}
+
+// ============================================================================
+// UNIT: the receive ring wraps; data past read + ring size is refused.
+// ============================================================================
+TEST(QuicStreamUnit, RecvRingWraps) {
+    using namespace q;
+    auto s_owner = std::make_unique<Stream>();
+    Stream& s = *s_owner;
+    std::vector<std::uint8_t> rings(2 * kStreamBufferSize);
+    s.attach_buffers(rings.data(), rings.data() + kStreamBufferSize);
+    s.open(/*id=*/0, 0, kStreamBufferSize);
+    const std::size_t total = 2 * kStreamBufferSize + 999;
+    const auto body = make_payload(total, 0xB0B);
+    std::vector<std::uint8_t> got;
+    std::size_t off = 0;
+    for (int guard = 0; guard < 10000 && off < total; ++guard) {
+        const std::size_t n = std::min<std::size_t>(5000, total - off);
+        const bool fin = off + n == total;
+        // Beyond read cursor + ring is refused, never stored.
+        EXPECT_FALSE(s.receive(got.size() + kStreamBufferSize, body.data(), 1, false));
+        ASSERT_TRUE(s.receive(off, body.data() + off, n, fin)) << "at " << off;
+        off += n;
+        for (int span = 0; span < 2 && s.recv_available() > 0; ++span) {
+            const std::size_t c = s.recv_contiguous();
+            got.insert(got.end(), s.recv_peek(), s.recv_peek() + c);
+            s.recv_consume(c);
+        }
+        s.grow_recv_window(kStreamBufferSize);
+    }
+    ASSERT_EQ(got.size(), total);
+    EXPECT_EQ(0, std::memcmp(got.data(), body.data(), total));
+    EXPECT_TRUE(s.recv_finished());
+    EXPECT_TRUE(s.take_fin_notice());
+    EXPECT_FALSE(s.take_fin_notice()) << "FIN must be reported once";
+}
+
+// ============================================================================
+// GATE: a multi-MB server->client body larger than any stream buffer arrives
+// byte-exact over a lossy link (ring reclaim + held body + go-back-N).
+// ============================================================================
+TEST(QuicStream, LargeBodyLossyLink) {
+    constexpr std::size_t kMsg = 3 * 1024 * 1024 + 123;
+    const auto payload = make_payload(kMsg, 0xB16B0D);
+
+    std::vector<std::uint8_t> client_rx;
+    bool client_saw_fin = false;
+    std::uint64_t req_id = UINT64_MAX;
+    auto p_owner = std::make_unique<Pair>();
+    Pair& p = *p_owner;
+    auto server_on_data = [&](std::uint64_t id, const std::uint8_t*, std::size_t,
+                              bool fin) { if (fin) req_id = id; };
+    auto client_on_data = [&](std::uint64_t, const std::uint8_t* d, std::size_t n,
+                              bool fin) {
+        client_rx.insert(client_rx.end(), d, d + n);
+        if (fin) client_saw_fin = true;
+    };
+    ASSERT_TRUE(p.setup(0, 21, server_on_data, client_on_data));
+    ASSERT_TRUE(p.handshake(std::chrono::seconds(10)));
+    p.drop_pct = 3;
+    p.recv_c = 0;
+    p.recv_s = 0;
+
+    const std::uint8_t req[] = {'G', 'E', 'T'};
+    const std::uint64_t sid = p.client.open_bidi();
+    p.client.stream_write(sid, req, sizeof(req), true);
+    bool sent = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    while (std::chrono::steady_clock::now() < deadline && !client_saw_fin) {
+        p.pump_once();
+        if (!sent && req_id == sid) {
+            ASSERT_TRUE(p.server.stream_write_owned(
+                sid, std::string(payload.begin(), payload.end()), true));
+            sent = true;
+        }
+    }
+    ASSERT_TRUE(client_saw_fin) << "large body incomplete: " << client_rx.size();
+    ASSERT_EQ(client_rx.size(), kMsg);
+    EXPECT_EQ(0, std::memcmp(client_rx.data(), payload.data(), kMsg));
+    p.stop();
+}
+
+// ============================================================================
+// GATE: finished streams return to the pool and the server grants MAX_STREAMS
+// credit, so one connection carries far more requests than the pool size.
+// ============================================================================
+TEST(QuicStream, StreamSlotsRecycleWithCredit) {
+    constexpr int kRequests = 3 * static_cast<int>(q::kMaxStreams) + 5;
+    auto p_owner = std::make_unique<Pair>();
+    Pair& p = *p_owner;
+    int responses = 0;
+    auto server_on_data = [&](std::uint64_t id, const std::uint8_t* d, std::size_t n,
+                              bool fin) {
+        if (n > 0) (void)p.server.stream_write(id, d, n, false);
+        if (fin) (void)p.server.stream_write(id, nullptr, 0, true);
+    };
+    auto client_on_data = [&](std::uint64_t, const std::uint8_t*, std::size_t, bool fin) {
+        if (fin) ++responses;
+    };
+    ASSERT_TRUE(p.setup(0, 5, server_on_data, client_on_data));
+    ASSERT_TRUE(p.handshake(std::chrono::seconds(10)));
+
+    int opened = 0;
+    std::size_t max_live = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (std::chrono::steady_clock::now() < deadline && responses < kRequests) {
+        while (opened < kRequests && p.client.can_open_bidi()) {
+            const std::uint64_t sid = p.client.open_bidi();
+            const std::uint8_t b[4] = {1, 2, 3, static_cast<std::uint8_t>(opened)};
+            p.client.stream_write(sid, b, sizeof(b), true);
+            ++opened;
+        }
+        p.pump_once();
+        max_live = std::max(max_live, p.server.live_streams());
+        ASSERT_FALSE(p.client.is_draining() || p.server.is_draining())
+            << "connection closed (stream limit?)";
+    }
+    EXPECT_EQ(responses, kRequests);
+    EXPECT_LE(max_live, q::kMaxStreams);
+    // The last FINs' ACKs release the remaining slots.
+    const auto drain_end = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < drain_end && p.server.live_streams() > 0)
+        p.pump_once();
+    EXPECT_EQ(p.server.live_streams(), 0u) << "finished streams not released";
     p.stop();
 }

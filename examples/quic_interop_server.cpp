@@ -53,18 +53,39 @@ bool read_file(const std::string& path, std::string* out) {
 
 }  // namespace
 
+// Options after the positional [port] [www-root] [host]:
+//   --retry          Retry before every handshake (runner "retry")
+//   --early-data     accept 0-RTT on resumed connections ("zerortt")
+//   --hq             also offer ALPN hq-interop (HTTP/0.9, transport cases)
+//   --cert F --key K present this chain/key instead of the self-signed one
 int main(int argc, char** argv) {
     api::net::sys::startup();
 
     std::uint16_t port = 443;
-    if (argc > 1) {
-        const long p = std::strtol(argv[1], nullptr, 10);
-        if (p > 0 && p < 65536) port = static_cast<std::uint16_t>(p);
-    }
-    const std::string root = argc > 2 ? argv[2] : "/www";
-    const char* host = argc > 3 ? argv[3] : "0.0.0.0";
-
+    std::string root = "/www";
+    const char* host = "0.0.0.0";
     api::App app;
+    int positional = 0;
+    std::string cert, key;
+    for (int i = 1; i < argc; ++i) {
+        const std::string_view a = argv[i];
+        if (a == "--retry") { app.http3_require_retry(); continue; }
+        if (a == "--early-data") { app.http3_early_data(); continue; }
+        if (a == "--hq") { app.http3_hq_interop(); continue; }
+        if (a == "--cert" && i + 1 < argc) { cert = argv[++i]; continue; }
+        if (a == "--key" && i + 1 < argc) { key = argv[++i]; continue; }
+        if (positional == 0) {
+            const long p = std::strtol(argv[i], nullptr, 10);
+            if (p > 0 && p < 65536) port = static_cast<std::uint16_t>(p);
+        } else if (positional == 1) {
+            root = argv[i];
+        } else if (positional == 2) {
+            host = argv[i];
+        }
+        ++positional;
+    }
+    if (!cert.empty() && !key.empty()) app.http3_certificate(cert, key);
+
     app.enable_http3(port);
     app.get("/{name}", [root](api::Request& req, api::Response& res) {
         const std::string_view name = req.path_param_view("name");

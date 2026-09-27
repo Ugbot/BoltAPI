@@ -12,5 +12,6 @@ inline constexpr std::size_t kWsMaxControlPayload = 125;     // RFC 6455 §5.5
 inline constexpr std::size_t kWsMaxFrameHeader = 14;         // 2 + 8 + 4
 inline constexpr std::uint64_t kQpackMaxIntValue = (1ull << 62) - 1;  // QUIC varint
 inline constexpr std::size_t kHttp3MaxMethodLen = 16;        // longest method we route
+inline constexpr std::size_t kHqMaxRequestLine = 4096;       // "GET /path\r\n" (hq-interop)
 
 }  // namespace bolt::api

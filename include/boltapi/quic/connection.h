@@ -47,6 +47,7 @@
 #include "boltapi/quic/packet.h"
 #include "boltapi/quic/packet_protection.h"
 #include "boltapi/quic/pn_space.h"
+#include "boltapi/quic/quic_limits.h"
 #include "boltapi/quic/robustness.h"
 #include "boltapi/quic/stream.h"
 #include "boltapi/quic/tls.h"
@@ -54,7 +55,6 @@
 #include "boltapi/quic/varint.h"
 
 #include "bolt/bolt_arena.h"
-#include "bolt/join/bolt_swiss.h"
 
 // Tracing is ALWAYS compiled in but RUNTIME-gated by the BOLTAPI_QUIC_TRACE env
 // var (checked once via a function-local static), so it costs nothing unless the
@@ -94,6 +94,10 @@ inline constexpr std::uint64_t kKeyUpdateGuardPkts = 8;  // reorder window margi
 inline constexpr std::uint64_t kNoError = 0x00;
 inline constexpr std::uint64_t kInternalError = 0x01;
 inline constexpr std::uint64_t kProtocolViolation = 0x0a;
+inline constexpr std::uint64_t kFlowControlError = 0x03;
+inline constexpr std::uint64_t kStreamLimitError = 0x04;
+inline constexpr std::uint64_t kStreamStateError = 0x05;
+inline constexpr std::uint64_t kFinalSizeError = 0x06;
 inline constexpr std::uint64_t kFrameEncodingError = 0x07;
 inline constexpr std::uint64_t kCryptoBufferExceeded = 0x0d;
 
@@ -266,7 +270,7 @@ using QuicDatagramFn =
 
 // STREAM payload budget per frame (leaves room for the frame header in a
 // packet). Bounded so a multi-KB message spans several frames/packets.
-inline constexpr std::size_t kMaxStreamChunk = 1024;
+inline constexpr std::size_t kMaxStreamChunk = kMaxPayloadSize;
 // Default connection-level recv window growth step + advertise threshold.
 inline constexpr std::uint64_t kConnFlowChunk = 64 * 1024;
 
@@ -280,7 +284,11 @@ class QuicConnection {
 
 public:
     QuicConnection() noexcept = default;
-    ~QuicConnection() = default;
+    // The pool lives in the arena; run the Stream destructors (held bodies).
+    ~QuicConnection() {
+        if (streams_ == nullptr) return;
+        for (std::size_t i = 0; i < kMaxStreams; ++i) streams_[i].~Stream();
+    }
     QuicConnection(const QuicConnection&) = delete;
     QuicConnection& operator=(const QuicConnection&) = delete;
 
@@ -299,8 +307,13 @@ public:
 
         const bool ok = is_server_ ? tls_.init_server() : tls_.init_client();
         if (!ok) return false;
+        if (is_server_) {
+            tls_.set_alpn_hook([this](const std::uint8_t* p, std::size_t n) {
+                on_alpn_selected(p, n);
+            });
+        }
         static const std::uint8_t kAlpn[] = {2, 'h', '3'};
-        if (!tls_.set_alpn(kAlpn, sizeof(kAlpn))) return false;
+        if (!is_server_ && !tls_.set_alpn(kAlpn, sizeof(kAlpn))) return false;
         if (!tls_.set_transport_params(make_local_params())) return false;
 
         if (!is_server_) {
@@ -337,6 +350,9 @@ public:
         assert((data != nullptr || len == 0) && "feed_datagram: null");
         if (state_ == ConnState::kClosed || state_ == ConnState::kDraining)
             return;
+        // We advertise max_udp_payload_size = kMaxDatagramSize; a larger
+        // datagram is a peer error and must never reach the fixed open buffers.
+        if (len > kMaxDatagramSize) return;
         QTRACE("feed_datagram len=%zu state=%s", len, conn_state_name(state_));
         // RFC 9000 §10.3.1: a datagram whose tail matches the peer's stateless
         // reset token tears the connection down (we have no other recourse).
@@ -361,6 +377,7 @@ public:
             off += consumed;
         }
         tls_.advance();
+        replay_held_zero_rtt();
         QTRACE("after advance: complete=%d failed=%d app_wr=%d app_rd=%d 1rtt=%d "
                "state=%s",
                tls_.is_complete(), tls_.failed(),
@@ -456,11 +473,39 @@ public:
     }
 
     // Negotiated ALPN convenience (true if "h3").
-    bool alpn_is_h3() const noexcept {
+    bool alpn_is_h3() const noexcept { return alpn_is("h3"); }
+
+    // True if the negotiated ALPN equals `proto`.
+    bool alpn_is(const char* proto) const noexcept {
+        assert(proto != nullptr && "alpn_is: null proto");
         const std::uint8_t* p = nullptr;
         std::size_t n = 0;
         tls_.negotiated_alpn(&p, &n);
-        return n == 2 && p != nullptr && p[0] == 'h' && p[1] == '3';
+        const std::size_t want = std::strlen(proto);
+        assert(want < 256 && "alpn_is: ALPN longer than 255");
+        return p != nullptr && n == want && std::memcmp(p, proto, n) == 0;
+    }
+
+    // Server: ALPN protocols accepted, in preference order (wire format:
+    // length-prefixed). Call before the first Initial; defaults to "h3".
+    bool set_server_alpn(const std::uint8_t* protos, std::size_t len) noexcept {
+        assert(is_server_ && "set_server_alpn: client role");
+        return tls_.set_server_alpn(protos, len);
+    }
+
+    // Server: connections that negotiate `alpn` grant `bidi` concurrent peer
+    // bidi streams (<= kPeerBidiStreamsMax) instead of the default; decided
+    // when TLS selects the ALPN, before our transport parameters are sent.
+    bool set_alpn_bidi_streams(const char* alpn, std::uint64_t bidi) noexcept {
+        assert(is_server_ && "set_alpn_bidi_streams: client role");
+        assert(alpn != nullptr && "set_alpn_bidi_streams: null alpn");
+        const std::size_t n = std::strlen(alpn);
+        if (n == 0 || n > sizeof(alpn_raise_) || bidi == 0 || bidi > kPeerBidiStreamsMax)
+            return false;
+        std::memcpy(alpn_raise_, alpn, n);
+        alpn_raise_len_ = n;
+        alpn_bidi_streams_ = bidi;
+        return true;
     }
 
     // ------------------------------------------------------------------------
@@ -518,6 +563,11 @@ public:
         return send_app_packet(payload, pos, /*ack_eliciting=*/true, ranges, 0);
     }
 
+    // True if the peer's stream credit (transport params + MAX_STREAMS) and
+    // the pool allow opening one more local stream of that direction.
+    bool can_open_bidi() noexcept { return can_open(false); }
+    bool can_open_uni() noexcept { return can_open(true); }
+
     // Open a client/server-initiated bidirectional stream. Returns its id.
     std::uint64_t open_bidi() noexcept {
         return open_stream(/*uni=*/false);
@@ -533,18 +583,80 @@ public:
     std::size_t stream_write(std::uint64_t id, const std::uint8_t* data,
                              std::size_t len, bool fin) noexcept {
         assert((data != nullptr || len == 0) && "stream_write: null");
-        Stream* s = get_or_create_stream(id);
+        assert(id <= kVarIntMax && "stream_write: id out of range");
+        Stream* s = writable_stream(id);
         if (s == nullptr) return 0;
         const std::size_t n = s->write(data, len, fin);
         flush();
         return n;
     }
 
-    // Bytes stream_write() can still queue on `id` (0 if the pool is full).
+    // Queue ALL of `body` (+FIN) on `id`: the stream ring takes what fits and
+    // the rest follows as the peer acknowledges. False (nothing queued) if the
+    // stream is closed, already holds a body, or the connection's held-bytes
+    // budget would be exceeded.
+    bool stream_write_owned(std::uint64_t id, std::string&& body, bool fin) noexcept {
+        assert(id <= kVarIntMax && "stream_write_owned: id out of range");
+        Stream* s = writable_stream(id);
+        if (s == nullptr || !s->pending_empty()) return false;
+        if (pending_total() + body.size() > kPendingSendBytesMax) return false;
+        s->write_owned(std::move(body), fin);
+        flush();
+        assert(s->pending_bytes() <= kPendingSendBytesMax && "pending over budget");
+        return true;
+    }
+
+    // Copying form of stream_write_owned for borrowed bytes.
+    bool stream_write_all(std::uint64_t id, const std::uint8_t* data,
+                          std::size_t len, bool fin) noexcept {
+        assert((data != nullptr || len == 0) && "stream_write_all: null");
+        Stream* s = writable_stream(id);
+        if (s == nullptr || !s->pending_empty()) return false;
+        const std::size_t n = s->write(data, len, fin);
+        if (n == len) { flush(); return true; }
+        std::string rest(reinterpret_cast<const char*>(data) + n, len - n);
+        return stream_write_owned(id, std::move(rest), fin);
+    }
+
+    // Bytes stream_write() can still queue on `id` (0 if it is closed).
     std::size_t stream_send_space(std::uint64_t id) noexcept {
         assert(id <= kVarIntMax && "stream id out of range");
-        const Stream* s = get_or_create_stream(id);
+        const Stream* s = writable_stream(id);
         return s == nullptr ? 0 : s->send_space();
+    }
+
+    // Abandon our send side of `id` with RESET_STREAM (RFC 9000 §19.4).
+    // Returns false if the stream is closed or has no send side.
+    bool reset_stream(std::uint64_t id, std::uint64_t app_error) noexcept {
+        assert(id <= kVarIntMax && "reset_stream: id out of range");
+        assert(app_error <= kVarIntMax && "reset_stream: error out of range");
+        Stream* s = writable_stream(id);
+        if (s == nullptr) return false;
+        queue_reset(id, app_error, s->queued_end());
+        s->abandon_send();
+        flush();
+        return true;
+    }
+
+    // True if a datagram with destination CID `cid` belongs to this
+    // connection: our CID, or (server) the client's first DCID / Retry SCID.
+    bool matches_dcid(const std::uint8_t* cid, std::size_t len) const noexcept {
+        assert(cid != nullptr || len == 0);
+        assert(len <= kMaxConnectionIdLen && "matches_dcid: cid too long");
+        const auto eq = [cid, len](const ConnectionId& c) {
+            return c.length == len && len > 0 && std::memcmp(c.data, cid, len) == 0;
+        };
+        return eq(local_cid_) || eq(initial_dcid_) || eq(first_dcid_) ||
+               (sent_retry_ && eq(retry_scid_));
+    }
+
+    // Live streams in the pool (freed once both directions finish).
+    std::size_t live_streams() const noexcept {
+        std::size_t n = 0;
+        for (std::size_t i = 0; streams_ != nullptr && i < kMaxStreams; ++i)
+            if (streams_[i].in_use()) ++n;
+        assert(n <= kMaxStreams && "live stream count overflow");
+        return n;
     }
 
     NewRenoCongestion& congestion() noexcept { return cc_; }
@@ -681,8 +793,51 @@ private:
             form == PacketForm::kLongHandshake) {
             return process_long_packet(data, len, form, out_consumed);
         }
-        // 0-RTT remains out of scope this wave; skip the datagram.
+        if (form == PacketForm::kLongZeroRtt)
+            return process_zero_rtt(data, len, out_consumed);
         return false;
+    }
+
+    // 0-RTT (RFC 9001 §4.6): opened with the early keys once TLS accepts the
+    // client's early data. A 0-RTT packet coalesced behind the Initial that
+    // carries the ClientHello arrives before TLS has run, so a few are held
+    // and replayed after the next advance().
+    bool process_zero_rtt(const std::uint8_t* data, std::size_t len,
+                          std::size_t& out_consumed) noexcept {
+        assert((data != nullptr || len == 0) && "process_zero_rtt: null");
+        LongHeader hdr;
+        std::size_t hdr_len = 0;
+        if (parse_long_header(data, len, hdr, hdr_len) != kParseOk) return false;
+        if (!hdr.has_length || hdr.length > len - hdr_len) return false;
+        const std::size_t pkt_len = hdr_len + static_cast<std::size_t>(hdr.length);
+        if (pkt_len <= hdr_len) return false;
+        out_consumed = pkt_len;
+        if (!is_server_ || !server_initialized_) return true;  // ignore
+        PacketProtection* pp = read_protection(TlsLevel::kEarlyData);
+        if (pp != nullptr && pp->is_initialized())
+            return open_and_handle(data, pkt_len, hdr_len, TlsLevel::kEarlyData) || true;
+        if (!tls_.is_complete() && early_held_ < kEarlyHeldPackets) {
+            std::memcpy(early_buf_[early_held_], data, pkt_len);
+            early_len_[early_held_++] = pkt_len;
+        }
+        assert(early_held_ <= kEarlyHeldPackets && "early hold overflow");
+        return true;
+    }
+
+    // Replay held 0-RTT packets once early keys exist (or drop them once the
+    // handshake completes without them: early data rejected).
+    void replay_held_zero_rtt() noexcept {
+        if (early_held_ == 0) return;
+        PacketProtection* pp = read_protection(TlsLevel::kEarlyData);
+        const bool keys = pp != nullptr && pp->is_initialized();
+        if (!keys && !tls_.is_complete()) return;
+        const std::size_t n = early_held_;
+        early_held_ = 0;
+        for (std::size_t i = 0; keys && i < n; ++i) {
+            std::size_t consumed = 0;
+            (void)process_zero_rtt(early_buf_[i], early_len_[i], consumed);
+        }
+        assert(early_held_ == 0 && "replay re-held a packet");
     }
 
     // ===================================================================
@@ -766,6 +921,7 @@ private:
     // client will use to re-key its retried Initial (RFC 9000 §8.1, §17.2.5).
     void emit_retry(const LongHeader& hdr) noexcept {
         assert(is_server_ && "emit_retry: not server");
+        first_dcid_ = hdr.dest_cid;  // retransmitted first Initials still route here
         // Our Retry SCID (the client adopts this as its new DCID). Generate it
         // ONCE: a client may retransmit its first Initial, and every Retry MUST
         // carry the SAME SCID so the retried Initial's DCID matches (RFC 9000
@@ -800,6 +956,7 @@ private:
                                      &odcid))
             return false;
         if (sent_retry_ && hdr.dest_cid != retry_scid_) return false;
+        odcid_ = odcid;  // §7.3: echoed as original_destination_connection_id
         address_validated_ = true;
         amp_.validate();  // §8.1: a valid token lifts the 3x limit
         return true;
@@ -970,6 +1127,10 @@ private:
         std::size_t pos = 0;
         while (pos < len) {
             const std::uint8_t type = data[pos];
+            if (level == TlsLevel::kEarlyData && !allowed_in_zero_rtt(type)) {
+                close(kProtocolViolation, false, "frame not allowed in 0-RTT");
+                return false;
+            }
             // RFC 9002 §2: any frame other than ACK/PADDING (and CONNECTION_CLOSE)
             // is ack-eliciting -> we owe the peer an ACK for this packet.
             if (type != 0x00 && type != 0x02 && type != 0x03 && type != 0x1c &&
@@ -985,6 +1146,20 @@ private:
             if (consumed == 0 && (type != 0x00 && type != 0x01)) return false;
         }
         return true;
+    }
+
+    // RFC 9000 §12.4 table 3: frames a client may not put in 0-RTT.
+    static bool allowed_in_zero_rtt(std::uint8_t type) noexcept {
+        switch (type) {
+            case 0x02: case 0x03:  // ACK
+            case 0x06:             // CRYPTO
+            case 0x07:             // NEW_TOKEN
+            case 0x1b:             // PATH_RESPONSE
+            case 0x1e:             // HANDSHAKE_DONE
+                return false;
+            default:
+                return true;
+        }
     }
 
     // Dispatch one frame; sets out_consumed (0 for PADDING/PING, handled by the
@@ -1016,7 +1191,9 @@ private:
             return handle_max_stream_data(data + 1, len - 1, out_consumed);
         if (type == static_cast<std::uint8_t>(FrameType::kMaxStreamsBidi) ||
             type == static_cast<std::uint8_t>(FrameType::kMaxStreamsUni))
-            return handle_max_streams(data + 1, len - 1, out_consumed);
+            return handle_max_streams(
+                type == static_cast<std::uint8_t>(FrameType::kMaxStreamsUni),
+                data + 1, len - 1, out_consumed);
         if (type == static_cast<std::uint8_t>(FrameType::kDataBlocked))
             return skip_one_varint(data + 1, len - 1, out_consumed);
         if (type == static_cast<std::uint8_t>(FrameType::kStreamsBlockedBidi) ||
@@ -1200,6 +1377,7 @@ private:
                 s.in_flight = false;
                 cc_.on_packet_acked(s.size, s.time_sent_us);
             }
+            on_packet_acked_ranges(s);
             if (s.packet_number == largest) {
                 time_largest_acked_sent_ = s.time_sent_us;
                 if (s.ack_eliciting) {
@@ -1245,10 +1423,23 @@ private:
         if (any_lost) cc_.on_congestion_event(earliest_lost_sent, now);
     }
 
+    // Acknowledged STREAM bytes leave their stream's send ring.
+    void on_packet_acked_ranges(const SentPacketInfo& s) noexcept {
+        assert(s.range_count <= kMaxFrameRangesPerPacket && "range overflow");
+        assert(s.acked && "ranges of an unacked packet");
+        for (std::size_t i = 0; i < s.range_count; ++i) {
+            const FrameRange& r = s.ranges[i];
+            if (r.is_crypto) continue;
+            Stream* st = find_stream(r.id);
+            if (st != nullptr) st->on_acked(r.offset, r.length, r.fin);
+        }
+    }
+
     // Re-frame a lost packet's content by rewinding the relevant send frontier
     // so flush() re-emits the bytes under a FRESH packet number (never reused).
     void requeue_lost(const SentPacketInfo& s) noexcept {
         assert(s.range_count <= kMaxFrameRangesPerPacket && "range overflow");
+        requeue_lost_control(s.ctrl_flags);
         for (std::size_t i = 0; i < s.range_count; ++i) {
             const FrameRange& r = s.ranges[i];
             if (r.is_crypto) {
@@ -1345,12 +1536,21 @@ private:
         std::size_t c = 0;
         if (sf.parse(type, data, len, c) != kFrameOk) return false;
         out_consumed = 1 + c;
-        Stream* s = get_or_create_stream(sf.stream_id);
-        if (s == nullptr) return false;
+        bool fatal = false;
+        Stream* s = inbound_stream(sf.stream_id, /*recv_frame=*/true, fatal);
+        if (fatal) return false;
+        if (s == nullptr) return true;  // closed stream: a retransmit, ignore
+        const std::uint64_t high_before = s->flow().recv_high;
         if (!s->receive(sf.offset, sf.data, static_cast<std::size_t>(sf.length),
-                        sf.fin))
+                        sf.fin)) {
+            close(kFlowControlError, false, "stream data outside window");
             return false;
-        conn_recv_total_ += static_cast<std::uint64_t>(sf.length);
+        }
+        conn_recv_total_ += s->flow().recv_high - high_before;  // new bytes only
+        if (conn_recv_total_ > conn_recv_max_) {
+            close(kFlowControlError, false, "connection data over MAX_DATA");
+            return false;
+        }
         deliver_stream(*s);
         return true;
     }
@@ -1359,15 +1559,21 @@ private:
     // FIN is signalled on the delivery that carries the final byte (i.e. once
     // consuming `avail` would reach the FIN offset), or on a FIN-only frame.
     void deliver_stream(Stream& s) noexcept {
-        const std::size_t avail = s.recv_available();
-        s.recv_consume(avail);                 // advance the read cursor first
-        const bool fin = s.recv_finished();    // now reflects bytes just consumed
-        if (avail > 0 || fin) {
-            if (on_stream_data_)
-                on_stream_data_(s.id(), s.recv_peek_consumed(avail), avail, fin);
+        const std::uint64_t id = s.id();
+        // The ring may wrap: at most two contiguous spans.
+        for (std::size_t span = 0; span < 2; ++span) {
+            const std::size_t n = s.recv_contiguous();
+            const std::uint8_t* p = s.recv_peek();
+            s.recv_consume(n);
+            const bool more = s.recv_available() > 0;
+            const bool fin = !more && s.take_fin_notice();
+            if ((n > 0 || fin) && on_stream_data_) on_stream_data_(id, p, n, fin);
+            if (!more) break;
         }
+        assert(s.in_use() && s.id() == id && "stream freed during delivery");
         if (s.needs_window_update(kConnFlowChunk / 2)) {
             s.grow_recv_window(kConnFlowChunk);
+            s.mark_window_dirty();
             stream_window_dirty_ = true;
         }
         if (conn_recv_max_ - conn_recv_total_ < kConnFlowChunk / 2) {
@@ -1393,19 +1599,27 @@ private:
         if (c1 < 0) return false;
         int c2 = varint_decode(data + c1, len - c1, v);
         if (c2 < 0) return false;
-        Stream* s = get_or_create_stream(id);
-        if (s != nullptr && v > s->flow().send_max) s->flow().send_max = v;
         out_consumed = 1 + static_cast<std::size_t>(c1 + c2);
+        bool fatal = false;
+        Stream* s = inbound_stream(id, /*recv_frame=*/false, fatal);
+        if (fatal) return false;
+        if (s != nullptr && v > s->flow().send_max) s->flow().send_max = v;
         return true;
     }
 
-    bool handle_max_streams(const std::uint8_t* data, std::size_t len,
+    bool handle_max_streams(bool uni, const std::uint8_t* data, std::size_t len,
                             std::size_t& out_consumed) noexcept {
         std::uint64_t v = 0;
         const int c = varint_decode(data, len, v);
         if (c < 0) return false;
         out_consumed = 1 + static_cast<std::size_t>(c);
-        return true;  // we never approach the limit at this scope
+        if (v > (1ull << 60)) {  // §19.11: beyond 2^60 is a FRAME_ENCODING_ERROR
+            close(kFrameEncodingError, false, "MAX_STREAMS over 2^60");
+            return false;
+        }
+        std::uint64_t& lim = uni ? local_uni_credit_ : local_bidi_credit_;
+        if (v > lim) lim = v;
+        return true;
     }
 
     bool handle_reset_stream(const std::uint8_t* data, std::size_t len,
@@ -1418,6 +1632,17 @@ private:
         int c3 = varint_decode(data + c1 + c2, len - c1 - c2, fsize);
         if (c3 < 0) return false;
         out_consumed = 1 + static_cast<std::size_t>(c1 + c2 + c3);
+        bool fatal = false;
+        Stream* s = inbound_stream(id, /*recv_frame=*/true, fatal);
+        if (fatal) return false;
+        if (s == nullptr) return true;
+        if (fsize < s->flow().recv_high ||
+            (s->fin_received() && fsize != s->flow().recv_high)) {
+            close(kFinalSizeError, false, "reset final size");
+            return false;
+        }
+        s->on_peer_reset();
+        (void)err;
         return true;
     }
 
@@ -1429,6 +1654,13 @@ private:
         int c2 = varint_decode(data + c1, len - c1, err);
         if (c2 < 0) return false;
         out_consumed = 1 + static_cast<std::size_t>(c1 + c2);
+        bool fatal = false;
+        Stream* s = inbound_stream(id, /*recv_frame=*/false, fatal);
+        if (fatal) return false;
+        if (s == nullptr || s->send_state() == SendState::kResetSent) return true;
+        // §3.5: answer STOP_SENDING with RESET_STREAM at the current size.
+        queue_reset(id, err, s->queued_end());
+        s->abandon_send();
         return true;
     }
 
@@ -1578,18 +1810,53 @@ private:
         PacketProtection* pp = write_protection(TlsLevel::kApplication);
         if (pp == nullptr || !pp->is_initialized()) return;
 
+        // Refill stream rings from held bodies; free finished streams (which
+        // may raise MAX_STREAMS credit for the control packet below).
+        sweep_streams();
+
         // Packet 0: control frames + ACK (always sendable; ACK-only is not in
         // flight, so cwnd does not gate it).
         flush_app_control();
+        flush_app_crypto();
 
         // STREAM data packets, bounded by coalesce count, cwnd and flow control.
         // A pending PTO probe may send up to two packets ignoring cwnd (§6.2.4).
         for (std::size_t i = 0; i < kMaxCoalescedPackets; ++i) {
             const bool probe = pto_probes_ > 0;
             if (!probe && !cc_.can_send(NewRenoCongestion::kMaxDatagram)) break;
+            if (!tracker_has_room(PacketNumberSpace::kApplication)) break;
+            if (!amp_allows(kMaxDatagramSize)) break;  // §8.1 before validation
             if (!flush_app_stream_packet()) break;  // nothing more to send
             if (probe && pto_probes_ > 0) --pto_probes_;
         }
+    }
+
+    // 1-RTT CRYPTO (post-handshake TLS: NewSessionTicket, RFC 9001 §4.1.3).
+    void flush_app_crypto() noexcept {
+        pull_pending_crypto(TlsLevel::kApplication);
+        for (std::size_t i = 0; i < kMaxCoalescedPackets; ++i) {
+            if (!has_unsent_crypto(TlsLevel::kApplication)) break;
+            if (!tracker_has_room(PacketNumberSpace::kApplication)) break;
+            std::uint8_t payload[kMaxPayloadSize];
+            FrameRange ranges[kMaxFrameRangesPerPacket];
+            bool has_range = false;
+            const std::size_t plen = frame_crypto(TlsLevel::kApplication, payload,
+                                                  sizeof(payload), &ranges[0],
+                                                  &has_range);
+            if (plen == 0) break;
+            send_app_packet(payload, plen, /*ack_eliciting=*/true, ranges,
+                            has_range ? 1 : 0);
+        }
+    }
+
+    // The oldest tracked packet may be overwritten only once it is resolved;
+    // otherwise sending stalls until ACKs arrive (bounds data in flight).
+    bool tracker_has_room(PacketNumberSpace space) noexcept {
+        SentPacketTracker& tr = sent_[static_cast<std::size_t>(space)];
+        if (tr.count() < kMaxSentPackets) return true;
+        const SentPacketInfo& old = tr.at(0);
+        assert(tr.count() == kMaxSentPackets && "tracker count overflow");
+        return old.acked || old.lost || !old.ack_eliciting;
     }
 
     // One packet of control frames (HANDSHAKE_DONE, window updates) + an ACK.
@@ -1597,13 +1864,21 @@ private:
         std::uint8_t payload[kMaxPayloadSize];
         std::size_t plen = 0;
         bool ack_eliciting = false;
+        std::uint8_t flags = 0;
         if (is_server_ && tls_.is_complete() && !handshake_done_sent_) {
             payload[plen++] = static_cast<std::uint8_t>(FrameType::kHandshakeDone);
             handshake_done_sent_ = true;
             ack_eliciting = true;
+            flags |= kCtrlHandshakeDone;
         }
+        const std::size_t before_flow = plen;
         plen += frame_flow_updates(payload + plen, sizeof(payload) - plen,
                                    &ack_eliciting);
+        if (plen > before_flow) flags |= kCtrlFlow;
+        const std::size_t before_streams = plen;
+        plen += frame_stream_credit(payload + plen, sizeof(payload) - plen);
+        plen += frame_resets(payload + plen, sizeof(payload) - plen);
+        if (plen > before_streams) { flags |= kCtrlStreams; ack_eliciting = true; }
         plen += maybe_append_ack(PacketNumberSpace::kApplication, payload + plen,
                                  sizeof(payload) - plen);
         if (plen == 0) return;
@@ -1611,7 +1886,60 @@ private:
                (int)(handshake_done_sent_ && ack_eliciting));
         FrameRange ranges[kMaxFrameRangesPerPacket];
         std::size_t rc = 0;
+        next_ctrl_flags_ = flags;
         send_app_packet(payload, plen, ack_eliciting, ranges, rc);
+        next_ctrl_flags_ = 0;
+    }
+
+    // MAX_STREAMS (§19.11) for each direction whose credit grew.
+    std::size_t frame_stream_credit(std::uint8_t* out, std::size_t cap) noexcept {
+        assert(out != nullptr && "frame_stream_credit: null out");
+        std::size_t pos = 0;
+        PeerStreamBook* books[2] = {&peer_bidi_, &peer_uni_};
+        const FrameType types[2] = {FrameType::kMaxStreamsBidi, FrameType::kMaxStreamsUni};
+        for (std::size_t i = 0; i < 2; ++i) {
+            if (books[i]->limit <= books[i]->sent_limit || cap - pos < 9) continue;
+            pos += serialize_single_varint(types[i], books[i]->limit, out + pos);
+            books[i]->sent_limit = books[i]->limit;
+        }
+        assert(pos <= cap && "stream credit overran");
+        return pos;
+    }
+
+    // Queued RESET_STREAM frames (answers to STOP_SENDING).
+    std::size_t frame_resets(std::uint8_t* out, std::size_t cap) noexcept {
+        assert(out != nullptr && "frame_resets: null out");
+        assert(reset_count_ <= kMaxStreams && "reset queue overflow");
+        std::size_t pos = 0;
+        std::size_t i = 0;
+        for (; i < reset_count_ && cap - pos >= 25; ++i)
+            pos += serialize_reset_stream(resets_[i].id, resets_[i].err,
+                                          resets_[i].final_size, out + pos);
+        for (std::size_t j = i; j < reset_count_; ++j) resets_[j - i] = resets_[j];
+        reset_count_ -= i;
+        return pos;
+    }
+
+    void queue_reset(std::uint64_t id, std::uint64_t err, std::uint64_t final_size) noexcept {
+        assert(id <= kVarIntMax && "reset id out of range");
+        if (reset_count_ >= kMaxStreams) return;  // one per stream slot at most
+        resets_[reset_count_++] = {id, err, final_size};
+        assert(reset_count_ <= kMaxStreams && "reset queue overflow");
+    }
+
+    // A lost packet's control frames are re-issued from current state.
+    void requeue_lost_control(std::uint8_t flags) noexcept {
+        if (flags & kCtrlHandshakeDone) handshake_done_sent_ = false;
+        if (flags & kCtrlFlow) {
+            conn_window_dirty_ = true;
+            stream_window_dirty_ = true;
+            for (std::size_t i = 0; streams_ != nullptr && i < kMaxStreams; ++i)
+                if (streams_[i].in_use()) streams_[i].mark_window_dirty();
+        }
+        if (flags & kCtrlStreams) {
+            peer_bidi_.sent_limit = 0;
+            peer_uni_.sent_limit = 0;
+        }
     }
 
     // Build one 1-RTT packet of STREAM data across ready streams. Returns false
@@ -1621,9 +1949,11 @@ private:
         std::size_t plen = 0;
         FrameRange ranges[kMaxFrameRangesPerPacket];
         std::size_t rc = 0;
-        for (std::size_t si = 0; si < stream_count_ && rc < kMaxFrameRangesPerPacket;
-             ++si) {
-            Stream& s = streams_[si];
+        if (streams_ == nullptr) return false;
+        rr_next_ = (rr_next_ + 1) % kMaxStreams;  // rotate so no stream starves
+        for (std::size_t k = 0; k < kMaxStreams && rc < kMaxFrameRangesPerPacket;
+             ++k) {
+            Stream& s = streams_[(rr_next_ + k) % kMaxStreams];
             if (!s.in_use() || !s.has_send_work()) continue;
             const std::size_t before = plen;
             plen += frame_one_stream(s, payload + plen, sizeof(payload) - plen,
@@ -1647,9 +1977,11 @@ private:
         if (chunk > kMaxStreamChunk) chunk = kMaxStreamChunk;
         if (chunk == 0) return 0;
         if (!s.peek_unsent(off, ptr, len, fin, chunk)) return 0;
-        // Apply per-stream + connection flow-control caps.
+        // Apply per-stream + connection flow-control caps; a clamped chunk no
+        // longer reaches the end, so it must not carry the FIN.
         len = clamp_send_window(s, off, len);
-        if (len == 0 && !(fin && off == s.flow().send_off)) return 0;
+        if (fin && off + len != s.queued_end()) fin = false;
+        if (len == 0 && !fin) return 0;
         StreamFrame sf;
         sf.stream_id = s.id();
         sf.offset = off;
@@ -1680,11 +2012,17 @@ private:
                                         ? s.flow().send_max - off : 0;
         std::uint64_t conn_room = (conn_send_total_ < conn_send_max_)
                                       ? conn_send_max_ - conn_send_total_ : 0;
-        if (stream_room == 0) stream_blocked_ = true;
-        if (conn_room == 0) conn_blocked_ = true;
         if (len > stream_room) len = static_cast<std::size_t>(stream_room);
-        if (len > conn_room) len = static_cast<std::size_t>(conn_room);
-        return len;
+        // Retransmitted bytes (below the high-water mark) were already counted
+        // against MAX_DATA; only the new tail needs connection credit.
+        const std::uint64_t hw = s.flow().send_off;
+        const std::size_t retx =
+            (off < hw) ? static_cast<std::size_t>((hw - off < len) ? hw - off : len) : 0;
+        std::size_t fresh = len - retx;
+        if (fresh > conn_room) fresh = static_cast<std::size_t>(conn_room);
+        if (stream_room == 0 || (len == 0 && s.unsent() > 0)) stream_blocked_ = true;
+        if (conn_room == 0 && retx < len) conn_blocked_ = true;
+        return retx + fresh;
     }
 
     // Emit MAX_DATA / MAX_STREAM_DATA window updates + DATA_BLOCKED /
@@ -1699,16 +2037,21 @@ private:
             conn_window_dirty_ = false;
             *ack_eliciting = true;
         }
-        for (std::size_t si = 0; si < stream_count_ && cap - pos >= 18; ++si) {
+        // MAX_STREAM_DATA only for streams that receive (a send-only stream
+        // would be a STREAM_STATE_ERROR at the peer, §19.10).
+        bool left = false;
+        for (std::size_t si = 0; stream_window_dirty_ && streams_ != nullptr &&
+                                 si < kMaxStreams; ++si) {
             Stream& s = streams_[si];
-            if (!s.in_use()) continue;
-            if (stream_window_dirty_) {
-                pos += serialize_stream_pair(FrameType::kMaxStreamData, s.id(),
-                                             s.flow().recv_max, out + pos);
-                *ack_eliciting = true;
-            }
+            if (!s.in_use() || !s.window_dirty()) continue;
+            if (!has_recv_side(s.id()) || s.recv_done()) { s.clear_window_dirty(); continue; }
+            if (cap - pos < 18) { left = true; break; }
+            pos += serialize_stream_pair(FrameType::kMaxStreamData, s.id(),
+                                         s.flow().recv_max, out + pos);
+            s.clear_window_dirty();
+            *ack_eliciting = true;
         }
-        stream_window_dirty_ = false;
+        stream_window_dirty_ = left;
         if (conn_blocked_ && cap - pos >= 9) {
             pos += serialize_single_varint(FrameType::kDataBlocked,
                                            conn_send_max_, out + pos);
@@ -1716,9 +2059,11 @@ private:
             *ack_eliciting = true;
         }
         if (stream_blocked_ && cap - pos >= 18) {
-            for (std::size_t si = 0; si < stream_count_ && cap - pos >= 18; ++si) {
+            for (std::size_t si = 0; streams_ != nullptr && si < kMaxStreams &&
+                                     cap - pos >= 18; ++si) {
                 Stream& s = streams_[si];
                 if (!s.in_use() || s.flow().send_window() != 0) continue;
+                if (!has_send_side(s.id()) || !s.has_send_work()) continue;
                 pos += serialize_stream_pair(FrameType::kStreamDataBlocked,
                                              s.id(), s.flow().send_max, out + pos);
                 *ack_eliciting = true;
@@ -1858,10 +2203,28 @@ private:
                      std::size_t wire, bool ack_eliciting,
                      const FrameRange* ranges, std::size_t range_count) noexcept {
         assert(range_count <= kMaxFrameRangesPerPacket && "range overflow");
-        if (wire == 0) return;  // seal failed; nothing sent
+        if (wire == 0) {
+            // Not sent (amplification budget or seal failure): the framed
+            // bytes must go out again.
+            SentPacketInfo unsent{};
+            unsent.range_count = range_count;
+            for (std::size_t i = 0; i < range_count; ++i) unsent.ranges[i] = ranges[i];
+            requeue_lost(unsent);
+            return;
+        }
+        SentPacketTracker& tr = sent_[static_cast<std::size_t>(space)];
+        if (tr.count() == kMaxSentPackets) {
+            // Overwriting an unresolved packet: treat it as lost so its data
+            // is re-sent instead of silently vanishing.
+            SentPacketInfo& old = tr.at(0);
+            if (!old.acked && !old.lost && old.ack_eliciting) {
+                requeue_lost(old);
+                old.lost = true;
+            }
+        }
         std::uint64_t evicted = 0;
-        SentPacketInfo& s = sent_[static_cast<std::size_t>(space)].record(
-            pn, now_us(), wire, ack_eliciting, &evicted);
+        SentPacketInfo& s = tr.record(pn, now_us(), wire, ack_eliciting, &evicted);
+        s.ctrl_flags = next_ctrl_flags_;
         // A bounded ring must not leak bytes_in_flight: if it overwrote a still
         // in-flight (very old, effectively lost) packet, free its bytes.
         if (evicted > 0) cc_.on_packet_lost(evicted);
@@ -2013,63 +2376,170 @@ private:
                 (pn >> ((pn_len - 1 - i) * 8)) & 0xFF);
     }
 
+    // TLS picked the ALPN (inside ClientHello processing, before our
+    // EncryptedExtensions): apply its stream credit to the transport params.
+    void on_alpn_selected(const std::uint8_t* p, std::size_t n) noexcept {
+        assert(is_server_ && "alpn hook on a client");
+        assert(p != nullptr || n == 0);
+        if (alpn_raise_len_ == 0 || n != alpn_raise_len_ ||
+            std::memcmp(p, alpn_raise_, n) != 0)
+            return;
+        peer_bidi_concurrency_ = alpn_bidi_streams_;
+        peer_bidi_.update_limit(peer_bidi_concurrency_);
+        peer_bidi_.sent_limit = peer_bidi_.limit;  // carried by the new params
+        (void)tls_.set_transport_params(make_local_params());
+    }
+
     // ===================================================================
-    // Stream pool + SwissTable map (stream_id -> pool index).
+    // Stream pool: kMaxStreams slots, reused once both directions finish.
     // ===================================================================
-    void ensure_stream_map() noexcept {
-        if (stream_map_ready_) return;
-        const bool ok = bolt::SwissTable::create(&stream_map_, kMaxStreams,
-                                                 &stream_arena_);
-        assert(ok && "stream map alloc failed");
-        // Pre-allocate the bounded Stream pool from the arena (placement-new so
-        // each Stream's default member initializers run). No per-stream malloc.
+    void ensure_stream_pool() noexcept {
+        if (streams_ != nullptr) return;
+        // Pre-allocate the bounded pool from the arena (placement-new so each
+        // Stream's default member initializers run). No per-stream malloc.
         void* raw = stream_arena_.allocate(kMaxStreams * sizeof(Stream),
                                            alignof(Stream));
         assert(raw != nullptr && "stream pool alloc failed");
         streams_ = static_cast<Stream*>(raw);
         for (std::size_t i = 0; i < kMaxStreams; ++i) new (&streams_[i]) Stream();
-        (void)ok;
-        stream_map_ready_ = true;
+        assert(streams_[0].in_use() == false && "fresh pool slot live");
+    }
+
+    bool can_open(bool uni) noexcept {
+        std::uint64_t credit = uni ? local_uni_credit_ : local_bidi_credit_;
+        if (tls_.have_peer_transport_params()) {
+            const TransportParameters& tp = tls_.peer_transport_params();
+            const std::uint64_t init = uni ? tp.initial_max_streams_uni
+                                           : tp.initial_max_streams_bidi;
+            if (init > credit) credit = init;
+        }
+        const std::uint64_t next = uni ? next_uni_seq_ : next_bidi_seq_;
+        if (next >= credit) return false;
+        return live_streams() < kMaxStreams;
     }
 
     // Allocate a new locally-initiated stream and return its id.
     std::uint64_t open_stream(bool uni) noexcept {
-        ensure_stream_map();
-        assert(stream_count_ < kMaxStreams && "stream pool exhausted");
+        ensure_stream_pool();
         std::uint64_t& seq = uni ? next_uni_seq_ : next_bidi_seq_;
         const std::uint64_t id = make_stream_id(seq++, is_server_, uni);
         Stream* s = alloc_stream(id);
-        assert(s != nullptr && "open_stream alloc failed");
+        assert(s != nullptr && "stream pool exhausted");
         (void)s;
         return id;
     }
 
     Stream* find_stream(std::uint64_t id) noexcept {
-        if (!stream_map_ready_) return nullptr;
-        const std::int32_t idx = stream_map_.find(id);
-        if (idx < 0) return nullptr;
-        assert(static_cast<std::size_t>(idx) < kMaxStreams && "stream idx oob");
-        return &streams_[static_cast<std::size_t>(idx)];
+        if (streams_ == nullptr) return nullptr;
+        for (std::size_t i = 0; i < kMaxStreams; ++i) {
+            Stream& s = streams_[i];
+            if (s.in_use() && s.id() == id) return &s;
+        }
+        return nullptr;
     }
 
-    Stream* get_or_create_stream(std::uint64_t id) noexcept {
+    bool is_local_stream(std::uint64_t id) const noexcept {
+        return stream_is_server_initiated(id) == is_server_;
+    }
+    bool has_send_side(std::uint64_t id) const noexcept {
+        return stream_is_bidi(id) || is_local_stream(id);
+    }
+    bool has_recv_side(std::uint64_t id) const noexcept {
+        return stream_is_bidi(id) || !is_local_stream(id);
+    }
+
+    // A stream the application may write: live and with a send side.
+    Stream* writable_stream(std::uint64_t id) noexcept {
+        assert(id <= kVarIntMax && "writable_stream: id out of range");
+        if (!has_send_side(id)) return nullptr;
         Stream* s = find_stream(id);
-        if (s != nullptr) return s;
-        return alloc_stream(id);
+        if (s == nullptr || s->send_state() == SendState::kResetSent) return nullptr;
+        return s;
+    }
+
+    // Resolve the stream a peer frame names (RFC 9000 §2.1, §3, §4.6). Opens a
+    // new peer stream within MAX_STREAMS credit; returns nullptr for a closed
+    // stream (late retransmit). A frame the stream's direction forbids, or one
+    // past our credit, closes the connection and sets `fatal`.
+    Stream* inbound_stream(std::uint64_t id, bool recv_frame, bool& fatal) noexcept {
+        assert(id <= kVarIntMax && "inbound_stream: id out of range");
+        fatal = false;
+        const bool uni = stream_is_uni(id);
+        const bool local = is_local_stream(id);
+        if ((recv_frame && !has_recv_side(id)) || (!recv_frame && !has_send_side(id))) {
+            close(kStreamStateError, false, "frame for the wrong stream direction");
+            fatal = true;
+            return nullptr;
+        }
+        if (Stream* s = find_stream(id)) return s;
+        const std::uint64_t seq = id >> 2;
+        if (local) {
+            const std::uint64_t next = uni ? next_uni_seq_ : next_bidi_seq_;
+            if (seq < next) return nullptr;  // ours, already finished
+            close(kStreamStateError, false, "frame for an unopened local stream");
+            fatal = true;
+            return nullptr;
+        }
+        PeerStreamBook& book = uni ? peer_uni_ : peer_bidi_;
+        if (seq >= book.limit) {
+            close(kStreamLimitError, false, "stream id over MAX_STREAMS");
+            fatal = true;
+            return nullptr;
+        }
+        if (book.is_closed(seq)) return nullptr;
+        Stream* s = alloc_stream(id);
+        if (s == nullptr) {
+            close(kInternalError, false, "stream pool exhausted");
+            fatal = true;
+        }
+        return s;
     }
 
     Stream* alloc_stream(std::uint64_t id) noexcept {
-        ensure_stream_map();
-        if (stream_count_ >= kMaxStreams) return nullptr;
-        const std::size_t idx = stream_count_++;
-        const std::uint64_t init_send_max = peer_initial_stream_window(id);
-        Stream& s = streams_[idx];
-        s.open(id, init_send_max, kStreamRecvWindow);
-        if (!stream_map_.insert(id, static_cast<std::uint32_t>(idx))) {
-            --stream_count_;
-            return nullptr;
+        ensure_stream_pool();
+        assert(find_stream(id) == nullptr && "alloc of a live stream id");
+        for (std::size_t i = 0; i < kMaxStreams; ++i) {
+            Stream& s = streams_[i];
+            if (s.in_use()) continue;
+            if (!s.has_buffers()) {
+                // First use of this slot: its rings stay with it across reuse.
+                void* rings = stream_arena_.allocate(2 * kStreamBufferSize, 64);
+                if (rings == nullptr) return nullptr;
+                auto* b = static_cast<std::uint8_t*>(rings);
+                s.attach_buffers(b, b + kStreamBufferSize);
+            }
+            s.open(id, peer_initial_stream_window(id), kStreamRecvWindow);
+            return &s;
         }
-        return &s;
+        return nullptr;
+    }
+
+    // Held bytes across all streams (bounded by kPendingSendBytesMax).
+    std::uint64_t pending_total() const noexcept {
+        std::uint64_t n = 0;
+        for (std::size_t i = 0; streams_ != nullptr && i < kMaxStreams; ++i)
+            if (streams_[i].in_use()) n += streams_[i].pending_bytes();
+        return n;
+    }
+
+    // Move held bytes into freed ring space; release streams whose send and
+    // receive sides are both finished, crediting the peer (MAX_STREAMS).
+    void sweep_streams() noexcept {
+        if (streams_ == nullptr) return;
+        for (std::size_t i = 0; i < kMaxStreams; ++i) {
+            Stream& s = streams_[i];
+            if (!s.in_use()) continue;
+            s.refill();
+            const std::uint64_t id = s.id();
+            if (has_send_side(id) && !s.send_done()) continue;
+            if (has_recv_side(id) && !s.recv_done()) continue;
+            s.release();
+            if (is_local_stream(id)) continue;
+            PeerStreamBook& book = stream_is_uni(id) ? peer_uni_ : peer_bidi_;
+            book.mark_closed(id >> 2);
+            book.update_limit(stream_is_uni(id) ? kPeerUniStreamsMax
+                                                : peer_bidi_concurrency_);
+        }
     }
 
     // The peer's advertised initial per-stream send window for `id` (RFC 9000
@@ -2093,7 +2563,6 @@ private:
             if (tp.initial_max_stream_data_bidi_local_present)
                 w = tp.initial_max_stream_data_bidi_local;
         }
-        if (w > kStreamBufferSize) w = kStreamBufferSize;
         return w;
     }
 
@@ -2326,18 +2795,21 @@ private:
         TransportParameters tp;
         tp.initial_max_data = 1u << 20;
         tp.initial_max_data_present = true;
-        tp.initial_max_stream_data_bidi_local = 256u * 1024;
+        // Every stream opens with a window of exactly its receive ring.
+        tp.initial_max_stream_data_bidi_local = kStreamRecvWindow;
         tp.initial_max_stream_data_bidi_local_present = true;
-        tp.initial_max_stream_data_bidi_remote = 256u * 1024;
+        tp.initial_max_stream_data_bidi_remote = kStreamRecvWindow;
         tp.initial_max_stream_data_bidi_remote_present = true;
-        tp.initial_max_stream_data_uni = 128u * 1024;
+        tp.initial_max_stream_data_uni = kStreamRecvWindow;
         tp.initial_max_stream_data_uni_present = true;
-        tp.initial_max_streams_bidi = 100;
+        tp.initial_max_streams_bidi = peer_bidi_concurrency_;
         tp.initial_max_streams_bidi_present = true;
-        tp.initial_max_streams_uni = 3;
+        tp.initial_max_streams_uni = kPeerUniStreamsMax;
         tp.initial_max_streams_uni_present = true;
         tp.max_idle_timeout = 30000;
         tp.max_idle_timeout_present = true;
+        tp.max_udp_payload_size = kMaxDatagramSize;  // our open buffers' size
+        tp.max_udp_payload_size_present = true;
         tp.active_connection_id_limit = 4;
         tp.active_connection_id_limit_present = true;
         // RFC 9221: advertise QUIC DATAGRAM support so the peer may enable HTTP/3
@@ -2359,12 +2831,22 @@ private:
         // RFC 9000 §7.3: the SERVER also echoes original_destination_connection_id
         // = the DCID the client used in its first Initial (== initial_dcid_ once
         // server_on_first_initial has run). Unknown before that, so only when set.
-        if (is_server_ && initial_dcid_.length > 0) {
-            assert(initial_dcid_.length <= kMaxConnectionIdLength && "odcid too long");
-            std::memcpy(tp.original_destination_connection_id, initial_dcid_.data,
-                        initial_dcid_.length);
-            tp.original_destination_connection_id_len = initial_dcid_.length;
+        // After a Retry the ODCID is the client's FIRST DCID (from the token)
+        // and retry_source_connection_id is the Retry's SCID.
+        const ConnectionId& odcid = sent_retry_ ? odcid_ : initial_dcid_;
+        if (is_server_ && odcid.length > 0) {
+            assert(odcid.length <= kMaxConnectionIdLength && "odcid too long");
+            std::memcpy(tp.original_destination_connection_id, odcid.data,
+                        odcid.length);
+            tp.original_destination_connection_id_len = odcid.length;
             tp.original_destination_connection_id_present = true;
+        }
+        if (is_server_ && sent_retry_) {
+            assert(retry_scid_.length <= kMaxConnectionIdLength && "rscid too long");
+            std::memcpy(tp.retry_source_connection_id, retry_scid_.data,
+                        retry_scid_.length);
+            tp.retry_source_connection_id_len = retry_scid_.length;
+            tp.retry_source_connection_id_present = true;
         }
         return tp;
     }
@@ -2418,7 +2900,7 @@ private:
     std::uint32_t pto_probes_ = 0;     // outstanding PTO probes (bypass cwnd)
 
     // ---- streams + flow control (wave 5) ----
-    static constexpr std::uint64_t kStreamRecvWindow = 128 * 1024;
+    static constexpr std::uint64_t kStreamRecvWindow = kStreamBufferSize;
     QuicStreamDataFn on_stream_data_;
     QuicDatagramFn   on_datagram_;       // RFC 9221 received-DATAGRAM handler
     // The Stream pool is pre-allocated from the connection arena (each Stream
@@ -2426,13 +2908,74 @@ private:
     // value would blow the stack). Pool-style allocation per CLAUDE.md — no
     // per-stream heap churn; bounded by kMaxStreams.
     Stream* streams_ = nullptr;
-    std::size_t stream_count_ = 0;
     std::uint64_t next_bidi_seq_ = 0;
     std::uint64_t next_uni_seq_ = 0;
+    std::uint64_t local_bidi_credit_ = 0;  // peer's MAX_STREAMS for our streams
+    std::uint64_t local_uni_credit_ = 0;
+    std::size_t rr_next_ = 0;  // round-robin start for STREAM framing
 
     bolt::Arena stream_arena_;
-    bolt::SwissTable stream_map_{};
-    bool stream_map_ready_ = false;
+
+    // Peer-initiated stream credit + closed-id memory, per direction.
+    struct PeerStreamBook {
+        static constexpr std::uint64_t kWords = kClosedStreamWindowMax / 64;
+        std::uint64_t limit = 0;         // streams granted (MAX_STREAMS)
+        std::uint64_t sent_limit = 0;    // last advertised
+        std::uint64_t floor = 0;         // every seq below is closed
+        std::uint64_t closed_total = 0;
+        std::uint64_t bits[kWords] = {};
+
+        bool bit(std::uint64_t seq) const noexcept {
+            const std::uint64_t i = seq % kClosedStreamWindowMax;
+            return (bits[i / 64] >> (i % 64)) & 1u;
+        }
+        void set_bit(std::uint64_t seq, bool on) noexcept {
+            const std::uint64_t i = seq % kClosedStreamWindowMax;
+            const std::uint64_t m = 1ull << (i % 64);
+            bits[i / 64] = on ? (bits[i / 64] | m) : (bits[i / 64] & ~m);
+        }
+        bool is_closed(std::uint64_t seq) const noexcept {
+            if (seq < floor) return true;
+            if (seq - floor >= kClosedStreamWindowMax) return false;
+            return bit(seq);
+        }
+        void mark_closed(std::uint64_t seq) noexcept {
+            assert(seq >= floor && seq - floor < kClosedStreamWindowMax &&
+                   "closed stream outside the window");
+            assert(!bit(seq) && "stream closed twice");
+            set_bit(seq, true);
+            ++closed_total;
+            for (std::uint64_t i = 0; i < kClosedStreamWindowMax && bit(floor); ++i) {
+                set_bit(floor, false);
+                ++floor;
+            }
+        }
+        // Credit = closed + concurrency, never past the closed-id window.
+        void update_limit(std::uint64_t concurrent) noexcept {
+            std::uint64_t next = closed_total + concurrent;
+            if (next > floor + kClosedStreamWindowMax)
+                next = floor + kClosedStreamWindowMax;
+            if (next > limit) limit = next;
+            assert(limit <= floor + kClosedStreamWindowMax && "credit past window");
+        }
+    };
+    PeerStreamBook peer_bidi_{kPeerBidiStreamsDefault, kPeerBidiStreamsDefault};
+    std::uint64_t peer_bidi_concurrency_ = kPeerBidiStreamsDefault;
+    // ALPN whose connections get alpn_bidi_streams_ concurrent bidi streams.
+    std::uint8_t alpn_raise_[32] = {};
+    std::size_t alpn_raise_len_ = 0;
+    std::uint64_t alpn_bidi_streams_ = 0;
+    PeerStreamBook peer_uni_{kPeerUniStreamsMax, kPeerUniStreamsMax};
+
+    struct PendingReset { std::uint64_t id; std::uint64_t err; std::uint64_t final_size; };
+    PendingReset resets_[kMaxStreams] = {};
+    std::size_t reset_count_ = 0;
+
+    // Control frames carried by the packet being built (re-issued on loss).
+    static constexpr std::uint8_t kCtrlHandshakeDone = 1;
+    static constexpr std::uint8_t kCtrlFlow = 2;
+    static constexpr std::uint8_t kCtrlStreams = 4;
+    std::uint8_t next_ctrl_flags_ = 0;
 
     // Connection-level flow control (RFC 9000 §4.1).
     std::uint64_t conn_send_max_ = 0;            // peer's MAX_DATA (set on init)
@@ -2457,6 +3000,14 @@ private:
     bool did_retry_ = false;                             // client re-keyed
     bool address_validated_ = false;                     // server validated peer
     ConnectionId retry_scid_;                            // server's Retry SCID
+    ConnectionId odcid_;                                 // ODCID from the token
+    ConnectionId first_dcid_;                            // DCID of the Retried Initial
+
+    // 0-RTT packets that arrived before TLS yielded the early keys.
+    static constexpr std::size_t kEarlyHeldPackets = 4;
+    std::uint8_t early_buf_[kEarlyHeldPackets][kMaxDatagramSize] = {};
+    std::size_t early_len_[kEarlyHeldPackets] = {};
+    std::size_t early_held_ = 0;
     AddressValidator validator_;                         // token mint/verify
     std::uint8_t retry_token_[kMaxRetryToken] = {};      // client-held token
     std::size_t retry_token_len_ = 0;

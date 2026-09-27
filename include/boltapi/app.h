@@ -49,7 +49,10 @@
 #include "boltapi/net/udp_transport.h"
 #include "boltapi/quic/connection.h"
 #include "boltapi/http3/h3_connection.h"
+#include "boltapi/http3/hq_connection.h"
+#include <atomic>
 #include <mutex>
+#include <thread>
 #endif
 
 #include <cassert>
@@ -183,6 +186,12 @@ public:
         // option is OFF, setting the runtime flag is a no-op warning.
         bool        enable_http3  = false;
         uint16_t    http3_port    = 0;      // 0 = reuse http1_port number over UDP
+        // HTTP/3 endpoint options (QUIC interop runner cases).
+        bool        http3_require_retry = false;  // Retry before every handshake
+        bool        http3_early_data    = false;  // accept 0-RTT on resumption
+        bool        http3_hq_interop    = false;  // also offer ALPN hq-interop
+        std::string http3_cert_file;              // PEM chain; empty = self-signed
+        std::string http3_key_file;
         bool        enable_webrtc = false;
 
         Config() noexcept {
@@ -313,6 +322,34 @@ public:
         assert(!started_);
         config_.enable_http3 = true;
         if (udp_port != 0) config_.http3_port = udp_port;
+        return *this;
+    }
+
+    // QUIC endpoint options. Retry validates every client address before the
+    // handshake (RFC 9000 §8.1); early data accepts 0-RTT requests on resumed
+    // connections (replayable: only for idempotent routes); hq-interop adds the
+    // HTTP/0.9-over-QUIC ALPN (GET only) beside h3.
+    App& http3_require_retry(bool on = true) {
+        assert(!started_);
+        config_.http3_require_retry = on;
+        return *this;
+    }
+    App& http3_early_data(bool on = true) {
+        assert(!started_);
+        config_.http3_early_data = on;
+        return *this;
+    }
+    App& http3_hq_interop(bool on = true) {
+        assert(!started_);
+        config_.http3_hq_interop = on;
+        return *this;
+    }
+    // Present this certificate chain + key instead of the self-signed identity.
+    // Process-wide: the first QUIC server started fixes it.
+    App& http3_certificate(std::string cert_pem_file, std::string key_pem_file) {
+        assert(!started_);
+        config_.http3_cert_file = std::move(cert_pem_file);
+        config_.http3_key_file = std::move(key_pem_file);
         return *this;
     }
 
@@ -586,6 +623,16 @@ private:
     // Build a CoroHttpRequest from a decoded H3Request, route it through
     // dispatch_http3(), and send the response back over the H3 stream.
     void serve_http3_request(http3::H3Connection& h3, const http3::H3Request& r);
+    // hq-interop: GET path -> raw body + FIN (a non-200 resets the stream).
+    void serve_hq_request(quic::QuicConnection& qc, const http3::HqRequest& r);
+    // Route a datagram to its connection by destination CID.
+    Http3Peer* http3_route_(const std::uint8_t* data, std::size_t len) noexcept;
+    // Timer duties for every connection (PTO, idle, pacing held bodies) and
+    // reclaiming closed slots. Runs on http3_ticker_ under http3_mtx_.
+    void http3_tick_all_() noexcept;
+    void http3_release_slot_(Http3Peer& s) noexcept;
+    // Apply the Config http3_* options to a fresh server connection.
+    bool http3_configure_(quic::QuicConnection& qc) noexcept;
 #endif
 
 #if defined(BOLTAPI_WITH_WEBRTC)
@@ -730,6 +777,7 @@ private:
     struct Http3Peer {
         std::unique_ptr<quic::QuicConnection> quic;
         std::unique_ptr<http3::H3Connection>  h3;
+        std::unique_ptr<http3::HqConnection>  hq;
         sockaddr_storage addr{};
         int              addr_len = 0;
         bool             used = false;
@@ -738,6 +786,8 @@ private:
     Http3Peer    http3_peers_[kMaxHttp3Peers];
     std::size_t  http3_peer_count_ = 0;
     std::mutex   http3_mtx_;
+    std::thread       http3_ticker_;
+    std::atomic<bool> http3_ticking_{false};
 #endif
 
     std::unique_ptr<Router>                   router_;
