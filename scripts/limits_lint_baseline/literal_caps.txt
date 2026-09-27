@@ -64,7 +64,6 @@ include/boltapi/quic/connection.h::kMaxCryptoBuffer
 include/boltapi/quic/connection.h::kMaxDatagramSize
 include/boltapi/quic/connection.h::kMaxPayloadSize
 include/boltapi/quic/connection.h::kMaxRanges
-include/boltapi/quic/connection.h::kMaxStreamChunk
 include/boltapi/quic/frames.h::kMaxAckRanges
 include/boltapi/quic/loss.h::kMaxDatagram
 include/boltapi/quic/loss.h::kMaxFrameRangesPerPacket

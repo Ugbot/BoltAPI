@@ -128,8 +128,9 @@ bool start_h3_app(bolt::api::App& app, std::uint16_t port) {
             .send(req.body());  // byte-exact echo
     });
     app.enable_http3(port);  // QUIC/HTTP3 server on this UDP port (ALPN h3).
-    // Bind H1 on an ephemeral TCP port; HTTP/3 uses the explicit UDP port above.
-    if (app.start_background("127.0.0.1", 0) != 0) return false;
+    // start_background needs a real TCP port: reuse the UDP port number
+    // (TCP and UDP port spaces are separate).
+    if (app.start_background("127.0.0.1", port) != 0) return false;
     std::this_thread::sleep_for(std::chrono::milliseconds(400));
     assert(app.is_running() && "start_h3_app: app running after start");
     return app.is_running();
