@@ -348,11 +348,12 @@ bool scan_placeholders(std::string_view sql, OnText on_text, OnParam on_param) n
         } else if (c == '$' && !prev_ident && i + 1 < n && is_digit(sql[i + 1])) {
             std::size_t j = i + 1;
             std::uint32_t num = 0;
-            while (j < n && is_digit(sql[j])) {
-                if (num > kMaxParamIndex) return false;
+            while (j < n && is_digit(sql[j])) {                // <= 6 digits accepted
                 num = num * 10 + static_cast<std::uint32_t>(sql[j] - '0');
+                if (num > kMaxParamIndex) return false;
                 ++j;
             }
+            assert(num <= kMaxParamIndex);
             if (!flush(i)) return false;
             if (!on_param(num)) return false;
             i = j;
@@ -976,10 +977,12 @@ bool is_query_shaped(std::string_view sql) noexcept {
 
 std::uint32_t max_param_ref(std::string_view sql) noexcept {
     std::uint32_t mx = 0;
-    (void)scan_placeholders(
+    // The callbacks never refuse, so a false scan is a `$n` past kMaxParamIndex.
+    const bool ok = scan_placeholders(
         sql, [](const char*, std::size_t) { return true; },
         [&](std::uint32_t num) { if (num > mx) mx = num; return true; });
-    assert(mx <= kMaxParamIndex + 9);
+    if (!ok) return kMaxParamIndex + 1;
+    assert(mx <= kMaxParamIndex);
     return mx;
 }
 
