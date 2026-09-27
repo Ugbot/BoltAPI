@@ -4,7 +4,8 @@ set(_src ${PROJECT_SOURCE_DIR}/src)
 set(_hpack_srcs ${_src}/http/hpack.cpp ${_src}/http/huffman.cpp
                 ${_src}/http/huffman_table.cpp ${_src}/http/huffman_table_data.cpp)
 set(_h2_srcs ${_hpack_srcs} ${_src}/http/http2_frame.cpp
-             ${_src}/http/http2_connection.cpp ${_src}/http/http2_stream.cpp)
+             ${_src}/http/http2_connection.cpp ${_src}/http/http2_connection_recv.cpp
+             ${_src}/http/http2_stream.cpp)
 
 boltapi_add_fuzz_target(http1_request SOURCE http1_request.cpp
     INSTRUMENT ${_src}/http/http1_parser.cpp)

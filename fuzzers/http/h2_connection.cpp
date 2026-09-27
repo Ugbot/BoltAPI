@@ -11,6 +11,7 @@
 #include "fuzz_util.h"
 
 #include <algorithm>
+#include <map>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -24,19 +25,68 @@ constexpr std::size_t kReadCap = 16384;  // handle_http2_connection's buffer
 constexpr std::size_t kMaxReads = 4096;
 constexpr std::size_t kBodySizes[8] = {0, 1, 100, 16384, 16385, 70000, 3, 200000};
 
+std::uint32_t be32(const std::uint8_t* p) {
+    return (std::uint32_t(p[0]) << 24) | (std::uint32_t(p[1]) << 16) | (std::uint32_t(p[2]) << 8) | p[3];
+}
+
+// Upper bounds on what the client ever allowed us to send, from its frames.
+struct Budget {
+    std::uint64_t conn = 65535;
+    std::uint64_t initial = 65535;
+    std::map<std::uint32_t, std::uint64_t> stream_updates;
+};
+
+Budget client_budget(const std::vector<std::uint8_t>& c, std::size_t start) {
+    Budget b;
+    for (std::size_t off = start; off + 9 <= c.size();) {
+        const std::uint32_t len = (std::uint32_t(c[off]) << 16) | (std::uint32_t(c[off + 1]) << 8) | c[off + 2];
+        const std::uint8_t type = c[off + 3];
+        const std::uint32_t sid = be32(&c[off + 5]) & 0x7FFFFFFFu;
+        if (off + 9 + len > c.size()) break;
+        const std::uint8_t* p = &c[off + 9];
+        if (type == 8 && len == 4) {
+            const std::uint32_t inc = be32(p) & 0x7FFFFFFFu;
+            if (sid == 0) b.conn += inc; else b.stream_updates[sid] += inc;
+        }
+        if (type == 4 && (c[off + 4] & 1) == 0) {
+            for (std::uint32_t i = 0; i + 6 <= len; i += 6) {
+                if (((p[i] << 8) | p[i + 1]) == 4) b.initial = std::max<std::uint64_t>(b.initial, be32(p + i + 2));
+            }
+        }
+        off += 9 + len;
+    }
+    return b;
+}
+
 // Walk the emitted byte stream frame by frame.
-void check_output(const std::vector<std::uint8_t>& out, std::uint32_t max_frame) {
+void check_output(const std::vector<std::uint8_t>& out, std::uint32_t max_frame, const Budget& b) {
     std::size_t off = 0;
     bool first = true;
+    std::uint64_t conn_data = 0;
+    std::map<std::uint32_t, std::uint64_t> stream_data;
     for (std::size_t guard = 0; guard < out.size() && off + 9 <= out.size(); ++guard) {
         auto h = parse_frame_header(out.data() + off);
         FUZZ_CHECK(h.is_ok());
-        if (first) FUZZ_CHECK(h.value().type == FrameType::SETTINGS);
+        const FrameHeader& f = h.value();
+        if (first) FUZZ_CHECK(f.type == FrameType::SETTINGS);
         first = false;
-        FUZZ_CHECK(h.value().length <= max_frame);
-        off += 9 + h.value().length;
+        FUZZ_CHECK(f.length <= max_frame);
+        FUZZ_CHECK(off + 9 + f.length <= out.size());
+        if (f.type == FrameType::DATA || f.type == FrameType::HEADERS) {
+            FUZZ_CHECK(f.stream_id % 2 == 1);  // only ever answers client streams
+        }
+        if (f.type == FrameType::DATA) {
+            conn_data += f.length;
+            stream_data[f.stream_id] += f.length;
+        }
+        off += 9 + f.length;
     }
     FUZZ_CHECK(off == out.size());  // never a torn frame at a drain boundary
+    FUZZ_CHECK(conn_data <= b.conn);
+    for (const auto& [sid, n] : stream_data) {
+        auto it = b.stream_updates.find(sid);
+        FUZZ_CHECK(n <= b.initial + (it == b.stream_updates.end() ? 0 : it->second));
+    }
 }
 
 }  // namespace
@@ -86,6 +136,7 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
         }
         if (r.is_err() || !conn.is_active()) break;
     }
-    check_output(emitted, conn.remote_settings().max_frame_size);
+    check_output(emitted, conn.remote_settings().max_frame_size,
+                 client_budget(client, raw ? 0 : CONNECTION_PREFACE_LEN));
     return 0;
 }

@@ -137,6 +137,7 @@ int HTTP1Parser::parse(
     // typical recv sizes) was answered 400 with no body. Found via S3
     // multipart part uploads (10 MB parts), which could never succeed.
     state_ = HTTP1State::START;
+    not_http_ = false;
     out_request.header_count = 0;
     out_request.content_length = 0;
     out_request.has_content_length = false;
@@ -415,7 +416,14 @@ int HTTP1Parser::parse_version(
     size_t len,
     HTTP1Request& req
 ) noexcept {
-    // Expect "HTTP/1.0" or "HTTP/1.1"
+    // Expect "HTTP/1.0" or "HTTP/1.1". Anything not even starting "HTTP/" is
+    // another protocol (e.g. a mistargeted HTTP/2 preface), answered by close.
+    const size_t avail = len - pos_;
+    if (std::memcmp(data + pos_, "HTTP/", std::min<size_t>(avail, 5)) != 0) {
+        not_http_ = true;
+        state_ = HTTP1State::ERROR;
+        return 1;
+    }
     if (pos_ + 10 > len) {
         return -1;  // Need more data
     }

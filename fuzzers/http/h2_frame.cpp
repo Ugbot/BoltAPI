@@ -74,28 +74,31 @@ void fuzz_push_promise(const FrameHeader& h, const std::vector<std::uint8_t>& p)
 }
 
 void fuzz_fixed(const FrameHeader& h, const std::vector<std::uint8_t>& p) {
+    // Fixed-size payloads: any other length is FRAME_SIZE_ERROR, never a read.
+    const std::uint8_t* d = p.empty() ? nullptr : p.data();
     switch (h.type) {
     case FrameType::PRIORITY:
-        if (p.size() == 5) (void)parse_priority_frame(p.data());
+        FUZZ_CHECK(parse_priority_frame(d, p.size()).is_ok() == (p.size() == 5));
         break;
     case FrameType::RST_STREAM:
-        if (p.size() == 4) (void)parse_rst_stream_frame(p.data());
+        FUZZ_CHECK(parse_rst_stream_frame(d, p.size()).is_ok() == (p.size() == 4));
         break;
-    case FrameType::PING:
-        if (p.size() == 8) {
-            auto r = parse_ping_frame(p.data());
-            FUZZ_CHECK(r.is_ok());
+    case FrameType::PING: {
+        auto r = parse_ping_frame(d, p.size());
+        FUZZ_CHECK(r.is_ok() == (p.size() == 8));
+        if (r.is_ok()) {
             std::uint8_t out[17];
             FUZZ_CHECK(write_ping_frame_to(out, sizeof(out), r.value(), true) == 17);
             FUZZ_CHECK(std::memcmp(out + 9, p.data(), 8) == 0);
         }
         break;
-    case FrameType::WINDOW_UPDATE:
-        if (p.size() == 4) {
-            auto r = parse_window_update_frame(p.data());
-            if (r.is_ok()) FUZZ_CHECK(r.value() > 0 && r.value() <= 0x7FFFFFFFu);
-        }
+    }
+    case FrameType::WINDOW_UPDATE: {
+        auto r = parse_window_update_frame(d, p.size());
+        if (p.size() != 4) FUZZ_CHECK(r.is_err());
+        if (r.is_ok()) FUZZ_CHECK(r.value() > 0 && r.value() <= 0x7FFFFFFFu);
         break;
+    }
     default:
         break;
     }

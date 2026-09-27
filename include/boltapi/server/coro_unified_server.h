@@ -412,6 +412,10 @@ struct CoroUnifiedServerConfig {
     size_t max_body_size = 10 * 1024 * 1024;  // Max request body size (10MB default)
     size_t max_header_size = 8192;            // Max header size (8KB default)
 
+    // HTTP/2 with prior knowledge on the cleartext port (RFC 9113 3.3): a
+    // connection opening with the h2 preface is served as HTTP/2.
+    bool enable_h2c = true;
+
     // Graceful shutdown configuration
     uint32_t shutdown_timeout_ms = 30000;   // Max time to wait for connections to drain (30s)
     bool enable_signal_handlers = true;     // Install SIGTERM/SIGINT handlers
@@ -666,7 +670,10 @@ private:
     core::coro_task<void> handle_http1_connection(net::IODispatcher& io, int fd, net::CoroTlsSocket* tls);
 
     // HTTP/2 request handling loop
-    core::coro_task<void> handle_http2_connection(net::IODispatcher& io, int fd, net::CoroTlsSocket* tls);
+    // `initial` holds bytes already read from the socket (the h2c preface).
+    core::coro_task<void> handle_http2_connection(net::IODispatcher& io, int fd, net::CoroTlsSocket* tls,
+                                                  const uint8_t* initial = nullptr,
+                                                  size_t initial_len = 0);
 
     // WebSocket connection handler coroutine
     core::coro_task<void> handle_websocket_connection(

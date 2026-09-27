@@ -8,6 +8,8 @@
 #include "boltapi/net/sys_compat.h"
 #include <openssl/err.h>
 #include <errno.h>
+#include <algorithm>
+#include <cassert>
 #include <cstring>
 
 namespace bolt::api {
@@ -249,99 +251,78 @@ ssize_t TlsSocket::write(const void* buffer, size_t len) {
 }
 
 bool TlsSocket::flush() {
-    // Nothing to send?
-    if (write_offset_ >= write_buffer_.size()) {
-        return true;  // All done
-    }
-
-    // Encrypt unsent data from write buffer
-    size_t remaining = write_buffer_.size() - write_offset_;
-    int encrypted = SSL_write(ssl_, write_buffer_.data() + write_offset_, remaining);
-
-    if (encrypted <= 0) {
-        int ssl_error = SSL_get_error(ssl_, encrypted);
-        if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
-            errno = EAGAIN;
-            return false;  // Would block, try again later
-        }
-        // Error
-        error_message_ = get_ssl_error(ssl_, encrypted);
-        state_ = TlsState::ERROR;
+    // Records already encrypted go first: they precede anything SSL_write adds.
+    if (flush_encrypted_output() < 0) {
+        if (errno != EAGAIN && errno != EWOULDBLOCK) state_ = TlsState::ERROR;
         return false;
     }
-
-    // encrypted > 0: SSL successfully encrypted 'encrypted' bytes
-    // Now flush the encrypted data from Wbio to socket
-    ssize_t result = flush_encrypted_output();
-
-    if (result < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            // Socket would block, but SSL already consumed the plaintext!
-            // We MUST update write_offset_ to mark this data as "in flight"
-            write_offset_ += encrypted;
-            return false;  // Not done yet, caller should retry
+    // Each pass moves >= 1 plaintext byte into the write BIO (or returns).
+    for (size_t guard = 0; write_offset_ < write_buffer_.size() && guard <= write_buffer_.size();
+         ++guard) {
+        const size_t remaining = write_buffer_.size() - write_offset_;
+        const int chunk = static_cast<int>(std::min<size_t>(remaining, kTlsWriteChunk));
+        const int encrypted = SSL_write(ssl_, write_buffer_.data() + write_offset_, chunk);
+        if (encrypted <= 0) {
+            const int ssl_error = SSL_get_error(ssl_, encrypted);
+            if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
+                errno = EAGAIN;
+                return false;
+            }
+            error_message_ = get_ssl_error(ssl_, encrypted);
+            state_ = TlsState::ERROR;
+            return false;
         }
-        // Error
-        error_message_ = "Socket send failed: " + std::string(strerror(errno));
-        state_ = TlsState::ERROR;
-        return false;
+        // The plaintext now lives, encrypted, in the write BIO / enc_out_:
+        // it is consumed whether or not the socket takes it right now.
+        write_offset_ += static_cast<size_t>(encrypted);
+        if (flush_encrypted_output() < 0) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK) state_ = TlsState::ERROR;
+            return false;
+        }
     }
-
-    // Success: encrypted data was sent
-    write_offset_ += encrypted;
-
-    // Clear buffer if all sent
-    if (write_offset_ >= write_buffer_.size()) {
-        write_buffer_.clear();
-        write_offset_ = 0;
-        return true;  // All done
-    }
-
-    return false;  // More data to send
+    assert(write_offset_ == write_buffer_.size());
+    write_buffer_.clear();
+    write_offset_ = 0;
+    return true;
 }
 
 ssize_t TlsSocket::flush_encrypted_output() {
-    char buffer[16384];  // 16KB buffer
+    // Send enc_out_, refill it from the write BIO, repeat. Bytes pulled out of
+    // the BIO are only dropped once the socket has taken them: a short or
+    // would-block send keeps the rest for the next call (dropping them tore
+    // the TLS record stream on any response larger than the socket buffer).
     ssize_t total_sent = 0;
-
-    while (true) {
-        // Read encrypted data from Wbio
-        int pending = BIO_read(wbio_, buffer, sizeof(buffer));
-
-        fprintf(stderr, "[TLS_FLUSH] BIO_read returned %d bytes\n", pending);
-        fflush(stderr);
-
-        if (pending <= 0) {
-            // No more data to send
-            break;
-        }
-
-        // Send to network
-        ssize_t sent = ::send(tcp_socket_.fd(), buffer, pending, 0);
-        fprintf(stderr, "[TLS_FLUSH] send() returned %zd (pending=%d)\n", sent, pending);
-        fflush(stderr);
-
-        if (sent < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // Would block - put unwritten data back
-                if (sent < pending) {
-                    // BIO doesn't support "put back", so we're stuck
-                    // In practice, this shouldn't happen with non-blocking sockets
-                }
-                return total_sent;
+    for (size_t guard = 0; guard < kMaxFlushPasses; ++guard) {
+        while (enc_off_ < enc_out_.size()) {
+            const size_t want = enc_out_.size() - enc_off_;
+#ifdef _WIN32
+            const ssize_t sent = ::send(tcp_socket_.fd(),
+                                        reinterpret_cast<const char*>(enc_out_.data() + enc_off_),
+                                        static_cast<int>(want), kSendFlags);
+#else
+            const ssize_t sent = ::send(tcp_socket_.fd(), enc_out_.data() + enc_off_, want,
+                                        kSendFlags);
+#endif
+            if (sent < 0) {
+                if (errno == EINTR) continue;
+                return -1;  // errno EAGAIN/EWOULDBLOCK: retry when writable
             }
-            // Error
-            return -1;
+            enc_off_ += static_cast<size_t>(sent);
+            total_sent += sent;
         }
-
-        total_sent += sent;
-
-        if (sent < pending) {
-            // Partial send - would block on next send
+        enc_out_.clear();
+        enc_off_ = 0;
+        const size_t pending = BIO_ctrl_pending(wbio_);
+        if (pending == 0) return total_sent;
+        enc_out_.resize(std::min(pending, kEncChunk));
+        const int n = BIO_read(wbio_, enc_out_.data(), static_cast<int>(enc_out_.size()));
+        if (n <= 0) {
+            enc_out_.clear();
             return total_sent;
         }
+        enc_out_.resize(static_cast<size_t>(n));
     }
-
+    assert(false && "flush_encrypted_output: pass bound hit");
     return total_sent;
 }
 
@@ -392,7 +373,7 @@ std::string TlsSocket::get_alpn_protocol() const {
 
 bool TlsSocket::has_pending_output() const {
     // Check if write buffer has unsent data
-    if (write_offset_ < write_buffer_.size()) {
+    if (write_offset_ < write_buffer_.size() || enc_off_ < enc_out_.size()) {
         return true;
     }
 

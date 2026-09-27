@@ -47,7 +47,10 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
         std::vector<std::uint8_t> block(data + off, data + off + n);
         off += n;
         std::vector<HPACKHeader> out;
-        if (dec.decode(block.data(), block.size(), out) != 0) break;  // COMPRESSION_ERROR ends the connection
+        const int rc = dec.decode(block.data(), block.size(), out);
+        if (rc == HPACKDecoder::kCompressionError) break;  // ends the connection
+        FUZZ_CHECK(out.size() <= 100);
+        if (rc != HPACKDecoder::kOk) continue;
         std::vector<std::pair<std::string, std::string>> got;
         for (const auto& h : out) got.emplace_back(std::string(h.name), std::string(h.value));
 

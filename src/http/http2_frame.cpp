@@ -198,8 +198,8 @@ result<void> parse_headers_frame(
 
 // PRIORITY frame (RFC 7540 Section 6.3)
 
-result<PrioritySpec> parse_priority_frame(const uint8_t* payload) {
-    if (!payload) {
+result<PrioritySpec> parse_priority_frame(const uint8_t* payload, size_t payload_len) {
+    if (!payload || payload_len != 5) {  // FRAME_SIZE_ERROR
         return result<PrioritySpec>(error_code::internal_error);
     }
 
@@ -215,8 +215,8 @@ result<PrioritySpec> parse_priority_frame(const uint8_t* payload) {
 
 // RST_STREAM frame (RFC 7540 Section 6.4)
 
-result<ErrorCode> parse_rst_stream_frame(const uint8_t* payload) {
-    if (!payload) {
+result<ErrorCode> parse_rst_stream_frame(const uint8_t* payload, size_t payload_len) {
+    if (!payload || payload_len != 4) {  // FRAME_SIZE_ERROR
         return result<ErrorCode>(error_code::internal_error);
     }
 
@@ -265,8 +265,8 @@ result<std::vector<SettingsParameter>> parse_settings_frame(
 
 // PING frame (RFC 7540 Section 6.7)
 
-result<uint64_t> parse_ping_frame(const uint8_t* payload) {
-    if (!payload) {
+result<uint64_t> parse_ping_frame(const uint8_t* payload, size_t payload_len) {
+    if (!payload || payload_len != 8) {  // FRAME_SIZE_ERROR
         return result<uint64_t>(error_code::internal_error);
     }
 
@@ -306,8 +306,8 @@ result<void> parse_goaway_frame(
 
 // WINDOW_UPDATE frame (RFC 7540 Section 6.9)
 
-result<uint32_t> parse_window_update_frame(const uint8_t* payload) {
-    if (!payload) {
+result<uint32_t> parse_window_update_frame(const uint8_t* payload, size_t payload_len) {
+    if (!payload || payload_len != 4) {  // FRAME_SIZE_ERROR
         return result<uint32_t>(error_code::internal_error);
     }
 
