@@ -711,6 +711,29 @@ WebSocketHandler* CoroUnifiedServer::get_websocket_handler(const std::string& pa
     return nullptr;
 }
 
+namespace {
+std::mutex g_sse_tls_mu;
+std::unordered_map<int, net::CoroTlsSocket*> g_sse_tls;  // live SSE-over-TLS connections
+}  // namespace
+
+void SSEWriter::register_tls(int fd, net::CoroTlsSocket* tls) noexcept {
+    assert(fd >= 0 && tls != nullptr);
+    std::lock_guard<std::mutex> lk(g_sse_tls_mu);
+    g_sse_tls[fd] = tls;
+}
+
+void SSEWriter::unregister_tls(int fd) noexcept {
+    std::lock_guard<std::mutex> lk(g_sse_tls_mu);
+    g_sse_tls.erase(fd);
+    assert(g_sse_tls.find(fd) == g_sse_tls.end());
+}
+
+net::CoroTlsSocket* SSEWriter::sse_tls_for_fd(int fd) noexcept {
+    std::lock_guard<std::mutex> lk(g_sse_tls_mu);
+    const auto it = g_sse_tls.find(fd);
+    return it == g_sse_tls.end() ? nullptr : it->second;
+}
+
 void CoroUnifiedServer::add_sse_handler(const std::string& path, CoroSSEHandler handler) {
     s_sse_handlers_[path] = std::move(handler);
     std::cout << "[CoroUnifiedServer] Registered SSE handler: " << path << std::endl;
@@ -1603,12 +1626,18 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
                     "Access-Control-Allow-Origin: *\r\n"
                     "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
                     "\r\n";
-                co_await conn_write(io, fd, tls,sse_headers, strlen(sse_headers));
+                if (!co_await conn_write_all(io, fd, tls, sse_headers, strlen(sse_headers))) {
+                    io.async_close(fd);
+                    co_return;
+                }
 
                 std::cout << "[CoroUnifiedServer] SSE stream for path: " << req.path << std::endl;
 
-                // Call SSE handler (streams events until done or client disconnects)
+                // Call SSE handler (streams events until done or client
+                // disconnects). Its SSEWriter finds the TLS socket by fd.
+                if (tls != nullptr) SSEWriter::register_tls(fd, tls);
                 co_await (*sse_handler)(io, fd, req);
+                if (tls != nullptr) SSEWriter::unregister_tls(fd);
 
                 // SSE stream ended
                 io.async_close(fd);

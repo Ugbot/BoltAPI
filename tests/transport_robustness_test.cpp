@@ -219,6 +219,15 @@ protected:
         app_ = new api::App(cfg);
         app_->get("/big", [](api::Request&, api::Response& res) { res.ok().text(big_body()); });
         app_->get("/ping", [](api::Request&, api::Response& res) { res.ok().text("pong"); });
+        app_->sse_coro("/events",
+            [](bolt::api::net::IODispatcher& io, int fd, const bolt::api::http::CoroHttpRequest&)
+                -> bolt::api::core::coro_task<void> {
+                bolt::api::http::SSEWriter sse(io, fd);
+                if (!co_await sse.send_event("tick", "a\r\nb", "1")) co_return;
+                // A line break in the event type would forge a field: refused.
+                if (co_await sse.send_event("tick\nevent: forged", "x", "2")) co_return;
+                co_await sse.send_event("", std::string(100000, 's'), "3");
+            });
         ASSERT_EQ(app_->start_background("127.0.0.1", kPlainPort), 0);
         std::this_thread::sleep_for(std::chrono::milliseconds(400));
     }
@@ -253,6 +262,31 @@ TEST_F(TransportRobustness, PeerResetMidResponseKeepsServerUp) {
     }
     EXPECT_EQ(body_of(http1_get(kPlainPort, false, "/ping", false)), "pong");
     EXPECT_EQ(body_of(http1_get(kTlsPort, true, "/ping", false)), "pong");
+}
+
+// SSE over TLS: SSEWriter(io, fd) must write through the TLS socket (it used
+// to write cleartext into the TLS stream).
+TEST_F(TransportRobustness, SseOverTlsIsEncryptedAndFramed) {
+    Conn c;
+    ASSERT_TRUE(c.open(kTlsPort, true, "http/1.1"));
+    const std::string req = "GET /events HTTP/1.1\r\nHost: x\r\nAccept: text/event-stream\r\n\r\n";
+    ASSERT_TRUE(c.send_all(req.data(), req.size()));
+    std::string raw;
+    char tmp[8192];
+    for (int i = 0; i < kMaxIo && raw.find("id: 3") == std::string::npos; ++i) {
+        const int n = c.recv_some(tmp, sizeof(tmp));
+        if (n <= 0) break;
+        raw.append(tmp, static_cast<std::size_t>(n));
+    }
+    for (int i = 0; i < kMaxIo && raw.size() < 100000; ++i) {
+        const int n = c.recv_some(tmp, sizeof(tmp));
+        if (n <= 0) break;
+        raw.append(tmp, static_cast<std::size_t>(n));
+    }
+    const std::string body = body_of(raw);
+    EXPECT_EQ(body.rfind("id: 1\nevent: tick\ndata: a\ndata: b\n\n", 0), 0u) << body.substr(0, 200);
+    EXPECT_EQ(body.find("forged"), std::string::npos);
+    EXPECT_NE(body.find("id: 3\ndata: " + std::string(100000, 's') + "\n\n"), std::string::npos);
 }
 
 TEST_F(TransportRobustness, H2cLargeResponseIsFramedAndFlowControlled) {

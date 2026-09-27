@@ -218,6 +218,7 @@ set(BOLTAPI_ENGINE_SOURCES
     src/http/http1_parser.cpp
     src/http/http2_connection.cpp
     src/http/http2_connection_recv.cpp
+    src/http/sse.cpp
     src/http/http2_frame.cpp
     src/http/http2_stream.cpp
     src/http/huffman.cpp

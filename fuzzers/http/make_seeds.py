@@ -120,7 +120,14 @@ def h2():
     put("h2_frame", "push", frame(5, 0x4, 1, struct.pack(">I", 2) + C3[0]))
 
 
+def sse():
+    put("sse", "event", b"42\xffupdate\xffline one\nline two\xffkeep-alive")
+    put("sse", "data_only", b"\xff\xff{\"a\":1}\xff")
+    put("sse", "terminators", b"7\xfftick\xffa\r\nb\rc\xffhi\nevent: forged")
+
+
 if __name__ == "__main__":
+    sse()
     http1()
     hpack()
     h2()
