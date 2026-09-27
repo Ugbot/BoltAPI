@@ -216,8 +216,10 @@ std::size_t SdpMedia::payload_types(std::uint8_t* out,
     std::size_t n = 0;
     for (std::size_t i = 0; i < format_count && n < cap; ++i) {
         std::uint8_t pt = 0;
-        if (parse_uint(formats[i], &pt)) out[n++] = pt;
+        // RTP payload types are 7-bit; a larger format token is not RTP.
+        if (parse_uint(formats[i], &pt) && pt <= 127) out[n++] = pt;
     }
+    assert(n <= cap);
     return n;
 }
 
@@ -467,11 +469,11 @@ SdpError build_answer(const AnswerParams& p, std::string& out) {
 // ===========================================================================
 namespace {
 
-// Case-insensitive equality of two ASCII spans.
+// Case-insensitive equality of a peer span `a` with a literal `b`.
 bool ieq(std::string_view a, std::string_view b) noexcept {
-    assert(a.size() <= 256 && "ieq: a span bound");
-    assert(b.size() <= 256 && "ieq: b span bound");
+    assert(b.size() <= 16 && "ieq: b is a codec literal");
     if (a.size() != b.size()) return false;
+    assert(a.size() <= 16);
     for (std::size_t i = 0; i < a.size(); ++i) {
         char ca = a[i], cb = b[i];
         if (ca >= 'a' && ca <= 'z') ca = static_cast<char>(ca - 32);
@@ -482,18 +484,19 @@ bool ieq(std::string_view a, std::string_view b) noexcept {
 }
 
 // The encoding name from an rtpmap value: "opus/48000/2" -> "opus".
+// `rtpmap` is peer text of any length.
 std::string_view encoding_name(std::string_view rtpmap) noexcept {
-    assert(rtpmap.size() <= 256 && "encoding_name: span bound");
     const std::size_t slash = rtpmap.find('/');
     const std::string_view name =
         slash == std::string_view::npos ? rtpmap : rtpmap.substr(0, slash);
     assert(name.size() <= rtpmap.size() && "encoding_name: overran");
+    assert(name.data() == rtpmap.data() && "encoding_name: not a prefix");
     return name;
 }
 
 // Is `name` a codec Bolt supports for `kind` (relay/echo, no transcode)?
+// `name` is peer text of any length.
 bool is_supported_codec(MediaKind kind, std::string_view name) noexcept {
-    assert(name.size() <= 64 && "is_supported_codec: name bound");
     assert((kind == MediaKind::kAudio || kind == MediaKind::kVideo) &&
            "is_supported_codec: bad kind");
     if (kind == MediaKind::kAudio) {
@@ -503,11 +506,12 @@ bool is_supported_codec(MediaKind kind, std::string_view name) noexcept {
 }
 
 // Map a media_type token to a MediaKind; false for non-audio/video sections.
+// `t` is the peer's m= media token, of any length.
 bool media_kind_of(std::string_view t, MediaKind* k) noexcept {
     assert(k != nullptr && "media_kind_of: null");
-    assert(t.size() <= 64 && "media_kind_of: type bound");
     if (t == "audio") { *k = MediaKind::kAudio; return true; }
     if (t == "video") { *k = MediaKind::kVideo; return true; }
+    assert(t != "audio" && t != "video");
     return false;
 }
 

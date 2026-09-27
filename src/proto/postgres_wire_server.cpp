@@ -292,6 +292,27 @@ void Protocol::worker_loop(IQueryExecutor& exec, std::uint16_t worker_id) noexce
     while (!stopping_.load(std::memory_order_acquire)) {
         const int fd = listener_->accept_one(cfg_.accept_poll_ms);
         if (fd < 0) continue;
+        serve_connection(fd, exec, worker_id, in, out, ext);
+        net::sys::close_socket(fd);
+    }
+}
+
+void Protocol::serve_socket(int fd, IQueryExecutor& exec) noexcept {
+    assert(fd >= 0);
+    assert(cfg_.message_buffer_bytes >= kMaxStartupPacket);
+    std::vector<std::uint8_t> in(cfg_.message_buffer_bytes);
+    std::vector<std::uint8_t> out(cfg_.write_buffer_bytes);
+    ExtendedSession ext(cfg_);
+    serve_connection(fd, exec, 0, in, out, ext);
+}
+
+void Protocol::serve_connection(int fd, IQueryExecutor& exec, std::uint16_t worker_id,
+                                std::vector<std::uint8_t>& in,
+                                std::vector<std::uint8_t>& out,
+                                detail::ExtendedSession& ext) noexcept {
+    assert(fd >= 0);
+    assert(in.size() >= kMaxStartupPacket && out.size() >= 16);
+    {
         (void)conn_seq_.fetch_add(1, std::memory_order_relaxed);
         ext.reset();
 
@@ -481,7 +502,6 @@ void Protocol::worker_loop(IQueryExecutor& exec, std::uint16_t worker_id) noexce
                 }
             }
         }
-        net::sys::close_socket(fd);
     }
 }
 

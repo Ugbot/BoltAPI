@@ -117,8 +117,8 @@ else()
         # bolt::parse hosts fionn — Bolt's skip-aware JSON parser. It is the canonical
         # JSON path for Bolt API (include/boltapi/json.h wraps it). See docs/JSON.md.
         set(BOLT_BUILD_PARSE      ON  CACHE BOOL "" FORCE)
-        # The Flight SQL tests build Arrow IPC fixtures with bolt::ingest.
-        if(BOLTAPI_WITH_FLIGHT_SQL AND BOLTAPI_BUILD_TESTS)
+        # The Flight SQL tests and fuzzers build Arrow IPC fixtures with bolt::ingest.
+        if(BOLTAPI_WITH_FLIGHT_SQL AND (BOLTAPI_BUILD_TESTS OR BOLTAPI_BUILD_FUZZERS))
             set(BOLT_BUILD_INGEST ON  CACHE BOOL "" FORCE)
         else()
             set(BOLT_BUILD_INGEST OFF CACHE BOOL "" FORCE)

@@ -293,7 +293,11 @@ inline RtcpError parse_feedback_body(Packet& pkt) noexcept {
             const std::uint32_t em = rd24(f + 5);
             const std::uint32_t exp = (em >> 18) & 0x3F;
             const std::uint32_t mant = em & 0x3FFFF;
-            pkt.remb_bitrate_bps = mant << exp;
+            // mantissa * 2^exp can reach 2^81; saturate at the field's range.
+            const std::uint64_t bps = exp < 32 ? static_cast<std::uint64_t>(mant) << exp
+                                               : (mant == 0 ? 0 : ~std::uint64_t{0});
+            pkt.remb_bitrate_bps = bps > 0xFFFFFFFFu ? 0xFFFFFFFFu
+                                                     : static_cast<std::uint32_t>(bps);
             std::size_t off = 8;
             for (std::uint8_t i = 0; i < num && off + 4 <= n; ++i) {
                 if (pkt.remb_ssrc_count >= kMaxFirEntries) break;

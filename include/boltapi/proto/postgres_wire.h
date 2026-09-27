@@ -84,6 +84,8 @@ namespace bolt::api {
 namespace proto {
 namespace pgwire {
 
+namespace detail { class ExtendedSession; }
+
 using Status = core::result<void>;
 inline Status ok_status() noexcept { return Status(); }
 
@@ -295,8 +297,15 @@ public:
     bool          running() const noexcept { return running_.load(std::memory_order_acquire); }
     std::uint16_t local_port() const noexcept { return listener_ ? listener_->local_port() : 0; }
 
+    // Serve one already-connected socket on the calling thread until the peer
+    // leaves (tests, fuzzing). Needs no listener; the caller closes `fd`.
+    void serve_socket(int fd, IQueryExecutor& exec) noexcept;
+
 private:
     void worker_loop(IQueryExecutor& exec, std::uint16_t worker_id) noexcept;
+    void serve_connection(int fd, IQueryExecutor& exec, std::uint16_t worker_id,
+                          std::vector<std::uint8_t>& in, std::vector<std::uint8_t>& out,
+                          detail::ExtendedSession& ext) noexcept;
 
     Config              cfg_;
     IExecutorFactory&   factory_;

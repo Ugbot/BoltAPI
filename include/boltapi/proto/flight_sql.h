@@ -295,6 +295,7 @@ struct Config {
 };
 
 class Listener;
+namespace detail { struct DirectConn; }
 
 class Protocol final {
 public:
@@ -311,6 +312,11 @@ public:
     bool          running() const noexcept { return running_.load(std::memory_order_acquire); }
     std::uint16_t local_port() const noexcept;
 
+    // Serve one already-connected h2c socket on the calling thread until the
+    // peer leaves (tests, fuzzing). Needs no listener; the caller closes `fd`.
+    // The connection state is reused across calls, as a worker reuses it.
+    void serve_socket(int fd, IQueryExecutor& exec) noexcept;
+
 private:
     void worker_loop(IQueryExecutor& exec, std::uint16_t worker_id) noexcept;
 
@@ -325,6 +331,7 @@ private:
     std::vector<IQueryExecutor*>                       execs_;
     std::atomic<bool>                                  running_{false};
     std::atomic<bool>                                  stopping_{false};
+    std::unique_ptr<detail::DirectConn>                direct_;
 };
 
 }  // namespace bolt::api::proto::flightsql

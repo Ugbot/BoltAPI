@@ -463,25 +463,24 @@ bool SctpAssociation::record_received(std::uint32_t tsn) noexcept {
 
 void SctpAssociation::advance_cum_ack() noexcept {
     if (!have_cum_ack_) return;
-    // Walk contiguous set bits at the front of the window, advancing cum_ack_in_
-    // and shifting the bitmap down.
-    std::uint32_t advanced = 0;
-    while (advanced < kRecvWindow) {
-        const std::uint32_t next = cum_ack_in_ + 1;  // candidate
-        const std::uint32_t off = 0;                 // always front after each advance
-        (void)next; (void)off;
-        if ((recv_bitmap_[0] & 1u) == 0) break;
-        // Pop the front bit: advance cum ack, shift whole bitmap right by 1.
-        cum_ack_in_ = cum_ack_in_ + 1;
-        // Shift bitmap down by one bit.
-        std::uint8_t carry = 0;
-        for (std::size_t i = (kRecvWindow / 8); i-- > 0; ) {
-            const std::uint8_t cur = recv_bitmap_[i];
-            recv_bitmap_[i] = static_cast<std::uint8_t>((cur >> 1) | (carry << 7));
-            carry = static_cast<std::uint8_t>(cur & 1u);
-        }
-        ++advanced;
+    // Count the run of set bits at the front of the window, then advance the
+    // cum ack past it and shift the bitmap down once.
+    constexpr std::size_t kBytes = kRecvWindow / 8;
+    std::size_t run = 0;
+    while (run < kRecvWindow && (recv_bitmap_[run >> 3] >> (run & 7)) & 1u) ++run;
+    if (run == 0) return;
+    cum_ack_in_ += static_cast<std::uint32_t>(run);
+    const std::size_t byte_shift = run >> 3;
+    const unsigned bit_shift = static_cast<unsigned>(run & 7);
+    for (std::size_t i = 0; i < kBytes; ++i) {   // bounded by the window
+        const std::size_t lo = i + byte_shift;
+        const std::size_t hi = lo + 1;
+        const unsigned a = lo < kBytes ? recv_bitmap_[lo] : 0u;
+        const unsigned b = (bit_shift != 0 && hi < kBytes) ? recv_bitmap_[hi] : 0u;
+        recv_bitmap_[i] = static_cast<std::uint8_t>((a >> bit_shift) | (b << (8 - bit_shift)));
     }
+    assert(run <= kRecvWindow);
+    assert(run == kRecvWindow || (recv_bitmap_[0] & 1u) == 0);
 }
 
 // ===========================================================================
@@ -684,13 +683,12 @@ void SctpAssociation::handle_forward_tsn(const std::uint8_t* chunk, std::size_t 
 
     if (tsn_gt(new_cum, cum_ack_in_)) {
         // Mark every TSN in (cum_ack_in_, new_cum] as received so the bitmap +
-        // cum ack walk advances cleanly, then advance.
-        std::uint32_t t = cum_ack_in_ + 1;
-        while (tsn_le(t, new_cum)) {
-            record_received(t);  // ignores out-of-window safely
-            if (t == new_cum) break;
-            ++t;
-        }
+        // cum ack walk advances cleanly, then advance. TSNs past the receive
+        // window are not tracked, so the walk stops there: a peer-chosen
+        // new_cum up to 2^31 ahead costs at most kRecvWindow steps.
+        const std::uint32_t span = new_cum - cum_ack_in_;
+        const std::uint32_t steps = span < kRecvWindow ? span : static_cast<std::uint32_t>(kRecvWindow);
+        for (std::uint32_t k = 1; k <= steps; ++k) (void)record_received(cum_ack_in_ + k);
         // Drop any in-progress reassembly whose begin TSN was abandoned.
         for (std::size_t i = 0; i < kSctpMaxReasm; ++i) {
             Reasm& r = reasm_[i];

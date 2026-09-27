@@ -503,20 +503,61 @@ DtlsSessionManager::find(const sockaddr* peer, int peer_len) noexcept {
     return e ? e->session.get() : nullptr;
 }
 
+namespace {
+
+// A DTLS ClientHello record (RFC 6347 §4.1/§4.2.2): handshake content type,
+// DTLS major version 0xFE, handshake type client_hello after the 13-byte
+// record header. Only this opens a session.
+bool is_client_hello(const std::uint8_t* d, std::size_t n) noexcept {
+    constexpr std::size_t kRecordHeader = 13;
+    if (d == nullptr || n < kRecordHeader + 12) return false;
+    return d[0] == 22 && d[1] == 0xFE && d[kRecordHeader] == 1;
+}
+
+}  // namespace
+
+DtlsSessionManager::Entry* DtlsSessionManager::claim_slot() noexcept {
+    assert(count_ <= kMaxPeers);
+    Entry* victim = nullptr;
+    for (std::size_t i = 0; i < kMaxPeers; ++i) {
+        Entry& e = entries_[i];
+        if (!e.used) return &e;
+        if (e.session && e.session->established()) continue;
+        if (victim == nullptr || e.seq < victim->seq) victim = &e;
+    }
+    if (victim != nullptr) release(*victim);
+    assert(victim == nullptr || !victim->used);
+    return victim;
+}
+
+void DtlsSessionManager::release(Entry& e) noexcept {
+    assert(e.used && count_ > 0);
+    e.session.reset();
+    e.used = false;
+    e.addr_len = 0;
+    --count_;
+    assert(count_ < kMaxPeers);
+}
+
 void DtlsSessionManager::feed(const sockaddr* peer, int peer_len,
                               const std::uint8_t* data, std::size_t len) noexcept {
     if (!ctx_ || !transport_ || !peer || peer_len <= 0) return;
     if (static_cast<std::size_t>(peer_len) > sizeof(sockaddr_storage)) return;
 
     Entry* e = lookup(peer, peer_len);
+    // A failed handshake frees its slot; the peer may start over.
+    if (e != nullptr && (!e->session || e->session->state() == DtlsSession::State::Failed)) {
+        release(*e);
+        e = nullptr;
+    }
     if (!e) {
-        // First DTLS record from this peer: create a session (the ClientHello).
-        if (count_ >= kMaxPeers) return;  // bounded; drop overflow peers
-        for (std::size_t i = 0; i < kMaxPeers; ++i) {
-            if (!entries_[i].used) { e = &entries_[i]; break; }
-        }
-        if (!e) return;
+        // Only a ClientHello opens a session, so stray datagrams from
+        // arbitrary sources cannot fill the table.
+        if (!is_client_hello(data, len)) return;
+        e = claim_slot();
+        if (!e) return;   // every slot holds an established peer
         e->used = true;
+        e->seq = ++next_seq_;
         std::memcpy(&e->addr, peer, static_cast<std::size_t>(peer_len));
         e->addr_len = peer_len;
         e->session = std::make_unique<DtlsSession>(*ctx_, *transport_, peer,
@@ -526,6 +567,7 @@ void DtlsSessionManager::feed(const sockaddr* peer, int peer_len,
         }
         ++count_;
     }
+    assert(e->used && count_ <= kMaxPeers);
     if (e->session) {
         e->session->feed(data, len);
     }

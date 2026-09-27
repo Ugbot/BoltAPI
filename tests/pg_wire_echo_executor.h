@@ -42,12 +42,12 @@ public:
             applied += sql_ + ";";
         } else if (starts(sql, "rows ")) {
             mode_ = Mode::Rows;
-            rows_ = static_cast<std::uint32_t>(std::atoi(sql_.c_str() + 5));
+            rows_ = clamp_rows(std::atoi(sql_.c_str() + 5));
             ncols_ = 1;
             f[0] = {"n", 20, 8};
         } else if (starts(sql, "select rows ")) {   // query-shaped, for DECLARE
             mode_ = Mode::Rows;
-            rows_ = static_cast<std::uint32_t>(std::atoi(sql_.c_str() + 12));
+            rows_ = clamp_rows(std::atoi(sql_.c_str() + 12));
             ncols_ = 1;
             f[0] = {"n", 20, 8};
         } else if (starts(sql, "types")) {
@@ -106,11 +106,16 @@ public:
     }
 
     int executes = 0;
+    std::uint32_t max_rows = 1u << 20;   // "rows N" beyond this yields max_rows
     int describes = 0;
     std::string applied;   // every "ddl..." statement run, ';'-terminated
 
 private:
     enum class Mode { Echo, Rows, Types, Ddl };
+    std::uint32_t clamp_rows(int n) const noexcept {
+        if (n < 0) return 0;
+        return static_cast<std::uint32_t>(n) < max_rows ? static_cast<std::uint32_t>(n) : max_rows;
+    }
     static bool starts(std::string_view s, const char* p) noexcept {
         return s.substr(0, std::strlen(p)) == p;
     }

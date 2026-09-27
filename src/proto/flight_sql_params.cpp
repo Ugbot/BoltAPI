@@ -214,18 +214,27 @@ std::uint32_t n_buffers(const Decoder::Col& c, bool v4) noexcept {
     }
 }
 
+// `have` bytes hold `n` items of `width` bytes. Division, not n * width: the
+// peer picks n (up to 2^63) and the product wraps.
+bool holds(std::uint64_t have, std::uint64_t n, std::uint64_t width) noexcept {
+    assert(width > 0 && width <= 8);
+    return n <= have / width;
+}
+
 // Checks that `v`'s buffers are long enough for `v.len` values of `c`.
 bool sized(const Decoder::Col& c, const View& v) noexcept {
+    assert(v.len >= 0);
     const auto n = static_cast<std::uint64_t>(v.len);
+    assert(n < (std::uint64_t{1} << 63));
     if (v.nulls != 0 && v.blen[0] != 0 && v.blen[0] < (n + 7) / 8) return false;
     switch (c.type) {
         case kTypeNull:      return true;
         case kTypeBool:      return v.blen[1] >= (n + 7) / 8;
-        case kTypeInt:       return v.blen[1] >= n * static_cast<std::uint64_t>(c.bits / 8);
-        case kTypeFloat:     return v.blen[1] >= n * (c.bits == 1 ? 4u : 8u);
+        case kTypeInt:       return holds(v.blen[1], n, static_cast<std::uint64_t>(c.bits / 8));
+        case kTypeFloat:     return holds(v.blen[1], n, c.bits == 1 ? 4u : 8u);
         case kTypeBinary:
-        case kTypeUtf8:      return n == 0 || v.blen[1] >= (n + 1) * 4;
-        case kTypeLargeUtf8: return n == 0 || v.blen[1] >= (n + 1) * 8;
+        case kTypeUtf8:      return n == 0 || holds(v.blen[1], n + 1, 4);
+        case kTypeLargeUtf8: return n == 0 || holds(v.blen[1], n + 1, 8);
         default:             return true;
     }
 }
