@@ -25,6 +25,83 @@ bool HTTP1Request::has_header(std::string_view name) const noexcept {
 }
 
 // ============================================================================
+// Field validation (RFC 9110 5.1 / 5.5, RFC 9112 6)
+// ============================================================================
+
+namespace {
+
+constexpr size_t kMaxLeadingEmptyLines = 4;
+// Far above any configured body limit; bounds the decimal accumulator.
+constexpr uint64_t kMaxContentLength = 1ULL << 53;
+constexpr size_t kMaxContentLengthDigits = 16;
+
+bool ieq(std::string_view a, std::string_view lower) noexcept {
+    if (a.size() != lower.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        const char c = (a[i] >= 'A' && a[i] <= 'Z') ? static_cast<char>(a[i] + 32) : a[i];
+        if (c != lower[i]) return false;
+    }
+    return true;
+}
+
+// 1*DIGIT only: no sign, no whitespace, no list ("5, 5"). 0 ok, 1 malformed.
+int parse_content_length(std::string_view v, uint64_t* out) noexcept {
+    assert(out != nullptr);
+    if (v.empty() || v.size() > kMaxContentLengthDigits) return 1;
+    uint64_t n = 0;
+    for (char c : v) {
+        if (c < '0' || c > '9') return 1;
+        n = n * 10 + static_cast<uint64_t>(c - '0');
+    }
+    if (n > kMaxContentLength) return 1;
+    *out = n;
+    assert(*out <= kMaxContentLength);
+    return 0;
+}
+
+}  // namespace
+
+int HTTP1Parser::extract_framing(HTTP1Request& req) noexcept {
+    assert(req.header_count <= HTTP1Request::MAX_HEADERS);
+    assert(!req.has_content_length && !req.chunked);
+    size_t te_count = 0;
+    for (size_t i = 0; i < req.header_count; ++i) {
+        const auto& h = req.headers[i];
+        if (ieq(h.name, "content-length")) {
+            uint64_t n = 0;
+            if (parse_content_length(h.value, &n) != 0) return 1;
+            // Repeats are tolerated only when identical (RFC 9110 8.6).
+            if (req.has_content_length && n != req.content_length) return 1;
+            req.content_length = n;
+            req.has_content_length = true;
+        } else if (ieq(h.name, "transfer-encoding")) {
+            // Only "chunked" is implemented; anything else leaves the body
+            // length undeterminable (RFC 9112 6.3 rule 4), and a repeated
+            // field or HTTP/1.0 framing is faulty (6.1).
+            if (++te_count > 1 || !ieq(h.value, "chunked")) return 1;
+            if (req.version != HTTP1Version::HTTP_1_1) return 1;
+            req.chunked = true;
+        }
+    }
+    // Both framings on one request is the classic smuggling vector.
+    if (req.chunked && req.has_content_length) return 1;
+
+    auto connection = req.get_header("connection");
+    if (req.version == HTTP1Version::HTTP_1_1) {
+        req.keep_alive = connection.empty() || ieq(connection, "keep-alive");
+    } else {
+        req.keep_alive = ieq(connection, "keep-alive");
+    }
+    auto upgrade = req.get_header("upgrade");
+    if (!upgrade.empty()) {
+        req.upgrade = true;
+        req.upgrade_protocol = upgrade;
+    }
+    assert(!(req.chunked && req.has_content_length));
+    return 0;
+}
+
+// ============================================================================
 // HTTP1Parser Implementation
 // ============================================================================
 
@@ -66,78 +143,62 @@ int HTTP1Parser::parse(
     out_request.chunked = false;
     out_request.upgrade = false;
 
-    // Parse request line: METHOD SP URL SP VERSION CRLF
-    
-    // 1. Parse method
+    // RFC 9112 2.2: ignore empty lines before the request-line (a pipelining
+    // client may trail its previous body with CRLF).
+    for (size_t skipped = 0; skipped < kMaxLeadingEmptyLines && pos_ < len &&
+                             data[pos_] == '\r'; ++skipped) {
+        if (pos_ + 1 >= len) return -1;
+        if (data[pos_ + 1] != '\n') {
+            state_ = HTTP1State::ERROR;
+            return 1;
+        }
+        pos_ += 2;
+    }
+    if (pos_ >= len) return -1;
+
+    // Request line: METHOD SP URL SP VERSION CRLF
     if (parse_method(data, len, out_request) != 0) {
         return state_ == HTTP1State::ERROR ? 1 : -1;
     }
-    
-    // 2. Parse URL
     if (parse_url(data, len, out_request) != 0) {
         return state_ == HTTP1State::ERROR ? 1 : -1;
     }
-    
-    // 3. Parse version
     if (parse_version(data, len, out_request) != 0) {
         return state_ == HTTP1State::ERROR ? 1 : -1;
     }
-    
-    // 4. Parse headers
+
+    // Header fields, up to the empty line.
+    bool headers_done = false;
     while (pos_ < len) {
-        // Check for end of headers (empty line)
-        if (pos_ + 1 < len && data[pos_] == '\r' && data[pos_ + 1] == '\n') {
+        if (data[pos_] == '\r') {
+            if (pos_ + 1 >= len) return -1;
+            if (data[pos_ + 1] != '\n') {
+                state_ = HTTP1State::ERROR;
+                return 1;
+            }
             pos_ += 2;
             state_ = HTTP1State::BODY;
+            headers_done = true;
             break;
         }
-
         if (parse_header_field(data, len, out_request) != 0) {
             return state_ == HTTP1State::ERROR ? 1 : -1;
         }
-
         if (parse_header_value(data, len, out_request) != 0) {
             return state_ == HTTP1State::ERROR ? 1 : -1;
         }
     }
+    if (!headers_done) return -1;
 
-    // Parse URL components
     parse_url_components(out_request);
-
-    // Extract important headers
-    auto content_len = out_request.get_header("content-length");
-    if (!content_len.empty()) {
-        out_request.content_length = std::stoull(std::string(content_len));
-        out_request.has_content_length = true;
-    }
-
-    auto transfer_enc = out_request.get_header("transfer-encoding");
-    if (!transfer_enc.empty() && transfer_enc.find("chunked") != std::string_view::npos) {
-        out_request.chunked = true;
-    }
-
-    auto connection = out_request.get_header("connection");
-    if (out_request.version == HTTP1Version::HTTP_1_1) {
-        out_request.keep_alive = connection.empty() || str_eq_ci(connection, "keep-alive");
-    } else {
-        out_request.keep_alive = str_eq_ci(connection, "keep-alive");
-    }
-
-    auto upgrade = out_request.get_header("upgrade");
-    if (!upgrade.empty()) {
-        out_request.upgrade = true;
-        out_request.upgrade_protocol = upgrade;
+    if (extract_framing(out_request) != 0) {
+        state_ = HTTP1State::ERROR;
+        return 1;
     }
 
     // 5. Chunked body: the raw framing is validated and handed back in
     // out_request.body; the caller decodes it in place (dechunk_in_place).
     if (out_request.chunked) {
-        // Both framings on one request is the classic smuggling vector
-        // (RFC 9112 6.3): refuse rather than pick one.
-        if (out_request.has_content_length) {
-            state_ = HTTP1State::ERROR;
-            return 1;
-        }
         size_t raw_len = 0;
         const int rc = scan_chunked(data + pos_, len - pos_, &raw_len);
         if (rc != 0) {
@@ -194,8 +255,9 @@ int chunk_size_line(const uint8_t* p, size_t len, size_t* line_len,
         if (h < 0) break;
         v = (v << 4) | static_cast<uint64_t>(h);
     }
+    if (i > 16) return 1;  // can never fit in 64 bits, however much follows
     if (i == len) return -1;
-    if (i == 0 || i > 16) return 1;
+    if (i == 0) return 1;
     constexpr size_t kMaxLine = 4096;             // bounds chunk extensions
     for (; i < len && i < kMaxLine; ++i) {
         if (p[i] == '\n') return 1;             // bare LF
@@ -282,7 +344,11 @@ int HTTP1Parser::parse_method(
     if (pos_ >= len) {
         return -1;  // Need more data
     }
-    
+    if (pos_ == mark_) {  // empty method
+        state_ = HTTP1State::ERROR;
+        return 1;
+    }
+
     // Extract method
     req.method_str = std::string_view(
         reinterpret_cast<const char*>(data + mark_),
@@ -314,13 +380,22 @@ int HTTP1Parser::parse_url(
 ) noexcept {
     mark_ = pos_;
     
-    // Find end of URL (space)
+    // request-target: visible octets up to SP (RFC 9112 3.2); a CTL or bare
+    // CR/LF here is a malformed request line, not "more data".
     while (pos_ < len && data[pos_] != ' ') {
+        if (data[pos_] < 0x21 || data[pos_] == 0x7F) {
+            state_ = HTTP1State::ERROR;
+            return 1;
+        }
         pos_++;
     }
-    
+
     if (pos_ >= len) {
         return -1;  // Need more data
+    }
+    if (pos_ == mark_) {  // empty request-target
+        state_ = HTTP1State::ERROR;
+        return 1;
     }
     
     // Extract URL
@@ -372,17 +447,22 @@ int HTTP1Parser::parse_header_field(
     
     mark_ = pos_;
     
-    // Find colon
+    // field-name = token, immediately followed by ':' — whitespace before the
+    // colon (and obs-fold) is rejected outright (RFC 9112 5.1, 5.2).
     while (pos_ < len && data[pos_] != ':') {
-        if (data[pos_] == '\r') {
-            // End of headers
-            return 0;
+        if (!is_token_char(data[pos_])) {
+            state_ = HTTP1State::ERROR;
+            return 1;
         }
         pos_++;
     }
-    
+
     if (pos_ >= len) {
         return -1;  // Need more data
+    }
+    if (pos_ == mark_) {  // empty field-name
+        state_ = HTTP1State::ERROR;
+        return 1;
     }
     
     // Extract field name
@@ -410,13 +490,23 @@ int HTTP1Parser::parse_header_value(
 ) noexcept {
     mark_ = pos_;
     
-    // Find CRLF
-    while (pos_ + 1 < len && !(data[pos_] == '\r' && data[pos_ + 1] == '\n')) {
+    // field-value: VCHAR / obs-text / SP / HTAB up to CRLF. NUL, a bare CR or
+    // a bare LF would let one header smuggle another (RFC 9110 5.5).
+    while (pos_ < len && data[pos_] != '\r') {
+        const uint8_t c = data[pos_];
+        if ((c < 0x20 && c != '\t') || c == 0x7F) {
+            state_ = HTTP1State::ERROR;
+            return 1;
+        }
         pos_++;
     }
-    
+
     if (pos_ + 1 >= len) {
         return -1;  // Need more data
+    }
+    if (data[pos_ + 1] != '\n') {
+        state_ = HTTP1State::ERROR;
+        return 1;
     }
     
     // Extract value (trim trailing whitespace)
@@ -470,7 +560,9 @@ void HTTP1Parser::parse_url_components(HTTP1Request& req) noexcept {
 
 bool HTTP1Parser::is_token_char(uint8_t c) noexcept {
     // RFC 7230: token characters
-    return std::isalnum(c) || c == '!' || c == '#' || c == '$' || c == '%' ||
+    const bool alnum = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+                       (c >= 'A' && c <= 'Z');
+    return alnum || c == '!' || c == '#' || c == '$' || c == '%' ||
            c == '&' || c == '\'' || c == '*' || c == '+' || c == '-' ||
            c == '.' || c == '^' || c == '_' || c == '`' || c == '|' || c == '~';
 }

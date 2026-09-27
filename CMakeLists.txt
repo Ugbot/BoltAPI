@@ -19,6 +19,11 @@ option(BOLTAPI_BUILD_TESTS      "Build Bolt API tests"      ${BOLTAPI_IS_TOPLEVE
 option(BOLTAPI_BUILD_EXAMPLES   "Build Bolt API examples"   ${BOLTAPI_IS_TOPLEVEL})
 option(BOLTAPI_BUILD_BENCHMARKS "Build Bolt API benchmarks" OFF)
 option(BOLTAPI_WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
+# libFuzzer targets (fuzzers/). Needs a clang that ships libFuzzer (Homebrew
+# LLVM on macOS; Apple clang does not). Instruments the WHOLE build, so use a
+# dedicated build dir. Without it the same harnesses build as corpus-replay
+# ctests (see cmake/BoltApiFuzz.cmake).
+option(BOLTAPI_BUILD_FUZZERS "Build libFuzzer targets (clang + libFuzzer)" OFF)
 
 # Declared HERE, with the other options, NOT next to the install block at the
 # bottom of this file. bolt hit exactly that ordering bug: BOLT_INSTALL was
@@ -80,6 +85,7 @@ set(CMAKE_CXX_EXTENSIONS        OFF)
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 include(BoltApiCompileOptions)
 include(BoltApiSanitizers)   # option(BOLTAPI_SANITIZE) + boltapi_apply_sanitizers()
+include(BoltApiFuzz)         # BOLTAPI_BUILD_FUZZERS global flags + boltapi_add_fuzz_target()
 
 # ---------------------------------------------------------------------------
 # Bolt submodule (zero-dependency compute core). Build only what we link.
@@ -485,6 +491,10 @@ if(BOLTAPI_BUILD_TESTS)
     add_test(NAME boltapi_engine_e2e COMMAND boltapi_engine_e2e)
 
     add_subdirectory(tests)
+endif()
+
+if(BOLTAPI_BUILD_FUZZERS OR BOLTAPI_BUILD_TESTS)
+    add_subdirectory(fuzzers)
 endif()
 
 # ---------------------------------------------------------------------------

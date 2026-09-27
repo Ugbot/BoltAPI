@@ -236,6 +236,12 @@ private:
     ) noexcept;
     
     /**
+     * Content-Length / Transfer-Encoding / Connection / Upgrade from the
+     * parsed fields. 0 ok, 1 when the framing is ambiguous or malformed.
+     */
+    static int extract_framing(HTTP1Request& req) noexcept;
+
+    /**
      * Parse URL components (path, query, fragment).
      */
     void parse_url_components(HTTP1Request& req) noexcept;
