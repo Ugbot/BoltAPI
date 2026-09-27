@@ -733,3 +733,15 @@ if(Python3_EXECUTABLE)
                      "$<TARGET_FILE:boltapi_h2spec_server>")
     set_tests_properties(boltapi_h2spec_conformance PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
 endif()
+
+# ---- Autobahn|Testsuite (G2ETL-114) -------------------------------------------
+# RFC 6455 conformance judged by the Autobahn fuzzingclient (docker
+# crossbario/autobahn-testsuite) against the ws_echo example. SKIPs (77)
+# without docker. Failing cases must be listed with their ticket.
+if(Python3_EXECUTABLE AND TARGET boltapi_ws_echo)
+    add_test(NAME boltapi_autobahn_conformance
+             COMMAND "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/autobahn_conformance.py"
+                     "$<TARGET_FILE:boltapi_ws_echo>")
+    set_tests_properties(boltapi_autobahn_conformance PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+endif()
