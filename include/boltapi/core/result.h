@@ -19,7 +19,11 @@ enum class error_code : int {
     internal_error = 5,
     host_error = 6,
     http_error = 7,
-    parse_error = 8
+    parse_error = 8,
+    // A budget or capacity refused the work; bolt::last_resource_exhausted()
+    // (bolt/bolt_resource.h) names the knob, the request and the limit.
+    // HTTP: 413 for request size, 507 for execution budgets; pgwire 54000.
+    resource_exhausted = 9
 };
 
 /**

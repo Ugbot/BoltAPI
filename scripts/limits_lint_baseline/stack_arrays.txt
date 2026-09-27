@@ -1,0 +1,2 @@
+# function-scope arrays > the stack budget (key<TAB>bytes). Only shrinks.
+src/server/coro_unified_server.cpp::response_buffer::uint8_t[RESPONSE_BUFFER_SIZE]	65536

@@ -331,6 +331,8 @@ std::string HttpResponse::get_status_text(Status status) const noexcept {
         case Status::NOT_FOUND: return "Not Found";
         case Status::METHOD_NOT_ALLOWED: return "Method Not Allowed";
         case Status::CONFLICT: return "Conflict";
+        case Status::PRECONDITION_FAILED: return "Precondition Failed";
+        case Status::PAYLOAD_TOO_LARGE: return "Content Too Large";
         case Status::RANGE_NOT_SATISFIABLE: return "Range Not Satisfiable";
         case Status::UNPROCESSABLE_ENTITY: return "Unprocessable Entity";
         case Status::TOO_MANY_REQUESTS: return "Too Many Requests";
@@ -338,6 +340,8 @@ std::string HttpResponse::get_status_text(Status status) const noexcept {
         case Status::NOT_IMPLEMENTED: return "Not Implemented";
         case Status::BAD_GATEWAY: return "Bad Gateway";
         case Status::SERVICE_UNAVAILABLE: return "Service Unavailable";
+        case Status::GATEWAY_TIMEOUT: return "Gateway Timeout";
+        case Status::INSUFFICIENT_STORAGE: return "Insufficient Storage";
         default: return "Unknown";
     }
 }
