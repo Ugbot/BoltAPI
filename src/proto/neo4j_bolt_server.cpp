@@ -17,6 +17,7 @@
 // than a silent empty result.
 
 #include "boltapi/proto/neo4j_bolt.h"
+#include "boltapi/proto/neo4j_values.h"
 
 #if defined(BOLTAPI_WITH_NEO4J_BOLT)
 
@@ -113,7 +114,12 @@ bool is_supported(Version v) noexcept {
 }
 
 Version negotiate(const std::uint8_t proposals[16]) noexcept {
+    return negotiate(proposals, 5);
+}
+
+Version negotiate(const std::uint8_t proposals[16], std::uint8_t max_major) noexcept {
     assert(proposals != nullptr);
+    assert(max_major == 4 || max_major == 5);
     Version best{};
     for (std::size_t k = 0; k < 4; ++k) {
         const std::uint8_t* e = proposals + k * 4;
@@ -131,7 +137,7 @@ Version negotiate(const std::uint8_t proposals[16]) noexcept {
         // Walk down from the client's highest offered minor to its lowest.
         for (int m = minor; m >= static_cast<int>(low); --m) {
             const Version cand{major, static_cast<std::uint8_t>(m)};
-            if (!is_supported(cand)) continue;
+            if (!is_supported(cand) || cand.major > max_major) continue;
             if (!best.valid() || cand.major > best.major ||
                 (cand.major == best.major && cand.minor > best.minor)) {
                 best = cand;
@@ -349,6 +355,7 @@ private:
     std::uint32_t    field_count_ = 0;
     bool             write_failed_ = false;
     int              idle_budget_ms_ = 0;
+    char             value_error_[160] = {0};
 };
 
 bool Connection::do_handshake() noexcept {
@@ -365,7 +372,7 @@ bool Connection::do_handshake() noexcept {
         // which an error could be expressed.
         return false;
     }
-    version_ = negotiate(hs + 4);
+    version_ = negotiate(hs + 4, cfg_.max_bolt_major);
     std::uint8_t reply[4] = {0, 0, 0, 0};
     if (version_.valid()) {
         reply[2] = version_.minor;
@@ -418,12 +425,21 @@ bool Connection::send_ignored() noexcept {
 
 bool Connection::emit(const PackValue* values, std::uint32_t n) noexcept {
     assert(values != nullptr || n == 0);
+    assert(version_.major == 4 || version_.major == 5);
     if (write_failed_) return false;
     PackWriter w(io_.out_buffer(), io_.out_capacity());
     if (w.begin_struct(static_cast<std::uint8_t>(Signature::Record), 1) != PackError::Ok) return false;
     if (w.begin_list(n) != PackError::Ok) return false;
     for (std::uint32_t k = 0; k < n; ++k) {
-        if (w.put_value(values[k]) != PackError::Ok) return false;
+        const PackError e = values::write_value(w, values[k], version_.major);
+        if (e != PackError::Ok) {
+            std::snprintf(value_error_, sizeof(value_error_),
+                          "result column %u could not be sent as a Bolt %u.%u value "
+                          "(%s); nothing was sent for this record",
+                          static_cast<unsigned>(k), static_cast<unsigned>(version_.major),
+                          static_cast<unsigned>(version_.minor), pack_error_name(e));
+            return false;
+        }
     }
     return flush(w);
 }
@@ -516,7 +532,12 @@ bool Connection::on_pull(const PackValue& msg, bool discard) noexcept {
         exec_.discard();
     } else if (!exec_.pull(n, *this, has_more, fail)) {
         if (write_failed_) return false;
-        return send_failure(fail);
+        if (value_error_[0] != '\0') {
+            fail = {"Neo.DatabaseError.Statement.ExecutionFailed", value_error_};
+        }
+        const bool sent = send_failure(fail);
+        value_error_[0] = '\0';
+        return sent;
     }
     if (write_failed_) return false;
 

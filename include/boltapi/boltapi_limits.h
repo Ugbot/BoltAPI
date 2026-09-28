@@ -19,6 +19,16 @@
       ::bolt::api::proto::pgwire::kMaxFields,                                   \
       ::bolt::api::proto::pgwire::kMaxFields, nullptr, nullptr,                 \
       "columns in one Postgres RowDescription")                                 \
+    X(bolt_max_offset_seconds, kInvariant, "seconds",                           \
+      ::bolt::api::kBoltMaxOffsetSeconds, ::bolt::api::kBoltMaxOffsetSeconds,   \
+      ::bolt::api::kBoltMaxOffsetSeconds, nullptr, nullptr,                     \
+      "Neo4j Bolt time zone offset magnitude (spec: +-18:00)")                  \
+    X(bolt_max_zone_id, kInvariant, "bytes", ::bolt::api::kBoltMaxZoneIdBytes,  \
+      ::bolt::api::kBoltMaxZoneIdBytes, ::bolt::api::kBoltMaxZoneIdBytes,       \
+      nullptr, nullptr, "Neo4j Bolt DateTime zone id; longer is refused")       \
+    X(bolt_max_path_hops, kInvariant, "hops", ::bolt::api::kBoltMaxPathHops,    \
+      ::bolt::api::kBoltMaxPathHops, ::bolt::api::kBoltMaxPathHops, nullptr,    \
+      nullptr, "hops in one Neo4j Bolt Path value; longer is refused")          \
     X(router_max_params, kInvariant, "params", ::bolt::api::kMaxParams,          \
       ::bolt::api::kMaxParams, ::bolt::api::kMaxParams, nullptr, nullptr,       \
       "path parameters captured per route match")                               \

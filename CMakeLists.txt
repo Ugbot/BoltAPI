@@ -340,7 +340,8 @@ endif()
 if(BOLTAPI_WITH_NEO4J_BOLT)
     target_sources(boltapi PRIVATE
         src/proto/neo4j_bolt_packstream.cpp
-        src/proto/neo4j_bolt_server.cpp)
+        src/proto/neo4j_bolt_server.cpp
+        src/proto/neo4j_values.cpp)
     target_compile_definitions(boltapi PUBLIC BOLTAPI_WITH_NEO4J_BOLT=1)
     message(STATUS "Bolt API Neo4j-Bolt wire protocol: ENABLED (PackStream v2, Bolt 4.4 + 5.0-5.4)")
 endif()

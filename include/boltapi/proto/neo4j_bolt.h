@@ -103,6 +103,8 @@ bool is_supported(Version v) noexcept;
 // implement the manifest exchange, so we skip that entry rather than select it;
 // drivers always carry plain proposals alongside it.
 Version negotiate(const std::uint8_t proposals[16]) noexcept;
+// As above, never selecting a major above `max_major` (4 or 5).
+Version negotiate(const std::uint8_t proposals[16], std::uint8_t max_major) noexcept;
 
 // Connection state machine (the published Bolt server states, minus the ones a
 // read-only server cannot enter).
@@ -231,6 +233,11 @@ struct Config {
     // protocol's product-identification slot; the SUCCESS metadata also carries
     // an honest `boltapi_server` naming this implementation.
     const char* server_agent = "Neo4j/5.4.0";
+
+    // Highest Bolt major this server negotiates (4 or 5). Graph and temporal
+    // structures are written in the negotiated major's dialect
+    // (proto/neo4j_values.h); 4 pins a server to the Bolt 4.4 shapes.
+    std::uint8_t max_bolt_major = 5;
 
     // How often a blocked accept() OR a blocked connection read wakes to
     // re-check stop(). It bounds shutdown latency, so it is deliberately the

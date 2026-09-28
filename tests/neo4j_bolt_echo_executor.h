@@ -20,7 +20,9 @@
 #pragma once
 
 #include "boltapi/proto/neo4j_bolt.h"
+#include "neo4j_bolt_value_gen.h"
 
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -35,7 +37,7 @@ inline constexpr std::int64_t kEchoMaxRows = 4096;
 class EchoExecutor final : public nb::IQueryExecutor {
 public:
     EchoExecutor()
-        : params_buf_(1u << 16), params_arena_mem_(1u << 16) {}
+        : params_buf_(1u << 16), params_arena_mem_(1u << 20) {}
 
     bool begin_query(std::string_view cypher, const ps::PackValue& params,
                      std::string_view* out_fields, std::uint32_t fields_cap,
@@ -57,6 +59,36 @@ public:
                            cypher.empty() ? "empty query"
                                           : "query rejected on request"};
             return false;
+        }
+
+        // "RANDOM <seed> <rows> [nozone]": random graph/temporal values plus
+        // their canonical text (neo4j_bolt_value_gen.h). "BADVALUE": a Node
+        // whose label is an integer, which the connection must refuse.
+        mode_ = Mode::Echo;
+        if (cypher.rfind("RANDOM ", 0) == 0 || cypher == "BADVALUE") {
+            unsigned long long seed = 0, rows = 0;
+            const std::string q(cypher);
+            if (cypher == "BADVALUE") {
+                mode_ = Mode::Bad;
+                rows = 1;
+            } else if (std::sscanf(q.c_str(), "RANDOM %llu %llu", &seed, &rows) == 2 &&
+                       rows <= static_cast<unsigned long long>(kEchoMaxRows)) {
+                mode_ = Mode::Random;
+                gen_opts_.allow_zone_id = q.find("nozone") == std::string::npos;
+            } else {
+                out_failure = {"Neo.ClientError.Statement.SyntaxError",
+                               "RANDOM <seed> <rows> [nozone]"};
+                return false;
+            }
+            rng_.s = seed;
+            id_seq_ = static_cast<std::int64_t>(seed % 1000000u) * 1000000;
+            gen_opts_.id_seq = &id_seq_;
+            rows_ = static_cast<std::int64_t>(rows);
+            emitted_ = 0;
+            out_fields[0] = "value";
+            out_fields[1] = "text";
+            out_field_count = 2;
+            return true;
         }
 
         // `cypher` / `params` are borrowed from the per-message arena, so copy
@@ -92,6 +124,18 @@ public:
         std::int64_t sent = 0;
         while (sent < want && emitted_ < rows_) {
             ps::PackArena arena(params_arena_mem_.data(), params_arena_mem_.size());
+            if (mode_ != Mode::Echo) {
+                ps::PackValue v2[2];
+                if (!generated_row(arena, v2)) {
+                    out_failure = {"Neo.DatabaseError.General.UnknownError",
+                                   "value generator ran out of scratch"};
+                    return false;
+                }
+                if (!sink.emit(v2, 2)) return false;
+                ++emitted_;
+                ++sent;
+                continue;
+            }
             ps::PackValue values[4];
             values[0] = make_string(arena, query_);
             {
@@ -111,6 +155,36 @@ public:
     void discard() noexcept override { emitted_ = rows_; }
 
 private:
+    enum class Mode { Echo, Random, Bad };
+
+    bool generated_row(ps::PackArena& a, ps::PackValue* v2) noexcept {
+        if (mode_ == Mode::Bad) {
+            ps::PackValue* f = a.alloc_n<ps::PackValue>(3);
+            ps::PackValue* lbl = a.alloc_n<ps::PackValue>(1);
+            if (f == nullptr || lbl == nullptr) return false;
+            f[0] = make_int(1);
+            lbl[0] = make_int(7);
+            f[1] = ps::PackValue{};
+            f[1].type = ps::PackType::List;
+            f[1].items = lbl;
+            f[1].len = 1;
+            f[2] = ps::PackValue{};
+            f[2].type = ps::PackType::Dict;
+            v2[0] = ps::PackValue{};
+            v2[0].type = ps::PackType::Struct;
+            v2[0].signature = 0x4E;
+            v2[0].items = f;
+            v2[0].len = 3;
+            v2[1] = lit_string(a, "bad");
+            return true;
+        }
+        v2[0] = gen_value(a, rng_, gen_opts_, 0);
+        text_.clear();
+        if (!describe(v2[0], true, text_)) return false;
+        v2[1] = make_string(a, text_);
+        return v2[1].len == text_.size();
+    }
+
     static ps::PackValue make_int(std::int64_t v) noexcept {
         ps::PackValue x{};
         x.type = ps::PackType::Int;
@@ -187,6 +261,11 @@ private:
     std::vector<std::uint8_t> params_arena_mem_;
     std::int64_t              rows_ = 0;
     std::int64_t              emitted_ = 0;
+    Mode                      mode_ = Mode::Echo;
+    SplitMix                  rng_{0};
+    GenOptions                gen_opts_{};
+    std::int64_t              id_seq_ = 0;
+    std::string               text_;
 };
 
 class EchoFactory final : public nb::IExecutorFactory {

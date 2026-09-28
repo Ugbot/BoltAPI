@@ -3,7 +3,7 @@
 // TEST HARNESS ONLY. Exists so the OFFICIAL neo4j Python driver can be pointed
 // at a real socket: conformance has to be judged by a client we did not write.
 //
-// Usage:  neo4j_bolt_echo_server [--port N]   (0 = ephemeral, the default)
+// Usage:  neo4j_bolt_echo_server [--port N] [--max-major 4|5]   (port 0 = ephemeral)
 // Prints  "PORT <n>" on stdout, flushed, then serves until SIGTERM/SIGINT.
 
 #include "boltapi/proto/neo4j_bolt.h"
@@ -24,9 +24,12 @@ extern "C" void on_signal(int) { g_stop.store(true, std::memory_order_release); 
 
 int main(int argc, char** argv) {
     std::uint16_t port = 0;
+    std::uint8_t max_major = 5;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             port = static_cast<std::uint16_t>(std::atoi(argv[++i]));
+        } else if (std::strcmp(argv[i], "--max-major") == 0 && i + 1 < argc) {
+            max_major = std::atoi(argv[++i]) == 4 ? 4 : 5;
         }
     }
 
@@ -39,6 +42,7 @@ int main(int argc, char** argv) {
     cfg.max_connections = 8;      // the driver pools connections
     cfg.accept_poll_ms = 50;
     cfg.idle_timeout_ms = 30000;
+    cfg.max_bolt_major = max_major;
 
     boltapi_test::EchoFactory factory;
     bolt::api::proto::neo4j::Neo4jBoltProtocol proto(cfg, factory);

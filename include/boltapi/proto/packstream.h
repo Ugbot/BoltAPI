@@ -65,6 +65,7 @@ enum class PackError : std::uint8_t {
     TooLarge,       // container/string past its bound
     OutOfMemory,    // decoder arena exhausted
     Unsupported,    // valid PackStream v1 shape this codec refuses (e.g. DC/DD)
+    Invalid,        // well-formed PackStream that is not a valid Bolt value
 };
 
 const char* pack_error_name(PackError e) noexcept;

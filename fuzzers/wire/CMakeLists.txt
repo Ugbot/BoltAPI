@@ -51,6 +51,10 @@ if(BOLTAPI_WITH_NEO4J_BOLT)
     boltapi_add_fuzz_target(packstream SOURCE packstream.cpp
         INSTRUMENT ${_src}/proto/neo4j_bolt_packstream.cpp)
     _wire_target(packstream)
+    boltapi_add_fuzz_target(neo4j_values SOURCE neo4j_values.cpp
+        INSTRUMENT ${_src}/proto/neo4j_bolt_packstream.cpp
+                   ${_src}/proto/neo4j_values.cpp)
+    _wire_target(neo4j_values)
     if(NOT WIN32)
         boltapi_add_fuzz_target(neo4j_session SOURCE neo4j_session.cpp
             INSTRUMENT ${_src}/proto/neo4j_bolt_packstream.cpp

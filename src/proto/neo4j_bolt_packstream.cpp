@@ -85,6 +85,7 @@ const char* pack_error_name(PackError e) noexcept {
         case PackError::TooLarge:      return "too_large";
         case PackError::OutOfMemory:   return "arena_exhausted";
         case PackError::Unsupported:   return "unsupported_marker";
+        case PackError::Invalid:       return "invalid_value";
     }
     return "unknown";
 }

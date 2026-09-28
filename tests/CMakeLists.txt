@@ -643,6 +643,10 @@ if(BOLTAPI_WITH_NEO4J_BOLT)
     # Golden PackStream vectors + handshake negotiation (pure, no sockets).
     boltapi_add_test(boltapi_neo4j_bolt_packstream_test neo4j_bolt_packstream_test.cpp)
 
+    # Graph + temporal structures in both dialects, goldens + seeded round trip.
+    boltapi_add_test(boltapi_neo4j_values_test neo4j_values_test.cpp)
+    target_include_directories(boltapi_neo4j_values_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
     # The server state machine, driven by a hand-rolled raw-socket Bolt client.
     boltapi_add_test(boltapi_neo4j_bolt_wire_test neo4j_bolt_wire_test.cpp)
     if(WIN32)
@@ -672,6 +676,31 @@ if(BOLTAPI_WITH_NEO4J_BOLT)
                          "${CMAKE_CURRENT_SOURCE_DIR}/neo4j_bolt_driver_conformance.py"
                          "$<TARGET_FILE:boltapi_neo4j_bolt_echo_server>")
         set_tests_properties(boltapi_neo4j_bolt_driver_conformance
+                             PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
+    endif()
+
+    # Random graph/temporal values judged by the official driver, Bolt 5 and
+    # 4.4 (8 seeds x 64 rows each here; NEO4J_VALUE_FUZZ_SEEDS for a campaign).
+    # The interpreter is picked by capability so the check cannot only skip.
+    set(_bolt_value_py "")
+    foreach(_cand IN ITEMS "$ENV{BOLTAPI_NEO4J_PYTHON}" "${Python3_EXECUTABLE}" "python3" "/usr/bin/python3")
+        if(_cand AND NOT _bolt_value_py)
+            execute_process(COMMAND "${_cand}" -c "import neo4j"
+                            RESULT_VARIABLE _bv_rc OUTPUT_QUIET ERROR_QUIET)
+            if(_bv_rc EQUAL 0)
+                set(_bolt_value_py "${_cand}")
+            endif()
+        endif()
+    endforeach()
+    if(NOT _bolt_value_py)
+        set(_bolt_value_py "${_bolt_py}")
+    endif()
+    if(_bolt_value_py)
+        add_test(NAME boltapi_neo4j_bolt_driver_value_fuzz
+                 COMMAND "${_bolt_value_py}"
+                         "${CMAKE_CURRENT_SOURCE_DIR}/neo4j_bolt_driver_value_fuzz.py"
+                         "$<TARGET_FILE:boltapi_neo4j_bolt_echo_server>")
+        set_tests_properties(boltapi_neo4j_bolt_driver_value_fuzz
                              PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
     endif()
 endif()
