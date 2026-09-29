@@ -49,19 +49,25 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
     docker build -f benchmarks/tfb/Dockerfile.wrk     -t tfb-wrk benchmarks/tfb
 fi
 
-docker network create "$NET" >/dev/null 2>&1 || true
+# gestalt.test labels let Gestalt2's scripts/docker_test_sweep.py remove what a
+# hard kill leaves behind; rm -v drops anonymous volumes.
+LABELS=(--label gestalt.test=1 --label gestalt.test.owner=boltapi_tfb_compare
+        --label "gestalt.test.started=$(date +%s)")
+docker network create "${LABELS[@]}" "$NET" >/dev/null 2>&1 || true
 cleanup() {
-    docker rm -f tfb-srv >/dev/null 2>&1 || true
+    docker rm -f -v tfb-srv >/dev/null 2>&1 || true
     docker network rm "$NET" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
 
 # Run wrk against one framework's container for each endpoint; print req/s + p99.
 run_fw() {
     local label="$1" image="$2"
-    docker rm -f tfb-srv >/dev/null 2>&1 || true
+    docker rm -f -v tfb-srv >/dev/null 2>&1 || true
     # IO_THREADS is read by the BoltAPI image; Drogon ignores it (uses all cores).
-    docker run -d --rm --name tfb-srv --network "$NET" \
+    docker run -d --rm --name tfb-srv "${LABELS[@]}" --network "$NET" \
         -e IO_THREADS="$BOLT_IO_THREADS" "$image" >/dev/null
     sleep 4   # warmup / listen
 
@@ -70,16 +76,16 @@ run_fw() {
         # Warm THIS endpoint first (discarded) so the measured run isn't paying
         # cold-start/first-traffic cost — otherwise whichever endpoint runs first
         # looks artificially slow (a test-ordering artifact).
-        docker run --rm --network "$NET" tfb-wrk \
+        docker run --rm "${LABELS[@]}" --network "$NET" tfb-wrk \
             -t"$THREADS" -c"$CONNS" -d3s "http://tfb-srv:8080${ep}" >/dev/null 2>&1 || true
-        out="$(docker run --rm --network "$NET" tfb-wrk \
+        out="$(docker run --rm "${LABELS[@]}" --network "$NET" tfb-wrk \
                  --latency -t"$THREADS" -c"$CONNS" -d"${DURATION}s" \
                  "http://tfb-srv:8080${ep}" 2>/dev/null || true)"
         rps="$(printf '%s\n' "$out" | awk '/Requests\/sec/{print $2}')"
         p99="$(printf '%s\n' "$out" | awk '/^[[:space:]]*99%/{print $2}')"
         printf "%-9s %-12s req/s=%-12s p99=%s\n" "$label" "$ep" "${rps:-ERR}" "${p99:-ERR}"
     done
-    docker rm -f tfb-srv >/dev/null 2>&1 || true
+    docker rm -f -v tfb-srv >/dev/null 2>&1 || true
 }
 
 echo ""

@@ -22,7 +22,25 @@ PY
 case "$work" in /tmp/*|/private/tmp/*) ;; *) echo "workdir must be under /tmp"; exit 2;; esac
 work=${work#/private}
 mkdir -p "$work/logs"
-docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+# The runner starts sim/client/server through compose (project = the runner
+# directory's name) and leaves them, and its networks, behind; remove them with
+# their volumes on every exit, along with the runner container itself.
+project=$(basename "$qir")
+runner_name="boltapi-qir-runner-$$"
+cleanup() {
+    docker rm -f -v "$runner_name" >/dev/null 2>&1 || true
+    ids=$(docker ps -aq --filter "label=com.docker.compose.project=$project")
+    [ -n "$ids" ] && docker rm -f -v $ids >/dev/null 2>&1 || true
+    nets=$(docker network ls -q --filter "label=com.docker.compose.project=$project")
+    [ -n "$nets" ] && docker network rm $nets >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
+docker run --rm --name "$runner_name" \
+    --label gestalt.test=1 --label gestalt.test.owner=boltapi_quic_interop \
+    --label "gestalt.test.started=$(date +%s)" \
+    -v /var/run/docker.sock:/var/run/docker.sock \
     -v /tmp:/tmp -w "$qir" boltapi-qir-runner \
     python3 run.py -s boltapi -c "$clients" -t "$tests" \
         -l "$work/logs/run-$(date +%s)" -j "$work/result.json" -m

@@ -18,6 +18,9 @@ import sys
 import tempfile
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import docker_run_once  # noqa: E402
+
 IMAGE = "summerwind/h2spec"
 # h2spec id -> tracker ticket. Keep empty unless a case is genuinely deferred.
 EXPECTED_FAILURES = {}
@@ -58,11 +61,11 @@ def docker_ready():
 
 def run_h2spec(port, tls):
     host = os.environ.get("BOLTAPI_H2SPEC_HOST", "host.docker.internal")
-    cmd = ["docker", "run", "--rm", "--add-host=host.docker.internal:host-gateway",
+    cmd = ["--add-host=host.docker.internal:host-gateway",
            IMAGE, "-h", host, "-p", str(port), "-o", "3", "-S"]
     if tls:
         cmd += ["-t", "-k"]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    r = docker_run_once.run("boltapi-h2spec", cmd, timeout=600)
     out = r.stdout + r.stderr
     # The "Failures:" section repeats each failed case under its spec line and
     # its numbered section heading; collect them as "<spec>/<section>/<case>".

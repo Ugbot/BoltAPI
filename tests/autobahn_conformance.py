@@ -20,6 +20,9 @@ import sys
 import tempfile
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import docker_run_once  # noqa: E402
+
 IMAGE = "crossbario/autobahn-testsuite"
 EXCLUDED = ["12.*", "13.*"]
 # case id -> tracker ticket.
@@ -70,10 +73,10 @@ def run_suite(port, cases, workdir):
     }
     with open(os.path.join(workdir, "fuzzingclient.json"), "w") as f:
         json.dump(spec, f)
-    cmd = ["docker", "run", "--rm", "--add-host=host.docker.internal:host-gateway",
+    cmd = ["--add-host=host.docker.internal:host-gateway",
            "-v", f"{workdir}:/work", IMAGE,
            "wstest", "-m", "fuzzingclient", "-s", "/work/fuzzingclient.json"]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=1500)
+    r = docker_run_once.run("boltapi-autobahn", cmd, timeout=1500)
     index = os.path.join(workdir, "reports", "index.json")
     if not os.path.exists(index):
         return r.stdout[-3000:] + r.stderr[-3000:], None
