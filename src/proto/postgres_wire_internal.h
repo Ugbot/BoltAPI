@@ -5,6 +5,7 @@
 
 #include "boltapi/proto/postgres_wire.h"
 #include "boltapi/net/sys_compat.h"
+#include "socket_wait.h"
 #include "bolt/bolt_resource.h"
 
 #include <atomic>
@@ -22,21 +23,7 @@ namespace detail {
 // Socket helpers (same shape as neo4j_bolt_server.cpp's).
 // ---------------------------------------------------------------------------
 inline int wait_readable(int fd, int timeout_ms) noexcept {
-    assert(fd >= 0);
-    assert(timeout_ms >= 0);
-    fd_set rd;
-    FD_ZERO(&rd);
-#if defined(_WIN32)
-    FD_SET(static_cast<SOCKET>(fd), &rd);
-#else
-    if (fd >= FD_SETSIZE) return -1;
-    FD_SET(fd, &rd);
-#endif
-    timeval tv;
-    tv.tv_sec  = timeout_ms / 1000;
-    tv.tv_usec = (timeout_ms % 1000) * 1000;
-    const int r = ::select(fd + 1, &rd, nullptr, nullptr, &tv);
-    return (r < 0) ? -1 : r;
+    return ::bolt::api::proto::detail::wait_readable(fd, timeout_ms);
 }
 
 inline bool read_exact(int fd, void* dst, std::size_t n, int poll_ms, int& idle_budget_ms,

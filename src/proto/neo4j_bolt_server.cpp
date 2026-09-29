@@ -22,6 +22,7 @@
 #if defined(BOLTAPI_WITH_NEO4J_BOLT)
 
 #include "boltapi/net/sys_compat.h"
+#include "socket_wait.h"
 
 #include <cstdio>
 #include <cstring>
@@ -44,23 +45,8 @@ constexpr std::size_t kMaxChunk        = 0xFFFF;
 constexpr std::size_t kHandshakeBytes  = 20;   // 4 magic + 4 * 4 proposals
 constexpr std::uint32_t kMaxChunksPerMessage = 1u << 14;  // bounded reassembly
 
-// select()-based readiness wait. Returns 1 ready, 0 timeout, -1 error.
 int wait_readable(int fd, int timeout_ms) noexcept {
-    assert(fd >= 0);
-    assert(timeout_ms >= 0);
-    fd_set rd;
-    FD_ZERO(&rd);
-#if defined(_WIN32)
-    FD_SET(static_cast<SOCKET>(fd), &rd);
-#else
-    if (fd >= FD_SETSIZE) return -1;  // refuse rather than smash the fd_set
-    FD_SET(fd, &rd);
-#endif
-    timeval tv;
-    tv.tv_sec  = timeout_ms / 1000;
-    tv.tv_usec = (timeout_ms % 1000) * 1000;
-    const int r = ::select(fd + 1, &rd, nullptr, nullptr, &tv);
-    return (r < 0) ? -1 : r;
+    return ::bolt::api::proto::detail::wait_readable(fd, timeout_ms);
 }
 
 // Read exactly `n` bytes, honouring an overall idle budget. Returns true on a
@@ -354,6 +340,7 @@ private:
     std::string_view fields_[kMaxFields]{};
     std::uint32_t    field_count_ = 0;
     bool             write_failed_ = false;
+    bool             tx_open_ = false;   // BEGIN seen, no COMMIT/ROLLBACK yet
     int              idle_budget_ms_ = 0;
     char             value_error_[160] = {0};
 };
@@ -548,9 +535,20 @@ bool Connection::on_pull(const PackValue& msg, bool discard) noexcept {
         (void)w.put_string("has_more"); (void)w.put_bool(true);
         // State is unchanged: more PULLs may follow.
     } else {
-        if (w.begin_dict(2) != PackError::Ok) return false;
-        (void)w.put_string("type");   (void)w.put_string("r");  // read-only
+        IQueryExecutor::Stat st[16];
+        const std::uint32_t ns = exec_.stats(st, 16);
+        assert(ns <= 16);
+        if (w.begin_dict(ns > 0 ? 3 : 2) != PackError::Ok) return false;
+        (void)w.put_string("type");   (void)w.put_string(exec_.query_type());
         (void)w.put_string("t_last"); (void)w.put_int(0);
+        if (ns > 0) {
+            (void)w.put_string("stats");
+            (void)w.begin_dict(ns);
+            for (std::uint32_t k = 0; k < ns && k < 16; ++k) {
+                (void)w.put_string(st[k].key);
+                (void)w.put_int(st[k].value);
+            }
+        }
         state_ = (state_ == State::TxStreaming) ? State::TxReady : State::Ready;
     }
     return flush(w);
@@ -606,8 +604,11 @@ bool Connection::dispatch(const PackValue& msg) noexcept {
                 return send_failure({"Neo.ClientError.Request.Invalid",
                                      "BEGIN requires a ready connection"});
             }
-            // Read-only server: a transaction is a no-op scope, honestly
-            // acknowledged rather than silently ignored.
+            {
+                QueryFailure fail{};
+                if (!exec_.begin_tx(fail)) return send_failure(fail);
+            }
+            tx_open_ = true;
             state_ = State::TxReady;
             return send_success_empty();
 
@@ -617,11 +618,20 @@ bool Connection::dispatch(const PackValue& msg) noexcept {
                 return send_failure({"Neo.ClientError.Request.Invalid",
                                      "COMMIT/ROLLBACK requires an open transaction"});
             }
+            tx_open_ = false;
             state_ = State::Ready;
+            if (sig == Signature::Commit) {
+                QueryFailure fail{};
+                if (!exec_.commit_tx(fail)) return send_failure(fail);
+            } else {
+                exec_.rollback_tx();
+            }
             return send_success_empty();
 
         case Signature::Reset:
             exec_.discard();
+            if (tx_open_) exec_.rollback_tx();
+            tx_open_ = false;
             field_count_ = 0;
             state_ = State::Ready;
             return send_success_empty();
@@ -649,6 +659,15 @@ bool Connection::dispatch(const PackValue& msg) noexcept {
 void Connection::run() noexcept {
     idle_budget_ms_ = cfg_.idle_timeout_ms;
     if (!do_handshake()) return;
+    struct TxGuard {
+        Connection* c;
+        ~TxGuard() {
+            if (!c->tx_open_) return;
+            c->exec_.discard();
+            c->exec_.rollback_tx();   // a connection that ends mid-transaction
+            c->tx_open_ = false;
+        }
+    } guard{this};
 
     // Bounded: the loop exits on peer close, idle timeout, protocol error or
     // shutdown. There is no unbounded wait anywhere inside it.

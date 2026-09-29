@@ -173,6 +173,35 @@ public:
     // Abandon the current result set. Idempotent; must not throw.
     virtual void discard() noexcept = 0;
 
+    // Explicit transactions. BEGIN calls begin_tx, COMMIT commit_tx and
+    // ROLLBACK rollback_tx; RESET and a connection that ends inside a
+    // transaction also call rollback_tx. The defaults serve a read-only
+    // executor: the transaction is an acknowledged no-op scope.
+    virtual bool begin_tx(QueryFailure& out_failure) noexcept {
+        (void)out_failure;
+        return true;
+    }
+    virtual bool commit_tx(QueryFailure& out_failure) noexcept {
+        (void)out_failure;
+        return true;
+    }
+    virtual void rollback_tx() noexcept {}
+
+    // The last result's statement type for PULL's summary: "r", "w", "rw".
+    virtual const char* query_type() const noexcept { return "r"; }
+
+    // The last result's update counters for PULL's summary `stats`
+    // ("nodes-created", ...). Fills out[0..n) and returns n; 0 = none.
+    struct Stat {
+        const char*  key;
+        std::int64_t value;
+    };
+    virtual std::uint32_t stats(Stat* out, std::uint32_t cap) const noexcept {
+        (void)out;
+        (void)cap;
+        return 0;
+    }
+
 protected:
     IQueryExecutor() = default;
 };
