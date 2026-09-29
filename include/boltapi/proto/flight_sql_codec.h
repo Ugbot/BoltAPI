@@ -46,6 +46,9 @@ private:
     bool             ok_ = true;
 };
 
+// Reads one raw varint at `*pos` (packed repeated fields).
+bool pb_read_varint(std::string_view buf, std::size_t* pos, std::uint64_t* out) noexcept;
+
 // Appenders. Each writes one complete field (tag + value) to `out`.
 void pb_put_varint_raw(std::string* out, std::uint64_t v);
 void pb_put_varint(std::string* out, std::uint32_t field, std::uint64_t v);

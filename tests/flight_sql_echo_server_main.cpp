@@ -6,6 +6,8 @@
 //   "SELECT <n>"   -> n rows (default 3): id int64 = i, name utf8 = "row<i>",
 //                     score float64 = i * 0.5, in 8192-row batches.
 //   "FAIL ..."     -> INVALID_ARGUMENT naming the statement.
+// Catalog: tables "orders" (pk id), "customers" (pk region, id) and view
+// "top_orders" (no pk), each with the "SELECT 0" schema.
 // Usage: flight_sql_echo_server [--port N] [--token T]
 // Prints "PORT <n>" on stdout, then serves until SIGTERM/SIGINT. With
 // --token, only "Bearer T" (or Basic user:T) is accepted.
@@ -74,6 +76,36 @@ public:
         }
         *rows = n;
         return encode(n, out);
+    }
+
+    bool has_catalog() const noexcept override { return true; }
+    std::uint32_t catalog_tables() noexcept override { return 3; }
+    bool catalog_table(std::uint32_t i, fs::CatalogTable* out) noexcept override {
+        assert(out != nullptr);
+        if (i == 0) {
+            out->name = "orders";
+            out->table_type = "TABLE";
+            out->n_key_columns = 1;
+            out->key_columns[0] = "id";
+        } else if (i == 1) {
+            out->name = "customers";
+            out->table_type = "TABLE";
+            out->n_key_columns = 2;
+            out->key_columns[0] = "region";
+            out->key_columns[1] = "id";
+        } else if (i == 2) {
+            out->name = "top_orders";
+            out->table_type = "VIEW";
+            out->n_key_columns = 0;
+        } else {
+            return false;
+        }
+        return true;
+    }
+    bool catalog_table_schema(std::uint32_t i, std::string* out,
+                              fs::QueryFailure& f) noexcept override {
+        std::int64_t rows = 0;
+        return i < 3 && execute("SELECT 0", out, &rows, f);
     }
 
 private:
@@ -181,6 +213,8 @@ int main(int argc, char** argv) {
     cfg.max_connections = 4;
     cfg.accept_poll_ms = 50;
     cfg.idle_timeout_ms = 30000;
+    cfg.server_name = "boltapi-echo";
+    cfg.server_version = "9.9.9";
     EchoFactory factory;
     TokenAuth auth(token);
     fs::Protocol proto(cfg, factory, &auth);
