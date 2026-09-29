@@ -12,6 +12,7 @@
 
 #include "boltapi/http/hpack.h"
 #include "boltapi/net/sys_compat.h"
+#include "socket_wait.h"
 #include "boltapi/net/tls_context.h"
 #include "boltapi/proto/flight_sql_arrow.h"
 #include "boltapi/proto/flight_sql_codec.h"
@@ -115,21 +116,7 @@ void put_be_u32(std::uint8_t* p, std::uint32_t v) noexcept {
 }
 
 int wait_readable(int fd, int timeout_ms) noexcept {
-    assert(fd >= 0);
-    assert(timeout_ms >= 0);
-    fd_set rd;
-    FD_ZERO(&rd);
-#if defined(_WIN32)
-    FD_SET(static_cast<SOCKET>(fd), &rd);
-#else
-    if (fd >= FD_SETSIZE) return -1;
-    FD_SET(fd, &rd);
-#endif
-    timeval tv;
-    tv.tv_sec = timeout_ms / 1000;
-    tv.tv_usec = (timeout_ms % 1000) * 1000;
-    const int r = ::select(fd + 1, &rd, nullptr, nullptr, &tv);
-    return (r < 0) ? -1 : r;
+    return ::bolt::api::proto::detail::wait_readable(fd, timeout_ms);
 }
 
 // HPACK integer with an N-bit prefix (RFC 7541 5.1).
