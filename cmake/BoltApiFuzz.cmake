@@ -28,6 +28,25 @@ if(BOLTAPI_BUILD_FUZZERS)
     message(STATUS "Bolt API fuzzers: ON (${_boltapi_fuzz_flags})")
 endif()
 
+# boltapi_fuzz_rest_<name>: libboltapi.a's objects without <instrumented>,
+# carrying boltapi's usage requirements.
+function(_boltapi_fuzz_rest_lib name instrumented)
+    set(_objs "$<TARGET_OBJECTS:boltapi>")
+    foreach(_src IN LISTS instrumented)
+        file(RELATIVE_PATH _rel ${PROJECT_SOURCE_DIR} ${_src})
+        string(REPLACE "." "\\." _re "${_rel}")
+        set(_objs "$<FILTER:${_objs},EXCLUDE,(^|/)boltapi\\.dir/(\\./)?${_re}\\.o(bj)?$>")
+    endforeach()
+    set(_lib boltapi_fuzz_rest_${name})
+    add_library(${_lib} STATIC ${_objs})
+    set_target_properties(${_lib} PROPERTIES LINKER_LANGUAGE CXX)
+    foreach(_p INCLUDE_DIRECTORIES COMPILE_DEFINITIONS COMPILE_FEATURES
+               LINK_LIBRARIES)
+        set_property(TARGET ${_lib} PROPERTY INTERFACE_${_p}
+                     "$<TARGET_PROPERTY:boltapi,INTERFACE_${_p}>")
+    endforeach()
+endfunction()
+
 # boltapi_add_fuzz_target(<name> SOURCE <harness.cpp> [INSTRUMENT <src>...])
 function(boltapi_add_fuzz_target name)
     cmake_parse_arguments(F "" "SOURCE" "INSTRUMENT" ${ARGN})
@@ -46,15 +65,23 @@ function(boltapi_add_fuzz_target name)
 
     set(exe boltapi_fuzz_replay_${name})
     add_executable(${exe} ${F_SOURCE} ${PROJECT_SOURCE_DIR}/fuzzers/replay_main.cpp)
-    target_link_libraries(${exe} PRIVATE boltapi::boltapi)
     if(NOT MSVC)
         # Only the named parser TUs (and the harness) are instrumented; the
-        # rest resolves from the uninstrumented libboltapi.a.
+        # rest resolves from an archive of libboltapi.a's objects minus those
+        # TUs, so the linker can never pull an uninstrumented duplicate.
         set(_san -fsanitize=address,undefined -fno-sanitize-recover=all
                  -fno-omit-frame-pointer)
         target_sources(${exe} PRIVATE ${F_INSTRUMENT})
         target_compile_options(${exe} PRIVATE ${_san})
         target_link_options(${exe} PRIVATE ${_san})
+        if(F_INSTRUMENT)
+            _boltapi_fuzz_rest_lib(${name} "${F_INSTRUMENT}")
+            target_link_libraries(${exe} PRIVATE boltapi_fuzz_rest_${name})
+        else()
+            target_link_libraries(${exe} PRIVATE boltapi::boltapi)
+        endif()
+    else()
+        target_link_libraries(${exe} PRIVATE boltapi::boltapi)
     endif()
     add_test(NAME ${exe} COMMAND ${exe} ${corpus_dir} ${regress_dir})
     # Mixed instrumented/uninstrumented libc++ containers false-positive the
