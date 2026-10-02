@@ -20,6 +20,19 @@
   sharing); spin-don't-sleep on hot loops; minimize syscalls/wakeups; mechanical
   sympathy (compact cache-resident state, prefetch, arena buffers).
 
+## Scale is tunable (1 thread to 200 cores)
+Reactor count, accept sockets, handler workers and connection caps come from
+one run-time scale profile (Gestalt2 `docs/ENGINEERING.md` §5a), reported in
+`boltapi_limits.h`; no hardcoded thread counts. **One reactor** (embedded, a
+sidecar, a test) handles accept, IO and dispatch on one thread with no
+cross-thread handoff and no idle threads. **Many cores, many NICs:** one
+pinned reactor per core with its own `SO_REUSEPORT` listener (no shared accept
+queue), one RSS/RX queue per reactor per NIC with IRQ affinity matched to the
+reactor's core, per-reactor arenas on the local NUMA node, listeners bindable
+per NIC/address. Perf claims report single-reactor req/s and p99 plus the
+reactor-scaling curve. Today the default is one IO thread and wire-protocol
+servers start a thread per connection up front: G2CHK-449.
+
 ## Hot paths use Bolt (the point of the fork)
 - Router: dictionary-interned segments + `bolt::SwissTable` static lookup + segment
   trie with interned ids (flagship — see docs/FASTPATHS.md).
