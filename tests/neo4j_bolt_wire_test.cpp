@@ -15,6 +15,7 @@
 
 #include "boltapi/net/sys_compat.h"
 
+#include <atomic>
 #include <chrono>
 #include <string>
 #include <thread>
@@ -484,6 +485,41 @@ TEST_F(BoltServerFixture, GoodbyeClosesWithoutAReply) {
     ASSERT_TRUE(bye.send(c));
     std::vector<std::uint8_t> out;
     EXPECT_LT(c.recv_message(out), 0) << "GOODBYE must close, not answer";
+}
+
+// Two readiness waiters compete for one queued connection. The losing
+// accept must return within its poll budget, then idle shutdown must finish.
+TEST(BoltListenerSeam, ConcurrentAcceptDoesNotBlockOnDrainedBacklog) {
+    nb::Neo4jBoltListener listener({"127.0.0.1", 0});
+    ASSERT_TRUE(listener.start().is_ok());
+    const auto port = listener.local_endpoint().port;
+    ASSERT_NE(port, 0);
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        std::atomic<unsigned> waiting{0};
+        int accepted[2] = {-1, -1};
+        std::thread first([&]() {
+            waiting.fetch_add(1, std::memory_order_release);
+            accepted[0] = listener.accept_one(100);
+        });
+        std::thread second([&]() {
+            waiting.fetch_add(1, std::memory_order_release);
+            accepted[1] = listener.accept_one(100);
+        });
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (waiting.load(std::memory_order_acquire) != 2 &&
+               std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        WireClient client;
+        const bool connected = client.connect(port);
+        first.join();
+        second.join();
+        EXPECT_TRUE(connected);
+        EXPECT_EQ(static_cast<int>(accepted[0] >= 0) + static_cast<int>(accepted[1] >= 0), 1);
+        for (int fd : accepted) {
+            if (fd >= 0) EXPECT_EQ(bolt::api::net::sys::close_socket(fd), 0);
+        }
+    }
+    listener.stop();
 }
 
 TEST_F(BoltServerFixture, ServesSeveralSequentialConnections) {

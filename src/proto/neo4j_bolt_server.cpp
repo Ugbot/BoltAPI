@@ -183,6 +183,13 @@ transport::Status Neo4jBoltListener::start() {
         return transport::Status(core::error_code::host_error);
     }
 
+    // Multiple workers may observe the same readiness. The losing accept
+    // must return would-block rather than park forever on a drained backlog.
+    if (net::sys::set_nonblocking(fd) != 0) {
+        net::sys::close_socket(fd);
+        return transport::Status(core::error_code::host_error);
+    }
+
     sockaddr_in actual{};
     socklen_t alen = sizeof(actual);
     if (::getsockname(fd, reinterpret_cast<sockaddr*>(&actual), &alen) == 0) {
@@ -197,8 +204,8 @@ transport::Status Neo4jBoltListener::start() {
 void Neo4jBoltListener::stop() noexcept {
     const int fd = fd_.exchange(-1, std::memory_order_acq_rel);
     if (fd >= 0) {
-        // Closing wakes every worker parked in select() with an error, which is
-        // how a bounded shutdown happens without a self-pipe.
+        // Idle readiness waits expire within accept_poll_ms. A racing
+        // accept cannot block because the listener is nonblocking.
         net::sys::close_socket(fd);
     }
     assert(fd_.load(std::memory_order_acquire) < 0);
@@ -213,6 +220,14 @@ int Neo4jBoltListener::accept_one(int timeout_ms) noexcept {
     // Re-check: stop() may have closed the fd between select() and accept().
     if (fd_.load(std::memory_order_acquire) < 0) return -1;
     const int c = static_cast<int>(::accept(fd, nullptr, nullptr));
+    if (c < 0) return -1;
+    // Some platforms inherit the listener mode. Connections use bounded
+    // readiness-gated blocking I/O, so restore that mode explicitly.
+    if (net::sys::set_nonblocking(c, false) != 0) {
+        net::sys::close_socket(c);
+        return -1;
+    }
+    assert(c >= 0);
     return c;
 }
 
