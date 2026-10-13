@@ -178,3 +178,12 @@ WebRTC). Current suite: **238/238** green on MSVC (default build; 1 expected aio
 ## License
 Licensed under the [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0).
 See [`LICENSE`](LICENSE) for the full text.
+
+
+## Contributing and security
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for local build and review guidance,
+[SECURITY.md](SECURITY.md) for private vulnerability reports, and the
+[Code of Conduct](CODE_OF_CONDUCT.md). Attribution is in [NOTICE](NOTICE);
+the existing [Apache 2.0 license](LICENSE) is unchanged. Design logs retain
+historical decisions; use [PROJECT_MAP.md](PROJECT_MAP.md) for current ownership.

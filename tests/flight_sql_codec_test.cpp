@@ -4,6 +4,7 @@
 #include "boltapi/proto/flight_sql_arrow.h"
 #include "boltapi/proto/flight_sql_codec.h"
 #include "boltapi/proto/flight_sql_params.h"
+#include "boltapi/proto/flight_sql_metadata.h"
 
 #include "bolt/bolt_arena.h"
 #include "bolt/bolt_column.h"
@@ -319,4 +320,73 @@ TEST(FlightSqlParams, DecodesABoltWrittenBatchAndTheAdvertisedSchema) {
     ASSERT_TRUE(cd::ipc_next_message(mixed, &pos, &sch, &bad));
     pm::Decoder dec4;
     EXPECT_TRUE(dec4.schema(sch.metadata, &err)) << err;
+}
+
+
+namespace {
+namespace fs = bolt::api::proto::flightsql;
+class CatalogBoundsExecutor final : public fs::IQueryExecutor {
+public:
+    std::uint32_t tables = 1, visits = 0;
+    std::uint16_t keys = 0;
+    bool empty_name = false;
+    bool execute(std::string_view, std::string*, std::int64_t*, fs::QueryFailure&) noexcept override {
+        return false;
+    }
+    bool has_catalog() const noexcept override { return true; }
+    std::uint32_t catalog_tables() noexcept override { return tables; }
+    bool catalog_table(std::uint32_t i, fs::CatalogTable* out) noexcept override {
+        ++visits;
+        if (i >= tables || out == nullptr) return false;
+        out->name = empty_name ? "" : "table";
+        out->table_type = "TABLE";
+        out->n_key_columns = keys;
+        for (std::uint16_t k = 0; k < fs::kMaxKeyColumns; ++k) out->key_columns[k] = "key";
+        return true;
+    }
+};
+
+void expect_catalog(CatalogBoundsExecutor& exec, bool primary_keys,
+                    fs::GrpcCode expected, std::int64_t expected_rows) {
+    std::string out = "old output", value;
+    if (primary_keys) cd::pb_put_bytes(&value, 3, "table");
+    std::int64_t rows = -1;
+    fs::QueryFailure failure;
+    char message[256]{};
+    const auto result = fs::metadata::build(primary_keys ?
+        "arrow.flight.protocol.sql.CommandGetPrimaryKeys" :
+        "arrow.flight.protocol.sql.CommandGetTables", value, exec, fs::Config{},
+        &out, &rows, failure, message, sizeof(message));
+    EXPECT_EQ(result, expected == fs::GrpcCode::kOk ?
+        fs::metadata::Outcome::kOk : fs::metadata::Outcome::kFailed);
+    EXPECT_EQ(rows, expected_rows);
+    if (expected == fs::GrpcCode::kOk) EXPECT_FALSE(out.empty());
+    else { EXPECT_EQ(failure.code, expected); EXPECT_TRUE(out.empty()); }
+}
+} // namespace
+
+TEST(FlightSqlMetadata, RejectsOversizedCatalogBeforeReadingEntries) {
+    CatalogBoundsExecutor exec;
+    exec.tables = fs::kMaxCatalogTables + 1;
+    expect_catalog(exec, false, fs::GrpcCode::kResourceExhausted, 0);
+    EXPECT_EQ(exec.visits, 0u);
+}
+
+TEST(FlightSqlMetadata, RejectsInvalidEntriesBeforeSerializingKeys) {
+    CatalogBoundsExecutor exec;
+    exec.empty_name = true;
+    expect_catalog(exec, false, fs::GrpcCode::kInternal, 0);
+    exec.empty_name = false;
+    exec.keys = fs::kMaxKeyColumns + 1;
+    expect_catalog(exec, true, fs::GrpcCode::kInternal, 0);
+}
+
+TEST(FlightSqlMetadata, AcceptsExactTableAndKeyCapacity) {
+    CatalogBoundsExecutor exec;
+    exec.tables = fs::kMaxCatalogTables;
+    expect_catalog(exec, false, fs::GrpcCode::kOk, fs::kMaxCatalogTables);
+    EXPECT_EQ(exec.visits, fs::kMaxCatalogTables);
+    exec.tables = 1;
+    exec.keys = fs::kMaxKeyColumns;
+    expect_catalog(exec, true, fs::GrpcCode::kOk, fs::kMaxKeyColumns);
 }

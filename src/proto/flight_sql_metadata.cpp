@@ -164,11 +164,17 @@ struct Snapshot {
 
 bool snapshot(IQueryExecutor& exec, Snapshot* s, QueryFailure& f) {
     assert(s != nullptr && s->tables.empty());
-    const std::uint32_t n = std::min(exec.catalog_tables(), kMaxCatalogTables);
+    const std::uint32_t n = exec.catalog_tables();
+    if (n > kMaxCatalogTables) {
+        return fail(f, GrpcCode::kResourceExhausted, "catalog exceeds table capacity");
+    }
     s->tables.resize(n);
     for (std::uint32_t i = 0; i < n; ++i) {
         if (!exec.catalog_table(i, &s->tables[i])) {
             return fail(f, GrpcCode::kInternal, "catalog changed while it was listed");
+        }
+        if (s->tables[i].name.empty() || s->tables[i].n_key_columns > kMaxKeyColumns) {
+            return fail(f, GrpcCode::kInternal, "invalid catalog entry");
         }
         assert(s->tables[i].n_key_columns <= kMaxKeyColumns);
     }

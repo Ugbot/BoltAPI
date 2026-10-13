@@ -139,3 +139,15 @@ not referenced from the root build.
   `-DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
   -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld` (never auto-detect). `WARNINGS_AS_ERRORS=OFF`
   (the suite is MSVC-primary `/WX`; running the gate on Linux is the point).
+
+
+### Main convergence (2026-10-13)
+
+- Rate-limit slots and UDP counters follow Bolt's exported cache-isolation
+  policy (default64; explicitAUTO/128), with independent channel-slot alignment.
+- Flight SQL metadata rejects oversized catalogs and invalid names/key counts
+  before serialization, rather than truncating or indexing beyond key storage.
+  `FlightSqlMetadata` in `tests/flight_sql_codec_test.cpp` covers refusal and
+  exact-capacity success; current protocol behavior remains the landed version.
+- Public contribution/security/attribution documents recover useful material
+  from the historical docs branch without importing old CI/status claims.

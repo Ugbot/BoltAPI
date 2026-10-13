@@ -11,6 +11,7 @@
 // fast path stays wait-free. No allocations after construction.
 #pragma once
 
+#include "bolt/bolt_config.h"
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -46,7 +47,7 @@ public:
     size_t size() const noexcept { return size_.load(std::memory_order_relaxed); }
 
 private:
-    struct alignas(64) Slot {
+    struct alignas(bolt::config::kCacheIsolationBytes) Slot {
         std::atomic<uint64_t> seq{0};       // even = stable, odd = writer in
         std::atomic<uint64_t> last_use_ns{0};
         uint8_t               key_len = 0;

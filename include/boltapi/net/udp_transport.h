@@ -55,6 +55,7 @@
 
 #pragma once
 
+#include "bolt/bolt_config.h"
 #include "boltapi/net/sys_compat.h"
 #include "boltapi/net/io_dispatcher.h"
 #include "boltapi/core/async_io.h"
@@ -197,9 +198,9 @@ private:
 
     // Cache-line-padded atomic to avoid false sharing between the counters the
     // rx callback bumps and any reader thread.
-    struct alignas(64) PaddedCounter {
+    struct alignas(bolt::config::kCacheIsolationBytes) PaddedCounter {
         std::atomic<std::uint64_t> v{0};
-        char pad[64 - sizeof(std::atomic<std::uint64_t>)]{};
+        char pad[bolt::config::kCacheIsolationBytes - sizeof(std::atomic<std::uint64_t>)]{};
     };
 
     IODispatcher*     dispatcher_ = nullptr;  // null => global on start()
