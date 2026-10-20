@@ -19,6 +19,9 @@
 #include <cassert>
 #include <cstdio>
 #include <cstring>
+#if !defined(_WIN32)
+#include <netinet/tcp.h>
+#endif
 
 namespace bolt::api {
 namespace proto {
@@ -267,7 +270,12 @@ int Listener::accept_one(int timeout_ms) noexcept {
     const int ready = wait_readable(fd, timeout_ms);
     if (ready <= 0) return -1;
     if (fd_.load(std::memory_order_acquire) < 0) return -1;
-    return static_cast<int>(::accept(fd, nullptr, nullptr));
+    const int c = static_cast<int>(::accept(fd, nullptr, nullptr));
+    if (c >= 0) {   // small request/response messages: no Nagle (a ~40 ms stall with delayed ACK on Linux)
+        int one = 1;
+        (void)::setsockopt(c, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one), sizeof(one));
+    }
+    return c;
 }
 
 // ---------------------------------------------------------------------------

@@ -26,6 +26,9 @@
 
 #include <cstdio>
 #include <cstring>
+#if !defined(_WIN32)
+#include <netinet/tcp.h>
+#endif
 
 namespace bolt::api {
 namespace proto {
@@ -221,6 +224,9 @@ int Neo4jBoltListener::accept_one(int timeout_ms) noexcept {
     if (fd_.load(std::memory_order_acquire) < 0) return -1;
     const int c = static_cast<int>(::accept(fd, nullptr, nullptr));
     if (c < 0) return -1;
+    // Bolt is request/response over small messages: Nagle plus delayed ACK costs ~40 ms a round trip on Linux.
+    int one = 1;
+    (void)::setsockopt(c, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one), sizeof(one));
     // Some platforms inherit the listener mode. Connections use bounded
     // readiness-gated blocking I/O, so restore that mode explicitly.
     if (net::sys::set_nonblocking(c, false) != 0) {
