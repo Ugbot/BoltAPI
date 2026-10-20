@@ -9,11 +9,20 @@
 
 #include "bolt/bolt_limits.h"
 #include "boltapi/proto/postgres_wire.h"
+#include "boltapi/http/fixed_stream_limits.h"
 #include "boltapi/quic/quic_limits.h"
 #include "boltapi/router.h"
 #include "boltapi/wire_limits.h"
 
 #define BOLTAPI_LIMITS(X)                                                       \
+    X(fixed_stream_slice_bytes, kFixedAtAlloc, "bytes",                             \
+      ::bolt::api::kFixedStreamSliceBytes, ::bolt::api::kFixedStreamSliceBytes,  \
+      ::bolt::api::kFixedStreamSliceBytes, nullptr, nullptr,                    \
+      "bytes in each startup fixed-stream handoff slot")                       \
+    X(fixed_stream_max_slots, kFixedAtAlloc, "slots",                               \
+      ::bolt::api::kFixedStreamMaxSlots, ::bolt::api::kFixedStreamMaxSlots,      \
+      ::bolt::api::kFixedStreamMaxSlots, nullptr, nullptr,                      \
+      "maximum fixed-stream slots allocated at server startup")                \
     X(pgwire_max_fields, kInvariant, "columns",                                 \
       ::bolt::api::proto::pgwire::kMaxFields,                                   \
       ::bolt::api::proto::pgwire::kMaxFields,                                   \

@@ -78,6 +78,56 @@ tools/fuzz_check/          # throwaway standalone validation of the fuzz util (n
 | Bolt primitives wired (Arena/SPSC/swiss/topology) | 🚧 | swiss=router done. **Request-body Arena**: `include/boltapi/http/body_buffer_arena.h` now dual-impl behind `option(BOLTAPI_USE_BOLT_ARENA)` (default OFF=slot-pool unchanged; ON=thread-local `bolt::Arena` bump alloc, Handle=non-owning view, self-guarding per-request `thread_body_arena_reset()` reclaims only when no view is live — safe under any-worker coroutine resumption). Reset wired in `coro_unified_server.cpp` (HTTP/1.1 keep-alive iter end ×2; HTTP/2 conn teardown). 45/45 ctest in BOTH modes on MSVC; ON also exercised under Linux ASan/UBSan CI. Dead `ring_buffer.h`/`coro_resumer.h` (SPSCRingBuffer/CoroResumer) removed — were unreferenced. TODO: Bolt topology/affinity thread pinning in worker_pool (deferred perf pass). |
 | Benchmark tooling (loadgen + bench_server + scripts) | ✅ | **In-tree async HTTP/1.1 load generator** `benchmarks/loadgen/` (zero third-party deps, built on the engine's own `IODispatcher` async_connect/read/write + WorkerThreadPool): `http_client.{h,cpp}` (request serializer + incremental response parser + pooled keep-alive `ClientConn` — transport-agnostic, **the seed of the gateway upstream HTTP client**), `latency_histogram.h` (log-linear, fixed storage, p50/p90/p99/p999), `loadgen.{h,cpp}` (1 coroutine/conn, bounded `kMaxConnections=1024`, self-terminating), `loadgen_main.cpp` (CLI + machine-scrapable `RESULT` line). **`benchmarks/bench_server.cpp`** TechEmpower-style routes over the real `App` (`/plaintext /json /db /queries?n=K /route/{id}`; `/db`+`/queries` are an honest synthetic CPU proxy — no PostgreSQL). **`scripts/run_benchmarks.{ps1,sh}`** orchestration (always stops server, no orphan/hang) + `wrk_crosscheck.sh` (skip-if-absent). CMake under `BOLTAPI_BUILD_BENCHMARKS` (not ctest). **Verified MSVC** (~63–69k req/s loopback, all endpoints failed=0, histogram monotonic, no orphan) **+ Linux/Clang+lld** via `Dockerfile.linux-bench` (build + bounded smoke gate green, failed=0). `docs/BENCHMARKS.md` extended (methodology, endpoint suite, comparison-framing template). |
 
+## Fixed-stream backpressure (G2ICE-251)
+
+Cleartext H1 `send_fixed` uses `src/server/h1_fixed_stream.h` on single and
+multiple reactors, including per-core engines. The synchronous producer runs in the existing
+blocking pool; its sink copies through one startup-allocated 64 KiB slot. Socket
+writes remain on the reactor and yield under backpressure. Slot count is
+`max(2, num_streaming_workers) - 1`, reserving one blocking worker for other
+requests. Occupied slots or a full blocking queue yield HTTP 503 before fixed
+headers are published. `WorkerThreadPool::try_submit_blocking` performs one-shot
+admission; an admitted callback waits on a start gate until headers are written.
+`http/fixed_stream_limits.h` records the allocation shape, also exposed by the
+limits registry. The object length is independent of slot capacity.
+
+The producer and consumer retain separate slot references. A producer cannot
+recycle its scratch until its synchronous sink returns. Disconnect suppresses
+later sink writes and the connection retains producer context until its bounded
+invocation returns. Stop cancels slots, posts socket shutdown on each owning
+reactor, and drains slot references before joining I/O and workers. Descriptor
+claims serialize shutdown with ordinary close even on shared-engine backends;
+only the connection closes its fd. Crossing `shutdown_timeout_ms` is reported,
+then completion processing remains alive until finite producers release their
+contexts; stop may exceed that deadline. A void sink cannot forcibly cancel
+arbitrary producer code. Copied slot
+bytes outlive final I/O drain and worker completion. The pool is destroyed
+after the engines. The existing void sink cannot cancel arbitrary producer code;
+producers must terminate bounded work and must not retain or concurrently invoke
+the sink. TLS/H2/H3 continue to materialize fixed producers. Each slot captures
+Bolt's `IODispatcher::current_io_thread_index()` before offload and wakes that
+reactor; off-dispatcher callers get `SIZE_MAX`, never a guessed owner. A separate
+arming/parked state prevents shared-engine completion from resuming an awaiter
+before its final publication. Calls
+already running off a per-core reactor retain their inline path.
+
+`boltapi_fixed_length_response_test` includes delayed owned-body and scratch-range
+drain checks: a second connection must answer before the first body is read,
+then every byte and keep-alive framing are verified. Concurrent scratch-range
+readers exercise producer-local buffer reuse. `FixedStreamLifecycle` configures
+one slot and verifies admission refusal, reset-driven recovery, and stop while a
+body remains unread. `FixedStreamMultiReactor` posts identity checks to both
+reactors and drives 16 delayed 8 MiB range responses across four clients,
+checking the original reactor survives keep-alive after each full body.
+`FixedStreamSharedCompletion` deterministically pauses arming on reactor 1 while
+owner 0 drains a wake/barrier, for both data and completion notifications.
+`FixedStreamAdmission` fills the blocking queue, verifies a framed 503 and
+subsequent recovery. `FixedStreamShutdown` holds a finite producer beyond its
+deadline and checks that its HTTP request context drains.
+The original producer path failed both delayed-drain cases;
+the first fixed-path gate passed all 14 framing/concurrency cases. The consuming
+Gestalt2 task owns the remaining lifecycle and S3 integration receipts.
+
 ## Consuming boltapi (install / find_package)
 
 boltapi is a SHIPPED artifact and resolves bolt three ways, announced in the

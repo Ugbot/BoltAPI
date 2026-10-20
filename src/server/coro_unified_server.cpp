@@ -13,6 +13,7 @@
 #include "boltapi/http/http1_parser.h"
 #include "boltapi/http/http2_connection.h"
 #include "boltapi/http/request_body_buffer.h"
+#include "h1_fixed_stream_wait.h"
 #include "boltapi/net/sys_compat.h"
 #include <algorithm>
 #include <cassert>
@@ -222,6 +223,7 @@ bool stream_chunked_h1(int fd, CoroHttpResponse& response, bool keep_alive) {
 enum class FixedStreamResult : uint8_t {
     kComplete,       // exactly `declared` bytes written; connection reusable
     kPeerGone,       // client vanished mid-body; close
+    kCapacity,       // worker/slot admission refused before any response headers
     kLengthMismatch  // producer under/over-produced; MUST close (frame is bad)
 };
 
@@ -390,6 +392,100 @@ core::coro_task<bool> stream_co_write_all(net::IODispatcher& io, int fd,
         off += static_cast<std::size_t>(n);
     }
     co_return true;
+}
+
+bool admit_fixed_producer(net::IODispatcher& io, CoroHttpResponse& response,
+                          H1FixedStreamSlot* slot) {
+    assert(response.stream_producer != nullptr);
+    assert(slot->producer == nullptr);
+    slot->producer = std::move(response.stream_producer);
+    response.stream_producer = nullptr;
+    slot->references.fetch_add(1, std::memory_order_relaxed);
+    if (io.worker_pool()->try_submit_blocking([slot] { slot->run_producer(); })) return true;
+    slot->producer = nullptr;
+    slot->release();  // no callback was accepted: relinquish its worker reference
+    return false;
+}
+
+void refuse_fixed_stream(CoroHttpResponse& response) {
+    assert(response.status >= 100);
+    assert(response.fixed_stream_length >= 0);
+    response.status = 503;
+    response.status_message = "Service Unavailable";
+    response.stream_producer = nullptr;
+    response.fixed_stream_length = CoroHttpResponse::kNoFixedLength;
+    response.headers.remove("Content-Length");
+    response.headers.remove("Content-Range");
+    response.headers.remove("Content-Encoding");
+    response.borrowed_data = nullptr;
+    response.borrowed_size = 0;
+    response.body_separate_write = false;
+    response.headers.set("Content-Type", "text/plain");
+    response.body = "fixed response stream capacity exhausted";
+    assert(!response.is_fixed_stream());
+}
+
+// G2ICE-251: a fixed producer must not park the reactor while its client waits
+// for a second request. Startup-owned slots bound staging and survive shutdown;
+// the worker handles production and the reactor alone performs socket I/O.
+core::coro_task<FixedStreamResult> stream_fixed_h1_offloaded(
+        net::IODispatcher& io, int fd, CoroHttpResponse& response,
+        bool keep_alive, H1FixedStreamSlot* slot) {
+    assert(slot != nullptr && response.stream_producer != nullptr);
+    assert(slot->references.load(std::memory_order_relaxed) == 1);
+    slot->active_fd.store(fd, std::memory_order_release);
+    if (!admit_fixed_producer(io, response, slot)) {
+        slot->deactivate_fd();
+        slot->release();
+        co_return FixedStreamResult::kCapacity;
+    }
+    std::string head;
+    build_fixed_head(head, response, slot->declared, keep_alive);
+    bool alive = co_await stream_co_write_all(io, fd, head.data(), head.size());
+    if (alive) {
+        auto expected = H1FixedStreamSlot::StartPhase::kWaiting;
+        alive = slot->start_phase.compare_exchange_strong(expected,
+            H1FixedStreamSlot::StartPhase::kRun, std::memory_order_acq_rel,
+            std::memory_order_acquire);
+        slot->start_phase.notify_one();
+    }
+    if (!alive) slot->cancel();
+    uint64_t written = 0;
+    while (alive && (written < slot->declared || !slot->done.load(std::memory_order_acquire))) {
+        co_await H1FixedStreamReady{slot};
+        int32_t pending = slot->pending.load(std::memory_order_acquire);
+        if (pending < 0) { alive = false; break; }
+        if (pending > 0) {
+            alive = co_await stream_co_write_all(io, fd, slot->bytes,
+                                                static_cast<std::size_t>(pending));
+            if (!alive) { slot->cancel(); break; }
+            written += static_cast<uint32_t>(pending);
+            if (!slot->pending.compare_exchange_strong(pending, 0,
+                    std::memory_order_acq_rel, std::memory_order_acquire)) {
+                alive = false;  // shutdown cancelled while the write completed
+                break;
+            }
+            slot->pending.notify_one();
+        }
+        if (slot->done.load(std::memory_order_acquire) && pending == 0) break;
+    }
+    // A void sink cannot abort arbitrary producer code. Suppress later writes
+    // and retain its context until its bounded invocation actually returns.
+    if (!alive) slot->cancel();
+    while (!slot->done.load(std::memory_order_acquire))
+        co_await H1FixedStreamReady{slot, true};
+    const bool matched = !slot->overrun && slot->produced == slot->declared;
+    assert(written <= slot->declared);
+    slot->deactivate_fd();
+    slot->release();  // no async socket write or producer access remains
+    if (!alive) co_return FixedStreamResult::kPeerGone;
+    co_return matched ? FixedStreamResult::kComplete : FixedStreamResult::kLengthMismatch;
+}
+
+core::detached_task shutdown_fixed_streams_on_reactor(
+        net::IODispatcher& io, H1FixedStreamPool& pool, std::size_t index) {
+    pool.shutdown_on_reactor(io, index);
+    co_return;
 }
 
 // Bounded producer -> I/O-thread handoff. shared_ptr-owned so an orphaned
@@ -794,6 +890,28 @@ int CoroUnifiedServer::start_background() {
     std::cout << "  I/O threads: " << config_.num_io_threads << std::endl;
     std::cout << "  Worker threads: " << config_.num_workers << std::endl;
 
+    // One startup slot per permitted fixed stream; reserve one blocking worker
+    // for other offloaded requests while clients hold fixed bodies unread.
+    const std::size_t fixed_slots = std::max<std::size_t>(2, config_.num_streaming_workers) - 1;
+    if (fixed_slots > kFixedStreamMaxSlots) {
+        error_message_ = "fixed stream slot count exceeds kFixedStreamMaxSlots";
+        shutdown_state_.store(CoroShutdownState::STOPPED, std::memory_order_release);
+        s_instance_ = nullptr;
+        return -1;
+    }
+    // Dispose previous stopped engines before their backing slots on restart.
+    tls_listener_.reset();
+    cleartext_listener_.reset();
+    io_dispatcher_.reset();
+    worker_pool_.reset();
+    fixed_stream_pool_.reset(new (std::nothrow) H1FixedStreamPool(fixed_slots));
+    if (!fixed_stream_pool_ || !fixed_stream_pool_->valid()) {
+        error_message_ = "could not allocate fixed stream startup slots";
+        shutdown_state_.store(CoroShutdownState::STOPPED, std::memory_order_release);
+        s_instance_ = nullptr;
+        return -1;
+    }
+
     // Create worker thread pool
     core::WorkerPoolConfig worker_config;
     worker_config.num_workers = config_.num_workers;
@@ -978,6 +1096,8 @@ void CoroUnifiedServer::stop() {
         cleartext_listener_->stop();
     }
 
+    cancel_fixed_streams();
+
     // Stop I/O dispatcher
     if (io_dispatcher_) {
         io_dispatcher_->stop();
@@ -994,6 +1114,36 @@ void CoroUnifiedServer::stop() {
     }
 
     std::cout << "CoroUnifiedServer stopped" << std::endl;
+}
+
+// Cancel new production, wake pending socket writes on their owning reactors,
+// and retain the engines until bounded producers/request contexts have drained.
+void CoroUnifiedServer::cancel_fixed_streams() {
+    if (!fixed_stream_pool_ || !fixed_stream_pool_->valid()) return;
+    fixed_stream_pool_->cancel_all();
+    if (!io_dispatcher_ || !io_dispatcher_->is_running()) return;
+    assert(io_dispatcher_->io_thread_count() > 0);
+    assert(io_dispatcher_->worker_pool() != nullptr);
+    for (std::size_t index = 0; index < io_dispatcher_->io_thread_count(); ++index) {
+        auto task = shutdown_fixed_streams_on_reactor(
+            *io_dispatcher_, *fixed_stream_pool_, index);
+        auto handle = task.release();
+        if (!io_dispatcher_->post_to_io_thread(index, handle)) {
+            handle.destroy();
+            std::fprintf(stderr, "[boltapi] fixed-stream shutdown post refused\n");
+        }
+    }
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(config_.shutdown_timeout_ms);
+    bool deadline_reported = false;
+    while (!fixed_stream_pool_->idle()) {
+        if (!deadline_reported && std::chrono::steady_clock::now() >= deadline) {
+            std::fprintf(stderr, "[boltapi] fixed streams exceeded shutdown_timeout_ms; "
+                                 "retaining completion processing until producer release\n");
+            deadline_reported = true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
 }
 
 // =============================================================================
@@ -1037,6 +1187,8 @@ bool CoroUnifiedServer::shutdown_gracefully() {
 
     // Complete shutdown
     shutdown_state_.store(CoroShutdownState::STOPPED, std::memory_order_release);
+
+    cancel_fixed_streams();
 
     // Stop I/O dispatcher and worker pool
     if (io_dispatcher_) {
@@ -1679,9 +1831,24 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
             // response came next on this keep-alive connection).
             if (tls == nullptr) {
                 keep_alive = parsed_req.keep_alive;
-                const FixedStreamResult r = stream_fixed_h1(fd, response, keep_alive);
-                if (r != FixedStreamResult::kComplete) keep_alive = false;
-                streamed = true;
+                const std::size_t current = io.current_io_thread_index();
+                const bool can_offload = current < io.io_thread_count() ||
+                    io.io_thread_count() == 1 || !io.per_thread_engines();
+                const std::size_t owner = current < io.io_thread_count() ? current : 0;
+                H1FixedStreamSlot* slot = can_offload
+                    ? fixed_stream_pool_->acquire(io, owner,
+                        static_cast<uint64_t>(response.fixed_stream_length))
+                    : nullptr;
+                const FixedStreamResult r = !can_offload
+                    ? stream_fixed_h1(fd, response, keep_alive)
+                    : slot == nullptr ? FixedStreamResult::kCapacity
+                    : co_await stream_fixed_h1_offloaded(io, fd, response, keep_alive, slot);
+                if (r == FixedStreamResult::kCapacity) {
+                    refuse_fixed_stream(response);  // no fixed headers were published
+                } else {
+                    if (r != FixedStreamResult::kComplete) keep_alive = false;
+                    streamed = true;
+                }
             } else {
                 if (!materialize_fixed(response)) force_close = true;
                 // -> normal buffered path below, Content-Length reconciled.

@@ -25,13 +25,17 @@
 
 #include "boltapi/app.h"
 #include "boltapi/net/sys_compat.h"
+#include "../src/server/h1_fixed_stream_wait.h"
 
 #include <gtest/gtest.h>
 
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <cctype>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <string>
 #include <thread>
 
@@ -42,6 +46,7 @@ namespace {
 
 constexpr uint16_t kPort = 19277;  // distinct from the other socket suites
 constexpr std::size_t kObjSize = 4096;
+constexpr std::size_t kLargeSize = 8u * 1024u * 1024u;
 
 // Process-lifetime bytes: exactly the lifetime class send_borrowed requires
 // (valid until well after the response is written).
@@ -84,14 +89,26 @@ std::string header_value_ci(const std::string& headers, const char* name) {
     return {};
 }
 
-int connect_client() {
+int connect_client(uint16_t port = kPort) {
     sys::startup();
     int fd = static_cast<int>(::socket(AF_INET, SOCK_STREAM, 0));
     if (fd < 0) return -1;
+    // Bound failed regressions: the old reactor path cannot answer the second
+    // request until this timeout lets the first client start draining.
+#ifdef _WIN32
+    DWORD timeout = 3000;
+#else
+    timeval timeout{3, 0};
+#endif
+    if (::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
+                     reinterpret_cast<const char*>(&timeout), sizeof(timeout)) != 0) {
+        sys::close_socket(fd);
+        return -1;
+    }
     sockaddr_in addr;
     std::memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(kPort);
+    addr.sin_port = htons(port);
     ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
     if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
         sys::close_socket(fd);
@@ -159,7 +176,7 @@ RawResponse read_one(int fd, std::string& carry, bool head_request = false) {
         ssize_t n = sys::recv_bytes(fd, tmp, sizeof(tmp));
         if (n <= 0) { peer_closed = true; continue; }
         buf.append(tmp, static_cast<std::size_t>(n));
-        if (buf.size() > (1u << 22)) break;  // safety cap
+        if (buf.size() > kLargeSize + (1u << 16)) break;  // safety cap
     }
 
     if (header_end == std::string::npos) return out;
@@ -198,9 +215,9 @@ std::string make_request(const char* method, const char* target, bool close_afte
 
 // One request on its own connection.
 RawResponse do_request(const char* method, const char* target,
-                       bool head_request = false) {
+                       bool head_request = false, uint16_t port = kPort) {
     RawResponse out;
-    const int fd = connect_client();
+    const int fd = connect_client(port);
     if (fd < 0) return out;
     if (!send_all(fd, make_request(method, target, /*close_after=*/true))) {
         sys::close_socket(fd);
@@ -300,6 +317,32 @@ protected:
                                        [](const api::Response::StreamSink& sink) {
                                            sink("only-ten!!");
                                        });
+        });
+
+        // G2ICE-251: offloaded handler owns its large slice; the other route
+        // reuses producer-local scratch after every sink call (file-read shape).
+        api::App* app = app_;
+        app_->get_async("/fixedbig", [app](api::Request&, api::Response& res)
+                                             -> api::core::coro_task<void> {
+            co_await app->offload([&res] {
+                std::string owned;
+                owned.reserve(kLargeSize);
+                for (std::size_t i = 0; i < kLargeSize / kObjSize; ++i)
+                    owned += object_bytes();
+                res.send_fixed(kLargeSize, [owned = std::move(owned)](
+                        const api::Response::StreamSink& sink) { sink(owned); });
+            });
+        });
+        app_->get("/fixedscratch", [](api::Request&, api::Response& res) {
+            res.status(206).header("Content-Range", "bytes 0-8388607/8388608")
+               .send_fixed(kLargeSize, [](const api::Response::StreamSink& sink) {
+                    char scratch[kObjSize];
+                    for (std::size_t i = 0; i < kLargeSize / kObjSize; ++i) {
+                        std::memcpy(scratch, object_bytes().data(), sizeof(scratch));
+                        sink(std::string_view(scratch, sizeof(scratch)));
+                        std::memset(scratch, 0, sizeof(scratch));
+                    }
+                });
         });
 
         ASSERT_EQ(app_->start_background("127.0.0.1", kPort), 0);
@@ -481,4 +524,696 @@ TEST_F(FixedLengthResponse, KeepAliveSurvivesBorrowedAndFixedResponses) {
     sys::close_socket(fd);
 }
 
+}  // namespace
+
+// G2ICE-251: do not drain the first body until another connection has answered.
+// SO_RCVBUF forces backpressure; the old synchronous fixed-stream sender wedges
+// the reactor here. A sleep before draining cannot prove this property.
+namespace {
+void check_delayed_drain(const char* target) {
+    const int fd = connect_client();
+    ASSERT_GE(fd, 0);
+    int receive_bytes = 16 * 1024;
+    ASSERT_EQ(::setsockopt(fd, SOL_SOCKET, SO_RCVBUF,
+                          reinterpret_cast<const char*>(&receive_bytes),
+                          sizeof(receive_bytes)), 0);
+    ASSERT_TRUE(send_all(fd, make_request("GET", target, false)));
+    std::string head;
+    char c = 0;
+    for (std::size_t i = 0; i < (1u << 16); ++i) {
+        if (sys::recv_bytes(fd, &c, 1) != 1) break;
+        head += c;
+        if (head.ends_with("\r\n\r\n")) break;
+    }
+    EXPECT_TRUE(head.ends_with("\r\n\r\n"));
+    EXPECT_EQ(header_value_ci(head, "Content-Length"), std::to_string(kLargeSize));
+    const RawResponse fast = do_request("GET", "/buf");
+    EXPECT_TRUE(fast.ok) << "other connection stalled behind unread fixed body";
+    EXPECT_EQ(fast.body, "BUFFERED-OK");
+    // Drain and compare in bounded scratch, avoiding a second whole-body copy.
+    std::size_t received = 0;
+    bool exact = true;
+    char bytes[kObjSize];
+    for (std::size_t i = 0; i < kLargeSize && received < kLargeSize; ++i) {
+        const ssize_t n = sys::recv_bytes(fd, bytes, sizeof(bytes));
+        if (n <= 0) break;
+        for (ssize_t j = 0; j < n; ++j)
+            exact &= bytes[j] == object_bytes()[(received + static_cast<std::size_t>(j)) % kObjSize];
+        received += static_cast<std::size_t>(n);
+    }
+    EXPECT_EQ(received, kLargeSize);
+    EXPECT_TRUE(exact);
+    // Reuse after complete drain must still frame the following response.
+    EXPECT_TRUE(send_all(fd, make_request("GET", "/buf", true)));
+    std::string carry;
+    const RawResponse next = read_one(fd, carry);
+    EXPECT_TRUE(next.ok);
+    EXPECT_EQ(next.body, "BUFFERED-OK");
+    sys::close_socket(fd);
+}
+
+TEST_F(FixedLengthResponse, OtherConnectionCompletesBeforeOwnedBodyDrains) {
+    check_delayed_drain("/fixedbig");
+}
+
+TEST_F(FixedLengthResponse, OtherConnectionCompletesBeforeScratchRangeDrains) {
+    check_delayed_drain("/fixedscratch");
+}
+
+TEST_F(FixedLengthResponse, ConcurrentRangeStreamsKeepScratchAndFramingExact) {
+    std::array<std::thread, 4> readers;
+    std::atomic<unsigned> failures{0};
+    for (auto& reader : readers) reader = std::thread([&failures] {
+        const RawResponse r = do_request("GET", "/fixedscratch");
+        bool exact = r.ok && !r.truncated && r.status == 206 &&
+                     r.declared == static_cast<long long>(kLargeSize) &&
+                     r.body.size() == kLargeSize && !r.chunked;
+        for (std::size_t i = 0; exact && i < r.body.size(); ++i)
+            exact = r.body[i] == object_bytes()[i % kObjSize];
+        if (!exact) failures.fetch_add(1);
+    });
+    for (auto& reader : readers) reader.join();
+    EXPECT_EQ(failures.load(), 0u);
+}
+}  // namespace
+
+namespace {
+constexpr uint16_t kLifecyclePort = 19329;
+
+class FixedStreamLifecycle : public ::testing::Test {
+protected:
+    void SetUp() override {
+        api::App::Config config;
+        config.server.num_workers = 1;
+        config.server.num_streaming_workers = 2;  // exactly one fixed-stream slot
+        app_ = new api::App(config);
+        app_->get("/hold", [this](api::Request&, api::Response& res) {
+            res.send_fixed(kLargeSize, [this](const api::Response::StreamSink& sink) {
+                started_.store(true);
+                char scratch[kObjSize];
+                std::memset(scratch, 'q', sizeof(scratch));
+                for (std::size_t i = 0; i < kLargeSize / sizeof(scratch); ++i)
+                    sink(std::string_view(scratch, sizeof(scratch)));
+                finished_.store(true);
+            });
+        });
+        app_->get("/small", [](api::Request&, api::Response& res) {
+            res.send_fixed(5, [](const api::Response::StreamSink& sink) { sink("SMALL"); });
+        });
+        ASSERT_EQ(app_->start_background("127.0.0.1", kLifecyclePort), 0);
+    }
+    void TearDown() override {
+        app_->stop();
+        delete app_;
+    }
+    int hold_body() {
+        const int fd = connect_client(kLifecyclePort);
+        if (fd < 0) return -1;
+        int window = 16 * 1024;
+        if (::setsockopt(fd, SOL_SOCKET, SO_RCVBUF,
+                reinterpret_cast<const char*>(&window), sizeof(window)) != 0 ||
+            !send_all(fd, make_request("GET", "/hold", false))) {
+            sys::close_socket(fd);
+            return -1;
+        }
+        std::string head;
+        char c = 0;
+        for (std::size_t i = 0; i < (1u << 16); ++i) {
+            if (sys::recv_bytes(fd, &c, 1) != 1) break;
+            head += c;
+            if (head.ends_with("\r\n\r\n")) return fd;
+        }
+        sys::close_socket(fd);
+        return -1;
+    }
+    bool wait_finished() {
+        for (unsigned i = 0; i < 1000 && !finished_.load(); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return finished_.load();
+    }
+    api::App* app_ = nullptr;
+    std::atomic<bool> started_{false};
+    std::atomic<bool> finished_{false};
+};
+
+TEST_F(FixedStreamLifecycle, ExhaustionRefusesBeforeHeadersAndResetReleasesSlot) {
+    const int fd = hold_body();
+    ASSERT_GE(fd, 0);
+    const RawResponse refused = do_request("GET", "/small", false, kLifecyclePort);
+    EXPECT_TRUE(refused.ok);
+    EXPECT_EQ(refused.status, 503);
+    EXPECT_FALSE(refused.chunked);
+    EXPECT_FALSE(refused.truncated);
+    EXPECT_EQ(refused.declared, static_cast<long long>(refused.body.size()));
+    EXPECT_NE(refused.body.find("capacity exhausted"), std::string::npos);
+
+    linger reset{1, 0};
+    EXPECT_EQ(::setsockopt(fd, SOL_SOCKET, SO_LINGER,
+                          reinterpret_cast<const char*>(&reset), sizeof(reset)), 0);
+    sys::close_socket(fd);
+    EXPECT_TRUE(wait_finished());
+    RawResponse next;
+    for (unsigned i = 0; i < 100; ++i) {
+        next = do_request("GET", "/small", false, kLifecyclePort);
+        if (next.status == 200) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_TRUE(next.ok);
+    EXPECT_EQ(next.status, 200);
+    EXPECT_EQ(next.body, "SMALL");
+}
+
+TEST_F(FixedStreamLifecycle, StopCancelsProducerWithUnreadBody) {
+    const int fd = hold_body();
+    ASSERT_GE(fd, 0);
+    for (unsigned i = 0; i < 1000 && !started_.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    EXPECT_TRUE(started_.load());
+    EXPECT_FALSE(finished_.load());
+    const auto before = std::chrono::steady_clock::now();
+    app_->stop();
+    const auto elapsed = std::chrono::steady_clock::now() - before;
+    EXPECT_LT(elapsed, std::chrono::seconds(2));
+    EXPECT_TRUE(finished_.load());
+    sys::close_socket(fd);
+}
+}  // namespace
+
+namespace {
+constexpr uint16_t kMultiReactorPort = 19330;
+std::atomic<unsigned> g_probe_zero{0}, g_probe_one{0}, g_probe_other{0};
+
+api::core::detached_task check_reactor_identity(
+        api::net::IODispatcher& io, api::net::IODispatcher& foreign,
+        std::size_t expected, std::atomic<unsigned>& completed,
+        std::atomic<unsigned>& failures) {
+    if (io.current_io_thread_index() != expected ||
+        foreign.current_io_thread_index() != SIZE_MAX) failures.fetch_add(1);
+    completed.fetch_add(1);
+    co_return;
+}
+
+// The GET read has completed before its handler reaches this awaiter. There is
+// no outstanding socket operation: transfer the owned handler continuation,
+// then let its response and subsequent keepalive reads use reactor 1's engine.
+struct PinIdleHandler {
+    api::net::IODispatcher* io;
+    bool await_ready() const noexcept { return false; }
+    bool await_suspend(std::coroutine_handle<> continuation) const noexcept {
+        auto* dispatcher = io;  // snapshot before publishing the frame handle
+        return dispatcher->post_to_io_thread(1, continuation);
+    }
+    void await_resume() const noexcept {}
+};
+
+// Natural accept distribution is not a coverage oracle (all 2048 observed
+// macOS accepts used reactor 0). Explicitly hand off this idle connection; a
+// failed post produces an error response and cannot silently qualify reactor 0.
+int connect_reactor_one() {
+    const int fd = connect_client(kMultiReactorPort);
+    if (fd < 0) return -1;
+    std::string carry;
+    if (send_all(fd, make_request("GET", "/pin1", false))) {
+        const RawResponse probe = read_one(fd, carry);
+        const std::string accepted = header_value_ci(probe.headers_block, "X-Accept-Reactor");
+        if (accepted == "0") g_probe_zero.fetch_add(1);
+        else if (accepted == "1") g_probe_one.fetch_add(1);
+        else g_probe_other.fetch_add(1);
+        if (probe.ok && probe.status == 200 && probe.body == "1") return fd;
+        std::fprintf(stderr, "[multi pin] ok=%d status=%d body=%.64s\n",
+            probe.ok ? 1 : 0, probe.status, probe.body.c_str());
+    }
+    sys::close_socket(fd);
+    return -1;  // lack of reactor-1 coverage must fail, never become a green test
+}
+
+int open_unread_range(bool pinned) {
+    const int fd = pinned ? connect_reactor_one() : connect_client(kMultiReactorPort);
+    if (fd < 0) return -1;
+    int window = 16 * 1024;
+    if (::setsockopt(fd, SOL_SOCKET, SO_RCVBUF,
+            reinterpret_cast<const char*>(&window), sizeof(window)) != 0 ||
+        !send_all(fd, make_request("GET", "/range", false))) {
+        sys::close_socket(fd);
+        return -1;
+    }
+    std::string head;
+    char c = 0;
+    for (std::size_t i = 0; i < (1u << 16); ++i) {
+        if (sys::recv_bytes(fd, &c, 1) != 1) break;
+        head += c;
+        if (head.ends_with("\r\n\r\n")) return fd;
+    }
+    sys::close_socket(fd);
+    return -1;
+}
+
+void check_multi_reactor_client(std::atomic<unsigned>& failures, bool pinned) {
+        for (unsigned round = 0; round < 4; ++round) {
+            const int fd = pinned ? connect_reactor_one() : connect_client(kMultiReactorPort);
+            if (fd < 0) { failures.fetch_add(1); continue; }
+            int window = 16 * 1024;
+            if (::setsockopt(fd, SOL_SOCKET, SO_RCVBUF,
+                    reinterpret_cast<const char*>(&window), sizeof(window)) != 0 ||
+                !send_all(fd, make_request("GET", "/range", false))) {
+                failures.fetch_add(1);
+                sys::close_socket(fd);
+                continue;
+            }
+            std::string carry;
+            char c = 0;
+            for (std::size_t i = 0; i < (1u << 16); ++i) {
+                if (sys::recv_bytes(fd, &c, 1) != 1) break;
+                carry += c;
+                if (carry.ends_with("\r\n\r\n")) break;
+            }
+            const std::string owner = header_value_ci(carry, "X-Reactor");
+            if (pinned && owner != "1") failures.fetch_add(1);
+            const RawResponse other = do_request("GET", "/where", false, kMultiReactorPort);
+            if (!other.ok || other.status != 200) failures.fetch_add(1);
+            const RawResponse range = read_one(fd, carry);
+            bool exact = range.ok && !range.truncated && range.status == 206 &&
+                         range.body.size() == kLargeSize && !range.chunked;
+            for (std::size_t i = 0; exact && i < range.body.size(); ++i)
+                exact = range.body[i] == 'r';
+            if (!exact || !send_all(fd, make_request("GET", "/where", true)))
+                failures.fetch_add(1);
+            const RawResponse next = read_one(fd, carry);
+            if (!next.ok || next.status != 200 || (pinned && next.body != owner))
+                failures.fetch_add(1);  // a wrong-reactor wake migrates this connection
+            sys::close_socket(fd);
+        }
+}
+
+TEST(FixedStreamMultiReactor, OwnerIdentityAndConcurrentDelayedRanges) {
+    api::net::IODispatcherConfig foreign_config;
+    api::net::IODispatcher foreign(foreign_config);
+    EXPECT_EQ(foreign.current_io_thread_index(), SIZE_MAX);
+    api::http::CoroUnifiedServerConfig config;
+    config.enable_tls = false;
+    config.enable_signal_handlers = false;
+    config.host = "127.0.0.1";
+    config.http1_port = kMultiReactorPort;
+    config.num_io_threads = 2;
+    config.num_workers = 2;
+    // Captures outlive server destruction even if a fatal assertion returns.
+    std::atomic<unsigned> failures{0};
+    std::atomic<unsigned> seen{0};
+    std::atomic<unsigned> checked{0};
+    api::http::CoroUnifiedServer server(config);
+    server.set_handler([&](const api::http::CoroHttpRequest& req)
+                                -> api::http::dispatch_task<api::http::CoroHttpResponse> {
+        auto* io = server.io_dispatcher();
+        const std::size_t accepted = io->current_io_thread_index();
+        if (req.path == "/pin1") co_await PinIdleHandler{io};
+        const std::size_t owner = io->current_io_thread_index();
+        api::http::CoroHttpResponse raw;
+        api::Response res(raw);
+        if (req.path == "/pin1" && owner != 1) {
+            failures.fetch_add(1);
+            res.status(503).text("reactor handoff failed");
+            co_return raw;
+        }
+        if (owner >= 2 || foreign.current_io_thread_index() != SIZE_MAX)
+            failures.fetch_add(1);
+        if (owner < 2) seen.fetch_or(1u << owner);
+        res.header("X-Reactor", std::to_string(owner));
+        if (req.path == "/where" || req.path == "/pin1") {
+            res.header("X-Accept-Reactor", std::to_string(accepted));
+            res.ok().text(std::to_string(owner));
+        } else {
+            res.status(206).header("Content-Range", "bytes 0-8388607/8388608")
+               .send_fixed(kLargeSize, [&, io](const api::Response::StreamSink& sink) {
+                    if (io->current_io_thread_index() != SIZE_MAX)
+                        failures.fetch_add(1);  // production must leave BOTH reactors
+                    char scratch[kObjSize];
+                    std::memset(scratch, 'r', sizeof(scratch));
+                    for (std::size_t i = 0; i < kLargeSize / sizeof(scratch); ++i)
+                        sink(std::string_view(scratch, sizeof(scratch)));
+                });
+        }
+        co_return raw;
+    });
+    ASSERT_EQ(server.start_background(), 0);
+    auto* io = server.io_dispatcher();
+    EXPECT_EQ(io->current_io_thread_index(), SIZE_MAX);  // test thread is foreign
+    for (std::size_t i = 0; i < 2; ++i) {
+        auto check = check_reactor_identity(*io, foreign, i, checked, failures);
+        auto handle = check.release();
+        const bool posted = io->post_to_io_thread(i, handle);
+        EXPECT_TRUE(posted);
+        if (!posted) handle.destroy();
+    }
+    for (unsigned i = 0; i < 1000 && checked.load() != 2; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    EXPECT_EQ(checked.load(), 2u);
+
+    std::array<std::thread, 4> clients;
+    const bool pinned = io->per_thread_engines();
+    for (auto& client : clients) client = std::thread([&] {
+        check_multi_reactor_client(failures, pinned);
+    });
+    for (auto& client : clients) client.join();
+    std::fprintf(stderr, "[multi accept] owner0=%u owner1=%u other=%u seen=%u\n",
+        g_probe_zero.load(), g_probe_one.load(), g_probe_other.load(), seen.load());
+    EXPECT_EQ(failures.load(), 0u);
+    EXPECT_NE(seen.load(), 0u);
+    const int unread = open_unread_range(pinned);
+    ASSERT_GE(unread, 0);
+    EXPECT_GT(server.get_active_connections(), 0u);
+    server.stop();
+    EXPECT_EQ(server.get_active_connections(), 0u)
+        << "stop must release the suspended HTTP request, not only its producer";
+    sys::close_socket(unread);
+    EXPECT_EQ(io->current_io_thread_index(), SIZE_MAX);
+}
+}  // namespace
+
+namespace {
+struct ArmingGate {
+    std::atomic<bool> armed{false}, release{false}, barrier{false};
+    std::atomic<bool> resumed{false}, premature{false}, returned{false}, inline_ok{false};
+    std::atomic<std::size_t> reactor{SIZE_MAX};
+};
+
+api::core::coro_task<void> arming_probe(api::net::IODispatcher& io, ArmingGate& gate) {
+    gate.reactor.store(io.current_io_thread_index());
+    gate.premature.store(!gate.release.load());
+    gate.resumed.store(true);
+    co_return;
+}
+
+api::core::detached_task pause_arming(api::http::H1FixedStreamSlot* slot,
+        ArmingGate& gate, bool completion_only, std::coroutine_handle<> probe) {
+    const bool parked = api::http::h1_fixed_stream_suspend(slot, completion_only, probe,
+        [&gate]() noexcept {
+            gate.armed.store(true);
+            while (!gate.release.load()) gate.release.wait(false);
+        });
+    // FIFO barrier proves an unsafe posted resume has already run. Avoid double
+    // resuming the probe in a negative control; its frame is owned by the test.
+    if (!parked && gate.inline_ok.load() && !gate.resumed.load()) probe.resume();
+    gate.returned.store(true);
+    co_return;
+}
+
+api::core::detached_task arming_barrier(ArmingGate& gate) {
+    gate.barrier.store(true);
+    co_return;
+}
+
+void check_arming_interleave(bool completion_only) {
+    ArmingGate gate;  // all captures outlive the I/O dispatcher and worker pool
+    api::http::H1FixedStreamPool slots(1);
+    ASSERT_TRUE(slots.valid());
+    api::core::WorkerPoolConfig workers_config;
+    workers_config.num_workers = 1;
+    workers_config.blocking_workers = 1;
+    api::core::WorkerThreadPool workers(workers_config);
+    api::net::IODispatcherConfig config;
+    config.num_io_threads = 2;
+    config.worker_pool = &workers;
+    api::net::IODispatcher io(config);
+    auto* slot = slots.acquire(io, 0, 1);  // captured owner differs from completion thread
+    ASSERT_NE(slot, nullptr);
+    slot->references.fetch_add(1);  // retain both refs until all synthetic work joins
+    auto probe = arming_probe(io, gate);
+    workers.start();
+    io.start();
+    auto arm = pause_arming(slot, gate, completion_only, probe.get_handle());
+    auto arm_handle = arm.release();
+    const bool posted = io.post_to_io_thread(1, arm_handle);
+    EXPECT_TRUE(posted);
+    if (!posted) arm_handle.destroy();
+    for (unsigned i = 0; i < 1000 && !gate.armed.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    EXPECT_TRUE(gate.armed.load());
+    if (completion_only) slot->done.store(true, std::memory_order_release);
+    else slot->pending.store(1, std::memory_order_release);
+    slot->wake();
+    auto barrier = arming_barrier(gate);
+    auto barrier_handle = barrier.release();
+    const bool barrier_posted = io.post_to_io_thread(0, barrier_handle);
+    EXPECT_TRUE(barrier_posted);
+    if (!barrier_posted) barrier_handle.destroy();
+    for (unsigned i = 0; i < 1000 && !gate.barrier.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    EXPECT_TRUE(gate.barrier.load());
+    EXPECT_FALSE(gate.resumed.load()) << "owner 0 resumed an awaiter still arming on 1";
+    gate.inline_ok.store(gate.barrier.load());
+    gate.release.store(true);  // no fatal assertion/return may bypass this release
+    gate.release.notify_all();
+    for (unsigned i = 0; i < 1000 && !gate.returned.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    io.stop();
+    workers.stop();
+    EXPECT_TRUE(gate.returned.load());
+    EXPECT_TRUE(gate.resumed.load());
+    EXPECT_FALSE(gate.premature.load());
+    EXPECT_EQ(gate.reactor.load(), 1u);
+    slot->release();
+    slot->release();
+}
+
+TEST(FixedStreamSharedCompletion, DataCannotResumeDuringArmingOnAnotherReactor) {
+    check_arming_interleave(false);
+}
+TEST(FixedStreamSharedCompletion, CompletionCannotResumeDuringArmingOnAnotherReactor) {
+    check_arming_interleave(true);
+}
+
+int request_headers(uint16_t port, const char* path) {
+    const int fd = connect_client(port);
+    if (fd < 0) return -1;
+    if (!send_all(fd, make_request("GET", path, false))) {
+        sys::close_socket(fd);
+        return -1;
+    }
+    std::string head;
+    char c = 0;
+    for (unsigned i = 0; i < (1u << 16); ++i) {
+        if (sys::recv_bytes(fd, &c, 1) != 1) break;
+        head += c;
+        if (head.ends_with("\r\n\r\n")) return fd;
+    }
+    sys::close_socket(fd);
+    return -1;
+}
+
+TEST(FixedStreamShutdown, FiniteProducerAfterDeadlineReleasesRequestContext) {
+    constexpr uint16_t port = 19331;
+    std::atomic<bool> release{false}, started{false}, finished{false}, stopped{false};
+    api::http::CoroUnifiedServerConfig config;
+    config.enable_tls = false;
+    config.enable_signal_handlers = false;
+    config.host = "127.0.0.1";
+    config.http1_port = port;
+    config.num_workers = 1;
+    config.num_streaming_workers = 2;
+    config.shutdown_timeout_ms = 1;
+    api::http::CoroUnifiedServer server(config);
+    server.set_handler([&](const api::http::CoroHttpRequest&)
+            -> api::http::dispatch_task<api::http::CoroHttpResponse> {
+        api::http::CoroHttpResponse raw;
+        api::Response res(raw);
+        res.send_fixed(5, [&](const api::Response::StreamSink& sink) {
+            started.store(true);
+            while (!release.load()) release.wait(false);
+            sink("READY");
+            finished.store(true);
+        });
+        co_return raw;
+    });
+    ASSERT_EQ(server.start_background(), 0);
+    const int fd = request_headers(port, "/fixed");
+    EXPECT_GE(fd, 0);
+    if (fd < 0) {
+        release.store(true);
+        release.notify_all();
+        server.stop();
+        return;
+    }
+    for (unsigned i = 0; i < 1000 && !started.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    EXPECT_TRUE(started.load());
+    std::thread stopper([&] { server.stop(); stopped.store(true); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    EXPECT_FALSE(stopped.load());
+    release.store(true);  // always release finite producer before joining stop
+    release.notify_all();
+    stopper.join();
+    EXPECT_TRUE(stopped.load());
+    EXPECT_TRUE(finished.load());
+    EXPECT_EQ(server.get_active_connections(), 0u);
+    sys::close_socket(fd);
+}
+
+TEST(FixedStreamAdmission, FullBlockingQueueRefusesBeforePublishingFixedHeaders) {
+    constexpr uint16_t port = 19332;
+    std::atomic<bool> release{false};
+    std::atomic<unsigned> entered{0};
+    api::http::CoroUnifiedServerConfig config;
+    config.enable_tls = false;
+    config.enable_signal_handlers = false;
+    config.host = "127.0.0.1";
+    config.http1_port = port;
+    config.num_workers = 1;
+    config.num_streaming_workers = 2;
+    api::http::CoroUnifiedServer server(config);
+    server.set_handler([](const api::http::CoroHttpRequest&)
+            -> api::http::dispatch_task<api::http::CoroHttpResponse> {
+        api::http::CoroHttpResponse raw;
+        api::Response res(raw);
+        res.send_fixed(5, [](const api::Response::StreamSink& sink) { sink("READY"); });
+        co_return raw;
+    });
+    ASSERT_EQ(server.start_background(), 0);
+    auto* workers = server.io_dispatcher()->worker_pool();
+    for (unsigned i = 0; i < 2; ++i) EXPECT_TRUE(workers->try_submit_blocking([&] {
+        entered.fetch_add(1);
+        while (!release.load()) release.wait(false);
+    }));
+    for (unsigned i = 0; i < 1000 && entered.load() != 2; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    EXPECT_EQ(entered.load(), 2u);
+    bool full = false;
+    for (unsigned i = 0; i < 4096; ++i) {
+        if (!workers->try_submit_blocking([] {})) { full = true; break; }
+    }
+    EXPECT_TRUE(full);
+    const RawResponse refused = do_request("GET", "/fixed", false, port);
+    EXPECT_TRUE(refused.ok);
+    EXPECT_EQ(refused.status, 503);
+    EXPECT_FALSE(refused.truncated);
+    EXPECT_FALSE(refused.chunked);
+    EXPECT_EQ(refused.declared, static_cast<long long>(refused.body.size()));
+    release.store(true);  // release on every assertion/timeout path, including mutants
+    release.notify_all();
+    RawResponse next;
+    for (unsigned i = 0; i < 100; ++i) {
+        next = do_request("GET", "/fixed", false, port);
+        if (next.status == 200) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_TRUE(next.ok);
+    EXPECT_EQ(next.status, 200);
+    EXPECT_EQ(next.body, "READY");
+    server.stop();
+    EXPECT_EQ(server.get_active_connections(), 0u);
+    EXPECT_FALSE(workers->try_submit_blocking([] {}));
+}
+}  // namespace
+
+namespace {
+TEST(BlockingAdmission, ZeroBlockingWorkersNeverAcceptsCallback) {
+    std::atomic<bool> executed{false};  // outlives queue-cell callback copies
+    api::core::WorkerPoolConfig config;
+    config.num_workers = 1;
+    config.blocking_workers = 0;
+    api::core::WorkerThreadPool workers(config);
+    EXPECT_FALSE(workers.try_submit_blocking([&] { executed.store(true); }));
+    workers.start();
+    EXPECT_FALSE(workers.try_submit_blocking([&] { executed.store(true); }));
+    workers.stop();
+    EXPECT_FALSE(executed.load());
+    EXPECT_FALSE(workers.try_submit_blocking([&] { executed.store(true); }));
+}
+
+constexpr std::size_t kAdmissionPublishers = 4;
+constexpr std::size_t kAdmissionBacklog = 64;
+constexpr std::size_t kAdmissionRaceIds = 64;
+constexpr std::size_t kAdmissionLateIds = 16;
+constexpr std::size_t kAdmissionStride = kAdmissionRaceIds + kAdmissionLateIds;
+constexpr std::size_t kAdmissionTracked =
+    1 + kAdmissionBacklog + kAdmissionPublishers * kAdmissionStride;
+
+struct AdmissionLedger {
+    std::array<std::atomic<unsigned>, kAdmissionTracked> executions{};
+    std::array<bool, kAdmissionTracked> accepted{};  // one publisher per ID
+    std::atomic<bool> entered{false}, release{false}, begin{false}, late{false};
+    std::atomic<unsigned> ready{0};
+
+    void submit(api::core::WorkerThreadPool& workers, std::size_t id) {
+        accepted[id] = workers.try_submit_blocking([this, id] {
+            executions[id].fetch_add(1);
+        });
+    }
+};
+
+void admission_publisher(api::core::WorkerThreadPool& workers,
+        AdmissionLedger& ledger, std::size_t publisher) {
+    const std::size_t base = 1 + kAdmissionBacklog + publisher * kAdmissionStride;
+    ledger.ready.fetch_add(1);
+    while (!ledger.begin.load()) ledger.begin.wait(false);
+    for (std::size_t i = 0; i < kAdmissionRaceIds; ++i) ledger.submit(workers, base + i);
+    while (!ledger.late.load()) ledger.late.wait(false);
+    for (std::size_t i = 0; i < kAdmissionLateIds; ++i)
+        ledger.submit(workers, base + kAdmissionRaceIds + i);
+}
+
+void check_concurrent_admission_stop(bool hold_backlog) {
+    AdmissionLedger ledger;  // every callback and publisher capture outlives pool
+    api::core::WorkerPoolConfig config;
+    config.num_workers = 1;
+    config.blocking_workers = 1;
+    api::core::WorkerThreadPool workers(config);
+    workers.start();
+    ledger.accepted[0] = workers.try_submit_blocking([&ledger] {
+        ledger.executions[0].fetch_add(1);
+        ledger.entered.store(true);
+        while (!ledger.release.load()) ledger.release.wait(false);
+    });
+    EXPECT_TRUE(ledger.accepted[0]);
+    for (unsigned i = 0; i < 1000 && !ledger.entered.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    EXPECT_TRUE(ledger.entered.load());
+    for (std::size_t id = 1; id <= kAdmissionBacklog; ++id) {
+        ledger.submit(workers, id);
+        EXPECT_TRUE(ledger.accepted[id]);
+        EXPECT_EQ(ledger.executions[id].load(), 0u);  // forced queued backlog
+    }
+    std::array<std::thread, kAdmissionPublishers> publishers;
+    for (std::size_t i = 0; i < publishers.size(); ++i)
+        publishers[i] = std::thread(admission_publisher, std::ref(workers),
+                                     std::ref(ledger), i);
+    std::thread stopper([&] {
+        ledger.ready.fetch_add(1);
+        while (!ledger.begin.load()) ledger.begin.wait(false);
+        workers.stop();
+    });
+    for (unsigned i = 0; i < 1000 && ledger.ready.load() != kAdmissionPublishers + 1; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    EXPECT_EQ(ledger.ready.load(), kAdmissionPublishers + 1);
+    ledger.begin.store(true);
+    ledger.begin.notify_all();
+    if (!hold_backlog) {
+        ledger.release.store(true);  // let final drain race active publishers
+        ledger.release.notify_all();
+    }
+    for (unsigned i = 0; i < 1000 && workers.is_running(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    EXPECT_FALSE(workers.is_running());
+    ledger.late.store(true);  // stop admission is closed before late attempts
+    ledger.late.notify_all();
+    for (auto& publisher : publishers) publisher.join();
+    ledger.release.store(true);  // release on every assertion failure path
+    ledger.release.notify_all();
+    stopper.join();
+    for (std::size_t id = 0; id < kAdmissionTracked; ++id)
+        EXPECT_EQ(ledger.executions[id].load(), ledger.accepted[id] ? 1u : 0u)
+            << "callback ID " << id;
+    for (std::size_t publisher = 0; publisher < kAdmissionPublishers; ++publisher)
+        for (std::size_t i = 0; i < kAdmissionLateIds; ++i)
+            EXPECT_FALSE(ledger.accepted[1 + kAdmissionBacklog +
+                publisher * kAdmissionStride + kAdmissionRaceIds + i]);
+}
+
+TEST(BlockingAdmission, ConcurrentStopDrainsEveryAcceptedCallbackExactlyOnce) {
+    // Finite scheduling stress, not exhaustive SC-interleaving proof. Each round
+    // forces queued work before stop and rejected attempts after stop begins.
+    for (unsigned round = 0; round < 8; ++round) {
+        SCOPED_TRACE(round);
+        check_concurrent_admission_stop((round & 1u) == 0);
+    }
+}
 }  // namespace

@@ -208,8 +208,16 @@ public:
     // equal the declared length the connection is closed instead of leaving a
     // mis-framed stream that would corrupt the next response on it.
     //
-    // The producer runs synchronously on the connection's I/O thread — the same
-    // contract, and the same place, a buffered handler body already runs in.
+    // Cleartext H1 runs the synchronous producer on an existing blocking
+    // worker and resumes socket I/O on the connection's owning reactor.
+    // sink(bytes) applies backpressure through one startup-allocated slice;
+    // bytes may be reused once sink returns. Capture owned data or storage that
+    // outlives the response; do not depend on handler-thread-local state.
+    // The producer must terminate bounded work even after a peer disconnects:
+    // the void sink then suppresses writes, and context remains live until the
+    // invocation returns. Sink may not be retained or invoked concurrently.
+    // If startup slots are occupied, H1 sends 503 before any fixed headers.
+    // Calls already running off a per-core reactor retain their inline path.
     // On TLS/HTTP-2/HTTP-3 the output is materialized and framed by the normal
     // path (same bytes, same Content-Length, just not incremental).
     Response& send_fixed(uint64_t n, StreamProducer producer) & {

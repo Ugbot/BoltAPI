@@ -414,7 +414,9 @@ struct CoroUnifiedServerConfig {
     bool enable_h2c = true;
 
     // Graceful shutdown configuration
-    uint32_t shutdown_timeout_ms = 30000;   // Max time to wait for connections to drain (30s)
+    // Connection drain deadline (30s). Fixed-response producer ownership may
+    // extend shutdown beyond this deadline until finite producers return.
+    uint32_t shutdown_timeout_ms = 30000;
     bool enable_signal_handlers = true;     // Install SIGTERM/SIGINT handlers
 
     // Pure C++ mode - always true for CoroUnifiedServer
@@ -443,6 +445,8 @@ struct CoroUnifiedServerConfig {
  *
  *   server.start();  // Blocks
  */
+class H1FixedStreamPool;
+
 class CoroUnifiedServer {
 public:
     explicit CoroUnifiedServer(const CoroUnifiedServerConfig& config);
@@ -503,7 +507,9 @@ public:
     int start_background();
 
     /**
-     * Stop the server
+     * Stop the server.
+     * Cancels fixed responses and retains I/O until their finite producers and
+     * request contexts release ownership; may exceed shutdown_timeout_ms.
      */
     void stop();
 
@@ -511,9 +517,11 @@ public:
      * Initiate graceful shutdown
      *
      * Stops accepting new connections and waits for in-flight requests to complete.
-     * Times out after shutdown_timeout_ms if connections don't drain.
+     * If connections remain after shutdown_timeout_ms, cancels fixed responses.
+     * Their finite producers and request contexts must release ownership before
+     * I/O stops, so this call may exceed the deadline.
      *
-     * @return true if shutdown completed within timeout, false if forced
+     * @return true if the initial connection drain met the deadline, false otherwise
      */
     bool shutdown_gracefully();
 
@@ -677,6 +685,8 @@ private:
         net::IODispatcher& io, int fd, WebSocketConnection& ws_conn,
         net::CoroTlsSocket* tls);
 
+    void cancel_fixed_streams();
+
     // Signal handler installation
     void install_signal_handlers();
     static void signal_handler(int signum);
@@ -698,6 +708,10 @@ private:
 
     // TLS context
     std::shared_ptr<net::TlsContext> tls_context_;
+
+    // Startup fixed-stream slots outlive workers and I/O engines (reverse member
+    // destruction order); final-drain writes always reference live slot bytes.
+    std::unique_ptr<H1FixedStreamPool> fixed_stream_pool_;
 
     // Workers and I/O infrastructure
     std::unique_ptr<core::WorkerThreadPool> worker_pool_;
