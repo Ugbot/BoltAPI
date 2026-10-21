@@ -662,6 +662,109 @@ TEST(Http2Client, ClientGoawayReportsNoPeerInitiatedStreams) {
     }
 }
 
+TEST(Http2Server, FirstGoawayReportsAcceptedStreamsInsteadOfRefusedIds) {
+    for (const bool accepted : {false, true}) {
+        Connection client(false), server;
+        uint32_t requests = 0;
+        server.set_request_callback([&](Http2Stream*) { ++requests; });
+        ASSERT_TRUE(transfer(client, server));
+        (void)take(server);
+        if (accepted) ASSERT_TRUE(headers(server, 1, kGet, true));
+        const uint32_t refused = accepted ? 3u : 1u;
+        ASSERT_TRUE(headers(server, refused, {{":method", "GET"}}, true));
+        EXPECT_EQ(take(server), frame(FrameType::RST_STREAM, refused, 0,
+                                     u32(static_cast<uint32_t>(ErrorCode::PROTOCOL_ERROR))));
+        ASSERT_TRUE(server.send_goaway(ErrorCode::NO_ERROR).is_ok());
+        EXPECT_EQ(take(server), goaway(accepted ? 1u : 0u));
+        EXPECT_EQ(requests, accepted ? 1u : 0u);
+        EXPECT_EQ(server.open_stream_count(), accepted ? 1u : 0u);
+    }
+}
+
+TEST(Http2Server, RepeatedGoawayKeepsCutoffAndDrainsAcceptedStream) {
+    for (const size_t chunk : {size_t{1}, SIZE_MAX}) {
+        Connection client(false), server;
+        Events events;
+        uint32_t requests = 0;
+        server.set_request_callback([&](Http2Stream*) { ++requests; });
+        client.set_response_callback([&](const auto& event) { events.save(event); });
+        ASSERT_TRUE(transfer(client, server));
+        ASSERT_TRUE(transfer(server, client));
+        ASSERT_TRUE(client.send_request(kGet.data(), kGet.size()).is_ok());
+        ASSERT_TRUE(transfer(client, server));
+        ASSERT_TRUE(server.send_goaway(ErrorCode::NO_ERROR).is_ok());
+        const Bytes first = take(server);
+        ASSERT_EQ(first, goaway(1));
+        ASSERT_TRUE(feed(client, first, chunk));
+        EXPECT_FALSE(server.wants_close());
+
+        Bytes indexed = block(kGet);
+        // Incremental literal x-drain:yes inserts dynamic index62 on refused3.
+        const Bytes entry{0x40, 7, 'x', '-', 'd', 'r', 'a', 'i', 'n', 3, 'y', 'e', 's'};
+        indexed.insert(indexed.end(), entry.begin(), entry.end());
+        Bytes referenced = block(kGet);
+        referenced.push_back(0xBE); // dynamic index62 must still decode on refused5
+        Bytes input = frame(FrameType::HEADERS, 3, 0x5, indexed);
+        const Bytes next = frame(FrameType::HEADERS, 5, 0x5, referenced);
+        input.insert(input.end(), next.begin(), next.end());
+        ASSERT_TRUE(feed(server, input, chunk));
+        Bytes expected = frame(FrameType::RST_STREAM, 3, 0,
+                               u32(static_cast<uint32_t>(ErrorCode::REFUSED_STREAM)));
+        const Bytes reset = frame(FrameType::RST_STREAM, 5, 0,
+                                  u32(static_cast<uint32_t>(ErrorCode::REFUSED_STREAM)));
+        expected.insert(expected.end(), reset.begin(), reset.end());
+        EXPECT_EQ(take(server), expected);
+        ASSERT_TRUE(server.send_goaway(ErrorCode::NO_ERROR).is_ok());
+        const Bytes repeated = take(server);
+        ASSERT_EQ(repeated, goaway(1));
+        ASSERT_TRUE(feed(client, repeated, chunk));
+        EXPECT_EQ(requests, 1u);
+        EXPECT_EQ(server.open_stream_count(), 1u);
+        ASSERT_TRUE(server.send_response(1, 200, {}, "accepted").is_ok());
+        ASSERT_TRUE(transfer(server, client));
+        EXPECT_EQ(events.count(Kind::Complete), 1u);
+        EXPECT_EQ(events.count(Kind::Reset), 0u);
+        ASSERT_EQ(events.items.size(), 3u);
+        EXPECT_EQ(events.items[1].data, "accepted");
+        EXPECT_TRUE(server.wants_close());
+        EXPECT_TRUE(client.wants_close());
+    }
+}
+
+TEST(Http2Server, FatalAndConnectionErrorGoawayPreserveSentCutoff) {
+    for (const size_t chunk : {size_t{1}, SIZE_MAX}) {
+        for (const bool explicit_fatal : {false, true}) {
+            Connection client(false), server;
+            uint32_t requests = 0;
+            server.set_request_callback([&](Http2Stream*) { ++requests; });
+            ASSERT_TRUE(transfer(client, server));
+            (void)take(server);
+            ASSERT_TRUE(headers(server, 1, kGet, true));
+            ASSERT_TRUE(server.send_goaway(ErrorCode::NO_ERROR).is_ok());
+            ASSERT_EQ(take(server), goaway(1));
+            Bytes input = frame(FrameType::HEADERS, 3, 0x5, block(kGet));
+            const ErrorCode error = explicit_fatal ? ErrorCode::INTERNAL_ERROR : ErrorCode::FRAME_SIZE_ERROR;
+            if (explicit_fatal) {
+                ASSERT_TRUE(feed(server, input, chunk));
+                ASSERT_TRUE(server.send_goaway(error).is_ok());
+            } else {
+                const Bytes malformed = frame(FrameType::PING, 0, 0, Bytes(7));
+                input.insert(input.end(), malformed.begin(), malformed.end());
+                EXPECT_FALSE(feed(server, input, chunk));
+            }
+            Bytes expected = frame(FrameType::RST_STREAM, 3, 0,
+                                   u32(static_cast<uint32_t>(ErrorCode::REFUSED_STREAM)));
+            const Bytes fatal = goaway(1, error);
+            expected.insert(expected.end(), fatal.begin(), fatal.end());
+            EXPECT_EQ(take(server), expected);
+            EXPECT_EQ(server.last_error(), error);
+            EXPECT_TRUE(server.wants_close());
+            EXPECT_EQ(requests, 1u);
+            EXPECT_TRUE(server.send_goaway(ErrorCode::NO_ERROR).is_err());
+        }
+    }
+}
+
 TEST(Http2Client, HeaderBudgetsAndUnreadControlFloodFailExplicitly) {
     Events events;
     const std::string oversized(Connection::kMaxHeaderListSize, 'h');

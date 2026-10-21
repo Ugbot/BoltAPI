@@ -635,11 +635,22 @@ bool Http2Connection::recently_closed(uint32_t id) const noexcept {
     return false;
 }
 
+uint32_t Http2Connection::next_goaway_cutoff() noexcept {
+    assert(accepted_peer_stream_id_ <= last_stream_id_);
+    assert(is_server_ || accepted_peer_stream_id_ == 0);  // server push is unsupported
+    const uint32_t candidate = is_server_ ? accepted_peer_stream_id_ : 0;
+    // RFC 9113 6.8: a peer may already have retried ids excluded by a prior
+    // notice. Seen-but-refused ids never enlarge the set we could have acted on.
+    sent_goaway_last_stream_id_ = std::min(sent_goaway_last_stream_id_, candidate);
+    assert(sent_goaway_last_stream_id_ <= candidate);
+    return sent_goaway_last_stream_id_;
+}
+
 result<void> Http2Connection::connection_error(ErrorCode code) noexcept {
     assert(code != ErrorCode::NO_ERROR);
     if (state_ != ConnectionState::CLOSED) {
         uint8_t payload[8];
-        put_u32(payload, is_server_ ? last_stream_id_ : 0);
+        put_u32(payload, next_goaway_cutoff());
         put_u32(payload + 4, static_cast<uint32_t>(code));
         queue_frame(FrameType::GOAWAY, 0, 0, payload, sizeof(payload));
         last_error_ = code;
@@ -683,7 +694,7 @@ result<void> Http2Connection::send_goaway(ErrorCode error, const std::string& de
     }
     const size_t dbg = std::min(debug_data.size(), static_cast<size_t>(kLocalMaxFrameSize - 8));
     std::array<uint8_t, kLocalMaxFrameSize> payload;
-    put_u32(payload.data(), is_server_ ? last_stream_id_ : 0);
+    put_u32(payload.data(), next_goaway_cutoff());
     put_u32(payload.data() + 4, static_cast<uint32_t>(error));
     if (dbg > 0) std::memcpy(payload.data() + 8, debug_data.data(), dbg);
     queue_frame(FrameType::GOAWAY, 0, 0, payload.data(), 8 + dbg);

@@ -576,6 +576,8 @@ result<void> Http2Connection::open_stream(uint32_t id, bool end_stream) noexcept
     }
     assert(open_count_ < kMaxConcurrentStreams);
     open_ids_[open_count_++] = id;
+    assert(id > accepted_peer_stream_id_ && id <= last_stream_id_);
+    accepted_peer_stream_id_ = id;  // publish before a completion callback can send GOAWAY
     s->on_headers_received(end_stream);
     if (!end_stream) return ok();
     return complete_request(s);

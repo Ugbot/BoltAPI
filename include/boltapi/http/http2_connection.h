@@ -411,8 +411,10 @@ private:
     int32_t connection_recv_window_{kLocalWindow};
 
     StreamManager stream_manager_;
-    uint32_t last_stream_id_{0};  // highest client stream id seen
+    uint32_t last_stream_id_{0};  // highest client stream id seen, including refusals
+    uint32_t accepted_peer_stream_id_{0};  // server: highest admitted request id
     uint32_t goaway_last_stream_id_{0x7FFFFFFFu};  // lowest peer GOAWAY cutoff
+    uint32_t sent_goaway_last_stream_id_{0x7FFFFFFFu};  // lowest sent cutoff
     std::array<uint32_t, kMaxConcurrentStreams> open_ids_{};
     size_t open_count_{0};
     std::array<uint32_t, kClosedRing> closed_ids_{};
@@ -475,6 +477,7 @@ private:
     void maybe_close(Http2Stream* stream) noexcept;
 
     // Send path (http2_connection.cpp).
+    uint32_t next_goaway_cutoff() noexcept;
     core::result<void> send_settings() noexcept;
     void queue_frame(FrameType type, uint8_t flags, uint32_t stream_id,
                      const uint8_t* payload, size_t len) noexcept;
