@@ -713,42 +713,37 @@ api::core::detached_task check_reactor_identity(
     co_return;
 }
 
-// The GET read has completed before its handler reaches this awaiter. There is
-// no outstanding socket operation: transfer the owned handler continuation,
-// then let its response and subsequent keepalive reads use reactor 1's engine.
-struct PinIdleHandler {
-    api::net::IODispatcher* io;
-    bool await_ready() const noexcept { return false; }
-    bool await_suspend(std::coroutine_handle<> continuation) const noexcept {
-        auto* dispatcher = io;  // snapshot before publishing the frame handle
-        return dispatcher->post_to_io_thread(1, continuation);
-    }
-    void await_resume() const noexcept {}
-};
-
-// Natural accept distribution is not a coverage oracle (all 2048 observed
-// macOS accepts used reactor 0). Explicitly hand off this idle connection; a
-// failed post produces an error response and cannot silently qualify reactor 0.
-int connect_reactor_one() {
-    const int fd = connect_client(kMultiReactorPort);
-    if (fd < 0) return -1;
-    std::string carry;
-    if (send_all(fd, make_request("GET", "/pin1", false))) {
+// Exercise the production listener's fresh-fd assignment. A handler must never
+// move this connection for the test: response completion and keepalive I/O must
+// stay on the naturally accepted owner. Bound probes because SO_REUSEPORT's
+// selection on Linux is not round-robin; macOS uses the bounded Bolt handoff.
+int connect_natural_owner(std::size_t expected) {
+    assert(expected < 2);
+    constexpr unsigned kMaxOwnerProbes = 64;
+    for (unsigned probe_index = 0; probe_index < kMaxOwnerProbes; ++probe_index) {
+        const int fd = connect_client(kMultiReactorPort);
+        if (fd < 0) return -1;
+        std::string carry;
+        if (!send_all(fd, make_request("GET", "/where", false))) {
+            sys::close_socket(fd);
+            return -1;
+        }
         const RawResponse probe = read_one(fd, carry);
         const std::string accepted = header_value_ci(probe.headers_block, "X-Accept-Reactor");
         if (accepted == "0") g_probe_zero.fetch_add(1);
         else if (accepted == "1") g_probe_one.fetch_add(1);
         else g_probe_other.fetch_add(1);
-        if (probe.ok && probe.status == 200 && probe.body == "1") return fd;
-        std::fprintf(stderr, "[multi pin] ok=%d status=%d body=%.64s\n",
-            probe.ok ? 1 : 0, probe.status, probe.body.c_str());
+        const bool valid = probe.ok && probe.status == 200 &&
+            (accepted == "0" || accepted == "1") && probe.body == accepted && carry.empty();
+        if (valid && accepted == std::to_string(expected)) return fd;
+        sys::close_socket(fd);
+        if (!valid) return -1;
     }
-    sys::close_socket(fd);
-    return -1;  // lack of reactor-1 coverage must fail, never become a green test
+    return -1;  // absent natural fanout fails; never substitute a test handoff
 }
 
 int open_unread_range(bool pinned) {
-    const int fd = pinned ? connect_reactor_one() : connect_client(kMultiReactorPort);
+    const int fd = pinned ? connect_natural_owner(1) : connect_client(kMultiReactorPort);
     if (fd < 0) return -1;
     int window = 16 * 1024;
     if (::setsockopt(fd, SOL_SOCKET, SO_RCVBUF,
@@ -762,15 +757,21 @@ int open_unread_range(bool pinned) {
     for (std::size_t i = 0; i < (1u << 16); ++i) {
         if (sys::recv_bytes(fd, &c, 1) != 1) break;
         head += c;
-        if (head.ends_with("\r\n\r\n")) return fd;
+        if (head.ends_with("\r\n\r\n")) {
+            if (head.starts_with("HTTP/1.1 206 ") &&
+                (!pinned || header_value_ci(head, "X-Reactor") == "1")) return fd;
+            break;
+        }
     }
     sys::close_socket(fd);
     return -1;
 }
 
-void check_multi_reactor_client(std::atomic<unsigned>& failures, bool pinned) {
+void check_multi_reactor_client(std::atomic<unsigned>& failures, bool pinned,
+                               std::size_t expected) {
         for (unsigned round = 0; round < 4; ++round) {
-            const int fd = pinned ? connect_reactor_one() : connect_client(kMultiReactorPort);
+            const int fd = pinned ? connect_natural_owner(expected)
+                                  : connect_client(kMultiReactorPort);
             if (fd < 0) { failures.fetch_add(1); continue; }
             int window = 16 * 1024;
             if (::setsockopt(fd, SOL_SOCKET, SO_RCVBUF,
@@ -788,9 +789,18 @@ void check_multi_reactor_client(std::atomic<unsigned>& failures, bool pinned) {
                 if (carry.ends_with("\r\n\r\n")) break;
             }
             const std::string owner = header_value_ci(carry, "X-Reactor");
-            if (pinned && owner != "1") failures.fetch_add(1);
-            const RawResponse other = do_request("GET", "/where", false, kMultiReactorPort);
-            if (!other.ok || other.status != 200) failures.fetch_add(1);
+            if (pinned && owner != std::to_string(expected)) failures.fetch_add(1);
+            // This must complete on the SAME reactor before draining the range.
+            // An arbitrary second connection could land on the other reactor
+            // and conceal a producer that still blocks its owner.
+            if (pinned) {
+                const int other = connect_natural_owner(expected);
+                if (other < 0) failures.fetch_add(1);
+                else sys::close_socket(other);
+            } else {
+                const RawResponse other = do_request("GET", "/where", false, kMultiReactorPort);
+                if (!other.ok || other.status != 200) failures.fetch_add(1);
+            }
             const RawResponse range = read_one(fd, carry);
             bool exact = range.ok && !range.truncated && range.status == 206 &&
                          range.body.size() == kLargeSize && !range.chunked;
@@ -806,6 +816,9 @@ void check_multi_reactor_client(std::atomic<unsigned>& failures, bool pinned) {
 }
 
 TEST(FixedStreamMultiReactor, OwnerIdentityAndConcurrentDelayedRanges) {
+    g_probe_zero.store(0);
+    g_probe_one.store(0);
+    g_probe_other.store(0);
     api::net::IODispatcherConfig foreign_config;
     api::net::IODispatcher foreign(foreign_config);
     EXPECT_EQ(foreign.current_io_thread_index(), SIZE_MAX);
@@ -825,20 +838,14 @@ TEST(FixedStreamMultiReactor, OwnerIdentityAndConcurrentDelayedRanges) {
                                 -> api::http::dispatch_task<api::http::CoroHttpResponse> {
         auto* io = server.io_dispatcher();
         const std::size_t accepted = io->current_io_thread_index();
-        if (req.path == "/pin1") co_await PinIdleHandler{io};
         const std::size_t owner = io->current_io_thread_index();
         api::http::CoroHttpResponse raw;
         api::Response res(raw);
-        if (req.path == "/pin1" && owner != 1) {
-            failures.fetch_add(1);
-            res.status(503).text("reactor handoff failed");
-            co_return raw;
-        }
         if (owner >= 2 || foreign.current_io_thread_index() != SIZE_MAX)
             failures.fetch_add(1);
         if (owner < 2) seen.fetch_or(1u << owner);
         res.header("X-Reactor", std::to_string(owner));
-        if (req.path == "/where" || req.path == "/pin1") {
+        if (req.path == "/where") {
             res.header("X-Accept-Reactor", std::to_string(accepted));
             res.ok().text(std::to_string(owner));
         } else {
@@ -870,14 +877,21 @@ TEST(FixedStreamMultiReactor, OwnerIdentityAndConcurrentDelayedRanges) {
 
     std::array<std::thread, 4> clients;
     const bool pinned = io->per_thread_engines();
-    for (auto& client : clients) client = std::thread([&] {
-        check_multi_reactor_client(failures, pinned);
-    });
+    for (std::size_t i = 0; i < clients.size(); ++i)
+        clients[i] = std::thread([&, expected = i % 2] {
+            check_multi_reactor_client(failures, pinned, expected);
+        });
     for (auto& client : clients) client.join();
     std::fprintf(stderr, "[multi accept] owner0=%u owner1=%u other=%u seen=%u\n",
         g_probe_zero.load(), g_probe_one.load(), g_probe_other.load(), seen.load());
     EXPECT_EQ(failures.load(), 0u);
     EXPECT_NE(seen.load(), 0u);
+    if (pinned) {
+        EXPECT_GT(g_probe_zero.load(), 0u);
+        EXPECT_GT(g_probe_one.load(), 0u);
+        EXPECT_EQ(g_probe_other.load(), 0u);
+        EXPECT_EQ(seen.load(), 3u);
+    }
     const int unread = open_unread_range(pinned);
     ASSERT_GE(unread, 0);
     EXPECT_GT(server.get_active_connections(), 0u);

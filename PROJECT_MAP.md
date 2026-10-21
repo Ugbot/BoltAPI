@@ -66,7 +66,7 @@ tools/fuzz_check/          # throwaway standalone validation of the fuzz util (n
 | HTTP/1.1 + parser + connection | ✅ | forked; http1_parser/http1_connection in `boltapi` lib |
 | TLS/ALPN | ✅ | OpenSSL 3.6.1 linked (OpenSSL::SSL/Crypto); BOLTAPI_ENABLE_TLS default ON |
 | HTTP/2 (frames/hpack/streams) | ✅ | forked custom impl (no nghttp2); frame/hpack/huffman/stream/connection compiled |
-| Native HTTP/2 client seam | 🚧 | Bounded `Http2Connection(false)` client in `include/boltapi/http/http2_connection.h`, `src/http/http2_connection.cpp`, and `src/http/http2_connection_recv.cpp`; focused suite `tests/http2_client_test.cpp`. Upload buffers are borrowed through a terminal stream event; response header/body/trailer views are callback-local; callbacks must not reenter the connection. `Complete` means HTTP framing completed, not successful gRPC status. Source review approved; combined client/stream/buffer/transport/HPACK CTests passed 37/37 (17+7+2+5+6 cases) at `541617b`. One native Flight SQL majority/no-quorum process drill passed (12 rows; after backup loss, terminal gRPC 13 `WriteUnconfirmed`); promotion and broader Flight qualification remain open. |
+| Native HTTP/2 client seam | 🚧 | Bounded `Http2Connection(false)` client in `include/boltapi/http/http2_connection.h`, `src/http/http2_connection.cpp`, and `src/http/http2_connection_recv.cpp`; focused suite `tests/http2_client_test.cpp`. Upload buffers are borrowed through a terminal stream event; response header/body/trailer views are callback-local; callbacks must not reenter the connection. Response header values with leading/trailing SP or HTAB are rejected; `TE` is rejected in responses and trailers. `Complete` means HTTP framing completed, not successful gRPC status. Graceful GOAWAY drains accepted stream IDs at or below the monotone cutoff, resets excluded streams, refuses new requests, and does not automatically retry; fatal GOAWAY resets remaining streams. The macOS-native BoltAPI v1 run passes 24 client cases within the 70-case suite; broader platform and Flight qualification remain open. Earlier combined client/stream/buffer/transport/HPACK CTests passed 37/37 at `541617b`. One native Flight SQL majority/no-quorum process drill passed (12 rows; after backup loss, terminal gRPC 13 `WriteUnconfirmed`); promotion and broader Flight qualification remain open. |
 | Windows portability shim | ✅ | include/boltapi/net/sys_compat.h: winsock close/recv/send/set_nonblocking, WSAStartup, ssize_t, time/byteorder shims, windows.h macro undefs |
 | Compression / CORS | 🚧 | M2 — gzip codec seam `include/boltapi/compression.h` + `src/compression.cpp` (Accept-Encoding parser + `gzip_encode`); zlib STOPGAP gated by `BOLTAPI_HAVE_GZIP` (option `BOLTAPI_WITH_GZIP` ON; identity when zlib absent — current state on this box). App appends compression middleware LAST (innermost) when `Config.enable_compression`: gzip iff Accept-Encoding gzip + body>256B + no existing Content-Encoding; sets Content-Encoding/Content-Length/Vary. Dual-mode test `tests/compression_test.cpp`. Docs: `docs/COMPRESSION.md` (Bolt-native-codec TODO). CORS done (M1). br/zstd options off/unwired. |
 | Coroutine SSE / WebSocket | ✅ | M2 — verified end-to-end through App. WebSocket: `app.websocket("/ws",...)` echo; engine handles RFC6455 upgrade (101 + Sec-WebSocket-Accept) by path, on_text_message→send_text echoes unmasked frames. SSE: `app.sse_coro("/events",...)` streams via SSEWriter; engine sends text/event-stream headers before handler. Tests: `tests/ws_echo_test.cpp` (handshake+accept-key, masked echo, multi-message, close) + `tests/sse_test.cpp` (content-type + ordered events, bounded reads). Examples: `examples/ws_echo.cpp`, `examples/sse_stream.cpp`. |
@@ -125,9 +125,35 @@ owner 0 drains a wake/barrier, for both data and completion notifications.
 `FixedStreamAdmission` fills the blocking queue, verifies a framed 503 and
 subsequent recovery. `FixedStreamShutdown` holds a finite producer beyond its
 deadline and checks that its HTTP request context drains.
+See the listener-distribution section below for the integrated natural-accept
+regression and its precise shutdown limitation.
 The original producer path failed both delayed-drain cases;
 the first fixed-path gate passed all 14 framing/concurrency cases. The consuming
 Gestalt2 task owns the remaining lifecycle and S3 integration receipts.
+
+## Listener distribution and HTTP/2 graceful drain (G2FEAT-260)
+
+The natural listener handoff at `85ee842` is already upstream; this maintenance
+increment adds no listener production fix. The integrated `G2ICE-251`
+fixed-stream regression now exercises actual distribution instead of forcing
+`PinIdleHandler`: it checks owners 0 and 1, a same-owner response before the
+first body drains, keep-alive reuse on the owning reactor, and unread-body
+shutdown on naturally selected owner 1. This verifies request-context drain,
+not producer-writer cancellation.
+
+The HTTP/2 client rejects response header values with leading/trailing SP or
+HTAB, and rejects `TE` in responses and trailers. Graceful GOAWAY preserves
+accepted stream IDs through its monotone cutoff, resets excluded streams,
+refuses new requests and performs no automatic retry; fatal GOAWAY resets
+remaining streams.
+
+The final macOS-native BoltAPI v1 run passes 70 cases: stream response (3),
+fixed stream (23), HTTP/2 client (24), stream manager (7), buffer pool (2),
+transport (5) and HPACK (6). The natural-owner regression observed the
+owner observations 23/23, other-owner count 0 and owner bitmask 3 (both reactors). This is
+macOS-native BoltAPI qualification only; wider Flight, Windows/Linux and
+performance acceptance remain open. G2FEAT-260 natural distribution and the
+G2ICE-251 fixed-stream behavior remain already-landed.
 
 ## Consuming boltapi (install / find_package)
 

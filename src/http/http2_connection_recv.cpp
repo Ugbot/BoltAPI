@@ -48,6 +48,9 @@ bool valid_name(std::string_view n) noexcept {
 }
 
 bool valid_value(std::string_view v) noexcept {
+    // RFC 9113 8.2.1 requires rejecting edge whitespace, not trimming it.
+    if (!v.empty() && (v.front() == ' ' || v.front() == '\t' ||
+                       v.back() == ' ' || v.back() == '\t')) return false;
     for (char c : v) {
         if (c == '\0' || c == '\r' || c == '\n') return false;
     }
@@ -130,7 +133,7 @@ bool validate_fields(const http::HPACKHeader* fields, size_t count, bool trailer
             h.name == "transfer-encoding" || h.name == "upgrade") {
             return false;
         }
-        if (h.name == "te" && h.value != "trailers") return false;
+        if (h.name == "te" && (status != nullptr || h.value != "trailers")) return false;
         if (h.name == "content-length") {
             uint64_t n = 0;
             if (!parse_digits(h.value, &n)) return false;
@@ -397,9 +400,27 @@ result<void> Http2Connection::handle_goaway_frame(const FrameHeader& h, const ui
     if (h.stream_id != 0) return connection_error(ErrorCode::PROTOCOL_ERROR);
     if (h.length < 8) return connection_error(ErrorCode::FRAME_SIZE_ERROR);
     if (state_ == ConnectionState::ACTIVE) state_ = ConnectionState::GOAWAY_RECEIVED;
-    // No automatic retry: processing may already have occurred even when the
-    // peer advertises a lower last-stream id. Caller owns uncertainty policy.
-    if (!is_server_) reset_client_streams(static_cast<ErrorCode>(get_u32(payload + 4)));
+    if (is_server_) return ok();
+    assert(open_count_ <= kMaxConcurrentStreams);
+    const ErrorCode error = static_cast<ErrorCode>(get_u32(payload + 4));
+    if (error != ErrorCode::NO_ERROR) {
+        reset_client_streams(error);
+        return ok();
+    }
+    // RFC 9113 6.8: a graceful notice stops new requests while streams at or
+    // below its cutoff can still finish. Later notices can only lower it.
+    goaway_last_stream_id_ = std::min(goaway_last_stream_id_, get_u32(payload) & 0x7FFFFFFFu);
+    std::array<uint32_t, kMaxConcurrentStreams> ids;
+    const size_t count = open_count_;
+    std::copy_n(open_ids_.begin(), count, ids.begin());
+    for (size_t i = 0; i < count; ++i) {
+        if (ids[i] <= goaway_last_stream_id_) continue;
+        Http2Stream* stream = get_stream(ids[i]);
+        assert(stream != nullptr);
+        notify_response(ResponseEventKind::Reset, stream, error);
+        close_stream(ids[i]);
+    }
+    assert(open_count_ <= count);
     return ok();
 }
 

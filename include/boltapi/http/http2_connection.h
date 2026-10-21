@@ -313,7 +313,9 @@ public:
     /** Client only. Views are borrowed until this callback returns. Callbacks
      * must not reenter, destroy or move the connection. Complete means HTTP
      * framing completed; application protocols must still check their trailers.
-     * Reset is a terminal failure, including a conservative GOAWAY cancellation.
+     * Reset is a terminal failure. Graceful GOAWAY cancels only streams above
+     * the peer's last-stream id; accepted streams drain. Fatal GOAWAY cancels
+     * all remaining streams. No request is retried automatically.
      * Destruction cancels remaining streams without invoking callbacks. */
     void set_response_callback(ResponseCallback callback) {
         if (in_response_callback_) return;
@@ -410,6 +412,7 @@ private:
 
     StreamManager stream_manager_;
     uint32_t last_stream_id_{0};  // highest client stream id seen
+    uint32_t goaway_last_stream_id_{0x7FFFFFFFu};  // lowest peer GOAWAY cutoff
     std::array<uint32_t, kMaxConcurrentStreams> open_ids_{};
     size_t open_count_{0};
     std::array<uint32_t, kClosedRing> closed_ids_{};

@@ -80,6 +80,13 @@ Bytes setting(SettingsId id, uint32_t v) {
     return frame(FrameType::SETTINGS, 0, 0, out);
 }
 
+Bytes goaway(uint32_t last, ErrorCode error = ErrorCode::NO_ERROR) {
+    Bytes payload = u32(last);
+    const auto code = u32(static_cast<uint32_t>(error));
+    payload.insert(payload.end(), code.begin(), code.end());
+    return frame(FrameType::GOAWAY, 0, 0, payload);
+}
+
 struct SavedEvent {
     Kind kind;
     uint32_t id;
@@ -324,6 +331,52 @@ TEST(Http2Client, RefusesMalformedRequestsWithoutConsumingStreamIds) {
     EXPECT_TRUE(client.send_response(1, 200, {}, "").is_err());
 }
 
+TEST(Http2Client, RefusesRequestFieldWhitespaceWithoutPublishingBytesOrIds) {
+    Connection client(false);
+    ready(client);
+    for (const auto value : {" leading", "trailing ", "\tleading", "trailing\t", " ", "\t"}) {
+        Fields request = kGet;
+        request.push_back({"x-value", value});
+        EXPECT_TRUE(client.send_request(request.data(), request.size()).is_err());
+        EXPECT_TRUE(take(client).empty());
+        EXPECT_EQ(client.open_stream_count(), 0u);
+    }
+    Fields request = kGet;
+    request.push_back({"x-value", "internal \t whitespace"});
+    request.push_back({"x-empty", ""});
+    request.push_back({"te", "trailers"});
+    const auto accepted = client.send_request(request.data(), request.size());
+    ASSERT_TRUE(accepted.is_ok());
+    EXPECT_EQ(accepted.value(), 1u);
+}
+
+TEST(Http2Client, RejectsWhitespaceAndTeInResponseHeadersAndTrailers) {
+    for (const bool trailers : {false, true}) {
+        for (const auto value : {" leading", "trailing ", "\tleading", "trailing\t", "trailers"}) {
+            Events events;
+            Connection client(false);
+            client.set_response_callback([&](const auto& e) { events.save(e); });
+            ready(client);
+            ASSERT_TRUE(client.send_request(kGet.data(), kGet.size()).is_ok());
+            Fields response;
+            if (trailers) ASSERT_TRUE(headers(client, 1, {{":status", "200"}}));
+            else response.push_back({":status", "200"});
+            response.push_back({std::string_view(value) == "trailers" ? "te" : "x-value", value});
+            ASSERT_TRUE(headers(client, 1, response, true));
+            EXPECT_EQ(events.count(Kind::Headers), trailers ? 1u : 0u);
+            EXPECT_EQ(events.count(Kind::Trailers), 0u);
+            EXPECT_EQ(events.count(Kind::Complete), 0u);
+            ASSERT_EQ(events.count(Kind::Reset), 1u);
+            EXPECT_EQ(events.items.back().error, ErrorCode::PROTOCOL_ERROR);
+            EXPECT_EQ(client.open_stream_count(), 0u);
+            EXPECT_TRUE(client.is_active());
+            ASSERT_TRUE(client.send_request(kGet.data(), kGet.size()).is_ok());
+            ASSERT_TRUE(headers(client, 3, {{":status", "204"}}, true));
+            EXPECT_EQ(events.count(Kind::Complete), 1u);
+        }
+    }
+}
+
 TEST(Http2Client, BoundsConcurrencyAndReusesStartupSlotsWithMonotonicIds) {
     Connection client(false);
     ready(client);
@@ -468,6 +521,127 @@ TEST(Http2Client, RejectsReentryAndInvalidServerFirstFrameOrPushSettings) {
         EXPECT_EQ(malformed.last_error(), ErrorCode::PROTOCOL_ERROR);
         EXPECT_EQ(errors.count(Kind::Reset), 1u);
         EXPECT_EQ(errors.count(Kind::Complete), 0u);
+    }
+}
+
+TEST(Http2Client, GracefulGoawayDrainsAcceptedStreamsAndLowersCutoff) {
+    Events events;
+    Connection client(false);
+    client.set_response_callback([&](const auto& e) { events.save(e); });
+    ready(client);
+    for (unsigned i = 0; i < 3; ++i) {
+        ASSERT_TRUE(client.send_request(kGet.data(), kGet.size()).is_ok());
+    }
+    (void)take(client);
+    ASSERT_TRUE(headers(client, 1, {{":status", "200"}}));
+    ASSERT_TRUE(feed(client, goaway(0x7FFFFFFFu), 1));
+    EXPECT_EQ(events.count(Kind::Reset), 0u);
+    EXPECT_EQ(client.open_stream_count(), 3u);
+    EXPECT_FALSE(client.wants_close());
+    EXPECT_TRUE(client.send_request(kGet.data(), kGet.size()).is_err());
+    ASSERT_TRUE(feed(client, goaway(3)));
+    ASSERT_EQ(events.count(Kind::Reset), 1u);
+    EXPECT_EQ(events.items.back().id, 5u);
+    EXPECT_EQ(events.items.back().error, ErrorCode::NO_ERROR);
+    EXPECT_EQ(client.open_stream_count(), 2u);
+    ASSERT_TRUE(feed(client, goaway(3))); // repeated notice is not another terminal event
+    EXPECT_EQ(events.count(Kind::Reset), 1u);
+    ASSERT_TRUE(feed(client, frame(FrameType::DATA, 1, FrameFlags::DATA_END_STREAM, {'x'})));
+    EXPECT_FALSE(client.wants_close());
+    ASSERT_TRUE(headers(client, 3, {{":status", "204"}}, true));
+    EXPECT_EQ(events.count(Kind::Complete), 2u);
+    EXPECT_EQ(events.count(Kind::Reset), 1u);
+    EXPECT_TRUE(client.wants_close());
+    EXPECT_EQ(client.last_error(), ErrorCode::NO_ERROR);
+}
+
+TEST(Http2Client, GracefulGoawayKeepsAcceptedUploadPacedAndReleasesExcludedBody) {
+    Events events;
+    const std::string accepted_body(100000, 'a');
+    std::string excluded_body(100000, 'x');
+    Connection client(false);
+    client.set_response_callback([&](const auto& e) { events.save(e); });
+    ready(client);
+    ASSERT_TRUE(client.send_request(kGet.data(), kGet.size(), accepted_body).is_ok());
+    EXPECT_EQ(client.connection_send_window(), 0);
+    (void)take(client);
+    ASSERT_TRUE(client.send_request(kGet.data(), kGet.size(), excluded_body).is_ok());
+    (void)take(client);
+    ASSERT_TRUE(feed(client, goaway(1)));
+    ASSERT_EQ(events.count(Kind::Reset), 1u);
+    EXPECT_EQ(events.items.back().id, 3u);
+    excluded_body.clear(); // Reset has ended this borrowed body's lifetime.
+    EXPECT_FALSE(client.wants_close());
+    ASSERT_TRUE(feed(client, frame(FrameType::WINDOW_UPDATE, 0, 0, u32(100000))));
+    ASSERT_TRUE(feed(client, frame(FrameType::WINDOW_UPDATE, 1, 0, u32(100000))));
+    ASSERT_TRUE(feed(client, frame(FrameType::WINDOW_UPDATE, 3, 0, u32(100000))));
+    const auto output = take(client);
+    size_t sent = 0;
+    bool ended = false;
+    for (size_t off = 0; off + 9 <= output.size();) {
+        const auto h = parse_frame_header(output.data() + off).value();
+        ASSERT_LE(off + 9 + h.length, output.size());
+        ASSERT_EQ(h.type, FrameType::DATA);
+        EXPECT_EQ(h.stream_id, 1u);
+        sent += h.length;
+        ended = ended || (h.flags & FrameFlags::DATA_END_STREAM) != 0;
+        off += 9 + h.length;
+    }
+    EXPECT_EQ(sent, accepted_body.size() - 65535);
+    EXPECT_TRUE(ended);
+    ASSERT_TRUE(headers(client, 1, {{":status", "204"}}, true));
+    EXPECT_EQ(events.count(Kind::Complete), 1u);
+    EXPECT_EQ(events.count(Kind::Reset), 1u);
+    EXPECT_TRUE(client.wants_close());
+}
+
+TEST(Http2Client, GracefulGoawayAndFinalResponseInOneReadCompleteNormally) {
+    Events events;
+    Connection client(false);
+    client.set_response_callback([&](const auto& e) { events.save(e); });
+    ready(client);
+    ASSERT_TRUE(client.send_request(kGet.data(), kGet.size()).is_ok());
+    Bytes input = goaway(1);
+    const auto response = frame(FrameType::HEADERS, 1,
+        FrameFlags::HEADERS_END_HEADERS | FrameFlags::HEADERS_END_STREAM, block({{":status", "204"}}));
+    input.insert(input.end(), response.begin(), response.end());
+    ASSERT_TRUE(feed(client, input));
+    EXPECT_EQ(events.count(Kind::Complete), 1u);
+    EXPECT_EQ(events.count(Kind::Reset), 0u);
+    EXPECT_EQ(client.open_stream_count(), 0u);
+    EXPECT_TRUE(client.wants_close());
+}
+
+TEST(Http2Client, FatalGoawayAfterGracefulNoticeResetsRemainingStreamsOnce) {
+    Events events;
+    Connection client(false);
+    client.set_response_callback([&](const auto& e) { events.save(e); });
+    ready(client);
+    ASSERT_TRUE(client.send_request(kGet.data(), kGet.size()).is_ok());
+    ASSERT_TRUE(feed(client, goaway(0x7FFFFFFFu)));
+    EXPECT_EQ(events.count(Kind::Reset), 0u);
+    ASSERT_TRUE(feed(client, goaway(1, ErrorCode::INTERNAL_ERROR)));
+    ASSERT_EQ(events.count(Kind::Reset), 1u);
+    EXPECT_EQ(events.items.back().error, ErrorCode::INTERNAL_ERROR);
+    ASSERT_TRUE(feed(client, goaway(1, ErrorCode::INTERNAL_ERROR)));
+    EXPECT_EQ(events.count(Kind::Reset), 1u);
+    EXPECT_EQ(events.count(Kind::Complete), 0u);
+    EXPECT_TRUE(client.wants_close());
+}
+
+TEST(Http2Client, MalformedGoawayRemainsAConnectionError) {
+    for (const bool invalid_stream : {false, true}) {
+        Events events;
+        Connection client(false);
+        client.set_response_callback([&](const auto& e) { events.save(e); });
+        ready(client);
+        ASSERT_TRUE(client.send_request(kGet.data(), kGet.size()).is_ok());
+        EXPECT_FALSE(feed(client, frame(FrameType::GOAWAY, invalid_stream ? 1u : 0u, 0,
+                                         Bytes(invalid_stream ? 8u : 7u)), 1));
+        EXPECT_EQ(client.last_error(), invalid_stream ? ErrorCode::PROTOCOL_ERROR : ErrorCode::FRAME_SIZE_ERROR);
+        EXPECT_EQ(events.count(Kind::Reset), 1u);
+        EXPECT_EQ(events.count(Kind::Complete), 0u);
+        EXPECT_TRUE(client.wants_close());
     }
 }
 
