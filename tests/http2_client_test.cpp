@@ -87,12 +87,13 @@ struct SavedEvent {
     ErrorCode error;
     std::string data;
     std::vector<std::pair<std::string, std::string>> fields;
+    bool end_stream{false};
 };
 
 struct Events {
     std::vector<SavedEvent> items;
     void save(const Connection::ResponseEvent& event) {
-        SavedEvent copy{event.kind, event.stream_id, event.status, event.error, std::string(event.data), {}};
+        SavedEvent copy{event.kind, event.stream_id, event.status, event.error, std::string(event.data), {}, event.end_stream};
         for (size_t i = 0; i < event.header_count; ++i) {
             copy.fields.emplace_back(std::string(event.headers[i].name), std::string(event.headers[i].value));
         }
@@ -164,6 +165,40 @@ TEST(Http2Client, DeliversBodyAndGrpcErrorTrailersWithoutMappingUncertainty) {
     EXPECT_EQ(events.items[2].fields[0], (std::pair<std::string, std::string>{"grpc-status", "13"}));
     EXPECT_EQ(events.items[2].fields[1].second, "chukonu: WriteUnconfirmed");
     EXPECT_EQ(events.items[3].kind, Kind::Complete); // HTTP completion is not gRPC success.
+    EXPECT_FALSE(events.items[0].end_stream);
+    EXPECT_FALSE(events.items[1].end_stream);
+    EXPECT_TRUE(events.items[2].end_stream);
+    EXPECT_TRUE(events.items[3].end_stream);
+}
+
+TEST(Http2Client, HeadersExposeEndStreamForTrailersOnlySuccess) {
+    Events events;
+    Connection client(false);
+    client.set_response_callback([&](const auto& e) { events.save(e); });
+    ready(client);
+    ASSERT_TRUE(client.send_request(kGet.data(), kGet.size()).is_ok());
+    ASSERT_TRUE(headers(client, 1, {{":status", "200"}, {"grpc-status", "0"}}, true));
+    ASSERT_EQ(events.items.size(), 2u);
+    EXPECT_EQ(events.items[0].kind, Kind::Headers);
+    EXPECT_TRUE(events.items[0].end_stream);
+    EXPECT_EQ(events.items[1].kind, Kind::Complete);
+    EXPECT_TRUE(events.items[1].end_stream);
+}
+
+TEST(Http2Client, NonterminalHeadersStayNonterminalThroughEmptyFinalData) {
+    Events events;
+    Connection client(false);
+    client.set_response_callback([&](const auto& e) { events.save(e); });
+    ready(client);
+    ASSERT_TRUE(client.send_request(kGet.data(), kGet.size()).is_ok());
+    ASSERT_TRUE(headers(client, 1, {{":status", "200"}, {"grpc-status", "0"}}));
+    ASSERT_EQ(events.items.size(), 1u);
+    EXPECT_FALSE(events.items[0].end_stream);
+    ASSERT_TRUE(feed(client, frame(FrameType::DATA, 1, FrameFlags::DATA_END_STREAM)));
+    ASSERT_EQ(events.items.size(), 2u);
+    EXPECT_FALSE(events.items[0].end_stream);
+    EXPECT_EQ(events.items[1].kind, Kind::Complete);
+    EXPECT_TRUE(events.items[1].end_stream);
 }
 
 TEST(Http2Client, ReassemblesContinuationAndSingleByteReads) {

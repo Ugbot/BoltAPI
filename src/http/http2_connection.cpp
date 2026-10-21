@@ -380,11 +380,11 @@ result<uint32_t> Http2Connection::send_request(const http::HPACKHeader* headers,
 }
 
 void Http2Connection::notify_response(ResponseEventKind kind, Http2Stream* stream,
-                                      ErrorCode error, std::string_view data) noexcept {
+                                      ErrorCode error, std::string_view data, bool end_stream) noexcept {
     assert(!is_server_ && stream != nullptr);
     assert(!in_response_callback_);
     if (!response_callback_) return;
-    ResponseEvent event{kind, stream->id(), stream->response_status(), error, nullptr, 0, data};
+    ResponseEvent event{kind, stream->id(), stream->response_status(), error, nullptr, 0, data, end_stream};
     if (kind == ResponseEventKind::Headers || kind == ResponseEventKind::Trailers) {
         event.headers = decoded_.data();
         event.header_count = decoded_.size();

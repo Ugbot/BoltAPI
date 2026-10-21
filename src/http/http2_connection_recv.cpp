@@ -192,13 +192,13 @@ result<void> Http2Connection::finish_response_headers(const HeaderBlockState& st
         // carried on this stream (RFC 9110 8.6).
         s->io.has_content_length = facts.has_cl && !s->io.is_head && status != 304;
         s->io.content_length = facts.cl;
-        notify_response(ResponseEventKind::Headers, s);
+        notify_response(ResponseEventKind::Headers, s, ErrorCode::NO_ERROR, {}, st.end_stream);
         if (status < 200) {
             s->response_status_ = 0;
             return ok();
         }
     } else {
-        notify_response(ResponseEventKind::Trailers, s);
+        notify_response(ResponseEventKind::Trailers, s, ErrorCode::NO_ERROR, {}, st.end_stream);
     }
     s->on_headers_received(st.end_stream);
     return st.end_stream ? complete_response(s) : ok();
@@ -218,7 +218,7 @@ result<void> Http2Connection::complete_response(Http2Stream* s) noexcept {
         queue_frame(FrameType::RST_STREAM, 0, s->id(), no_error, sizeof(no_error));
     }
     const uint32_t id = s->id();
-    notify_response(ResponseEventKind::Complete, s);
+    notify_response(ResponseEventKind::Complete, s, ErrorCode::NO_ERROR, {}, true);
     close_stream(id);
     return ok();
 }
@@ -616,7 +616,8 @@ result<void> Http2Connection::handle_data_frame(const FrameHeader& h, const uint
             return stream_error(h.stream_id, ErrorCode::PROTOCOL_ERROR);
         }
         if (n > 0) notify_response(ResponseEventKind::Data, s, ErrorCode::NO_ERROR,
-            std::string_view(reinterpret_cast<const char*>(payload + off), n));
+            std::string_view(reinterpret_cast<const char*>(payload + off), n),
+            (h.flags & FrameFlags::DATA_END_STREAM) != 0);
     } else if (n > 0) {
         s->append_request_body(payload + off, n);
     }

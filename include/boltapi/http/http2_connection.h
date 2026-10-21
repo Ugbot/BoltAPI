@@ -307,6 +307,7 @@ public:
         const http::HPACKHeader* headers{nullptr};
         size_t header_count{0};
         std::string_view data;
+        bool end_stream{false}; // this section/frame ends the peer response; Complete is true
     };
     using ResponseCallback = std::function<void(const ResponseEvent&)>;
     /** Client only. Views are borrowed until this callback returns. Callbacks
@@ -458,7 +459,7 @@ private:
     std::string_view client_body(uint32_t id) const noexcept;
     void notify_response(ResponseEventKind kind, Http2Stream* stream,
                          ErrorCode error = ErrorCode::NO_ERROR,
-                         std::string_view data = {}) noexcept;
+                         std::string_view data = {}, bool end_stream = false) noexcept;
     void reset_client_streams(ErrorCode error) noexcept;
 
     // Errors.
