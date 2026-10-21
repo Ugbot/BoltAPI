@@ -266,7 +266,7 @@ enum class ConnectionState : uint8_t {
 };
 
 /**
- * HTTP/2 connection (RFC 9113), server side.
+ * HTTP/2 connection (RFC 9113), with server and bounded client roles.
  *
  * process_input() reassembles frames across reads, validates every frame and
  * header block, and answers violations as the RFC prescribes: a connection
@@ -286,10 +286,50 @@ public:
     static constexpr size_t kDefaultMaxRequestBody = 16u * 1024 * 1024;
     static constexpr int32_t kLocalWindow = 65535;            // stream + connection
     static constexpr size_t kMaxControlBacklog = 1u << 20;    // unread control frames
+    static constexpr size_t kClientOutputCapacity =
+        kMaxControlBacklog + kMaxHeaderBlock + 2 * kLocalMaxFrameSize;
     static constexpr size_t kClosedRing = 256;                // recently closed ids
     static constexpr size_t kMaxFramesPerInput = 1u << 20;
 
     explicit Http2Connection(bool is_server = true);
+    ~Http2Connection();
+    Http2Connection(const Http2Connection&) = delete;
+    Http2Connection& operator=(const Http2Connection&) = delete;
+    Http2Connection(Http2Connection&&) = delete;
+    Http2Connection& operator=(Http2Connection&&) = delete;
+
+    enum class ResponseEventKind : uint8_t { Headers, Data, Trailers, Complete, Reset };
+    struct ResponseEvent {
+        ResponseEventKind kind;
+        uint32_t stream_id;
+        uint16_t status{0};  // informational status, or the final response status
+        ErrorCode error{ErrorCode::NO_ERROR};
+        const http::HPACKHeader* headers{nullptr};
+        size_t header_count{0};
+        std::string_view data;
+    };
+    using ResponseCallback = std::function<void(const ResponseEvent&)>;
+    /** Client only. Views are borrowed until this callback returns. Callbacks
+     * must not reenter, destroy or move the connection. Complete means HTTP
+     * framing completed; application protocols must still check their trailers.
+     * Reset is a terminal failure, including a conservative GOAWAY cancellation.
+     * Destruction cancels remaining streams without invoking callbacks. */
+    void set_response_callback(ResponseCallback callback) {
+        if (in_response_callback_) return;
+        response_callback_ = std::move(callback);
+    }
+    /** Client only: allocates the next odd stream id, or refuses without
+     * publishing a request. Headers are borrowed only during this call. The
+     * body must remain valid and unchanged through Complete/Reset (or connection
+     * destruction). No CONNECT tunnels, push, or request trailers. At most
+     * kMaxConcurrentStreams live requests and kDefaultMaxRequestBody body bytes.
+     * All connection operations are confined to one owning thread. */
+    core::result<uint32_t> send_request(const http::HPACKHeader* headers, size_t count,
+                                      std::string_view body = {}) noexcept;
+    /** Client response byte budget (streaming callbacks do not accumulate it). */
+    void set_max_response_body(size_t bytes) noexcept {
+        if (!in_response_callback_) max_request_body_ = bytes;
+    }
 
     /**
      * Feed bytes read from the peer. Consumes all of them (partial frames
@@ -328,7 +368,9 @@ public:
     /** The code of the connection error we sent, NO_ERROR if none. */
     ErrorCode last_error() const noexcept { return last_error_; }
 
-    void set_max_request_body(size_t bytes) noexcept { max_request_body_ = bytes; }
+    void set_max_request_body(size_t bytes) noexcept {
+        if (!in_response_callback_) max_request_body_ = bytes;
+    }
 
     const ConnectionSettings& local_settings() const noexcept { return local_settings_; }
     const ConnectionSettings& remote_settings() const noexcept { return remote_settings_; }
@@ -338,10 +380,15 @@ public:
 
     using RequestCallback = std::function<void(Http2Stream*)>;
     void set_request_callback(RequestCallback callback) {
+        if (in_response_callback_) return;
         request_callback_ = std::move(callback);
     }
 
 private:
+    struct ClientPool;
+    ClientPool* client_pool_{nullptr};  // client only, allocated once at construction
+    ResponseCallback response_callback_;
+    bool in_response_callback_{false};
     struct HeaderBlockState {
         uint32_t stream_id{0};   // non-zero while CONTINUATION is expected
         bool end_stream{false};
@@ -403,6 +450,16 @@ private:
     core::result<void> replenish(Http2Stream* stream, uint32_t consumed) noexcept;
     core::result<void> complete_request(Http2Stream* stream) noexcept;
     bool is_idle(uint32_t id) const noexcept;
+    core::result<void> finish_response_headers(const HeaderBlockState& st, int decoded) noexcept;
+    core::result<void> complete_response(Http2Stream* stream) noexcept;
+    bool validate_request(const http::HPACKHeader* headers, size_t count,
+                          size_t body_size, bool* is_head) const noexcept;
+    Http2Stream* acquire_client_stream(uint32_t id, std::string_view body) noexcept;
+    std::string_view client_body(uint32_t id) const noexcept;
+    void notify_response(ResponseEventKind kind, Http2Stream* stream,
+                         ErrorCode error = ErrorCode::NO_ERROR,
+                         std::string_view data = {}) noexcept;
+    void reset_client_streams(ErrorCode error) noexcept;
 
     // Errors.
     core::result<void> connection_error(ErrorCode code) noexcept;

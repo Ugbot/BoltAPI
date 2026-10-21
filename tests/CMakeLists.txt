@@ -95,6 +95,10 @@ endif()
 # G2ETL-130: HPACK RFC 7541 Appendix C vectors + table/size-update regressions.
 boltapi_add_test(boltapi_hpack_test hpack_test.cpp)
 
+# Bounded HTTP/2 client role: existing framing/HPACK/windows, response events
+# and failure semantics used by native Flight SQL clients (no gRPC runtime).
+boltapi_add_test(boltapi_http2_client_test http2_client_test.cpp)
+
 # G2ETL-114: TLS partial writes, peer reset (SIGPIPE), HTTP/2 framing and
 # flow control for large responses, over h2c and TLS.
 boltapi_add_test(boltapi_transport_robustness_test transport_robustness_test.cpp)

@@ -54,6 +54,27 @@ bool valid_value(std::string_view v) noexcept {
     return true;
 }
 
+bool valid_method(std::string_view method) noexcept {
+    if (method.empty()) return false;
+    for (char c : method) {
+        const char lower = c >= 'A' && c <= 'Z' ? static_cast<char>(c + ('a' - 'A')) : c;
+        if (!is_lower_tchar(lower)) return false;
+    }
+    return true;
+}
+
+bool valid_scheme(std::string_view scheme) noexcept {
+    if (scheme.empty()) return false;
+    for (size_t i = 0; i < scheme.size(); ++i) {
+        const char c = scheme[i];
+        const bool alpha = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+        if (!alpha && (i == 0 || !((c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool parse_digits(std::string_view v, uint64_t* out) noexcept {
     if (v.empty() || v.size() > 16) return false;
     uint64_t n = 0;
@@ -72,19 +93,29 @@ struct RequestFacts {
 };
 
 // RFC 9113 8.2 / 8.3.1. Trailers carry no pseudo-header fields.
-bool validate_fields(const std::vector<http::HPACKHeader>& fields, bool trailers,
-                     RequestFacts* f) noexcept {
+bool validate_fields(const http::HPACKHeader* fields, size_t count, bool trailers,
+                     RequestFacts* f, uint16_t* status = nullptr) noexcept {
     assert(f != nullptr);
     bool regular_seen = false;
     bool method = false, scheme = false, path = false, authority = false;
     std::string_view method_v;
     size_t list_size = 0;
-    for (const auto& h : fields) {
+    for (size_t i = 0; i < count; ++i) {
+        const auto& h = fields[i];
+        if (h.name.size() > Http2Connection::kMaxHeaderListSize ||
+            h.value.size() > Http2Connection::kMaxHeaderListSize) return false;
         list_size += h.name.size() + h.value.size() + 32;
         if (!valid_name(h.name) || !valid_value(h.value)) return false;
         if (h.name[0] == ':') {
             if (trailers || regular_seen) return false;
             bool* seen = nullptr;
+            if (status != nullptr) {
+                if (h.name != ":status" || *status != 0 || h.value.size() != 3) return false;
+                uint64_t code = 0;
+                if (!parse_digits(h.value, &code) || code < 100 || code > 599) return false;
+                *status = static_cast<uint16_t>(code);
+                continue;
+            }
             if (h.name == ":method") seen = &method, method_v = h.value;
             else if (h.name == ":scheme") seen = &scheme;
             else if (h.name == ":path") seen = &path;
@@ -110,12 +141,87 @@ bool validate_fields(const std::vector<http::HPACKHeader>& fields, bool trailers
     }
     if (list_size > Http2Connection::kMaxHeaderListSize) return false;
     if (trailers) return true;
+    if (status != nullptr) return *status != 0;
     if (method_v == "CONNECT") return method && authority && !scheme && !path;
     f->is_head = method_v == "HEAD";
     return method && scheme && path;
 }
 
 }  // namespace
+
+bool Http2Connection::validate_request(const http::HPACKHeader* headers, size_t count,
+                                       size_t body_size, bool* is_head) const noexcept {
+    assert(!is_server_ && is_head != nullptr);
+    assert(count <= kMaxRequestHeaders);
+    if (headers == nullptr || count == 0) return false;
+    RequestFacts facts;
+    if (!validate_fields(headers, count, false, &facts)) return false;
+    if (facts.has_cl && facts.cl != body_size) return false;
+    size_t list_size = 0;
+    for (size_t i = 0; i < count; ++i) {
+        list_size += headers[i].name.size() + headers[i].value.size() + 32;
+        if (headers[i].name == ":method" &&
+            (!valid_method(headers[i].value) || headers[i].value == "CONNECT")) return false;
+        if (headers[i].name == ":scheme" && !valid_scheme(headers[i].value)) return false;
+    }
+    *is_head = facts.is_head;
+    return list_size <= remote_settings_.max_header_list_size;
+}
+
+result<void> Http2Connection::finish_response_headers(const HeaderBlockState& st, int decoded) noexcept {
+    assert(!is_server_ && st.stream_id != 0);
+    Http2Stream* s = get_stream(st.stream_id);
+    if (is_idle(st.stream_id)) return connection_error(ErrorCode::PROTOCOL_ERROR);
+    if (s == nullptr || !s->can_receive()) return stream_error(st.stream_id, ErrorCode::STREAM_CLOSED);
+    if (st.self_dependent || decoded != http::HPACKDecoder::kOk) {
+        return stream_error(st.stream_id, ErrorCode::PROTOCOL_ERROR);
+    }
+    assert(open_count_ > 0 && open_count_ <= kMaxConcurrentStreams);
+    RequestFacts facts;
+    const bool trailers = s->response_status_ != 0;
+    uint16_t status = 0;
+    if (!validate_fields(decoded_.data(), decoded_.size(), trailers, &facts, &status) ||
+        (trailers && (!st.end_stream || facts.has_cl))) {
+        return stream_error(st.stream_id, ErrorCode::PROTOCOL_ERROR);
+    }
+    if (!trailers) {
+        if ((status < 200 && (status == 101 || st.end_stream || facts.has_cl)) ||
+            (status == 204 && facts.has_cl)) return stream_error(st.stream_id, ErrorCode::PROTOCOL_ERROR);
+        s->response_status_ = status;
+        // HEAD and 304 describe the selected representation's size, not bytes
+        // carried on this stream (RFC 9110 8.6).
+        s->io.has_content_length = facts.has_cl && !s->io.is_head && status != 304;
+        s->io.content_length = facts.cl;
+        notify_response(ResponseEventKind::Headers, s);
+        if (status < 200) {
+            s->response_status_ = 0;
+            return ok();
+        }
+    } else {
+        notify_response(ResponseEventKind::Trailers, s);
+    }
+    s->on_headers_received(st.end_stream);
+    return st.end_stream ? complete_response(s) : ok();
+}
+
+result<void> Http2Connection::complete_response(Http2Stream* s) noexcept {
+    assert(!is_server_ && s != nullptr);
+    assert(s->response_status_ >= 200);
+    if (s->io.has_content_length && s->io.content_length != s->io.body_received) {
+        return stream_error(s->id(), ErrorCode::PROTOCOL_ERROR);
+    }
+    // A server can finish before the upload has drained. Stop borrowing its
+    // body before the terminal event lets the caller release it.
+    s->io.send_pending = false;
+    if (s->state() != StreamState::CLOSED) {
+        const uint8_t no_error[4]{};
+        queue_frame(FrameType::RST_STREAM, 0, s->id(), no_error, sizeof(no_error));
+    }
+    const uint32_t id = s->id();
+    notify_response(ResponseEventKind::Complete, s);
+    close_stream(id);
+    return ok();
+}
 
 bool Http2Connection::is_idle(uint32_t id) const noexcept {
     // Clients open odd streams; we never push, so even ids stay idle.
@@ -124,7 +230,7 @@ bool Http2Connection::is_idle(uint32_t id) const noexcept {
 
 result<size_t> Http2Connection::process_input(const uint8_t* data, size_t len) noexcept {
     assert(data != nullptr || len == 0);
-    if (state_ == ConnectionState::CLOSED) return err<size_t>(error_code::invalid_state);
+    if (in_response_callback_ || state_ == ConnectionState::CLOSED) return err<size_t>(error_code::invalid_state);
     size_t off = 0;
     if (is_server_ && state_ == ConnectionState::PREFACE_PENDING) {
         const size_t n = std::min(CONNECTION_PREFACE_LEN - preface_bytes_validated_, len);
@@ -185,7 +291,10 @@ result<size_t> Http2Connection::process_input(const uint8_t* data, size_t len) n
 
 result<void> Http2Connection::handle_frame(const FrameHeader& h, const uint8_t* payload) noexcept {
     assert(h.length <= kLocalMaxFrameSize);
-    if (is_server_ && !first_frame_seen_) {  // 3.4: the preface continues with SETTINGS
+    if (!is_server_ && output_backlog() > kMaxControlBacklog) {
+        return connection_error(ErrorCode::ENHANCE_YOUR_CALM);
+    }
+    if (!first_frame_seen_) {  // 3.4: the preface continues with SETTINGS
         first_frame_seen_ = true;
         if (h.type != FrameType::SETTINGS || (h.flags & FrameFlags::SETTINGS_ACK) != 0) {
             return connection_error(ErrorCode::PROTOCOL_ERROR);
@@ -240,7 +349,7 @@ result<void> Http2Connection::apply_settings(const uint8_t* payload, size_t len)
             hpack_encoder_.set_max_table_size(v);
             break;
         case SettingsId::ENABLE_PUSH:
-            if (v > 1) return connection_error(ErrorCode::PROTOCOL_ERROR);
+            if (!is_server_ || v > 1) return connection_error(ErrorCode::PROTOCOL_ERROR);
             remote_settings_.enable_push = v == 1;
             break;
         case SettingsId::MAX_CONCURRENT_STREAMS:
@@ -250,7 +359,7 @@ result<void> Http2Connection::apply_settings(const uint8_t* payload, size_t len)
             if (v > kMaxWindow) return connection_error(ErrorCode::FLOW_CONTROL_ERROR);
             const int64_t delta = static_cast<int64_t>(v) - remote_settings_.initial_window_size;
             for (size_t i = 0; i < open_count_; ++i) {  // 6.9.2: adjust open streams
-                Http2Stream* s = stream_manager_.get_stream(open_ids_[i]);
+                Http2Stream* s = get_stream(open_ids_[i]);
                 if (s == nullptr) continue;
                 const int64_t w = static_cast<int64_t>(s->send_window_) + delta;
                 if (w > kMaxWindow) return connection_error(ErrorCode::FLOW_CONTROL_ERROR);
@@ -285,10 +394,12 @@ result<void> Http2Connection::handle_ping_frame(const FrameHeader& h, const uint
 }
 
 result<void> Http2Connection::handle_goaway_frame(const FrameHeader& h, const uint8_t* payload) noexcept {
-    (void)payload;
     if (h.stream_id != 0) return connection_error(ErrorCode::PROTOCOL_ERROR);
     if (h.length < 8) return connection_error(ErrorCode::FRAME_SIZE_ERROR);
     if (state_ == ConnectionState::ACTIVE) state_ = ConnectionState::GOAWAY_RECEIVED;
+    // No automatic retry: processing may already have occurred even when the
+    // peer advertises a lower last-stream id. Caller owns uncertainty policy.
+    if (!is_server_) reset_client_streams(static_cast<ErrorCode>(get_u32(payload + 4)));
     return ok();
 }
 
@@ -297,10 +408,11 @@ result<void> Http2Connection::handle_rst_stream_frame(const FrameHeader& h,
     if (h.stream_id == 0) return connection_error(ErrorCode::PROTOCOL_ERROR);
     if (h.length != 4) return connection_error(ErrorCode::FRAME_SIZE_ERROR);
     if (is_idle(h.stream_id)) return connection_error(ErrorCode::PROTOCOL_ERROR);
-    Http2Stream* s = stream_manager_.get_stream(h.stream_id);
+    Http2Stream* s = get_stream(h.stream_id);
     if (s != nullptr) {
         s->set_error_code(static_cast<ErrorCode>(get_u32(payload)));
         s->on_rst_stream();
+        if (!is_server_) notify_response(ResponseEventKind::Reset, s, s->error_code());
         close_stream(h.stream_id);
     }
     return ok();
@@ -330,7 +442,7 @@ result<void> Http2Connection::handle_window_update_frame(const FrameHeader& h,
         return ok();
     }
     if (is_idle(h.stream_id)) return connection_error(ErrorCode::PROTOCOL_ERROR);
-    Http2Stream* s = stream_manager_.get_stream(h.stream_id);
+    Http2Stream* s = get_stream(h.stream_id);
     if (s == nullptr) return ok();  // closed: may still be in flight (6.9)
     if (inc == 0) return stream_error(h.stream_id, ErrorCode::PROTOCOL_ERROR);
     if (static_cast<int64_t>(s->send_window_) + inc > kMaxWindow) {
@@ -395,8 +507,9 @@ result<void> Http2Connection::finish_header_block(const HeaderBlockState& st, co
     if (rc == http::HPACKDecoder::kCompressionError) {
         return connection_error(ErrorCode::COMPRESSION_ERROR);
     }
+    if (!is_server_) return finish_response_headers(st, rc);
     const uint32_t id = st.stream_id;
-    Http2Stream* s = stream_manager_.get_stream(id);
+    Http2Stream* s = get_stream(id);
     if (s == nullptr) {
         if (id % 2 == 0) return connection_error(ErrorCode::PROTOCOL_ERROR);  // 5.1.1
         if (id <= last_stream_id_) {
@@ -416,7 +529,7 @@ result<void> Http2Connection::finish_header_block(const HeaderBlockState& st, co
         return stream_error(id, ErrorCode::STREAM_CLOSED);
     }
     RequestFacts facts;
-    if (!st.end_stream || rc != http::HPACKDecoder::kOk || !validate_fields(decoded_, true, &facts)) {
+    if (!st.end_stream || rc != http::HPACKDecoder::kOk || !validate_fields(decoded_.data(), decoded_.size(), true, &facts)) {
         return stream_error(id, ErrorCode::PROTOCOL_ERROR);
     }
     s->on_headers_received(true);
@@ -425,7 +538,7 @@ result<void> Http2Connection::finish_header_block(const HeaderBlockState& st, co
 
 result<void> Http2Connection::open_stream(uint32_t id, bool end_stream) noexcept {
     RequestFacts facts;
-    if (!validate_fields(decoded_, false, &facts)) return stream_error(id, ErrorCode::PROTOCOL_ERROR);
+    if (!validate_fields(decoded_.data(), decoded_.size(), false, &facts)) return stream_error(id, ErrorCode::PROTOCOL_ERROR);
     auto created = stream_manager_.create_stream(id);
     if (created.is_err()) return connection_error(ErrorCode::INTERNAL_ERROR);
     Http2Stream* s = created.value();
@@ -476,7 +589,7 @@ result<void> Http2Connection::handle_data_frame(const FrameHeader& h, const uint
         if (pad >= h.length) return connection_error(ErrorCode::PROTOCOL_ERROR);
     }
     if (is_idle(h.stream_id)) return connection_error(ErrorCode::PROTOCOL_ERROR);
-    Http2Stream* s = stream_manager_.get_stream(h.stream_id);
+    Http2Stream* s = get_stream(h.stream_id);
     if (s == nullptr || (s->state() != StreamState::OPEN &&
                          s->state() != StreamState::HALF_CLOSED_LOCAL)) {
         return stream_error(h.stream_id, ErrorCode::STREAM_CLOSED);
@@ -486,6 +599,10 @@ result<void> Http2Connection::handle_data_frame(const FrameHeader& h, const uint
     }
     s->recv_window_ -= static_cast<int32_t>(h.length);
     const size_t n = h.length - off - pad;
+    if (!is_server_ && (s->io.body_received > max_request_body_ ||
+                        n > max_request_body_ - s->io.body_received)) {
+        return stream_error(h.stream_id, ErrorCode::ENHANCE_YOUR_CALM);
+    }
     s->io.body_received += n;
     if (s->io.has_content_length && s->io.body_received > s->io.content_length) {
         return stream_error(h.stream_id, ErrorCode::PROTOCOL_ERROR);
@@ -493,10 +610,19 @@ result<void> Http2Connection::handle_data_frame(const FrameHeader& h, const uint
     if (s->io.body_received > max_request_body_) {
         return stream_error(h.stream_id, ErrorCode::ENHANCE_YOUR_CALM);
     }
-    if (n > 0) s->append_request_body(payload + off, n);
+    if (!is_server_) {
+        if (s->response_status_ == 0 || (n != 0 &&
+            (s->io.is_head || s->response_status_ == 204 || s->response_status_ == 304))) {
+            return stream_error(h.stream_id, ErrorCode::PROTOCOL_ERROR);
+        }
+        if (n > 0) notify_response(ResponseEventKind::Data, s, ErrorCode::NO_ERROR,
+            std::string_view(reinterpret_cast<const char*>(payload + off), n));
+    } else if (n > 0) {
+        s->append_request_body(payload + off, n);
+    }
     const bool end = (h.flags & FrameFlags::DATA_END_STREAM) != 0;
     s->on_data_received(end);
-    if (end) return complete_request(s);
+    if (end) return is_server_ ? complete_request(s) : complete_response(s);
     return replenish(s, h.length);
 }
 

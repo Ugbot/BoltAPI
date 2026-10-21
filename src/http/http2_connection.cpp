@@ -265,6 +265,15 @@ bool is_hop_by_hop(std::string_view lower) noexcept {
 
 }  // namespace
 
+struct Http2Connection::ClientPool {
+    struct Slot {
+        Http2Stream stream{0};
+        std::string_view body;
+        bool used{false};
+    };
+    std::array<Slot, kMaxConcurrentStreams> slots;
+};
+
 Http2Connection::Http2Connection(bool is_server)
     : is_server_(is_server),
       stream_manager_(static_cast<uint32_t>(kLocalWindow)),
@@ -286,10 +295,114 @@ Http2Connection::Http2Connection(bool is_server)
         state_ = ConnectionState::PREFACE_PENDING;
         (void)send_settings();  // server preface (3.4)
     } else {
+        client_pool_ = new (std::nothrow) ClientPool;
+        if (client_pool_ == nullptr) {
+            state_ = ConnectionState::CLOSED;
+            last_error_ = ErrorCode::INTERNAL_ERROR;
+            return;
+        }
+        // Control margin accommodates one maximum-size frame and GOAWAY after
+        // the unread-output threshold. Compact in place instead of growing.
+        output_buffer_.reserve(kClientOutputCapacity);
+        header_block_.reserve(kMaxHeaderBlock);
+        encode_buf_.resize(kMaxResponseHeaderBlock);
+        output_buffer_.insert(output_buffer_.end(), CONNECTION_PREFACE,
+                              CONNECTION_PREFACE + CONNECTION_PREFACE_LEN);
         state_ = ConnectionState::ACTIVE;
+        (void)send_settings();
     }
     assert(remote_settings_.max_frame_size == kLocalMaxFrameSize);
     assert(!is_server || output_backlog() > 0);
+}
+
+Http2Connection::~Http2Connection() { delete client_pool_; }
+
+Http2Stream* Http2Connection::acquire_client_stream(uint32_t id, std::string_view body) noexcept {
+    assert(!is_server_ && client_pool_ != nullptr);
+    assert(id % 2 == 1 && open_count_ < kMaxConcurrentStreams);
+    for (auto& slot : client_pool_->slots) {
+        if (slot.used) continue;
+        Http2Stream& s = slot.stream;
+        s.stream_id_ = id;
+        s.state_ = StreamState::IDLE;
+        s.io = Http2Stream::Io{};
+        s.send_window_ = static_cast<int32_t>(remote_settings_.initial_window_size);
+        s.recv_window_ = kLocalWindow;
+        s.response_status_ = 0;
+        s.error_code_ = ErrorCode::NO_ERROR;
+        slot.body = body;
+        slot.used = true;
+        open_ids_[open_count_++] = id;
+        return &s;
+    }
+    return nullptr;
+}
+
+std::string_view Http2Connection::client_body(uint32_t id) const noexcept {
+    assert(!is_server_ && client_pool_ != nullptr);
+    assert(id != 0);
+    for (const auto& slot : client_pool_->slots) {
+        if (slot.used && slot.stream.id() == id) return slot.body;
+    }
+    return {};
+}
+
+result<uint32_t> Http2Connection::send_request(const http::HPACKHeader* headers, size_t count,
+                                               std::string_view body) noexcept {
+    if (is_server_ || in_response_callback_ || state_ != ConnectionState::ACTIVE) {
+        return err<uint32_t>(error_code::invalid_state);
+    }
+    if (count > kMaxRequestHeaders || body.size() > kDefaultMaxRequestBody ||
+        open_count_ >= kMaxConcurrentStreams || open_count_ >= remote_settings_.max_concurrent_streams ||
+        last_stream_id_ >= 0x7FFFFFFFu || output_backlog() > kMaxControlBacklog) {
+        return err<uint32_t>(error_code::resource_exhausted);
+    }
+    bool head = false;
+    if (!validate_request(headers, count, body.size(), &head)) {
+        return err<uint32_t>(error_code::parse_error);
+    }
+    size_t block_len = 0;
+    if (hpack_encoder_.encode(headers, count, encode_buf_.data(), encode_buf_.size(), block_len) != 0) {
+        return err<uint32_t>(error_code::resource_exhausted);
+    }
+    const uint32_t id = last_stream_id_ == 0 ? 1 : last_stream_id_ + 2;
+    Http2Stream* s = acquire_client_stream(id, body);
+    if (s == nullptr) return err<uint32_t>(error_code::resource_exhausted);
+    assert(id % 2 == 1 && s->state() == StreamState::IDLE);
+    last_stream_id_ = id;
+    s->io.is_head = head;
+    queue_header_block(id, encode_buf_.data(), block_len, body.empty());
+    s->on_headers_sent(body.empty());
+    s->io.send_pending = !body.empty();
+    pump_data();
+    assert(open_count_ <= kMaxConcurrentStreams);
+    return ok(id);
+}
+
+void Http2Connection::notify_response(ResponseEventKind kind, Http2Stream* stream,
+                                      ErrorCode error, std::string_view data) noexcept {
+    assert(!is_server_ && stream != nullptr);
+    assert(!in_response_callback_);
+    if (!response_callback_) return;
+    ResponseEvent event{kind, stream->id(), stream->response_status(), error, nullptr, 0, data};
+    if (kind == ResponseEventKind::Headers || kind == ResponseEventKind::Trailers) {
+        event.headers = decoded_.data();
+        event.header_count = decoded_.size();
+    }
+    in_response_callback_ = true;
+    response_callback_(event);
+    in_response_callback_ = false;
+}
+
+void Http2Connection::reset_client_streams(ErrorCode error) noexcept {
+    if (is_server_) return;
+    assert(open_count_ <= kMaxConcurrentStreams);
+    for (size_t i = 0; i < kMaxConcurrentStreams && open_count_ != 0; ++i) {
+        const uint32_t id = open_ids_[open_count_ - 1];
+        notify_response(ResponseEventKind::Reset, get_stream(id), error);
+        close_stream(id);
+    }
+    assert(open_count_ == 0);
 }
 
 bool Http2Connection::get_output(const uint8_t** out_data, size_t* out_len) noexcept {
@@ -301,12 +414,14 @@ bool Http2Connection::get_output(const uint8_t** out_data, size_t* out_len) noex
 }
 
 void Http2Connection::commit_output(size_t len) noexcept {
+    if (in_response_callback_) return;
     assert(len <= output_backlog());
     output_offset_ += std::min(len, output_backlog());
     if (output_offset_ >= output_buffer_.size()) {
         output_buffer_.clear();
         output_offset_ = 0;
     }
+    if (!is_server_ && state_ != ConnectionState::CLOSED) pump_data();
 }
 
 bool Http2Connection::wants_close() const noexcept {
@@ -320,6 +435,13 @@ void Http2Connection::queue_frame(FrameType type, uint8_t flags, uint32_t stream
                                   const uint8_t* payload, size_t len) noexcept {
     assert(len <= 0xFFFFFFu);
     assert(payload != nullptr || len == 0);
+    if (!is_server_ && output_offset_ != 0) {
+        const size_t pending = output_backlog();
+        std::memmove(output_buffer_.data(), output_buffer_.data() + output_offset_, pending);
+        output_buffer_.resize(pending);
+        output_offset_ = 0;
+    }
+    assert(is_server_ || output_buffer_.size() + 9 + len <= output_buffer_.capacity());
     uint8_t hdr[9];
     hdr[0] = static_cast<uint8_t>(len >> 16);
     hdr[1] = static_cast<uint8_t>(len >> 8);
@@ -360,7 +482,7 @@ result<void> Http2Connection::send_settings() noexcept {
         {SettingsId::MAX_FRAME_SIZE, local_settings_.max_frame_size},
         {SettingsId::MAX_HEADER_LIST_SIZE, local_settings_.max_header_list_size},
     };
-    uint8_t payload[sizeof(params) / sizeof(params[0]) * 6];
+    uint8_t payload[(sizeof(params) / sizeof(params[0]) + 1) * 6];
     size_t n = 0;
     for (const auto& [id, v] : params) {
         payload[n] = static_cast<uint8_t>(static_cast<uint16_t>(id) >> 8);
@@ -368,7 +490,13 @@ result<void> Http2Connection::send_settings() noexcept {
         put_u32(payload + n + 2, v);
         n += 6;
     }
-    assert(n == sizeof(payload));
+    if (!is_server_) {
+        payload[n] = 0;
+        payload[n + 1] = static_cast<uint8_t>(SettingsId::ENABLE_PUSH);
+        put_u32(payload + n + 2, 0);
+        n += 6;
+    }
+    assert(n <= sizeof(payload));
     queue_frame(FrameType::SETTINGS, 0, 0, payload, n);
     settings_ack_pending_ = true;
     return ok();
@@ -377,7 +505,8 @@ result<void> Http2Connection::send_settings() noexcept {
 result<void> Http2Connection::send_response(uint32_t stream_id, uint16_t status,
                                             const http::CoroResponseHeaders& headers,
                                             const std::string& body) noexcept {
-    Http2Stream* stream = stream_manager_.get_stream(stream_id);
+    if (!is_server_ || in_response_callback_) return err<void>(error_code::invalid_state);
+    Http2Stream* stream = get_stream(stream_id);
     if (stream == nullptr || state_ == ConnectionState::CLOSED) {
         return err<void>(error_code::invalid_state);  // reset meanwhile
     }
@@ -425,21 +554,24 @@ bool Http2Connection::pump_stream(Http2Stream* stream) noexcept {
     assert(stream != nullptr);
     Http2Stream::Io& io = stream->io;
     if (!io.send_pending) return false;
-    assert(io.send_off < io.send_buf.size());
+    const std::string_view body = is_server_ ? std::string_view(io.send_buf) : client_body(stream->id());
+    assert(io.send_off < body.size());
     const int32_t window = std::min(connection_send_window_, stream->send_window_);
     if (window <= 0) return false;
-    const size_t remaining = io.send_buf.size() - io.send_off;
-    const size_t n = std::min({remaining, static_cast<size_t>(remote_settings_.max_frame_size),
+    const size_t remaining = body.size() - io.send_off;
+    const size_t max_frame = is_server_ ? remote_settings_.max_frame_size : kLocalMaxFrameSize;
+    const size_t n = std::min({remaining, max_frame,
                                static_cast<size_t>(window)});
+    if (!is_server_ && output_backlog() + 9 + n > kMaxControlBacklog) return false;
     const bool last = n == remaining;
     queue_frame(FrameType::DATA, last ? FrameFlags::DATA_END_STREAM : 0, stream->id(),
-                reinterpret_cast<const uint8_t*>(io.send_buf.data()) + io.send_off, n);
+                reinterpret_cast<const uint8_t*>(body.data()) + io.send_off, n);
     io.send_off += n;
     connection_send_window_ -= static_cast<int32_t>(n);
     stream->send_window_ -= static_cast<int32_t>(n);
     if (last) {
         io.send_pending = false;
-        std::string().swap(io.send_buf);
+        if (is_server_) std::string().swap(io.send_buf);
         stream->on_data_sent(true);
         maybe_close(stream);
     }
@@ -457,7 +589,7 @@ void Http2Connection::pump_data() noexcept {
         std::copy(open_ids_.begin(), open_ids_.begin() + static_cast<std::ptrdiff_t>(n), ids.begin());
         bool progress = false;
         for (size_t i = 0; i < n; ++i) {
-            Http2Stream* s = stream_manager_.get_stream(ids[i]);
+            Http2Stream* s = get_stream(ids[i]);
             if (s != nullptr && pump_stream(s)) progress = true;
         }
         if (!progress) return;
@@ -478,11 +610,21 @@ void Http2Connection::close_stream(uint32_t id) noexcept {
         --open_count_;
         break;
     }
-    stream_manager_.remove_stream(id);
+    if (is_server_) {
+        stream_manager_.remove_stream(id);
+    } else if (client_pool_ != nullptr) {
+        for (auto& slot : client_pool_->slots) {
+            if (!slot.used || slot.stream.id() != id) continue;
+            slot.used = false;
+            slot.body = {};
+            slot.stream.io.send_pending = false;
+            break;
+        }
+    }
     closed_ids_[closed_next_ % kClosedRing] = id;
     ++closed_next_;
     assert(open_count_ <= kMaxConcurrentStreams);
-    assert(stream_manager_.get_stream(id) == nullptr);
+    assert(get_stream(id) == nullptr);
 }
 
 bool Http2Connection::recently_closed(uint32_t id) const noexcept {
@@ -497,11 +639,12 @@ result<void> Http2Connection::connection_error(ErrorCode code) noexcept {
     assert(code != ErrorCode::NO_ERROR);
     if (state_ != ConnectionState::CLOSED) {
         uint8_t payload[8];
-        put_u32(payload, last_stream_id_);
+        put_u32(payload, is_server_ ? last_stream_id_ : 0);
         put_u32(payload + 4, static_cast<uint32_t>(code));
         queue_frame(FrameType::GOAWAY, 0, 0, payload, sizeof(payload));
         last_error_ = code;
         state_ = ConnectionState::CLOSED;
+        reset_client_streams(code);
     }
     assert(state_ == ConnectionState::CLOSED);
     return err<void>(error_code::http_error);
@@ -515,7 +658,8 @@ result<void> Http2Connection::stream_error(uint32_t stream_id, ErrorCode code) n
     uint8_t payload[4];
     put_u32(payload, static_cast<uint32_t>(code));
     queue_frame(FrameType::RST_STREAM, 0, stream_id, payload, sizeof(payload));
-    if (stream_manager_.get_stream(stream_id) != nullptr) {
+    if (Http2Stream* stream = get_stream(stream_id)) {
+        if (!is_server_) notify_response(ResponseEventKind::Reset, stream, code);
         close_stream(stream_id);
     } else if (!recently_closed(stream_id)) {
         closed_ids_[closed_next_ % kClosedRing] = stream_id;
@@ -525,21 +669,28 @@ result<void> Http2Connection::stream_error(uint32_t stream_id, ErrorCode code) n
 }
 
 result<void> Http2Connection::send_rst_stream(uint32_t stream_id, ErrorCode error) noexcept {
+    if (in_response_callback_) return err<void>(error_code::invalid_state);
     if (stream_id == 0) return err<void>(error_code::invalid_state);
+    if (!is_server_ && get_stream(stream_id) == nullptr) return err<void>(error_code::invalid_state);
     return stream_error(stream_id, error);
 }
 
 result<void> Http2Connection::send_goaway(ErrorCode error, const std::string& debug_data) noexcept {
+    if (in_response_callback_) return err<void>(error_code::invalid_state);
     if (state_ == ConnectionState::CLOSED) return err<void>(error_code::invalid_state);
+    if (!is_server_ && output_backlog() > kMaxControlBacklog) {
+        return connection_error(ErrorCode::ENHANCE_YOUR_CALM);
+    }
     const size_t dbg = std::min(debug_data.size(), static_cast<size_t>(kLocalMaxFrameSize - 8));
-    std::vector<uint8_t> payload(8 + dbg);
-    put_u32(payload.data(), last_stream_id_);
+    std::array<uint8_t, kLocalMaxFrameSize> payload;
+    put_u32(payload.data(), is_server_ ? last_stream_id_ : 0);
     put_u32(payload.data() + 4, static_cast<uint32_t>(error));
     if (dbg > 0) std::memcpy(payload.data() + 8, debug_data.data(), dbg);
-    queue_frame(FrameType::GOAWAY, 0, 0, payload.data(), payload.size());
+    queue_frame(FrameType::GOAWAY, 0, 0, payload.data(), 8 + dbg);
     if (error != ErrorCode::NO_ERROR) {
         last_error_ = error;
         state_ = ConnectionState::CLOSED;
+        reset_client_streams(error);
     } else if (state_ == ConnectionState::ACTIVE) {
         state_ = ConnectionState::GOAWAY_SENT;
     }
@@ -547,7 +698,12 @@ result<void> Http2Connection::send_goaway(ErrorCode error, const std::string& de
 }
 
 Http2Stream* Http2Connection::get_stream(uint32_t stream_id) noexcept {
-    return stream_manager_.get_stream(stream_id);
+    if (is_server_) return stream_manager_.get_stream(stream_id);
+    if (client_pool_ == nullptr) return nullptr;
+    for (auto& slot : client_pool_->slots) {
+        if (slot.used && slot.stream.id() == stream_id) return &slot.stream;
+    }
+    return nullptr;
 }
 
 } // namespace http2
