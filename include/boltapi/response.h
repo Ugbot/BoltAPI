@@ -202,11 +202,17 @@ public:
     //      .send_fixed("application/octet-stream", 1024,
     //                  [=](const auto& sink) { sink(slice); });
     //
-    // CONTRACT: the producer must emit EXACTLY content_length bytes. The server
-    // never writes past the declared length (a write that would overrun is
-    // refused, not truncated-and-continued), and if the produced total does not
-    // equal the declared length the connection is closed instead of leaving a
-    // mis-framed stream that would corrupt the next response on it.
+    // CONTRACT: the producer must emit EXACTLY content_length bytes. A write
+    // that would overrun is refused, and further sink calls are ignored.
+    // Cleartext H1 publishes the declared headers before producing bytes; a
+    // mismatch closes that connection, and rejected surplus never reaches it.
+    // TLS H1/H2 materialize before response headers, under the startup config's
+    // max_fixed_materialization_bytes (finite, nonzero, default 16 MiB).
+    // Declarations above that cap refuse before invoking the producer. A cap
+    // refusal or length mismatch sends a fresh empty 500 with no original body
+    // or representation metadata. Larger fixed TLS H1/H2 responses require an
+    // explicitly raised finite cap. HEAD/204/304 on H1/H2 skip the producer and
+    // retain only legal representation metadata, without applying this cap.
     //
     // Cleartext H1 runs the synchronous producer on an existing blocking
     // worker and resumes socket I/O on the connection's owning reactor.
@@ -218,8 +224,9 @@ public:
     // invocation returns. Sink may not be retained or invoked concurrently.
     // If startup slots are occupied, H1 sends 503 before any fixed headers.
     // Calls already running off a per-core reactor retain their inline path.
-    // On TLS/HTTP-2/HTTP-3 the output is materialized and framed by the normal
-    // path (same bytes, same Content-Length, just not incremental).
+    // These transport policies cover H1/H2. They do not specify HTTP/3 behavior.
+    // TLS H1/H2 materialization bounds retained bytes, not producer execution
+    // time or allocation failure; it is not incremental transport streaming.
     Response& send_fixed(uint64_t n, StreamProducer producer) & {
         assert(producer != nullptr);
         assert(out_.stream_producer == nullptr);  // set once per response

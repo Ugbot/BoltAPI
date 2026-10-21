@@ -25,6 +25,7 @@
 #include "boltapi/net/tls_context.h"
 #include "boltapi/net/coro_tls_socket.h"
 #include "boltapi/http/dispatch_task.h"
+#include "boltapi/http/fixed_stream_limits.h"
 #include "boltapi/http/http1_parser.h"
 #include "boltapi/http/http1_connection.h"
 #include "boltapi/http/http2_connection.h"
@@ -421,6 +422,16 @@ struct CoroUnifiedServerConfig {
 
     // Pure C++ mode - always true for CoroUnifiedServer
     bool pure_cpp_mode = true;
+
+    // Startup limit for each fixed response materialized by TLS H1 or H2.
+    // Must be nonzero and <= kMaxFixedResponseBytes (and fit size_t). Declarations
+    // above it refuse before reserve/producer invocation; a length mismatch or
+    // refusal sends a fresh empty 500 before response headers. HEAD/204/304 never
+    // invoke a producer. Cleartext incremental fixed H1 is unaffected. This is
+    // a per-response byte limit, not a producer time/cancellation guarantee.
+    // New field changes C++ config layout: rebuild all consumers. Callers with
+    // larger TLS/H2 fixed responses must explicitly raise this finite limit.
+    size_t max_fixed_materialization_bytes = kDefaultFixedMaterializationBytes;
 };
 
 /**

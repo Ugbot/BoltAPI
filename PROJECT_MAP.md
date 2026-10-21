@@ -56,7 +56,7 @@ tools/fuzz_check/          # throwaway standalone validation of the fuzz util (n
 |---|---|---|
 | Build skeleton + Bolt submodule | ✅ | M0 — MSVC build green, smoke test passes |
 | `bolt::api::App` facade | ✅ | M1 — `include/boltapi/app.h` + `src/app.cpp`. Sync get/post/put/del/patch/head/options + async *_async incl. head_async; use()/use_async(); websocket()/sse_coro() forward to engine; run()/start_background()/stop()/is_running(). Dispatch bridge: Router.build() once, single set_handler() does method_from->match->Request/Response->middleware chain->handler, 404 on miss. Built-in CORS middleware inserted first when enable_cors. |
-| `bolt::api::Request`/`Response` | ✅ | M1 — `include/boltapi/request.h` (zero-copy view: method/path/query/path_param/header CI/client_ip) + `include/boltapi/response.h` (fluent status/content_type/header/send/json/text/html/body + ok()/created()/.../internal_error()). **Fixed-length (identity) bodies** — `Response::stream()` forces `Transfer-Encoding: chunked`, which cannot carry a `Content-Length`, so it can serve neither a **206 Range** reply (Content-Length + Content-Range are REQUIRED) nor a **HEAD** reply; four ADDITIVE members close that gap without touching `send()`/`stream()`: **`send_borrowed(string_view)`** (ZERO-copy — the caller's bytes go straight to the socket; `send()` costs two copies, one into the body and one into the header buffer. Caller owns the lifetime: the bytes must outlive the write, which happens on the I/O thread after the handler returns and before that connection's next request — an arena/cache/static is fine, a handler local is NOT), **`send_owned(string&&)`** (moves an already-built body in: one copy total, no lifetime obligation), **`send_fixed([content_type,] n, producer)`** (identity producer streaming — `Content-Length: n`, no chunk framing, 200 and 206 alike), and **`content_length(n)`** (declare a length with no body = the HEAD shape; the connection only synthesizes Content-Length when the header is ABSENT, so an explicit one on an empty body survives — verified on the wire). Declared-length integrity is enforced, not assumed: the sink REFUSES a write that would pass the declared length (surplus bytes never reach the wire) and a produced total ≠ declared closes the connection rather than leave a short body under a declared length that would mis-frame the next response on a keep-alive connection. Server-side: `CoroHttpResponse::{borrowed_data,borrowed_size,body_separate_write,fixed_stream_length}` + `body_bytes()`/`is_fixed_stream()`, `stream_fixed_h1`/`materialize_fixed`/`conn_write_all` in `coro_unified_server.cpp`. TLS-H1/H2/H3 materialize (same bytes, same Content-Length, H2/H3 cost one copy for a borrowed body); cleartext H1 is the zero-copy path. Gate: `boltapi_fixed_length_response_test` (11 cases over a real socket — identity framing for 200/206, HEAD, over/under-produce guards, keep-alive across borrowed+fixed+206 on ONE connection, plus buffered/chunked no-regression). Also added the missing `206 Partial Content` / `416 Range Not Satisfiable` reason phrases (both previously fell through to the literal text "OK"). |
+| `bolt::api::Request`/`Response` | ✅ | M1 — `include/boltapi/request.h` (zero-copy view: method/path/query/path_param/header CI/client_ip) + `include/boltapi/response.h` (fluent status/content_type/header/send/json/text/html/body + ok()/created()/.../internal_error()). **Fixed-length (identity) bodies** — `Response::stream()` forces `Transfer-Encoding: chunked`, which cannot carry a `Content-Length`, so it can serve neither a **206 Range** reply (Content-Length + Content-Range are REQUIRED) nor a **HEAD** reply; four ADDITIVE members close that gap without touching `send()`/`stream()`: **`send_borrowed(string_view)`** (ZERO-copy — the caller's bytes go straight to the socket; `send()` costs two copies, one into the body and one into the header buffer. Caller owns the lifetime: the bytes must outlive the write, which happens on the I/O thread after the handler returns and before that connection's next request — an arena/cache/static is fine, a handler local is NOT), **`send_owned(string&&)`** (moves an already-built body in: one copy total, no lifetime obligation), **`send_fixed([content_type,] n, producer)`** (identity producer streaming — `Content-Length: n`, no chunk framing, 200 and 206 alike), and **`content_length(n)`** (declare a length with no body = the HEAD shape; the connection only synthesizes Content-Length when the header is ABSENT, so an explicit one on an empty body survives — verified on the wire). Declared-length integrity is enforced, not assumed: the sink REFUSES a write that would pass the declared length (surplus bytes never reach the wire) and a produced total ≠ declared closes the connection rather than leave a short body under a declared length that would mis-frame the next response on a keep-alive connection. Server-side: `CoroHttpResponse::{borrowed_data,borrowed_size,body_separate_write,fixed_stream_length}` + `body_bytes()`/`is_fixed_stream()`, `stream_fixed_h1`/`materialize_fixed`/`conn_write_all` in `coro_unified_server.cpp`. TLS H1/H2 fixed producers now materialize under a finite 16 MiB startup cap by default; mismatch/cap refusal becomes an empty 500 before headers, and H1/H2 bodyless responses skip producers. Cleartext H1 fixed responses remain incremental with bounded backpressure. [CORRECTED 2026-10-21: HTTP/3 does not share this H1/H2 policy; it is disabled in the current build and remains separately unqualified with source-derived fixed-body issues.](docs/FIXED_RESPONSES.md) Gate: `boltapi_fixed_length_response_test` (11 cases over a real socket — identity framing for 200/206, HEAD, over/under-produce guards, keep-alive across borrowed+fixed+206 on ONE connection, plus buffered/chunked no-regression). Also added the missing `206 Partial Content` / `416 Range Not Satisfiable` reason phrases (both previously fell through to the literal text "OK"). |
 | Bolt-native router (dictionary + SwissTable) | ✅ | flagship fast path — `include/boltapi/router.h` + `src/router.cpp`; static via SwissTable (`swiss_mix`), param/wildcard via flat trie w/ DictionaryPool-interned segments; integrated into `boltapi` lib; router test green in suite |
 | Test infrastructure (gtest + http fuzz) | ✅ | `cmake/BoltApiGTest.cmake` (`boltapi_add_test`) + `tests/util/http_fuzz.h` seeded request generator. M1 adds `tests/app_integration_test.cpp` (real App on ephemeral port, raw client socket, multi-route/multi-verb + http_fuzz) and `tests/middleware_test.cpp` (chain order, 401 short-circuit, sync+async mix). 24/24 ctest green on MSVC. |
 | Coroutine middleware onion | ✅ | M1 — `include/boltapi/middleware.h`. AsyncMiddleware(Request&,Response&,Next) + sync Middleware auto-wrapped via to_async(); terminal = matched handler; not calling next() short-circuits. **TigerStyle / LMAX-Disruptor rewrite (banned shared_ptr):** the onion is driven by a borrowed value HANDLE (`Next` = `ChainCtx*` + index — no smart pointers, no per-link `std::function`, no `make_shared` fold); `Next::operator()` returns the next link's task directly (no driver frame); terminal reached via a plain function pointer. Every chain coroutine FRAME is bump-allocated from a per-request **frame arena** acquired from a pre-allocated **ring pool** (`include/boltapi/http/frame_arena.h` — Vyukov bounded MPMC ring free-list: sequenced slots, cache-line-padded cursors, lock-free claim/publish; one contiguous block, range-checked `operator delete`). `chain_task` frames use a param-passing promise `operator new` that pulls the arena from the trailing `Next`. **Gated by `middleware_alloc_test`: 100k chain runs → 0 global allocs** (full onion + short-circuit), green MSVC + Linux/Clang (`Dockerfile.linux-gateway`). |
@@ -105,12 +105,16 @@ arbitrary producer code. Copied slot
 bytes outlive final I/O drain and worker completion. The pool is destroyed
 after the engines. The existing void sink cannot cancel arbitrary producer code;
 producers must terminate bounded work and must not retain or concurrently invoke
-the sink. TLS/H2/H3 continue to materialize fixed producers. Each slot captures
-Bolt's `IODispatcher::current_io_thread_index()` before offload and wakes that
-reactor; off-dispatcher callers get `SIZE_MAX`, never a guessed owner. A separate
-arming/parked state prevents shared-engine completion from resuming an awaiter
-before its final publication. Calls
-already running off a per-core reactor retain their inline path.
+the sink. Each slot captures Bolt's `IODispatcher::current_io_thread_index()`
+before offload and wakes that reactor; off-dispatcher callers get `SIZE_MAX`,
+never a guessed owner. A separate arming/parked state prevents shared-engine
+completion from resuming an awaiter before its final publication. Calls already
+running off a per-core reactor retain their inline path.
+
+TLS H1/H2 materialize fixed producers before headers under the configured
+`max_fixed_materialization_bytes` cap. H3 is not covered by that contract; it is
+disabled in the current build and has separate unqualified fixed-body issues.
+See [fixed-response behavior and limits](docs/FIXED_RESPONSES.md).
 
 `boltapi_fixed_length_response_test` includes delayed owned-body and scratch-range
 drain checks: a second connection must answer before the first body is read,
@@ -147,13 +151,39 @@ accepted stream IDs through its monotone cutoff, resets excluded streams,
 refuses new requests and performs no automatic retry; fatal GOAWAY resets
 remaining streams.
 
-The final macOS-native BoltAPI v1 run passes 70 cases: stream response (3),
+The earlier macOS-native BoltAPI v1 checkpoint passed 70 cases: stream response (3),
 fixed stream (23), HTTP/2 client (24), stream manager (7), buffer pool (2),
 transport (5) and HPACK (6). The natural-owner regression observed the
 owner observations 23/23, other-owner count 0 and owner bitmask 3 (both reactors). This is
 macOS-native BoltAPI qualification only; wider Flight, Windows/Linux and
 performance acceptance remain open. G2FEAT-260 natural distribution and the
 G2ICE-251 fixed-stream behavior remain already-landed.
+
+## Fixed-response materialization and outgoing GOAWAY (current source)
+
+TLS H1/H2 fixed responses preflight the finite startup materialization cap and
+then require an exact body before success headers. Cap refusal, short output or
+sticky overrun becomes a fresh empty 500; bodyless H1/H2 responses skip the
+producer and cap. Cleartext H1 remains incremental, closes on a post-header
+length mismatch, and returns 503 before fixed headers when its bounded worker
+slot is unavailable. HTTP/3 is disabled in the current build and is separately
+unqualified; it does not share the H1/H2 fallback contract.
+
+The HTTP/2 server now tracks the highest admitted peer stream ID and sends a
+nonincreasing GOAWAY cutoff for explicit and fatal/error notices. Seen-but-
+refused IDs do not enlarge the accepted drain set. The private
+`Http2Connection` layout and startup config layout changed; rebuild consumers
+with the matching headers. No implicit retry or replay is added.
+
+The earlier 70-case checkpoint is historical and predates these changes. The
+final combined repository gate passed 127/127 CTest targets, 709 GoogleTest
+executions (707 pass, two Azure/GCS skips); the BoltAPI subset passed 87/87 with
+no skips. Four source-binding manifests and 49 executable bindings verified
+unchanged. Companion Bolt S3 client/native SST MinIO v5 passed: 34,508,928-byte MBLT, 32,768 rows,
+256-wide vectors, five service-reported parts, 8 MiB first part, HTTP 206, exact
+bit and SHA match. These are scoped macOS results; H3, Windows/Linux, Flight and
+performance gates remain separate. See [fixed-response contract, ABI and
+verification scope](docs/FIXED_RESPONSES.md).
 
 ## Consuming boltapi (install / find_package)
 

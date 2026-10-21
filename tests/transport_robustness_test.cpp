@@ -8,6 +8,7 @@
 //     (prior knowledge) and TLS (ALPN h2).
 
 #include "boltapi/app.h"
+#include "boltapi/http/http2_connection.h"
 #include "boltapi/net/sys_compat.h"
 
 #include <gtest/gtest.h>
@@ -15,6 +16,9 @@
 #include <openssl/ssl.h>
 
 #include <chrono>
+#include <array>
+#include <atomic>
+#include <charconv>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -55,7 +59,11 @@ struct Conn {
         if (fd < 0) return false;
         int rcv = 16 * 1024;
         ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcv), sizeof(rcv));
+#ifdef _WIN32
+        DWORD tv = 10000;
+#else
         timeval tv{10, 0};
+#endif
         ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
         sockaddr_in addr;
         std::memset(&addr, 0, sizeof(addr));
@@ -307,6 +315,319 @@ TEST_F(TransportRobustness, H2OverTlsLargeResponseIsFramedAndFlowControlled) {
     EXPECT_TRUE(body == big_body());
     EXPECT_LE(max_frame, 16384u);
     EXPECT_TRUE(window_ok);
+}
+
+constexpr uint16_t kFixedPlainPort = 19473, kFixedTlsPort = 19474;
+constexpr std::size_t kMaterializationCap = 16;
+struct FixedCase {
+    const char* path;
+    uint64_t declared;
+    const char* first;
+    const char* second;
+    uint16_t expected_status;
+    const char* expected_body;
+};
+constexpr std::array<FixedCase, 6> kFixedCases{{
+    {"/below", 15, "0123456789abcde", "", 207, "0123456789abcde"},
+    {"/at", 16, "0123456789abcdef", "", 207, "0123456789abcdef"},
+    {"/above", 17, "MUST-NOT-RUN", "", 500, ""},
+    {"/short", 16, "SHORT", "", 500, ""},
+    {"/over", 16, "0123456789", "OVERRUN-SENTINEL", 500, ""},
+    {"/empty", 0, "", "", 207, ""},
+}};
+std::array<std::atomic<unsigned>, kFixedCases.size()> g_fixed_calls{};
+std::atomic<unsigned> g_bodyless_calls{0};
+
+struct H2Reply {
+    uint16_t status = 0;
+    std::string body;
+    std::vector<std::pair<std::string, std::string>> headers;
+    unsigned data_events = 0, data_frames = 0;
+    bool complete = false, reset = false;
+    std::string header(std::string_view name) const {
+        for (const auto& field : headers) if (field.first == name) return field.second;
+        return {};
+    }
+};
+
+// Use the native client decoder: status/headers and completion are checked,
+// rather than treating every DATA body (including a successful error) as 200.
+class FixedH2Session {
+public:
+    bool open(bool tls) {
+        if (!wire_.open(tls ? kFixedTlsPort : kFixedPlainPort, tls, tls ? "h2" : nullptr)) return false;
+        if (tls) {
+            const unsigned char* protocol = nullptr;
+            unsigned length = 0;
+            SSL_get0_alpn_selected(wire_.ssl, &protocol, &length);
+            if (length != 2 || std::memcmp(protocol, "h2", 2) != 0) return false;
+        }
+        tls_ = tls;
+        client_.set_response_callback([this](const auto& event) {
+            if (event.stream_id != wanted_) return;
+            using Kind = api::http2::Http2Connection::ResponseEventKind;
+            if (event.kind == Kind::Headers) {
+                reply_.status = event.status;
+                for (std::size_t i = 0; i < event.header_count; ++i)
+                    reply_.headers.emplace_back(event.headers[i].name, event.headers[i].value);
+            } else if (event.kind == Kind::Data) {
+                reply_.body.append(event.data);
+                ++reply_.data_events;
+            } else if (event.kind == Kind::Complete) reply_.complete = true;
+            else if (event.kind == Kind::Reset) reply_.reset = true;
+        });
+        return flush();
+    }
+    bool request(const char* method, const char* path, H2Reply& reply) {
+        reply_ = H2Reply{};
+        const std::array<api::http::HPACKHeader, 4> fields{{
+            {":method", method}, {":scheme", tls_ ? "https" : "http"},
+            {":path", path}, {":authority", "localhost"}}};
+        const auto sent = client_.send_request(fields.data(), fields.size());
+        if (sent.is_err()) return false;
+        wanted_ = sent.value();
+        if (!flush()) return false;
+        for (unsigned i = 0; i < 128 && !reply_.complete && !reply_.reset; ++i) {
+            std::array<uint8_t, 9 + api::http2::Http2Connection::kLocalMaxFrameSize> frame{};
+            if (!wire_.recv_exact(frame.data(), 9)) return false;
+            const auto parsed = api::http2::parse_frame_header(frame.data());
+            if (parsed.is_err() || parsed.value().length > api::http2::Http2Connection::kLocalMaxFrameSize) return false;
+            const auto& header = parsed.value();
+            if (header.length > 0 && !wire_.recv_exact(frame.data() + 9, header.length)) return false;
+            if (header.type == api::http2::FrameType::DATA && header.stream_id == wanted_)
+                ++reply_.data_frames; // includes empty DATA, independently of callbacks
+            const std::size_t size = 9 + header.length;
+            const auto read = client_.process_input(frame.data(), size);
+            if (read.is_err() || read.value() != size || !flush()) return false;
+        }
+        reply = reply_;
+        return reply.complete && !reply.reset;
+    }
+private:
+    bool flush() {
+        for (unsigned i = 0; i < 128; ++i) {
+            const uint8_t* data = nullptr;
+            std::size_t size = 0;
+            if (!client_.get_output(&data, &size)) return true;
+            if (!wire_.send_all(data, size)) return false;
+            client_.commit_output(size);
+        }
+        return false;
+    }
+    Conn wire_;
+    api::http2::Http2Connection client_{false};
+    H2Reply reply_;
+    uint32_t wanted_ = 0;
+    bool tls_ = false;
+};
+
+class FixedMaterialization : public ::testing::Test {
+protected:
+    static void SetUpTestSuite() {
+        sys::startup();
+        api::App::Config cfg;
+        cfg.server.enable_tls = true;
+        cfg.server.tls_port = kFixedTlsPort;
+        cfg.server.num_workers = 1;
+        cfg.server.num_streaming_workers = 2;
+        cfg.server.max_fixed_materialization_bytes = kMaterializationCap;
+        app_ = new api::App(cfg);
+        for (std::size_t i = 0; i < kFixedCases.size(); ++i) {
+            app_->get(kFixedCases[i].path, [i](api::Request&, api::Response& res) {
+                const FixedCase& c = kFixedCases[i];
+                res.status(207).header("Content-Range", "bytes 0-15/100")
+                    .header("Content-Encoding", "gzip").header("ETag", "old-representation")
+                    .send_fixed(c.declared, [i](const api::Response::StreamSink& sink) {
+                        g_fixed_calls[i].fetch_add(1);
+                        sink(kFixedCases[i].first);
+                        sink(kFixedCases[i].second);
+                        if (i == 4) sink("abcdef"); // must stay refused after overrun
+                    });
+            });
+        }
+        for (const uint16_t status : std::array<uint16_t, 3>{200, 204, 304}) {
+            const std::string path = "/bodyless" + std::to_string(status);
+            const auto handler = [status](api::Request&, api::Response& res) {
+                res.status(status).send_fixed(17, [](const api::Response::StreamSink& sink) {
+                    g_bodyless_calls.fetch_add(1);
+                    sink("MUST-NOT-RUN");
+                });
+                if (status == 204) {
+                    res.raw().headers.append("content-length", "17");
+                    res.raw().headers.append("transfer-encoding", "chunked");
+                }
+            };
+            app_->head(path, handler);
+            if (status != 200) app_->get(path, handler);
+        }
+        app_->head("/bodylessfull", [](api::Request&, api::Response& res) {
+            for (std::size_t i = 0; i < api::http::CoroResponseHeaders::MAX_RESPONSE_HEADERS; ++i)
+                res.raw().headers.append("X-Fill-" + std::to_string(i), "x");
+            res.send_fixed(17, [](const api::Response::StreamSink& sink) {
+                g_bodyless_calls.fetch_add(1);
+                sink("MUST-NOT-RUN");
+            });
+        });
+        app_->get("/ok", [](api::Request&, api::Response& res) { res.status(207).text("CHECK"); });
+        ASSERT_EQ(app_->start_background("127.0.0.1", kFixedPlainPort), 0);
+    }
+    static void TearDownTestSuite() {
+        if (app_) { app_->stop(); delete app_; app_ = nullptr; }
+    }
+    static api::App* app_;
+};
+api::App* FixedMaterialization::app_ = nullptr;
+
+void expect_h2_materialization(bool tls) {
+    FixedH2Session session;
+    ASSERT_TRUE(session.open(tls));
+    for (std::size_t i = 0; i < kFixedCases.size(); ++i) {
+        SCOPED_TRACE(kFixedCases[i].path);
+        const unsigned before = g_fixed_calls[i].load();
+        H2Reply reply;
+        ASSERT_TRUE(session.request("GET", kFixedCases[i].path, reply));
+        EXPECT_EQ(reply.status, kFixedCases[i].expected_status);
+        EXPECT_EQ(reply.body, kFixedCases[i].expected_body);
+        EXPECT_EQ(g_fixed_calls[i].load(), before + (i == 2 ? 0u : 1u));
+        if (reply.status == 500) {
+            EXPECT_EQ(reply.header("content-length"), "0");
+            EXPECT_TRUE(reply.header("content-range").empty());
+            EXPECT_TRUE(reply.header("content-encoding").empty());
+            EXPECT_TRUE(reply.header("etag").empty());
+        }
+        ASSERT_TRUE(session.request("GET", "/ok", reply));
+        EXPECT_EQ(reply.status, 207);
+        EXPECT_EQ(reply.body, "CHECK");
+    }
+}
+
+TEST_F(FixedMaterialization, H2cValidatesFixedBodiesBeforeSuccessHeaders) {
+    expect_h2_materialization(false);
+}
+
+TEST_F(FixedMaterialization, AlpnH2ValidatesFixedBodiesBeforeSuccessHeaders) {
+    expect_h2_materialization(true);
+}
+
+TEST_F(FixedMaterialization, BodylessH2SkipsProducerAndCapBeforeHeaders) {
+    for (const bool tls : {false, true}) {
+        FixedH2Session session;
+        ASSERT_TRUE(session.open(tls));
+        for (const uint16_t status : std::array<uint16_t, 3>{200, 204, 304}) {
+            SCOPED_TRACE(status);
+            const unsigned before = g_bodyless_calls.load();
+            H2Reply reply;
+            const std::string path = "/bodyless" + std::to_string(status);
+            ASSERT_TRUE(session.request(status == 200 ? "HEAD" : "GET", path.c_str(), reply));
+            EXPECT_EQ(reply.status, status);
+            EXPECT_TRUE(reply.body.empty());
+            EXPECT_EQ(reply.data_events, 0u);
+            EXPECT_EQ(reply.data_frames, 0u);
+            EXPECT_EQ(reply.header("content-length"), status == 204 ? "" : "17");
+            EXPECT_TRUE(reply.header("transfer-encoding").empty());
+            EXPECT_EQ(g_bodyless_calls.load(), before);
+            ASSERT_TRUE(session.request("GET", "/ok", reply));
+            EXPECT_EQ(reply.status, 207);
+            EXPECT_EQ(reply.body, "CHECK");
+        }
+        const unsigned before = g_bodyless_calls.load();
+        H2Reply full;
+        ASSERT_TRUE(session.request("HEAD", "/bodylessfull", full));
+        EXPECT_EQ(full.status, 200);
+        EXPECT_EQ(full.data_events, 0u);
+        EXPECT_EQ(full.data_frames, 0u);
+        EXPECT_TRUE(full.header("content-length").empty());
+        EXPECT_EQ(g_bodyless_calls.load(), before);
+    }
+}
+
+struct FixedH1Reply {
+    std::string head, body;
+    uint16_t status = 0;
+};
+
+bool fixed_h1_request(Conn& c, const char* method, const char* path, FixedH1Reply& reply) {
+    reply = FixedH1Reply{};
+    const std::string request = std::string(method) + " " + path +
+        " HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+    if (!c.send_all(request.data(), request.size())) return false;
+    char byte = 0;
+    for (unsigned i = 0; i < 8192; ++i) {
+        if (!c.recv_exact(&byte, 1)) return false;
+        reply.head += byte;
+        if (reply.head.ends_with("\r\n\r\n")) break;
+    }
+    if (!reply.head.starts_with("HTTP/1.1 ") || !reply.head.ends_with("\r\n\r\n")) return false;
+    const auto parsed = std::from_chars(reply.head.data() + 9, reply.head.data() + 12, reply.status);
+    if (parsed.ec != std::errc{}) return false;
+    if (std::strcmp(method, "HEAD") == 0 || reply.status == 204 || reply.status == 304) return true;
+    const std::size_t field = reply.head.find("\r\nContent-Length: ");
+    if (field == std::string::npos) return false;
+    std::size_t length = 0;
+    const char* begin = reply.head.data() + field + std::strlen("\r\nContent-Length: ");
+    const auto size = std::from_chars(begin, reply.head.data() + reply.head.size(), length);
+    if (size.ec != std::errc{} || length > kMaterializationCap) return false;
+    reply.body.resize(length);
+    return length == 0 || c.recv_exact(reply.body.data(), length);
+}
+
+TEST_F(FixedMaterialization, TlsH1RejectsMismatchBeforeHeadersAndReusesConnection) {
+    Conn wire;
+    ASSERT_TRUE(wire.open(kFixedTlsPort, true, "http/1.1"));
+    for (std::size_t i = 0; i < kFixedCases.size(); ++i) {
+        SCOPED_TRACE(kFixedCases[i].path);
+        const unsigned before = g_fixed_calls[i].load();
+        FixedH1Reply reply;
+        ASSERT_TRUE(fixed_h1_request(wire, "GET", kFixedCases[i].path, reply));
+        EXPECT_EQ(reply.status, kFixedCases[i].expected_status);
+        EXPECT_EQ(reply.body, kFixedCases[i].expected_body);
+        EXPECT_EQ(g_fixed_calls[i].load(), before + (i == 2 ? 0u : 1u));
+        if (reply.status == 500) {
+            EXPECT_NE(reply.head.find("\r\nContent-Length: 0\r\n"), std::string::npos);
+            EXPECT_EQ(reply.head.find("Content-Range"), std::string::npos);
+            EXPECT_EQ(reply.head.find("Content-Encoding"), std::string::npos);
+            EXPECT_EQ(reply.head.find("ETag"), std::string::npos);
+        }
+        ASSERT_TRUE(fixed_h1_request(wire, "GET", "/ok", reply));
+        EXPECT_EQ(reply.status, 207);
+        EXPECT_EQ(reply.body, "CHECK");
+    }
+}
+
+TEST_F(FixedMaterialization, BodylessTlsH1SkipsMaterializationAndKeepsWireAligned) {
+    Conn wire;
+    ASSERT_TRUE(wire.open(kFixedTlsPort, true, "http/1.1"));
+    for (const uint16_t status : std::array<uint16_t, 3>{200, 204, 304}) {
+        SCOPED_TRACE(status);
+        const unsigned before = g_bodyless_calls.load();
+        const std::string path = "/bodyless" + std::to_string(status);
+        FixedH1Reply reply;
+        ASSERT_TRUE(fixed_h1_request(wire, status == 200 ? "HEAD" : "GET", path.c_str(), reply));
+        EXPECT_EQ(reply.status, status);
+        EXPECT_TRUE(reply.body.empty());
+        EXPECT_EQ(reply.head.find("Transfer-Encoding"), std::string::npos);
+        if (status == 204) EXPECT_EQ(reply.head.find("Content-Length"), std::string::npos);
+        else EXPECT_NE(reply.head.find("Content-Length: 17\r\n"), std::string::npos);
+        EXPECT_EQ(g_bodyless_calls.load(), before);
+        ASSERT_TRUE(fixed_h1_request(wire, "GET", "/ok", reply));
+        EXPECT_EQ(reply.status, 207);
+        EXPECT_EQ(reply.body, "CHECK");
+    }
+}
+
+TEST(FixedMaterializationConfig, RefusesZeroAndUnrepresentablePublicFixedLimit) {
+    api::http::CoroUnifiedServerConfig config;
+    config.enable_tls = false;
+    config.enable_http1_cleartext = false;
+    config.enable_signal_handlers = false;
+    config.max_fixed_materialization_bytes = 0;
+    api::http::CoroUnifiedServer zero(config);
+    EXPECT_NE(zero.start_background(), 0);
+    if constexpr (sizeof(std::size_t) >= sizeof(uint64_t)) {
+        config.max_fixed_materialization_bytes = static_cast<std::size_t>(api::kMaxFixedResponseBytes + 1);
+        api::http::CoroUnifiedServer excessive(config);
+        EXPECT_NE(excessive.start_background(), 0);
+    }
 }
 
 }  // namespace

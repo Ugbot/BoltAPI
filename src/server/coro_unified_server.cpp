@@ -101,6 +101,64 @@ inline void append_uint(std::string& out, std::uint64_t v) {
     out.append(tmp, static_cast<std::size_t>(p - tmp));
 }
 
+struct ResponseContentPolicy {
+    bool suppressed = false;
+    bool implicit_length = true;
+    bool fixed_length = false;
+    uint64_t representation_length = 0;
+};
+
+// Decide before slot acquisition or materialization: an intentionally absent
+// body must never start a producer (RFC 9112 6.3). HEAD/304 may describe the
+// representation's length; 204 forbids Content-Length (RFC 9110 8.6).
+ResponseContentPolicy prepare_response_content(CoroHttpResponse& response, bool head) {
+    ResponseContentPolicy policy;
+    policy.suppressed = head || response.status == 204 || response.status == 304;
+    if (!policy.suppressed) return policy;
+    policy.fixed_length = response.is_fixed_stream();
+    policy.implicit_length = response.status != 204 &&
+        (policy.fixed_length || !response.stream_producer);
+    policy.representation_length = policy.fixed_length
+        ? static_cast<uint64_t>(response.fixed_stream_length)
+        : static_cast<uint64_t>(response.body_bytes().size());
+    // Destroy the unstarted capture: no worker, slot, or cancellation exists.
+    response.stream_producer = nullptr;
+    response.fixed_stream_length = CoroHttpResponse::kNoFixedLength;
+    response.body.clear();
+    response.borrowed_data = nullptr;
+    response.borrowed_size = 0;
+    response.body_separate_write = false;
+    assert(!response.stream_producer && !response.is_fixed_stream());
+    assert(response.body_bytes().empty());
+    return policy;
+}
+
+void remove_all_headers(CoroResponseHeaders& headers, std::string_view name) {
+    assert(headers.size() <= CoroResponseHeaders::MAX_RESPONSE_HEADERS);
+    for (std::size_t i = 0; i < CoroResponseHeaders::MAX_RESPONSE_HEADERS; ++i) {
+        if (headers.find(name) == headers.end()) break;
+        headers.remove(name);
+    }
+    assert(headers.find(name) == headers.end());
+}
+
+void apply_h2_content_metadata(CoroHttpResponse& response, const ResponseContentPolicy& policy) {
+    assert(policy.suppressed);
+    assert(response.body_bytes().empty() && !response.stream_producer);
+    remove_all_headers(response.headers, "Transfer-Encoding");
+    if (response.status == 204) {
+        remove_all_headers(response.headers, "Content-Length");
+    } else if (policy.implicit_length &&
+               (policy.fixed_length || response.headers.find("Content-Length") == response.headers.end())) {
+        char length[20];
+        const auto [end, ec] = std::to_chars(length, length + sizeof(length), policy.representation_length);
+        assert(ec == std::errc{});
+        (void)ec;
+        // A full store may omit this optional derived HEAD/304 metadata.
+        response.headers.set("Content-Length", {length, static_cast<std::size_t>(end - length)});
+    }
+}
+
 // =====================================================================
 // Incremental streaming (STATION-96) — cleartext HTTP/1.1 chunked output.
 // =====================================================================
@@ -310,40 +368,49 @@ FixedStreamResult stream_fixed_h1(int fd, CoroHttpResponse& response, bool keep_
     return peer_gone ? FixedStreamResult::kPeerGone : FixedStreamResult::kComplete;
 }
 
-// Convert a fixed-length streaming response into a buffered one for transports
-// that cannot do the per-chunk synchronous socket write (TLS H1, HTTP/2,
-// HTTP/3). Reconciles Content-Length with what the producer ACTUALLY emitted so
-// the frame is always self-consistent, and reports whether that matched the
-// declaration — a mismatch still closes the connection (the frame is fine, but
-// the response is wrong and the caller must find out).
-bool materialize_fixed(CoroHttpResponse& response) {
+// TLS H1/H2 fallback: validate the entire fixed representation before headers.
+// The void sink refuses further writes after an overrun; finite producer work
+// must still return. This bounds retained bytes, not producer execution time.
+bool materialize_fixed(CoroHttpResponse& response, std::size_t capacity) {
     assert(response.fixed_stream_length >= 0);
     assert(response.stream_producer != nullptr);
 
     const uint64_t declared = static_cast<uint64_t>(response.fixed_stream_length);
+    if (declared > capacity) return false;  // no reserve or producer invocation
     std::string acc;
+    if (declared > acc.max_size()) return false;
     acc.reserve(static_cast<std::size_t>(declared));
-    response.stream_producer(
-        [&acc](std::string_view s) { acc.append(s.data(), s.size()); });
-    const bool matched = (acc.size() == declared);
-
+    bool overrun = false;
+    response.stream_producer([&acc, declared, &overrun](std::string_view s) {
+        if (overrun || s.empty()) return;
+        if (s.size() > declared - acc.size()) { overrun = true; return; }
+        acc.append(s.data(), s.size());
+    });
+    response.stream_producer = nullptr;
+    assert(acc.size() <= declared && acc.size() <= capacity);
+    if (overrun || acc.size() != declared) return false;
     response.body                = std::move(acc);
-    response.stream_producer     = nullptr;
+    response.borrowed_data       = nullptr;
+    response.borrowed_size       = 0;
     response.fixed_stream_length = CoroHttpResponse::kNoFixedLength;
-    response.headers.remove("Transfer-Encoding");
+    remove_all_headers(response.headers, "Transfer-Encoding");
+    remove_all_headers(response.headers, "Content-Length");
     char buf[24];
     const int m = std::snprintf(buf, sizeof(buf), "%zu", response.body.size());
     assert(m > 0 && static_cast<std::size_t>(m) < sizeof(buf));
     response.headers.set("Content-Length",
                          std::string_view(buf, static_cast<std::size_t>(m)));
-    if (!matched) {
-        std::fprintf(stderr,
-                     "[boltapi] send_fixed: declared %llu bytes, producer emitted %zu "
-                     "-- Content-Length corrected, closing connection\n",
-                     static_cast<unsigned long long>(declared), response.body.size());
-    }
     assert(response.stream_producer == nullptr);
-    return matched;
+    return true;
+}
+
+void refuse_fixed_materialization(CoroHttpResponse& response) {
+    response = CoroHttpResponse{};  // discard every stale representation field
+    response.status = 500;
+    response.status_message = "Internal Server Error";
+    response.headers.set("Content-Length", "0");
+    assert(response.body_bytes().empty());
+    assert(!response.stream_producer && !response.is_fixed_stream());
 }
 
 // Run a streaming producer's writes into `response.body` as a flat concatenation
@@ -870,6 +937,11 @@ int CoroUnifiedServer::start() {
 }
 
 int CoroUnifiedServer::start_background() {
+    if (config_.max_fixed_materialization_bytes == 0 ||
+        static_cast<uint64_t>(config_.max_fixed_materialization_bytes) > kMaxFixedResponseBytes) {
+        error_message_ = "invalid max_fixed_materialization_bytes";
+        return -1;
+    }
     CoroShutdownState expected = CoroShutdownState::STOPPED;
     if (!shutdown_state_.compare_exchange_strong(expected, CoroShutdownState::RUNNING)) {
         error_message_ = "Server already running or draining";
@@ -1810,6 +1882,8 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
             response.body = "Hello, World!";
         }
 
+        const ResponseContentPolicy content_policy = prepare_response_content(response, req.method == "HEAD");
+
         // STATION-96: incremental streaming response. When the handler set a
         // stream producer (Response::stream) on a cleartext HTTP/1.1 connection,
         // drive it here: Transfer-Encoding: chunked headers, then each producer
@@ -1818,10 +1892,6 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
         // (a synchronous per-chunk TLS write isn't available on this path); the
         // frames are byte-identical, only the incremental flush is lost. The
         // buffered/chunked path below is UNCHANGED for the non-streaming case.
-        // Latched by a fixed-length body whose produced size did not match its
-        // declaration. The buffered path below re-reads keep_alive from the
-        // request, so the decision has to survive in its own flag.
-        bool force_close = false;
         bool streamed = false;
         if (response.is_fixed_stream()) {
             // Fixed-length (identity) streaming: Content-Length, no chunking —
@@ -1850,8 +1920,9 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
                     streamed = true;
                 }
             } else {
-                if (!materialize_fixed(response)) force_close = true;
-                // -> normal buffered path below, Content-Length reconciled.
+                if (!materialize_fixed(response, config_.max_fixed_materialization_bytes))
+                    refuse_fixed_materialization(response);
+                // -> normal buffered path below; failures are fresh empty500.
             }
         } else if (response.stream_producer) {
             if (tls == nullptr) {
@@ -1888,7 +1959,8 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
         // Check if chunked transfer encoding is requested (no allocation).
         bool use_chunked = false;
         auto transfer_encoding_it = response.headers.find("Transfer-Encoding");
-        if (!streamed && transfer_encoding_it != response.headers.end() &&
+        if (!streamed && !content_policy.suppressed &&
+            transfer_encoding_it != response.headers.end() &&
             contains_ci(transfer_encoding_it->value, "chunked")) {
             use_chunked = true;
         }
@@ -1915,14 +1987,23 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
         // an EXPLICIT Content-Length is never overwritten and is emitted by the
         // header loop below — which is what lets a HEAD reply declare a length
         // with no body at all.
-        if (!use_chunked && response.headers.find("Content-Length") == response.headers.end()) {
+        if (!use_chunked && content_policy.implicit_length &&
+            (content_policy.fixed_length ||
+             response.headers.find("Content-Length") == response.headers.end())) {
             resp_str += "Content-Length: ";
-            append_uint(resp_str, out_body.size());
+            append_uint(resp_str, content_policy.suppressed
+                ? content_policy.representation_length : out_body.size());
             resp_str += "\r\n";
         }
 
         // Add headers (skip zstd content-encoding as browsers don't support it)
         for (const auto& [name, value] : response.headers) {
+            if (content_policy.suppressed &&
+                (ieq_ascii(name, "transfer-encoding") ||
+                 (ieq_ascii(name, "content-length") &&
+                  (response.status == 204 || content_policy.fixed_length)))) {
+                continue;
+            }
             // Skip ANY content-encoding with zstd value (branchless ci key check).
             if (ieq_ascii(name, "content-encoding") && value == "zstd") {
                 continue;  // Skip zstd header - browser will fail to decode
@@ -1933,10 +2014,9 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
             resp_str += "\r\n";
         }
 
-        // Check keep-alive. force_close is latched when a fixed-length body's
-        // produced size disagreed with its declaration: the frame was corrected
-        // but the response is wrong, so the connection does not get reused.
-        keep_alive = parsed_req.keep_alive && !force_close;
+        // Materialization failures occur before headers and carry a complete
+        // empty500, so they preserve ordinary connection reuse.
+        keep_alive = parsed_req.keep_alive;
         if (!keep_alive) {
             resp_str += "Connection: close\r\n";
         }
@@ -2166,11 +2246,15 @@ core::coro_task<void> CoroUnifiedServer::handle_http2_connection(
             // chunked transfer-encoding, so a streaming producer is materialized
             // into a buffered body here (byte-identical frames, not incremental)
             // and the hop-by-hop Transfer-Encoding header is stripped.
-            if (response.is_fixed_stream()) {
-                // Fixed-length streaming on H2: same bytes, H2's own DATA
-                // framing. Content-Length is reconciled to what was produced.
-                (void)materialize_fixed(response);
-                response.headers.remove("Transfer-Encoding");
+            if (h2_conn.get_stream(pending.stream_id) == nullptr) continue;
+            const ResponseContentPolicy content_policy =
+                prepare_response_content(response, pending.request.method == "HEAD");
+            if (content_policy.suppressed) {
+                apply_h2_content_metadata(response, content_policy);
+            } else if (response.is_fixed_stream()) {
+                // Validate fixed bytes before any H2 success HEADERS.
+                if (!materialize_fixed(response, config_.max_fixed_materialization_bytes))
+                    refuse_fixed_materialization(response);
             } else if (response.stream_producer) {
                 materialize_stream(response, /*drop_transfer_encoding=*/true);
             }
@@ -2183,12 +2267,16 @@ core::coro_task<void> CoroUnifiedServer::handle_http2_connection(
             }
 
             // Send response on the HTTP/2 stream
-            h2_conn.send_response(
+            const auto sent = h2_conn.send_response(
                 pending.stream_id,
                 response.status,
                 response.headers,
                 response.body
             );
+            if (sent.is_err() && h2_conn.get_stream(pending.stream_id) != nullptr) {
+                const auto reset = h2_conn.send_rst_stream(pending.stream_id, http2::ErrorCode::INTERNAL_ERROR);
+                if (reset.is_err()) break;
+            }
         }
         pending_requests.clear();
 

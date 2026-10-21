@@ -47,6 +47,37 @@ namespace {
 constexpr uint16_t kPort = 19277;  // distinct from the other socket suites
 constexpr std::size_t kObjSize = 4096;
 constexpr std::size_t kLargeSize = 8u * 1024u * 1024u;
+std::atomic<unsigned> g_suppressed_fixed_calls{0}, g_suppressed_chunked_calls{0};
+constexpr std::array<const char*, 5> kBodyShapes = {
+    "buffered", "owned", "borrowed", "fixed", "chunked"};
+
+void set_bodyless_shape(api::Response& res, std::size_t shape, uint16_t status) {
+    res.status(status);
+    switch (shape) {
+    case 0: res.text("FORBIDDEN"); break;
+    case 1: res.send_owned(std::string("FORBIDDEN")); break;
+    case 2: res.send_borrowed("FORBIDDEN"); break;
+    case 3:
+        res.send_fixed(9, [](const api::Response::StreamSink& sink) {
+            g_suppressed_fixed_calls.fetch_add(1);
+            sink("FORBIDDEN");
+        });
+        break;
+    case 4:
+        res.stream("text/plain", [](const api::Response::StreamSink& sink) {
+            g_suppressed_chunked_calls.fetch_add(1);
+            sink("FORBIDDEN");
+        });
+        break;
+    default: ADD_FAILURE() << "unknown body shape";
+    }
+    if (status == 204) {
+        res.raw().headers.append("Content-Length", "999");
+        res.raw().headers.append("content-length", "999");
+        res.raw().headers.append("Transfer-Encoding", "chunked");
+        res.raw().headers.append("transfer-encoding", "chunked");
+    }
+}
 
 // Process-lifetime bytes: exactly the lifetime class send_borrowed requires
 // (valid until well after the response is written).
@@ -229,6 +260,62 @@ RawResponse do_request(const char* method, const char* target,
     return out;
 }
 
+struct BodylessPair {
+    std::string first_head;
+    std::string next_wire;
+    bool closed = false;
+};
+
+// Read ONLY the first headers, byte by byte. Any forbidden body or final chunk
+// must remain in front of response 2; read_one(head_request) cannot prove this.
+BodylessPair bodyless_then_get(const char* method, const char* target,
+                              uint16_t port = kPort, const char* next = "/buf") {
+    BodylessPair pair;
+    const int fd = connect_client(port);
+    if (fd < 0) return pair;
+    bool ok = send_all(fd, make_request(method, target, false));
+    char c = 0;
+    for (unsigned i = 0; ok && i < (1u << 16); ++i) {
+        ok = sys::recv_bytes(fd, &c, 1) == 1;
+        if (!ok) break;
+        pair.first_head += c;
+        if (pair.first_head.ends_with("\r\n\r\n")) break;
+    }
+    ok = ok && pair.first_head.ends_with("\r\n\r\n") &&
+        send_all(fd, make_request("GET", next, true));
+    char buf[4096];
+    for (unsigned i = 0; ok && i < 16; ++i) {
+        const ssize_t n = sys::recv_bytes(fd, buf, sizeof(buf));
+        if (n == 0) { pair.closed = true; break; }
+        if (n < 0) break;
+        pair.next_wire.append(buf, static_cast<std::size_t>(n));
+    }
+    sys::close_socket(fd);
+    return pair;
+}
+
+void expect_bodyless_shapes(const char* method, uint16_t status) {
+    const unsigned fixed_before = g_suppressed_fixed_calls.load();
+    const unsigned chunked_before = g_suppressed_chunked_calls.load();
+    for (std::size_t shape = 0; shape < kBodyShapes.size(); ++shape) {
+        const std::string target = "/bodyless/" + std::to_string(status) + "/" + kBodyShapes[shape];
+        SCOPED_TRACE(std::string(method) + " " + target);
+        const BodylessPair pair = bodyless_then_get(method, target.c_str());
+        ASSERT_TRUE(pair.closed);
+        ASSERT_TRUE(pair.first_head.starts_with("HTTP/1.1 " + std::to_string(status) + " "));
+        EXPECT_TRUE(header_value_ci(pair.first_head, "Transfer-Encoding").empty());
+        EXPECT_EQ(header_value_ci(pair.first_head, "Content-Length"),
+                  status == 204 || shape == 4 ? "" : "9");
+        ASSERT_TRUE(pair.next_wire.starts_with("HTTP/1.1 200 OK\r\n")) << pair.next_wire;
+        const std::size_t end = pair.next_wire.find("\r\n\r\n");
+        ASSERT_NE(end, std::string::npos);
+        EXPECT_EQ(header_value_ci(pair.next_wire.substr(0, end), "Content-Length"), "11");
+        EXPECT_EQ(pair.next_wire.substr(end + 4), "BUFFERED-OK");
+    }
+    EXPECT_EQ(g_suppressed_fixed_calls.load(), fixed_before);
+    EXPECT_EQ(g_suppressed_chunked_calls.load(), chunked_before);
+}
+
 // ---------------------------------------------------------------------------
 class FixedLengthResponse : public ::testing::Test {
 protected:
@@ -240,6 +327,25 @@ protected:
         // Control: the classic buffered path must stay byte-identical.
         app_->get("/buf", [](api::Request&, api::Response& res) {
             res.ok().text("BUFFERED-OK");
+        });
+
+        for (const uint16_t status : std::array<uint16_t, 3>{200, 204, 304}) {
+            for (std::size_t shape = 0; shape < kBodyShapes.size(); ++shape) {
+                const std::string path = "/bodyless/" + std::to_string(status) + "/" + kBodyShapes[shape];
+                const auto handler = [shape, status](api::Request&, api::Response& res) {
+                    set_bodyless_shape(res, shape, status);
+                };
+                app_->head(path, handler);
+                if (status != 200) app_->get(path, handler);
+            }
+        }
+        app_->head("/bodyless/fullfixed", [](api::Request&, api::Response& res) {
+            for (unsigned i = 0; i < api::http::CoroResponseHeaders::MAX_RESPONSE_HEADERS; ++i)
+                res.raw().headers.append("X-Fill-" + std::to_string(i), "x");
+            set_bodyless_shape(res, 3, 200);  // builder cannot append its length
+        });
+        app_->get("/bodyless/metadata304", [](api::Request&, api::Response& res) {
+            res.status(304).content_length(99).send_borrowed("FORBIDDEN");
         });
 
         // Control: the classic chunked stream must stay chunked.
@@ -450,6 +556,37 @@ TEST_F(FixedLengthResponse, HeadDeclaresLengthWithEmptyBody) {
     EXPECT_FALSE(r.chunked);
 }
 
+TEST_F(FixedLengthResponse, HeadSuppressesEveryBodyShapeBeforeNextResponse) {
+    expect_bodyless_shapes("HEAD", 200);
+}
+
+TEST_F(FixedLengthResponse, NoContentSuppressesEveryBodyShapeAndFraming) {
+    expect_bodyless_shapes("GET", 204);
+}
+
+TEST_F(FixedLengthResponse, NotModifiedSuppressesEveryBodyShapeRetainingLength) {
+    expect_bodyless_shapes("GET", 304);
+}
+
+TEST_F(FixedLengthResponse, HeadNoContentStillForbidsContentLength) {
+    expect_bodyless_shapes("HEAD", 204);
+}
+
+TEST_F(FixedLengthResponse, SuppressedLengthSurvivesFullHeadersAndExplicitMetadata) {
+    const unsigned before = g_suppressed_fixed_calls.load();
+    const BodylessPair full = bodyless_then_get("HEAD", "/bodyless/fullfixed");
+    ASSERT_TRUE(full.closed);
+    EXPECT_EQ(header_value_ci(full.first_head, "Content-Length"), "9");
+    EXPECT_TRUE(full.next_wire.starts_with("HTTP/1.1 200 OK\r\n"));
+    EXPECT_TRUE(full.next_wire.ends_with("\r\n\r\nBUFFERED-OK"));
+    EXPECT_EQ(g_suppressed_fixed_calls.load(), before);
+    const BodylessPair metadata = bodyless_then_get("GET", "/bodyless/metadata304");
+    ASSERT_TRUE(metadata.closed);
+    EXPECT_EQ(header_value_ci(metadata.first_head, "Content-Length"), "99");
+    EXPECT_TRUE(metadata.next_wire.starts_with("HTTP/1.1 200 OK\r\n"));
+    EXPECT_TRUE(metadata.next_wire.ends_with("\r\n\r\nBUFFERED-OK"));
+}
+
 // --- The declared-length guarantee -----------------------------------------
 
 TEST_F(FixedLengthResponse, OverProducingProducerIsRefusedAtDeclaredLength) {
@@ -620,6 +757,13 @@ protected:
         app_->get("/small", [](api::Request&, api::Response& res) {
             res.send_fixed(5, [](const api::Response::StreamSink& sink) { sink("SMALL"); });
         });
+        app_->get("/buffered", [](api::Request&, api::Response& res) { res.text("NEXT"); });
+        app_->head("/suppressed", [this](api::Request&, api::Response& res) {
+            res.send_fixed(9, [this](const api::Response::StreamSink& sink) {
+                suppressed_calls_.fetch_add(1);
+                sink("FORBIDDEN");
+            });
+        });
         ASSERT_EQ(app_->start_background("127.0.0.1", kLifecyclePort), 0);
     }
     void TearDown() override {
@@ -654,7 +798,26 @@ protected:
     api::App* app_ = nullptr;
     std::atomic<bool> started_{false};
     std::atomic<bool> finished_{false};
+    std::atomic<unsigned> suppressed_calls_{0};
 };
+
+TEST_F(FixedStreamLifecycle, HeadNeedsNoSlotWhenFixedCapacityIsOccupied) {
+    const int fd = hold_body();
+    ASSERT_GE(fd, 0);
+    const BodylessPair pair = bodyless_then_get("HEAD", "/suppressed",
+                                               kLifecyclePort, "/buffered");
+    EXPECT_TRUE(pair.closed);
+    EXPECT_TRUE(pair.first_head.starts_with("HTTP/1.1 200 OK\r\n"));
+    EXPECT_EQ(header_value_ci(pair.first_head, "Content-Length"), "9");
+    EXPECT_TRUE(pair.next_wire.starts_with("HTTP/1.1 200 OK\r\n"));
+    EXPECT_TRUE(pair.next_wire.ends_with("\r\n\r\nNEXT"));
+    EXPECT_EQ(suppressed_calls_.load(), 0u);
+    linger reset{1, 0};
+    EXPECT_EQ(::setsockopt(fd, SOL_SOCKET, SO_LINGER,
+                          reinterpret_cast<const char*>(&reset), sizeof(reset)), 0);
+    sys::close_socket(fd);
+    EXPECT_TRUE(wait_finished());
+}
 
 TEST_F(FixedStreamLifecycle, ExhaustionRefusesBeforeHeadersAndResetReleasesSlot) {
     const int fd = hold_body();
