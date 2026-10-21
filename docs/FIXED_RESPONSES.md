@@ -38,6 +38,14 @@ Append-only config changes still change its C++ layout:
 rebuild the BoltAPI library and every consumer against the same header revision.
 Do not mix old and new binaries.
 
+The normal `App` configuration passes this field through both startup paths:
+
+```cpp
+bolt::api::App::Config config;
+config.server.max_fixed_materialization_bytes = 32u * 1024u * 1024u;
+bolt::api::App app(config);
+```
+
 `send_fixed` and its producer signature did not change. The documented
 transport behavior is H1/H2 only; the current HTTP/3 source path has separate
 source-derived fixed-body and bodyless-response issues and no matching runtime
