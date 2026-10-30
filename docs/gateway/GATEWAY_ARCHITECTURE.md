@@ -122,7 +122,7 @@ re-target (or 404) based on header predicates.
 | Cross-thread handoff (if any) | `bolt::SPSC/MPSC` | bounded, lock-free, backpressure |
 | Worker/IO affinity | `bolt::CpuTopology` | thread-per-core pinning (already in engine) |
 
-Per CLAUDE.md: **prefer Bolt over third-party** — `SwissTable` not
+Per `CONTRIBUTING.md`: **prefer Bolt over third-party** — `SwissTable` not
 `std::unordered_map`, `Arena` not `malloc`, bolt channels not `std::queue`. The
 FasterAPI rate limiter we port (FEATURES) uses `std::unordered_map`+`shared_mutex`
 today; re-homing it onto sharded `SwissTable` is part of that port.

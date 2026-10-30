@@ -14,14 +14,14 @@ There is **no simdjson, no nlohmann, nothing hand-rolled**. Rationale:
   engine: `noexcept` everywhere, no STL in production code, all allocation
   through `bolt::Arena`.
 - **Faster than simdjson on Bolt's target workloads.** Per Bolt's research
-  log [`extern/bolt/docs/research/json-fionn.md`](../extern/bolt/docs/research/json-fionn.md),
+  log [`extern/bolt/docs/research/json-fionn.md`](https://github.com/Ugbot/bolt/blob/main/docs/research/json-fionn.md),
   fionn's skip-aware architecture reaches 8+ GiB/s (the upstream Rust project
   reports ~29.5x serde_json; the AVX2 path 4–8 GiB/s) by traversing JSON in a
   **single pass** and **never materialising a DOM tree**. Strings and numbers
   are zero-copy slices of the input; numbers are parsed lazily on demand. For
   selective field extraction it does O(1)-ish memory instead of
   O(document-size). The companion note
-  [`json-skip-architecture.md`](../extern/bolt/docs/research/json-skip-architecture.md)
+  [`json-skip-architecture.md`](https://github.com/Ugbot/bolt/blob/main/docs/research/json-skip-architecture.md)
   measures the path-filter skip at ~98.6% token reduction on its synthetic
   benchmark.
 - **Right shape for request handling.** A request body is parsed once, fields

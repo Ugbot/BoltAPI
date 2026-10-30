@@ -1,7 +1,7 @@
 # Dispatch & threading perf — diagnosis, work, measurements
 
 Tracking the work to make BoltAPI's HTTP/1.1 dispatch path match/beat Drogon.
-Plan: `~/.claude/plans/foamy-munching-reddy.md`. Harness: `benchmarks/tfb/`.
+Harness: `benchmarks/tfb/`. Remaining slices: [`THREAD_PER_CORE_REMAINING.md`](THREAD_PER_CORE_REMAINING.md).
 
 > **Measurement caveat:** numbers below were taken on a **loaded, thermally-busy
 > 16-core dev box** under Docker-Desktop/WSL2 (server + wrk share the host CPU).
@@ -108,8 +108,8 @@ fd-slot atomics. This is the motivation for Phase 3.
 
 ## Next — Phase 3: thread-per-core (epoll → io_uring) + zero-alloc dispatch
 
-Traceable punch-card: **`docs/THREAD_PER_CORE_REMAINING.md`** (slices A–E). Full
-design + decision rationale: `~/.claude/plans/foamy-munching-reddy.md`.
+Traceable checklist: **`docs/THREAD_PER_CORE_REMAINING.md`** (slices A–E), which
+also carries the design + decision rationale.
 
 Per-thread engine instance + connection sharding (each connection pinned to one IO
 thread for its lifetime; SO_REUSEPORT accept per thread) + CPU affinity (bolt_topology).
@@ -117,6 +117,6 @@ Removes the shared-epoll contention/thundering-herd → collapses the tail, scal
 linearly with cores, needs far fewer IO threads. Pinning also makes a per-IO-thread
 frame arena safe → kills the last allocs/request (the 3840 B dispatch frame). Then a
 real **io_uring ring-per-thread** backend (raw syscalls, epoll stays the fallback) for
-the next 2–2.3×. Research (this session) confirmed thread-per-core + worker-offload
-hybrid beats the "one IO loop + workers" reactor pattern for our trivial-handler goal.
-Re-measure on an idle box for trustworthy absolutes.
+the next 2–2.3×. Prior art confirms a thread-per-core + worker-offload hybrid beats
+the "one IO loop + workers" reactor pattern for the trivial-handler goal.
+Re-measure on an idle machine for trustworthy absolutes.
