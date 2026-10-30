@@ -1,5 +1,11 @@
 # Bolt API — Project Map
 
+Shared-state alignment follows `bolt::config::kCacheIsolationBytes` (CMake
+`BOLT_CACHE_ISOLATION_BYTES=AUTO|64|128`; AUTO is Apple ARM64 128, otherwise 64).
+Channel slot alignment is independently configurable, default 64. Rebuild all
+consumers together when changing this C++ layout policy; dense and wire layouts
+retain their existing alignment.
+
 > What exists and its status. Updated as work lands. Design rationale and the
 > per-area plans live in [`docs/`](docs/README.md); `FasterAPI` below refers to
 > this project's predecessor, whose HTTP engine BoltAPI hard-forked.
