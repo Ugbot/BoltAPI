@@ -1111,7 +1111,8 @@ int CoroUnifiedServer::start_background() {
     // Create cleartext HTTP/1.1 listener
     if (config_.enable_http1_cleartext) {
         net::CoroTcpListenerConfig http1_listener_config;
-        http1_listener_config.host = config_.host;
+        const std::string& http1_host = config_.http1_host.empty() ? config_.host : config_.http1_host;
+        http1_listener_config.host = http1_host;
         http1_listener_config.port = config_.http1_port;
         http1_listener_config.backlog = config_.backlog;
         http1_listener_config.num_io_threads = config_.num_io_threads;
@@ -1139,7 +1140,7 @@ int CoroUnifiedServer::start_background() {
             return -1;
         }
 
-        std::cout << "  HTTP/1.1 cleartext: " << config_.host << ":" << config_.http1_port << std::endl;
+        std::cout << "  HTTP/1.1 cleartext: " << http1_host << ":" << config_.http1_port << std::endl;
     }
 
     std::cout << "CoroUnifiedServer started" << std::endl;

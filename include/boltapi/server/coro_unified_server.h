@@ -357,6 +357,9 @@ struct CoroUnifiedServerConfig {
     bool enable_tls = true;
     uint16_t tls_port = 443;
     std::string host = "0.0.0.0";
+    // Bind the cleartext HTTP/1.1 listener here instead of `host`, so TLS can
+    // face the network while cleartext stays on loopback. Empty = `host`.
+    std::string http1_host;
 
     // Certificate configuration
     std::string cert_file;
