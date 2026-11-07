@@ -536,6 +536,12 @@ bool ExtendedSession::materialize(std::int32_t pi, int fd, MsgWriter& w,
         p.materialized = true;
         return true;
     }
+    if (exec.session_statement(sql, &p.session_tag, qf)) {
+        if (qf.message != nullptr && qf.message[0] != '\0') return false;
+        p.field_count  = 0;
+        p.materialized = true;
+        return true;
+    }
     CodecError ce;
     const SessionCommand sc = classify_session_command(sql, p.session_tag, ce);
     if (sc == SessionCommand::Refused) {

@@ -109,6 +109,9 @@ struct CoroHttpRequest {
     // never found anything — fixed by carrying the query through explicitly.
     std::string_view query;
     std::string_view body;
+    // The connection's socket, for a handler that watches for the peer leaving.
+    // -1 where no socket exists (HTTP/3, tests). Never read or write it.
+    int client_fd = -1;
 
     CoroHttpHeaderView headers[MAX_HEADERS];
     size_t header_count = 0;

@@ -130,6 +130,11 @@ void handle_simple_query(int fd, MsgWriter& w, ExtendedSession& ext,
             else if (e == ExtendedSession::Emit::Done) send_ready_for_query(fd, w, ext.tx_status());
             return;
         }
+        if (exec.session_statement(sql, &tag, qf)) {
+            if (qf.message != nullptr && qf.message[0] != '\0') simple_fail(fd, w, ext, qf.sqlstate, qf.message);
+            else simple_tag(fd, w, ext, tag);
+            return;
+        }
         CodecError ce;
         const SessionCommand sc = classify_session_command(sql, tag, ce);
         if (sc == SessionCommand::Refused) {
@@ -320,6 +325,7 @@ void Protocol::serve_connection(int fd, IQueryExecutor& exec, std::uint16_t work
                                 detail::ExtendedSession& ext) noexcept {
     assert(fd >= 0);
     assert(in.size() >= kMaxStartupPacket && out.size() >= 16);
+    exec.connection_opened(fd);
     {
         (void)conn_seq_.fetch_add(1, std::memory_order_relaxed);
         ext.reset();
