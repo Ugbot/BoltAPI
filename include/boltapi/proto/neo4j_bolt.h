@@ -49,6 +49,8 @@
 #include "bolt/api/core/stacked_thread.h"
 #include <vector>
 
+namespace bolt::api::net { class TlsContext; }
+
 namespace bolt::api {
 namespace proto {
 namespace neo4j {
@@ -165,6 +167,14 @@ public:
                              std::uint32_t& out_field_count,
                              QueryFailure& out_failure) noexcept = 0;
 
+    // What the client said around a statement, from the RUN or BEGIN extra
+    // dictionary. Delivered before begin_query / begin_tx; `db` is borrowed like
+    // `cypher`.
+    struct StatementContext {
+        std::string_view db;                  // empty = the default database
+    };
+    virtual void statement_context(const StatementContext& ctx) noexcept { (void)ctx; }
+
     // Stream at most `n` records into `sink` (kPullAll = every remaining one).
     // Set out_has_more when records remain. Return false + out_failure on error.
     virtual bool pull(std::int64_t n, IRecordSink& sink, bool& out_has_more,
@@ -251,6 +261,10 @@ struct Config {
     // execute on each worker; a platform-default secondary-thread stack
     // (512 KiB on macOS) is exhausted by an ordinary query.
     std::size_t worker_stack_bytes = core::kDefaultStackBytes;
+
+    // PEM files. Both set = every connection is TLS (bolt+s / bolt+ssc).
+    std::string tls_cert_file;
+    std::string tls_key_file;
 
     // Per-worker buffers, allocated once at serve() start.
     std::uint32_t message_buffer_bytes = 1u << 20;  // largest inbound message
@@ -356,6 +370,7 @@ private:
                           std::uint8_t* out, void* arena_mem) noexcept;
 
     Config              cfg_;
+    std::shared_ptr<::bolt::api::net::TlsContext> tls_;
     IExecutorFactory&   factory_;
     IAuthenticator*     auth_;
     AcceptAnyAuthenticator default_auth_{};
