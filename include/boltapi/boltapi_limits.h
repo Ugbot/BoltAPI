@@ -38,6 +38,9 @@
     X(bolt_max_path_hops, kInvariant, "hops", ::bolt::api::kBoltMaxPathHops,    \
       ::bolt::api::kBoltMaxPathHops, ::bolt::api::kBoltMaxPathHops, nullptr,    \
       nullptr, "hops in one Neo4j Bolt Path value; longer is refused")          \
+    X(bolt_tls_write_retries, kInvariant, "retries", ::bolt::api::kBoltTlsWriteRetries, \
+      ::bolt::api::kBoltTlsWriteRetries, ::bolt::api::kBoltTlsWriteRetries, nullptr, \
+      nullptr, "SSL_write retries on one Neo4j Bolt TLS write")                 \
     X(router_max_params, kInvariant, "params", ::bolt::api::kMaxParams,          \
       ::bolt::api::kMaxParams, ::bolt::api::kMaxParams, nullptr, nullptr,       \
       "path parameters captured per route match")                               \

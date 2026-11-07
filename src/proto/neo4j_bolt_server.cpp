@@ -22,7 +22,10 @@
 #if defined(BOLTAPI_WITH_NEO4J_BOLT)
 
 #include "boltapi/net/sys_compat.h"
+#include "boltapi/net/tls_context.h"
 #include "socket_wait.h"
+
+#include <openssl/ssl.h>
 
 #include <cstdio>
 #include <cstring>
@@ -52,6 +55,54 @@ int wait_readable(int fd, int timeout_ms) noexcept {
     return ::bolt::api::proto::detail::wait_readable(fd, timeout_ms);
 }
 
+// The TLS session of the connection this worker serves, or null. One worker
+// serves one connection at a time.
+thread_local SSL* t_ssl = nullptr;
+
+// >0 bytes read, 0 try again, <0 closed or failed.
+ssize_t conn_read(int fd, void* p, std::size_t n) noexcept {
+    if (t_ssl == nullptr) {
+        const ssize_t r = net::sys::recv_bytes(fd, p, n);
+        return r <= 0 ? -1 : r;
+    }
+    const int r = SSL_read(t_ssl, p, n > 0x40000000u ? 0x40000000 : static_cast<int>(n));
+    if (r > 0) return r;
+    const int e = SSL_get_error(t_ssl, r);
+    return (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) ? 0 : -1;
+}
+
+ssize_t conn_write(int fd, const void* p, std::size_t n) noexcept {
+    if (t_ssl == nullptr) return net::sys::send_bytes(fd, p, n);
+    for (std::uint32_t tries = 0; tries < ::bolt::api::kBoltTlsWriteRetries; ++tries) {
+        const int w = SSL_write(t_ssl, p, n > 0x40000000u ? 0x40000000 : static_cast<int>(n));
+        if (w > 0) return w;
+        const int e = SSL_get_error(t_ssl, w);
+        if (e != SSL_ERROR_WANT_READ && e != SSL_ERROR_WANT_WRITE) return -1;
+    }
+    return -1;
+}
+
+// Server-side handshake, bounded by socket timeouts.
+SSL* tls_accept(SSL_CTX* ctx, int fd, int timeout_ms) noexcept {
+    assert(ctx != nullptr && fd >= 0);
+#if defined(_WIN32)
+    const DWORD tv = static_cast<DWORD>(timeout_ms);
+#else
+    timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+#endif
+    (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
+    (void)::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
+    SSL* ssl = SSL_new(ctx);
+    if (ssl == nullptr) return nullptr;
+    if (SSL_set_fd(ssl, fd) != 1 || SSL_accept(ssl) != 1) {
+        SSL_free(ssl);
+        return nullptr;
+    }
+    return ssl;
+}
+
 // Read exactly `n` bytes, honouring an overall idle budget. Returns true on a
 // complete read; false on peer close, timeout, error, or shutdown.
 bool read_exact(int fd, void* dst, std::size_t n, int poll_ms, int& idle_budget_ms,
@@ -62,15 +113,17 @@ bool read_exact(int fd, void* dst, std::size_t n, int poll_ms, int& idle_budget_
     std::size_t got = 0;
     while (got < n) {
         if (stopping.load(std::memory_order_acquire)) return false;
-        const int ready = wait_readable(fd, poll_ms);
-        if (ready < 0) return false;
-        if (ready == 0) {
-            idle_budget_ms -= poll_ms;
-            if (idle_budget_ms <= 0) return false;
-            continue;
+        if (t_ssl == nullptr || SSL_pending(t_ssl) == 0) {
+            const int ready = wait_readable(fd, poll_ms);
+            if (ready < 0) return false;
+            if (ready == 0) {
+                idle_budget_ms -= poll_ms;
+                if (idle_budget_ms <= 0) return false;
+                continue;
+            }
         }
-        const ssize_t r = net::sys::recv_bytes(fd, p + got, n - got);
-        if (r <= 0) return false;  // peer closed or error
+        const ssize_t r = conn_read(fd, p + got, n - got);
+        if (r < 0) return false;  // peer closed or error
         got += static_cast<std::size_t>(r);
         assert(got <= n);
     }
@@ -83,7 +136,7 @@ bool write_all(int fd, const void* src, std::size_t n) noexcept {
     std::size_t sent = 0;
     // Bounded: each iteration must make progress or we bail on the error path.
     while (sent < n) {
-        const ssize_t w = net::sys::send_bytes(fd, p + sent, n - sent);
+        const ssize_t w = conn_write(fd, p + sent, n - sent);
         if (w <= 0) return false;
         sent += static_cast<std::size_t>(w);
         assert(sent <= n);
@@ -332,6 +385,7 @@ private:
 
     bool on_hello(const PackValue& msg) noexcept;
     bool on_logon(const PackValue& msg) noexcept;
+    void deliver_context(const PackValue* extra) noexcept;
     bool on_run(const PackValue& msg) noexcept;
     bool on_pull(const PackValue& msg, bool discard) noexcept;
 
@@ -498,6 +552,16 @@ bool Connection::on_logon(const PackValue& msg) noexcept {
     return send_success_empty();
 }
 
+void Connection::deliver_context(const PackValue* extra) noexcept {
+    IQueryExecutor::StatementContext ctx;
+    ctx.client_fd = fd_;
+    if (extra != nullptr && extra->is_dict()) {
+        ctx.tx_timeout_ms = extra->find_int("tx_timeout", 0);
+        ctx.db = extra->find_str("db");
+    }
+    exec_.statement_context(ctx);
+}
+
 bool Connection::on_run(const PackValue& msg) noexcept {
     assert(msg.type == PackType::Struct);
     if (msg.len < 2 || msg.items[0].type != PackType::String) {
@@ -507,6 +571,7 @@ bool Connection::on_run(const PackValue& msg) noexcept {
     const PackValue& params = msg.items[1];
     QueryFailure fail{};
     field_count_ = 0;
+    deliver_context(msg.len >= 3 ? &msg.items[2] : nullptr);
     if (!exec_.begin_query(msg.items[0].str(), params, fields_, kMaxFields,
                            field_count_, fail)) {
         return send_failure(fail);
@@ -627,6 +692,7 @@ bool Connection::dispatch(const PackValue& msg) noexcept {
             }
             {
                 QueryFailure fail{};
+                deliver_context(msg.len >= 1 ? &msg.items[0] : nullptr);
                 if (!exec_.begin_tx(fail)) return send_failure(fail);
             }
             tx_open_ = true;
@@ -751,7 +817,16 @@ void Neo4jBoltProtocol::worker_loop(Neo4jBoltListener& listener, IQueryExecutor&
     while (!stopping_.load(std::memory_order_acquire)) {
         const int fd = listener.accept_one(cfg_.accept_poll_ms);
         if (fd < 0) continue;
-        serve_connection(fd, exec, in.data(), out.data(), arena_mem.data());
+        SSL* ssl = tls_ != nullptr ? tls_accept(tls_->get_ssl_ctx(), fd, cfg_.idle_timeout_ms) : nullptr;
+        if (tls_ == nullptr || ssl != nullptr) {
+            t_ssl = ssl;
+            serve_connection(fd, exec, in.data(), out.data(), arena_mem.data());
+            t_ssl = nullptr;
+        }
+        if (ssl != nullptr) {
+            (void)SSL_shutdown(ssl);
+            SSL_free(ssl);
+        }
         net::sys::close_socket(fd);
     }
 }
@@ -844,6 +919,16 @@ Status Neo4jBoltProtocol::listen_and_serve() {
 }
 
 Status Neo4jBoltProtocol::start_background() {
+    if (!cfg_.tls_cert_file.empty()) {
+        net::TlsContextConfig tc;
+        tc.cert_file = cfg_.tls_cert_file;
+        tc.key_file = cfg_.tls_key_file;
+        tls_ = net::TlsContext::create_server(tc);
+        if (tls_ == nullptr || !tls_->is_valid()) {
+            tls_.reset();
+            return Status(core::error_code::invalid_state);
+        }
+    }
     if (owned_listener_ != nullptr) return Status(core::error_code::invalid_state);
     owned_listener_ = std::make_unique<Neo4jBoltListener>(cfg_.bind);
     const Status s = owned_listener_->start();

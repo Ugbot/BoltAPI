@@ -120,6 +120,18 @@ class IQueryExecutor {
 public:
     virtual ~IQueryExecutor() = default;
 
+    // A new connection starts on this executor: `fd` is its socket. Executors
+    // are per worker, so per-connection state resets here.
+    virtual void connection_opened(int fd) noexcept { (void)fd; }
+
+    // A SET or RESET the host owns (query controls). True when it was one:
+    // *tag is the command tag, or out_failure.message is set on a bad value.
+    virtual bool session_statement(std::string_view sql, const char** tag,
+                                   QueryFailure& out_failure) noexcept {
+        (void)sql; (void)tag; (void)out_failure;
+        return false;
+    }
+
     // Compile + run `sql` (one Simple-Query-protocol statement — the wire
     // layer does not split a client's ';'-separated multi-statement string;
     // v1 treats it as one statement, matching what chukonu's parser accepts
