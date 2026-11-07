@@ -172,6 +172,11 @@ class IQueryExecutor {
 public:
     virtual ~IQueryExecutor() = default;
 
+    // A new connection starts on this executor: `fd` is its socket.
+    virtual void connection_opened(int fd) noexcept { (void)fd; }
+    // The RPC about to run asked for this deadline (grpc-timeout); 0 = none.
+    virtual void request_timeout(std::uint64_t timeout_ms) noexcept { (void)timeout_ms; }
+
     // Compile + run `sql`. On success `*out_ipc` holds a complete Arrow IPC
     // stream (Schema message, >= 1 RecordBatch, end-of-stream marker) and
     // `*out_rows` the total row count; the string is reused across calls.
