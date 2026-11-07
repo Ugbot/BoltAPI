@@ -168,9 +168,11 @@ public:
                              QueryFailure& out_failure) noexcept = 0;
 
     // What the client said around a statement, from the RUN or BEGIN extra
-    // dictionary. Delivered before begin_query / begin_tx; `db` is borrowed like
-    // `cypher`.
+    // dictionary, plus its socket. Delivered before begin_query / begin_tx; `db`
+    // is borrowed like `cypher`.
     struct StatementContext {
+        int              client_fd = -1;
+        std::int64_t     tx_timeout_ms = 0;   // 0 = none asked for
         std::string_view db;                  // empty = the default database
     };
     virtual void statement_context(const StatementContext& ctx) noexcept { (void)ctx; }
