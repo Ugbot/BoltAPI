@@ -58,7 +58,6 @@ int wait_readable(int fd, int timeout_ms) noexcept {
 // The TLS session of the connection this worker serves, or null. One worker
 // serves one connection at a time.
 thread_local SSL* t_ssl = nullptr;
-constexpr int kMaxTlsRetries = 1 << 16;
 
 // >0 bytes read, 0 try again, <0 closed or failed.
 ssize_t conn_read(int fd, void* p, std::size_t n) noexcept {
@@ -74,7 +73,7 @@ ssize_t conn_read(int fd, void* p, std::size_t n) noexcept {
 
 ssize_t conn_write(int fd, const void* p, std::size_t n) noexcept {
     if (t_ssl == nullptr) return net::sys::send_bytes(fd, p, n);
-    for (int tries = 0; tries < kMaxTlsRetries; ++tries) {
+    for (std::uint32_t tries = 0; tries < ::bolt::api::kBoltTlsWriteRetries; ++tries) {
         const int w = SSL_write(t_ssl, p, n > 0x40000000u ? 0x40000000 : static_cast<int>(n));
         if (w > 0) return w;
         const int e = SSL_get_error(t_ssl, w);
