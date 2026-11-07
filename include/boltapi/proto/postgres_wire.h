@@ -124,6 +124,15 @@ public:
     // are per worker, so per-connection state resets here.
     virtual void connection_opened(int fd) noexcept { (void)fd; }
 
+    // BackendKeyData for this connection; false sends none. A later
+    // CancelRequest carrying these two values reaches cancel_request(), on
+    // whichever executor takes that connection.
+    virtual bool backend_key(std::int32_t* pid, std::int32_t* secret) noexcept {
+        (void)pid; (void)secret;
+        return false;
+    }
+    virtual void cancel_request(std::int32_t pid, std::int32_t secret) noexcept { (void)pid; (void)secret; }
+
     // A SET or RESET the host owns (query controls). True when it was one:
     // *tag is the command tag, or out_failure.message is set on a bad value.
     virtual bool session_statement(std::string_view sql, const char** tag,

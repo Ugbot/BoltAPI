@@ -361,7 +361,10 @@ void Protocol::serve_connection(int fd, IQueryExecutor& exec, std::uint16_t work
                 if (!write_all(fd, &deny, 1)) break;
                 continue;  // client will resend a real StartupMessage next
             }
-            if (code == kCancelCode) break;  // no real query-cancel in v1
+            if (code == kCancelCode) {
+                if (body_len >= 12) exec.cancel_request(read_be_i32(in.data() + 4), read_be_i32(in.data() + 8));
+                break;   // the protocol answers a cancel with nothing
+            }
             if (code != kProtocolV3) {
                 send_error(fd, w, "08P01",
                           "gestaltd's Postgres-wire endpoint speaks protocol "
@@ -465,10 +468,12 @@ void Protocol::serve_connection(int fd, IQueryExecutor& exec, std::uint16_t work
                 w.put_cstring(cfg_.application_name);
                 if (w.finish()) (void)w.send(fd);
 
+                std::int32_t key_pid = static_cast<std::int32_t>(worker_id) + 1;
+                std::int32_t key_secret = static_cast<std::int32_t>(conn_seq_.load(std::memory_order_relaxed));
+                (void)exec.backend_key(&key_pid, &key_secret);   // a host without one keeps these inert values
                 w.begin('K');
-                w.put_i32(static_cast<std::int32_t>(worker_id) + 1);   // fabricated pid
-                w.put_i32(static_cast<std::int32_t>(
-                    conn_seq_.load(std::memory_order_relaxed)));       // fabricated secret
+                w.put_i32(key_pid);
+                w.put_i32(key_secret);
                 if (w.finish()) (void)w.send(fd);
 
                 send_ready_for_query(fd, w, 'I');
