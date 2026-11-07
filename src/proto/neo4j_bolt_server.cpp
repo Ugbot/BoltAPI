@@ -555,11 +555,7 @@ bool Connection::on_logon(const PackValue& msg) noexcept {
 
 void Connection::deliver_context(const PackValue* extra) noexcept {
     IQueryExecutor::StatementContext ctx;
-    ctx.client_fd = fd_;
-    if (extra != nullptr && extra->is_dict()) {
-        ctx.tx_timeout_ms = extra->find_int("tx_timeout", 0);
-        ctx.db = extra->find_str("db");
-    }
+    if (extra != nullptr && extra->is_dict()) ctx.db = extra->find_str("db");
     exec_.statement_context(ctx);
 }
 
