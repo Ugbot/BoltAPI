@@ -73,6 +73,7 @@ constexpr std::uint32_t kRecvWindow = 16u * 1024u * 1024u;
 constexpr int kMaxFramesPerWait = 1 << 20;
 constexpr int kMaxTlsRetries = 1024;
 constexpr int kMaxPollFrames = 4096;
+constexpr std::size_t kWriteCoalesce = 256u * 1024u;
 
 std::uint32_t be_u32(const std::uint8_t* p) noexcept {
     return (static_cast<std::uint32_t>(p[0]) << 24) |
@@ -205,11 +206,13 @@ private:
     bool write_all(const void* src, std::size_t n) noexcept;
     bool send_frame(std::uint8_t type, std::uint8_t flags, std::uint32_t sid,
                     const void* payload, std::size_t len) noexcept;
+    bool flush() noexcept;
     void goaway(std::uint32_t err) noexcept {
         std::uint8_t p[8];
         put_be_u32(p, last_stream_id_);
         put_be_u32(p + 4, err);
         (void)send_frame(kFrameGoaway, 0, 0, p, 8);
+        (void)flush();
         dead_ = true;
     }
     void window_update(std::uint32_t sid, std::uint32_t inc) noexcept {
@@ -269,6 +272,7 @@ private:
     std::unique_ptr<http::HPACKDecoder> hpack_;
     std::vector<http::HPACKHeader>      headers_;
     std::string                         scratch_;
+    std::string                         wbuf_;
 };
 
 namespace {
@@ -317,6 +321,7 @@ Stream* Conn::alloc(std::uint32_t sid) noexcept {
 
 bool Conn::read_exact(void* dst, std::size_t n) noexcept {
     assert(dst != nullptr || n == 0);
+    if (!flush()) return false;
     auto* p = static_cast<std::uint8_t*>(dst);
     std::size_t got = 0;
     while (got < n) {
@@ -392,7 +397,18 @@ bool Conn::send_frame(std::uint8_t type, std::uint8_t flags, std::uint32_t sid,
     h[3] = type;
     h[4] = flags;
     put_be_u32(h + 5, sid);
-    return write_all(h, 9) && write_all(payload, len);
+    // Frames coalesce in wbuf_ and leave in one write: before any read
+    // (flush()) or once the buffer passes kWriteCoalesce.
+    wbuf_.append(reinterpret_cast<const char*>(h), 9);
+    if (len > 0) wbuf_.append(static_cast<const char*>(payload), len);
+    return wbuf_.size() < kWriteCoalesce || flush();
+}
+
+bool Conn::flush() noexcept {
+    if (wbuf_.empty()) return !dead_;
+    const bool ok = write_all(wbuf_.data(), wbuf_.size());
+    wbuf_.clear();
+    return ok;
 }
 
 void Conn::serve(int fd, SSL* ssl) noexcept {
@@ -415,6 +431,7 @@ void Conn::serve(int fd, SSL* ssl) noexcept {
         s.body.shrink_to_fit();
     }
     hpack_ = std::make_unique<http::HPACKDecoder>();
+    wbuf_.clear();
 
     char preface[kPrefaceLen];
     if (!read_exact(preface, kPrefaceLen) || std::memcmp(preface, kPreface, kPrefaceLen) != 0) {
@@ -709,6 +726,7 @@ void Conn::finish(Stream& s, Code code, std::string_view msg, std::string_view d
     assert(scratch_.size() < kOurMaxFrame);
     (void)send_frame(kFrameHeaders, kFlagEndHeaders | kFlagEndStream, s.id, scratch_.data(),
                      scratch_.size());
+    (void)flush();
 }
 
 bool Conn::wait_for_window(Stream& s) noexcept {
