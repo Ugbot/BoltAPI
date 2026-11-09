@@ -1,10 +1,10 @@
-# WebTransport in-browser via `serverCertificateHashes` — punch-card
+# WebTransport in-browser via `serverCertificateHashes` — checklist
 
 Goal: make `new WebTransport(url, {serverCertificateHashes:[…]})` open in a normal
 Chrome (no flags) against our self-signed server → the test page's **WebTransport
 pill goes green**.
 
-Diagnosis (proven via chrome-devtools MCP + QUIC trace): our QUIC/TLS handshake
+Diagnosis (proven via Chrome DevTools automation + QUIC trace): our QUIC/TLS handshake
 already interoperates with Chrome (`failed=0`, full ServerHello+Cert+Finished sent),
 but Chrome **rejects the self-signed cert** and CONNECTION_CLOSEs (→ Draining).
 `--ignore-certificate-errors` does NOT enable WebTransport for self-signed certs.
@@ -41,7 +41,7 @@ but Chrome **rejects the self-signed cert** and CONNECTION_CLOSEs (→ Draining)
 - [x] C3. `await wt.ready` → pill green; clear error text on failure (hash mismatch,
       cert expired, etc.).
 
-## Phase D — build, verify (chrome-devtools MCP), commit
+## Phase D — build, verify (Chrome DevTools automation), commit
 - [x] D1. `docker build -t boltapi .` builds (cert-pin code compiles WITH_HTTP3).
 - [~] D2. MCP real-Chrome: the pin is ACCEPTED — Chrome no longer immediately
       rejects the cert (pre-pin: `Draining`/CERTIFICATE_UNKNOWN; post-pin: no cert
@@ -55,7 +55,7 @@ but Chrome **rejects the self-signed cert** and CONNECTION_CLOSEs (→ Draining)
       CONNECT->200 OK (cert change did not regress the proven path).
 - [ ] D5. Commit + push (serverCertificateHashes done; handshake-completion open).
 
-## REMAINING (the actual blockers, #45) — verified via chrome-devtools MCP + QUIC trace
+## REMAINING (the actual blockers, #45) — verified via Chrome DevTools automation + QUIC trace
 The cert/pin side is DONE and correct (diagnostic confirmed: ECDSA P-256,
 validity_days=13, hash == /wt/cert-hash). Two deeper QUIC↔Chrome interop bugs remain:
 
@@ -83,7 +83,7 @@ Net: WebTransport server logic + cert pinning are correct; the browser pill need
 focused QUIC interop efforts. A publicly/locally-trusted cert (e.g. mkcert) would
 also let normal Chrome connect without pinning, but does not bypass (2)/(3).
 
-### UPDATE — verified on a TRULY FRESH connection (chrome-devtools MCP + trace)
+### UPDATE — verified on a TRULY FRESH connection (Chrome DevTools automation + trace)
 With the Uint8Array pin AND a fresh Chrome QUIC connection (no pooled/wedged one):
 - **failed=0 throughout** — the OpenSSL "bad extension" (2) does NOT occur on a clean
   first connection; it was an artifact of the single-peer wedging (3) corrupting

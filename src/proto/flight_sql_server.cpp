@@ -163,6 +163,25 @@ bool is_statement_update_put(std::string_view first_message) noexcept {
            cd::decode_any(d.cmd, &any) && is_sql(any.type_name, "CommandStatementUpdate");
 }
 
+// gRPC's header: up to 8 digits, then H, M, S, m, u or n. 0 when malformed.
+std::uint64_t grpc_timeout_ms(std::string_view v) noexcept {
+    if (v.size() < 2 || v.size() > 9) return 0;
+    std::uint64_t n = 0;
+    for (std::size_t i = 0; i + 1 < v.size(); ++i) {
+        if (v[i] < '0' || v[i] > '9') return 0;
+        n = n * 10u + static_cast<std::uint64_t>(v[i] - '0');
+    }
+    switch (v.back()) {
+        case 'H': return n * 3600000u;
+        case 'M': return n * 60000u;
+        case 'S': return n * 1000u;
+        case 'm': return n;
+        case 'u': return n / 1000u + 1u;
+        case 'n': return n / 1000000u + 1u;
+        default:  return 0;
+    }
+}
+
 struct Stream {
     bool          in_use = false;
     bool          ready = false;       // request complete, awaiting dispatch
@@ -174,6 +193,7 @@ struct Stream {
     std::int64_t  send_window = kDefaultWindow;
     std::size_t   body_len = 0;
     std::size_t   auth_len = 0;
+    std::uint64_t timeout_ms = 0;      // grpc-timeout; 0 = none
     char          auth[kAuthCap] = {};
     char          path[160] = {};
     std::uint8_t* body = nullptr;      // kStreamBodyCap, owned by Conn
@@ -405,6 +425,7 @@ void Conn::serve(int fd, SSL* ssl) noexcept {
     assert(fd >= 0);
     fd_ = fd;
     ssl_ = ssl;
+    exec_.connection_opened(fd);
     tls_retries_ = 0;
     dead_ = false;
     idle_budget_ = cfg_.idle_timeout_ms;
@@ -587,6 +608,8 @@ void Conn::finish_header_block(std::uint32_t sid, bool end_stream) noexcept {
             } else if (hh.name == "authorization") {
                 s->auth_len = hh.value.size() < kAuthCap ? hh.value.size() : kAuthCap;
                 std::memcpy(s->auth, hh.value.data(), s->auth_len);
+            } else if (hh.name == "grpc-timeout") {
+                s->timeout_ms = grpc_timeout_ms(hh.value);
             }
         }
         s->method = method_for(s->path);
@@ -747,6 +770,7 @@ bool Conn::authorized(const Stream& s) noexcept {
 void Conn::dispatch(Stream& s) noexcept {
     assert(s.in_use);
     if (s.reset) return;
+    exec_.request_timeout(s.timeout_ms);
     if (!authorized(s)) {
         respond_error(s, GrpcCode::kUnauthenticated,
                       "authentication required: send an authorization header "

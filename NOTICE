@@ -12,7 +12,8 @@ Bolt API's HTTP engine is a hard fork of the coroutine HTTP core from FasterAPI,
 a predecessor project by the same author.
 
 Bolt (https://github.com/Ugbot/bolt) is included as a git submodule under
-extern/bolt and is covered by its own license.
+extern/bolt and is covered by its own license. It is not distributed as part of
+this source tree.
 
 Bolt API links against OpenSSL (https://www.openssl.org/) for TLS, DTLS, and
 cryptographic primitives, and optionally against zlib (https://zlib.net/) for

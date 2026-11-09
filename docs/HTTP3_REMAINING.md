@@ -1,4 +1,4 @@
-# HTTP/3 — Remaining Work (ordered punch-card)
+# HTTP/3 — Remaining Work (ordered checklist)
 
 > Execute top-to-bottom. Each wave: correctness-gated, default `ctest` stays green,
 > committed + pushed. Tiger Style, prefer Bolt, OpenSSL for crypto only.
@@ -79,7 +79,7 @@
   `bounded_proc.h`) tests. The default suite (HTTP3=OFF) is unaffected: the
   interop test compiles to a single instant `GTEST_SKIP`, so default `ctest`
   stays green.
-- [ ] Docs: README HTTP/3 section; fold this punch-card's done items back into PROJECT_MAP + HTTP3_PLAN; remove HTTP3_REMAINING when complete.
+- [ ] Docs: README HTTP/3 section; fold this checklist's done items back into PROJECT_MAP + HTTP3_PLAN; remove HTTP3_REMAINING when complete.
 
 ---
 **Order:** W5a → W5b (HTTP/3 serves requests) → W5c (interop proof) → W5d (robustness) → W5f (perf) → W5e (advanced, as needed) → W5g (consolidate). W5b is the milestone that makes HTTP/3 *real*; W5c proves it against the world.

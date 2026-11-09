@@ -1,9 +1,9 @@
-# QUIC — completion punch-card
+# QUIC — completion checklist
 
 What's left to make our QUIC stack a *complete, browser- and relay-grade* transport.
 Foundation for HTTP/3 **and** WebTransport. Tiger Style throughout (bounded, noexcept,
 ≥2 asserts/fn, no exceptions, zero warnings). Verify with aioquic (have) + Chrome via
-the **chrome-devtools MCP** + the QUIC Interop Runner.
+**Chrome DevTools automation** + the QUIC Interop Runner.
 
 Status: `[x]` done · `[~]` partial · `[ ]` todo.
 
@@ -24,7 +24,7 @@ Status: `[x]` done · `[~]` partial · `[ ]` todo.
       `server_cert_sha256()` for WebTransport pinning.
 
 ## P0 — Chrome handshake completion  ✅ DONE (#45) — Chrome reaches Established
-Diagnosed + fixed via the chrome-devtools MCP + QUIC packet trace. THREE real bugs,
+Diagnosed + fixed via Chrome DevTools automation + QUIC packet trace. THREE real bugs,
 each surfaced only by a real Chrome handshake (aioquic masked all three by sending
 in-order, single-cert, and tolerant); aioquic interop + all QUIC/H3 gates stay green:
 - [x] **Coalesce the first flight** (#45): Initial(ServerHello)+Handshake(Cert/
@@ -83,7 +83,7 @@ source 4-tuple** (`App::Http3Peer` pool + `http3_lookup_`/`http3_obtain_`/`http3
 ## P4 — Interop + CI
 - [ ] **QUIC Interop Runner** matrix rows vs quiche / ngtcp2 / picoquic / msquic
       (handshake, transfer, retry, resumption, multiplexing).
-- [ ] Browser (Chrome + Firefox) H3 via the chrome-devtools MCP; curl --http3 smoke.
+- [ ] Browser (Chrome + Firefox) H3 via Chrome DevTools automation; curl --http3 smoke.
 - [ ] CI leg (WITH_HTTP3=ON) runs unit + loopback + bounded interop (skip-if-absent).
 
 **Order:** P0 handshake-ACK/coalesce → P0 multi-connection demux → P1 DATAGRAM →

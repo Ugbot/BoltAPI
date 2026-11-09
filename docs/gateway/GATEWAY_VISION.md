@@ -8,8 +8,8 @@
 > Status: **design only.** Nothing in this suite is built yet. These are the
 > executable blueprints — the gateway is a planned milestone, sequenced behind the
 > upstream HTTP client (Phase 0, see ROADMAP). The thinking here was seeded by the
-> gateway work explored in the predecessor **FasterAPI** (`C:\code\FasterAPI`,
-> mostly inside its now-dropped MCP subsystem) plus fresh competitive research.
+> gateway work explored in this project's predecessor, **FasterAPI** (mostly inside
+> its now-dropped MCP subsystem), plus fresh competitive research.
 
 ## The thesis
 

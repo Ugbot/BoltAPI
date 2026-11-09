@@ -1,13 +1,16 @@
 # Bolt API — Roadmap, Known Issues & Things Not Yet Fully Tried
 
 The core is feature-complete (HTTP/1.1–3, WebSocket, SSE, WebRTC data + audio +
-video), interop-proven (aioquic for HTTP/3, aiortc for WebRTC), 239/239 tests
-green on MSVC. This file tracks what's **known-imperfect, deferred, or unverified**
-so nothing gets lost — plus the infrastructure we're adding next (Docker, real
-long-running integration tests).
+video) and interop-proven (aioquic for HTTP/3, aiortc for WebRTC), with the suite
+green across the CI lanes (see the badges in the top-level `README.md`). This file
+tracks what's **known-imperfect, deferred, or unverified** so nothing gets lost.
+
+It is deliberately blunt about limitations. If you are evaluating Bolt API, read
+this alongside the feature table in the README.
 
 Legend: 🔴 bug · 🟡 incomplete/plumbed-not-negotiated · ⚪ untried/unverified · 🟢 planned infra.
-Task numbers (`#NN`) refer to the in-repo task tracker.
+`#NN` markers are historical internal task ids, kept so entries stay traceable to
+the commit that introduced them.
 
 ---
 
@@ -43,7 +46,7 @@ Task numbers (`#NN`) refer to the in-repo task tracker.
   soak / many-connection / resource-drift** runs, and **vs-peers** numbers
   (nginx/Drogon — the comparison-framing template in `docs/BENCHMARKS.md` is ready
   but unfilled). QUIC/media remain micro/loopback only (≈ 62 handshakes/s,
-  ≈ 1.7 MB/s on this box). (See §4 integration tests.)
+  ≈ 1.7 MB/s on the reference machine). (See §4 integration tests.)
 - ✅ **Middleware chain is now allocation-free** (was: per-request `std::function`
   + `std::make_shared<Next>` fold). Rebuilt TigerStyle / LMAX-Disruptor: the onion
   is driven by a borrowed value **handle** (`Next` = `ChainCtx*` + index — no smart
@@ -78,10 +81,13 @@ Task numbers (`#NN`) refer to the in-repo task tracker.
 
 ## 3. Untried / unverified (the big one)
 
-- ⚪ **Linux / macOS not continuously tested.** Everything is developed and gated on
-  **Windows/MSVC**. The `epoll`/`io_uring` (Linux) and `kqueue` (macOS) async-I/O
-  backends compile but have **no continuous test coverage**. → **Dockerfile + Linux
-  CI** (§4) is the top infra priority.
+- 🟡 **macOS coverage is thinner than Linux/Windows.** Windows/MSVC (IOCP) and
+  Linux/Clang (epoll, plus an `io_uring` lane) are both continuously gated in CI,
+  including four container parity lanes. macOS/Clang builds and runs the default
+  suite in CI, but the `kqueue` backend gets **no dedicated protocol lane** — and
+  `async_io_kqueue.cpp::close_async` is known to carry the same latent bug that
+  was fixed in the epoll backend (it does not complete in-flight ops before
+  closing, which can stall `UdpTransport::stop()`). Fix + a macOS WebRTC lane.
 - ⚪ **HTTP/3 browser interop (Chrome/Firefox)** — only **aioquic** is proven. Needs
   a valid (non-self-signed) cert + Alt-Svc to drive a real browser.
 - ⚪ **QUIC Interop Runner matrix** — handshake/transfer/retry/resumption rows not run
@@ -100,25 +106,35 @@ Task numbers (`#NN`) refer to the in-repo task tracker.
   browser doing simulcast + our negotiation (blocked on `#37`) is unverified.
 - ⚪ **Multi-peer WebRTC at scale** — some paths assume a single active peer
   (signaling keyed by ufrag); concurrent-peer lifecycle not load-tested.
-- ⚪ **Sanitizers (ASan/UBSan) on the full suite** — `BOLTAPI_SANITIZE` exists but
-  isn't run continuously (needs the Linux/Docker lane).
+- 🟡 **Sanitizers run on the default suite only.** `BOLTAPI_SANITIZE` is wired and
+  an ASan/UBSan job runs in CI, but not across the `WITH_HTTP3=ON` /
+  `WITH_WEBRTC=ON` configurations, so the QUIC and media paths are not
+  sanitizer-covered continuously.
 - ⚪ **Continuous fuzzing** — beyond the seeded in-suite fuzz gates (QUIC parser,
   HTTP/1.1), there's no persistent fuzzing.
 
-## 4. Planned infrastructure 🟢
+## 4. Infrastructure
 
-### 4.1 Dockerfile — reproducible Linux build + test (`#NEW`)
-- Multi-stage image: builder (cmake + ninja + a C++20 toolchain + OpenSSL 3.x +
-  the Bolt submodule) → runtime/test. Builds with `WITH_HTTP3=ON` + `WITH_WEBRTC=ON`.
-- Runs the full `ctest` suite on **Linux** (exercises the epoll/io_uring backend the
-  Windows box never touches) and, separately, an **ASan/UBSan** configured build.
-- A `docker-compose` (or compose-like) bringing up the demo server + the interop
-  peers (aioquic / aiortc via `uv`, Pion via Go) in containers so interop runs
-  hermetically — no dependence on a dev box having uv/Go/curl-http3.
-- Wire into CI: a Linux job (default + sanitizers) and the interop job, each under a
-  job timeout, alongside the existing MSVC build.
+### 4.1 Container parity lanes ✅ (done)
+Reproducible Linux build + test now exists and gates every push and PR via the
+`linux-docker` workflow. Each Dockerfile runs its own `ctest` gate as a build
+step, so a green `docker build` **is** a green test run:
 
-### 4.2 Real integration tests — long-running, no skip-on-timeout (`#NEW`)
+| Lane | Dockerfile | Covers |
+|---|---|---|
+| `linux-clang-http3` | `Dockerfile.linux-h3-test` | OpenSSL 3.6 from source; QUIC / HTTP/3 / QPACK suite |
+| `linux-clang-webrtc` | `Dockerfile.linux-test` | System OpenSSL; WebRTC incl. media echo + SFU relay |
+| `linux-clang-bench` | `Dockerfile.linux-bench` | `bench_server` + in-tree loadgen, bounded smoke gate |
+| `linux-clang-gateway` | `Dockerfile.linux-gateway` | Outbound HTTP client (gateway Phase 0) |
+
+All lanes are LLVM/Clang + lld. The top-level `Dockerfile` builds the demo server
+serving H1/H2/H3 + WebRTC — see [`../RUNNING.md`](../RUNNING.md).
+
+Still open: a hermetic compose bringing up the demo server **and** the interop
+peers (aioquic / aiortc via `uv`, Pion via Go) together, so interop runs without
+depending on the host having `uv`/Go/curl-http3.
+
+### 4.2 Real integration tests — long-running, no skip-on-timeout 🟢 (planned)
 The current interop tests are deliberately **bounded + skip-if-absent** so the PR
 suite can never hang (hard ctest TIMEOUT ceiling + `tests/interop/bounded_proc.h`
 process-tree kill). That's right for the **fast** lane, but we also want a separate
@@ -137,11 +153,12 @@ process-tree kill). That's right for the **fast** lane, but we also want a separ
   CI workflow) so they never gate fast PR feedback.
 
 ## 5. Smaller follow-ups
-- WX leftovers (`#36`): CI workflow legs (WEBRTC=ON / HTTP3=ON), browser manual-gate
-  docs, Pion harness `maxMessageSize` tuning.
-- Close out M4 (`#18`): fold done punch-card items back into `PROJECT_MAP.md`, README
+- WX leftovers (`#36`): browser manual-gate docs, Pion harness `maxMessageSize`
+  tuning.
+- Close out M4 (`#18`): fold done checklist items back into `PROJECT_MAP.md`, README
   benchmark section.
-- `LICENSE` is still TBD.
+- macOS `async_io_kqueue.cpp::close_async` — apply the epoll `close_async` fix
+  (complete in-flight ops before closing) and add a macOS lane that would catch it.
 
 ---
 *Keep this file honest: when something here gets fixed/verified, move it to

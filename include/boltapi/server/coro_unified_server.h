@@ -109,6 +109,9 @@ struct CoroHttpRequest {
     // never found anything — fixed by carrying the query through explicitly.
     std::string_view query;
     std::string_view body;
+    // The connection's socket, for a handler that watches for the peer leaving.
+    // -1 where no socket exists (HTTP/3, tests). Never read or write it.
+    int client_fd = -1;
 
     CoroHttpHeaderView headers[MAX_HEADERS];
     size_t header_count = 0;
@@ -357,6 +360,9 @@ struct CoroUnifiedServerConfig {
     bool enable_tls = true;
     uint16_t tls_port = 443;
     std::string host = "0.0.0.0";
+    // Bind the cleartext HTTP/1.1 listener here instead of `host`, so TLS can
+    // face the network while cleartext stays on loopback. Empty = `host`.
+    std::string http1_host;
 
     // Certificate configuration
     std::string cert_file;

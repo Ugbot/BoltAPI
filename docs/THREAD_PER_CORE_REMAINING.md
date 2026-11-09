@@ -1,4 +1,4 @@
-# Thread-per-core — Remaining Work (ordered punch-card)
+# Thread-per-core — Remaining Work (ordered checklist)
 
 > Phase 3 of the dispatch/threading perf work. Execute top-to-bottom. Each slice:
 > correctness-gated on **both** platforms (MSVC/IOCP + Linux/Clang), default `ctest`
@@ -6,7 +6,6 @@
 > Bolt; OpenSSL for crypto only; **no new third-party deps** (io_uring via raw
 > syscalls, not liburing).
 >
-> Full design + decision rationale: `~/.claude/plans/foamy-munching-reddy.md`.
 > Diagnosis + measurements so far: `docs/PERF_DISPATCH.md`. Targets: `docs/PERF_TARGETS.md`.
 
 ## Why (the gap this closes)
@@ -75,4 +74,4 @@ Outcome: near-linear scaling, collapsed p99, high throughput with *few* IO threa
 - **Correctness:** MSVC `ctest` full suite (IOCP, unaffected); Linux/Clang (LLVM+lld, never GCC) via `Dockerfile.linux-test` (WebRTC/UDP/close — epoll/pinning stress) + `Dockerfile.linux-gateway` (HTTP client + `dispatch_alloc_test`); zero `/WX`.
 - **Scaling:** IO-thread sweep (1/2/4/8/16, /plaintext) — shape should move from ~3.9×@16 plateau toward **linear**. `benchmarks/tfb/run_compare.sh` for throughput + p99 vs Drogon (read the RATIO; absolutes need an idle box).
 - **Allocs:** `dispatch_alloc_test` (deterministic) — ceiling tightened per slice D.
-- Update this punch-card + `docs/PERF_DISPATCH.md` + `docs/PERF_TARGETS.md` as slices land.
+- Update this checklist + `docs/PERF_DISPATCH.md` + `docs/PERF_TARGETS.md` as slices land.

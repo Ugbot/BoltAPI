@@ -21,11 +21,11 @@ build/wrtc/examples/Release/boltapi_demo_server.exe   # H1/H2/WS on :8080 + H3 o
 |---|---|
 | **WebRTC data channel (browser)** | open `http://localhost:8080/webrtc.html`, click **Connect & echo** — expect "ECHO ROUND-TRIP OK" |
 | **WebRTC data channel (headless)** | `uv run --with aiortc python testing/aiortc_datachannel.py 8080` — expect "INTEROP OK" |
-| **WebRTC media echo (browser, WM6)** | open `http://localhost:8080/media.html`, click **Start camera & echo** — your audio+video is offered to the server and the echoed stream renders in the right `<video>` |
-| **WebRTC media echo (headless, WM6)** | `uv run --no-project --with aiortc --with numpy --with av python tests/interop/aiortc_media.py 8080` — sends a synthetic audio+video track, expect "INTEROP OK: media echo round-tripped" |
+| **WebRTC media echo (browser)** | open `http://localhost:8080/media.html`, click **Start camera & echo** — your audio+video is offered to the server and the echoed stream renders in the right `<video>` |
+| **WebRTC media echo (headless)** | `uv run --no-project --with aiortc --with numpy --with av python tests/interop/aiortc_media.py 8080` — sends a synthetic audio+video track, expect "INTEROP OK: media echo round-tripped" |
 | HTTP/1.1 + verbs | `curl -v http://localhost:8080/health` → `ok` (response carries `alt-svc: h3=":8080"`) |
 | WebSocket | connect a WS client to `ws://localhost:8080/ws` (text echo) |
-| **HTTP/3 (headless, W5c)** | `uv run --no-project --with aioquic python tests/interop/aioquic_client.py 8080` — GET /ping (200 "pong") + POST /echo (byte-exact) over QUIC; expect "INTEROP OK". aioquic is the independent pure-Python HTTP/3 stack `uv` fetches — the HTTP/3 analogue of aiortc. |
+| **HTTP/3 (headless)** | `uv run --no-project --with aioquic python tests/interop/aioquic_client.py 8080` — GET /ping (200 "pong") + POST /echo (byte-exact) over QUIC; expect "INTEROP OK". aioquic is the independent pure-Python HTTP/3 stack `uv` fetches — the HTTP/3 analogue of aiortc. |
 | HTTP/3 (curl, optional) | a curl built with an HTTP/3 backend: `curl -k --http3-only https://localhost:8080/ping` |
 
 > The bounded gtest versions of the headless legs live in

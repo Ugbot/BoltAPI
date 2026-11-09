@@ -1111,7 +1111,8 @@ int CoroUnifiedServer::start_background() {
     // Create cleartext HTTP/1.1 listener
     if (config_.enable_http1_cleartext) {
         net::CoroTcpListenerConfig http1_listener_config;
-        http1_listener_config.host = config_.host;
+        const std::string& http1_host = config_.http1_host.empty() ? config_.host : config_.http1_host;
+        http1_listener_config.host = http1_host;
         http1_listener_config.port = config_.http1_port;
         http1_listener_config.backlog = config_.backlog;
         http1_listener_config.num_io_threads = config_.num_io_threads;
@@ -1139,7 +1140,7 @@ int CoroUnifiedServer::start_background() {
             return -1;
         }
 
-        std::cout << "  HTTP/1.1 cleartext: " << config_.host << ":" << config_.http1_port << std::endl;
+        std::cout << "  HTTP/1.1 cleartext: " << http1_host << ":" << config_.http1_port << std::endl;
     }
 
     std::cout << "CoroUnifiedServer started" << std::endl;
@@ -1626,6 +1627,7 @@ core::coro_task<void> CoroUnifiedServer::handle_http1_connection(
         // only reset AFTER the response is written (end of this loop iteration),
         // so every view is valid for the whole request, including keep-alive.
         CoroHttpRequest req;
+        req.client_fd = fd;
         req.method = std::string_view(parsed_req.method_str);
         req.path = std::string_view(parsed_req.path);
         // Carry the query string through explicitly — the H1 parser strips
@@ -2148,7 +2150,7 @@ core::coro_task<void> CoroUnifiedServer::handle_http2_connection(
     std::vector<PendingH2Request> pending_requests;
 
     // Set request callback to queue requests for async processing
-    h2_conn.set_request_callback([this, &pending_requests](http2::Http2Stream* stream) {
+    h2_conn.set_request_callback([this, &pending_requests, fd](http2::Http2Stream* stream) {
         if (!stream) return;
 
         // Convert stream request to CoroHttpRequest.
@@ -2159,6 +2161,7 @@ core::coro_task<void> CoroUnifiedServer::handle_http2_connection(
         // bytes in req.owned_storage_ and points the views there — stable for
         // the whole request including the handler hop. H1 stays truly zero-copy.
         CoroHttpRequest req;
+        req.client_fd = fd;
 
         // Extract method, path, and headers from request_headers()
         for (const auto& [name, value] : stream->request_headers()) {
