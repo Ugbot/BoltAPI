@@ -231,6 +231,7 @@ set(BOLTAPI_ENGINE_SOURCES
     src/http/websocket_parser.cpp
     # server
     src/server/coro_unified_server.cpp
+    src/server/coro_h2_stream.cpp
 )
 
 # Per-OS async I/O + event loop backends (IOCP / epoll+io_uring / kqueue) now

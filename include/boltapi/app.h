@@ -447,6 +447,12 @@ public:
     int run(std::string_view host, uint16_t port);
     // Non-blocking; server runs on background threads.
     int start_background(std::string_view host, uint16_t port);
+    // Cleartext HTTP/2 requests `route` accepts are served by `handler` on a
+    // blocking worker, streaming (http::H2StreamWriter). Before run/start.
+    void h2_stream(http::H2StreamRoute route, http::H2StreamHandler handler) {
+        h2_route_ = std::move(route);
+        h2_handler_ = std::move(handler);
+    }
     // Immediate stop: stops listeners, the io_dispatcher, and the worker pool
     // in one call with no wait for an in-flight request to finish. Use
     // stop_gracefully() instead when a request mid-flight matters (SIGTERM
@@ -792,6 +798,8 @@ private:
 
     std::unique_ptr<Router>                   router_;
     std::unique_ptr<http::CoroUnifiedServer>  server_;
+    http::H2StreamRoute                       h2_route_;
+    http::H2StreamHandler                     h2_handler_;
     // route_id (from router.add) -> index into routes_. Sized at build().
     std::vector<std::size_t>                  route_id_to_index_;
 
