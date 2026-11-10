@@ -12,6 +12,7 @@ namespace {
 using namespace bolt::api::http2;
 using bolt::api::http::HPACKEncoder;
 using bolt::api::http::HPACKHeader;
+using bolt::api::http::CoroResponseHeaders;
 using Connection = Http2Connection;
 using Kind = Connection::ResponseEventKind;
 using Bytes = std::vector<uint8_t>;
@@ -795,3 +796,74 @@ TEST(Http2Client, HeaderBudgetsAndUnreadControlFloodFailExplicitly) {
 }
 
 } // namespace
+
+// gRPC server streaming: headers, DATA chunks, then trailers with END_STREAM;
+// trailers queued behind a body larger than the peer's window wait for it.
+TEST(Http2Server, StreamsDataThenTrailersBehindTheWindow) {
+    Events events;
+    Connection client(false);
+    Connection server;
+    client.set_response_callback([&](const auto& e) { events.save(e); });
+    const std::string big(100000, 'x');
+    CoroResponseHeaders head;
+    head.append("content-type", "application/grpc");
+    CoroResponseHeaders trail;
+    trail.append("grpc-status", "0");
+    server.set_request_callback([&](Http2Stream* stream) {
+        const uint32_t id = stream->id();
+        EXPECT_TRUE(server.send_response_head(id, 200, head).is_ok());
+        EXPECT_TRUE(server.send_response_data(id, "ab").is_ok());
+        EXPECT_TRUE(server.send_response_data(id, big).is_ok());
+        EXPECT_TRUE(server.send_response_trailers(id, trail).is_ok());
+        EXPECT_TRUE(server.send_response_data(id, "late").is_err());   // after trailers
+    });
+    ASSERT_TRUE(feed(server, take(client)));
+    ASSERT_TRUE(transfer(server, client));
+    ASSERT_TRUE(client.send_request(kGet.data(), kGet.size()).is_ok());
+    for (int i = 0; i < 64 && events.count(Kind::Complete) == 0; ++i) {
+        ASSERT_TRUE(transfer(client, server));
+        ASSERT_TRUE(transfer(server, client));
+    }
+    ASSERT_EQ(events.count(Kind::Complete), 1u);
+    std::string body;
+    for (const auto& e : events.items) {
+        if (e.kind == Kind::Data) body += e.data;
+    }
+    EXPECT_EQ(body, "ab" + big);
+    ASSERT_EQ(events.count(Kind::Trailers), 1u);
+    const auto trailers = std::find_if(events.items.begin(), events.items.end(),
+                                       [](const SavedEvent& e) { return e.kind == Kind::Trailers; });
+    ASSERT_EQ(trailers->fields.size(), 1u);
+    EXPECT_EQ(trailers->fields[0], (std::pair<std::string, std::string>{"grpc-status", "0"}));
+    EXPECT_TRUE(trailers->end_stream);
+    EXPECT_EQ(server.open_stream_count(), 0u);
+}
+
+TEST(Http2Server, TrailersOnlyAfterHeadAndRefusalsOutOfOrder) {
+    Events events;
+    Connection client(false);
+    Connection server;
+    CoroResponseHeaders trail;
+    trail.append("grpc-status", "12");
+    client.set_response_callback([&](const auto& e) { events.save(e); });
+    server.set_request_callback([&](Http2Stream* stream) {
+        const uint32_t id = stream->id();
+        EXPECT_TRUE(server.send_response_data(id, "x").is_err());       // before the head
+        EXPECT_TRUE(server.send_response_trailers(id, {}).is_err());
+        EXPECT_TRUE(server.send_response_head(id, 200, {}).is_ok());
+        EXPECT_TRUE(server.send_response_head(id, 200, {}).is_err());   // twice
+        EXPECT_TRUE(server.send_response_trailers(id, trail).is_ok());
+    });
+    ASSERT_TRUE(feed(server, take(client)));
+    ASSERT_TRUE(transfer(server, client));
+    ASSERT_TRUE(client.send_request(kGet.data(), kGet.size()).is_ok());
+    ASSERT_TRUE(transfer(client, server));
+    ASSERT_TRUE(transfer(server, client));
+    ASSERT_EQ(events.count(Kind::Complete), 1u);
+    EXPECT_EQ(events.count(Kind::Trailers), 1u);
+    EXPECT_EQ(events.count(Kind::Data), 0u);
+    const auto tr = std::find_if(events.items.begin(), events.items.end(),
+                                 [](const SavedEvent& e) { return e.kind == Kind::Trailers; });
+    ASSERT_EQ(tr->fields.size(), 1u);
+    EXPECT_EQ(tr->fields[0].second, "12");
+}

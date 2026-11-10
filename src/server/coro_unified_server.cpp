@@ -2139,6 +2139,14 @@ core::coro_task<void> CoroUnifiedServer::handle_http2_connection(
     net::IODispatcher& io, int fd, net::CoroTlsSocket* tls,
     const uint8_t* initial, size_t initial_len) {
 
+    if (tls == nullptr && h2_stream_handler_ && io.worker_pool() != nullptr) {
+        const std::size_t current = io.current_io_thread_index();
+        if (current < io.io_thread_count() || io.io_thread_count() == 1 || !io.per_thread_engines()) {
+            const std::size_t owner = current < io.io_thread_count() ? current : 0;
+            co_await handle_http2_stream_connection(io, fd, initial, initial_len, owner);
+            co_return;
+        }
+    }
     http2::Http2Connection h2_conn(true);  // Server mode
     h2_conn.set_max_request_body(config_.max_body_size);
 

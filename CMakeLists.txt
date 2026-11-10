@@ -231,6 +231,7 @@ set(BOLTAPI_ENGINE_SOURCES
     src/http/websocket_parser.cpp
     # server
     src/server/coro_unified_server.cpp
+    src/server/coro_h2_stream.cpp
 )
 
 # Per-OS async I/O + event loop backends (IOCP / epoll+io_uring / kqueue) now
@@ -374,7 +375,9 @@ if(BOLTAPI_WITH_FLIGHT_SQL)
         src/proto/flight_sql_codec.cpp
         src/proto/flight_sql_metadata.cpp
         src/proto/flight_sql_params.cpp
-        src/proto/flight_sql_server.cpp)
+        src/proto/flight_sql_server.cpp
+        src/proto/grpc_server.cpp
+        src/proto/grpc_reactor.cpp)
     target_compile_definitions(boltapi PUBLIC BOLTAPI_WITH_FLIGHT_SQL=1)
     message(STATUS "Bolt API Arrow Flight SQL: ENABLED (h2c/TLS gRPC, statements, updates, prepared statements with parameters, metadata)")
 endif()

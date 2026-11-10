@@ -315,6 +315,11 @@ public:
         uint64_t content_length{0};
         uint64_t body_received{0};
         bool request_complete{false};
+        // Streaming server response (send_response_head / _data / _trailers):
+        // DATA never carries END_STREAM; the trailers HEADERS does.
+        bool streaming{false};
+        bool trailers_pending{false};  // encoded, waiting for send_buf to drain
+        std::string trailer_block;
     };
     Io io;
 

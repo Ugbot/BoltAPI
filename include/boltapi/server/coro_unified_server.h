@@ -464,6 +464,33 @@ struct CoroUnifiedServerConfig {
  */
 class H1FixedStreamPool;
 
+struct H2StreamOut;
+
+/**
+ * The response side of one HTTP/2 stream whose handler runs on a blocking
+ * worker thread (gRPC server streaming). Frames go to the connection's
+ * single writer coroutine, which owns the socket; the reader keeps reading
+ * meanwhile (WINDOW_UPDATE, RST_STREAM, other streams' requests). data()
+ * blocks while the stream has more than its queue budget unsent. Every call
+ * returns false once the stream or connection is gone; the handler should
+ * stop then. A handler that returns without trailers() resets the stream.
+ */
+class H2StreamWriter {
+public:
+    explicit H2StreamWriter(H2StreamOut* out) noexcept : out_(out) {}
+    bool head(uint16_t status, const CoroResponseHeaders& headers);
+    bool data(std::string_view bytes);
+    bool trailers(const CoroResponseHeaders& trailers);
+    bool cancelled() const noexcept;
+private:
+    H2StreamOut* out_;
+};
+
+// Picks the requests a streaming handler serves (others go to the ordinary
+// handler); called on the connection's reader.
+using H2StreamRoute = std::function<bool(const CoroHttpRequest&)>;
+using H2StreamHandler = std::function<void(const CoroHttpRequest&, H2StreamWriter&)>;
+
 class CoroUnifiedServer {
 public:
     explicit CoroUnifiedServer(const CoroUnifiedServerConfig& config);
@@ -477,6 +504,14 @@ public:
      * Set the HTTP request handler
      */
     void set_handler(CoroHttpHandler handler);
+
+    /**
+     * Cleartext HTTP/2 requests `route` accepts run `handler` on a blocking
+     * worker with an H2StreamWriter (see there). Set before start(). TLS
+     * connections and per-core reactors whose owner thread is unknown keep
+     * the ordinary (buffered) path.
+     */
+    void set_h2_stream_handler(H2StreamRoute route, H2StreamHandler handler);
 
     /**
      * Register a pure C++ WebSocket handler
@@ -702,6 +737,12 @@ private:
         net::IODispatcher& io, int fd, WebSocketConnection& ws_conn,
         net::CoroTlsSocket* tls);
 
+    // HTTP/2 with streamed responses: a reader (this coroutine), one writer
+    // coroutine owning the socket's writes, and handlers on blocking workers.
+    core::coro_task<void> handle_http2_stream_connection(net::IODispatcher& io, int fd,
+                                                         const uint8_t* initial, size_t initial_len,
+                                                         size_t io_thread_index);
+
     void cancel_fixed_streams();
 
     // Signal handler installation
@@ -722,6 +763,8 @@ private:
 
     CoroUnifiedServerConfig config_;
     CoroHttpHandler handler_;
+    H2StreamRoute h2_stream_route_;
+    H2StreamHandler h2_stream_handler_;
 
     // TLS context
     std::shared_ptr<net::TlsContext> tls_context_;

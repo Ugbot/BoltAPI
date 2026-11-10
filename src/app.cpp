@@ -243,6 +243,7 @@ void App::build_dispatch() {
     // (server_ is owned by App and stopped in stop()/dtor). The body lives in
     // dispatch_coro_ so the HTTP/3 path (dispatch_http3) reuses it verbatim.
     App* self = this;
+    if (h2_handler_) server_->set_h2_stream_handler(h2_route_, h2_handler_);
     server_->set_handler(
         [self](const http::CoroHttpRequest& creq) {
             assert(self != nullptr);

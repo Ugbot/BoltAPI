@@ -98,6 +98,7 @@ boltapi_add_test(boltapi_hpack_test hpack_test.cpp)
 # Bounded HTTP/2 client role: existing framing/HPACK/windows, response events
 # and failure semantics used by native Flight SQL clients (no gRPC runtime).
 boltapi_add_test(boltapi_http2_client_test http2_client_test.cpp)
+boltapi_add_test(boltapi_h2_stream_test h2_stream_test.cpp)
 
 # G2ETL-114: TLS partial writes, peer reset (SIGPIPE), HTTP/2 framing and
 # flow control for large responses, over h2c and TLS.
@@ -716,6 +717,9 @@ endif()
 if(BOLTAPI_WITH_FLIGHT_SQL AND TARGET bolt::ingest)
     boltapi_add_test(boltapi_flight_sql_codec_test flight_sql_codec_test.cpp)
     target_link_libraries(boltapi_flight_sql_codec_test PRIVATE bolt::ingest)
+    if(NOT WIN32)
+        boltapi_add_test(boltapi_grpc_server_test grpc_server_test.cpp)
+    endif()
 
     add_executable(boltapi_flight_sql_echo_server flight_sql_echo_server_main.cpp)
     target_link_libraries(boltapi_flight_sql_echo_server PRIVATE boltapi::boltapi bolt::ingest)
