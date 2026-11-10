@@ -867,6 +867,13 @@ public:
         if (::bolt::api::proto::detail::wait_readable(fd, timeout_ms) <= 0) return -1;
         if (fd_.load(std::memory_order_acquire) < 0) return -1;
         const int c = static_cast<int>(::accept(fd, nullptr, nullptr));
+        if (c >= 0 && !unix_path_.empty()) {
+            // macOS Unix sockets default to 8 KiB buffers: a large result
+            // would take a syscall per few KiB. Ask for 4 MiB each way.
+            int buf = 4 << 20;
+            (void)::setsockopt(c, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&buf), sizeof(buf));
+            (void)::setsockopt(c, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&buf), sizeof(buf));
+        }
         if (c >= 0 && unix_path_.empty()) {
             int one = 1;
             (void)::setsockopt(c, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one),
