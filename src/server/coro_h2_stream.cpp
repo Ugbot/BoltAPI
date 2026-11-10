@@ -15,6 +15,8 @@
 #include "boltapi/http/http2_connection.h"
 
 #include <cassert>
+#include <cerrno>
+#include <sys/socket.h>
 #include <condition_variable>
 #include <coroutine>
 #include <cstring>
@@ -67,6 +69,14 @@ struct H2Shared {
     bool closing = false;
     bool writer_done = false;
     bool write_failed = false;
+    // One party writes the socket at a time: the writer coroutine, or a
+    // handler thread writing its own frames straight out (no reactor hop)
+    // when nothing else is pending. A short direct write leaves the rest in
+    // `backlog` for the writer coroutine, which writes it first.
+    bool writing = false;
+    bool deferred = false;      // the writer woke while a handler was writing
+    std::string backlog;
+    int fd = -1;
     std::coroutine_handle<> writer{};
     std::coroutine_handle<> reader{};
 
@@ -160,8 +170,11 @@ core::detached_task h2_writer(std::shared_ptr<H2Shared> keep, int fd) {
         {
             std::lock_guard<std::mutex> lk(c->mu);
             c->wake = false;
+            if (c->writing) { c->deferred = true; continue; }   // the handler re-signals
+            c->writing = true;
             if (!c->write_failed) frame_ops(*c);
             out.clear();
+            out.swap(c->backlog);
             const std::uint8_t* p = nullptr;
             std::size_t n = 0;
             while (c->h2->get_output(&p, &n)) {
@@ -176,10 +189,13 @@ core::detached_task h2_writer(std::shared_ptr<H2Shared> keep, int fd) {
             if (w <= 0) break;
             off += static_cast<std::size_t>(w);
         }
-        if (off < out.size()) {
+        {
             std::lock_guard<std::mutex> lk(c->mu);
-            c->write_failed = true;
-            for (auto& s : c->streams) { s->cancelled = true; s->cv.notify_all(); }
+            c->writing = false;
+            if (off < out.size()) {
+                c->write_failed = true;
+                for (auto& s : c->streams) { s->cancelled = true; s->cv.notify_all(); }
+            }
         }
         if (closing && out.empty()) break;
     }
@@ -191,6 +207,46 @@ core::detached_task h2_writer(std::shared_ptr<H2Shared> keep, int fd) {
         c->reader = {};
     }
     c->post(r);
+}
+
+// Frame what is queued and write it from this (handler) thread without
+// blocking; the unwritten rest goes to the backlog. `lk` holds mu on entry
+// and exit, released around the send.
+void direct_write(H2Shared* c, std::unique_lock<std::mutex>& lk) {
+    assert(!c->writing && c->backlog.empty());
+    c->writing = true;
+    frame_ops(*c);
+    std::string out;
+    const std::uint8_t* p = nullptr;
+    std::size_t n = 0;
+    while (c->h2->get_output(&p, &n)) {
+        out.append(reinterpret_cast<const char*>(p), n);
+        c->h2->commit_output(n);
+    }
+    lk.unlock();
+    std::size_t off = 0;
+    bool failed = false;
+#ifdef MSG_NOSIGNAL
+    constexpr int kFlags = MSG_DONTWAIT | MSG_NOSIGNAL;
+#else
+    constexpr int kFlags = MSG_DONTWAIT;
+#endif
+    for (int i = 0; i < 64 && off < out.size(); ++i) {
+        const ssize_t w = ::send(c->fd, out.data() + off, out.size() - off, kFlags);
+        if (w > 0) { off += static_cast<std::size_t>(w); continue; }
+        if (w < 0 && errno == EINTR) continue;
+        failed = !(w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+        break;
+    }
+    lk.lock();
+    c->writing = false;
+    if (c->deferred) { c->deferred = false; c->wake = true; }
+    if (failed) {
+        c->write_failed = true;
+        for (auto& s : c->streams) { s->cancelled = true; s->cv.notify_all(); }
+    } else if (off < out.size()) {
+        c->backlog.append(out, off, std::string::npos);
+    }
 }
 
 // Queue one op from a handler thread; false when the stream is gone.
@@ -205,7 +261,12 @@ bool push(H2StreamOut* s, H2Op op) {
         if (op.kind == H2Op::Kind::kHead) s->head_queued = true;
         s->queued += op.bytes.size();
         s->ops.push_back(std::move(op));
-        h = c->signal_writer();
+        if (c->writing || c->closing || c->write_failed || !c->backlog.empty() || c->h2 == nullptr) {
+            h = c->signal_writer();
+        } else {
+            direct_write(c, lk);
+            if (!c->backlog.empty() || c->wake) h = c->signal_writer();
+        }
     }
     c->post(h);
     return true;
@@ -294,6 +355,7 @@ core::coro_task<void> CoroUnifiedServer::handle_http2_stream_connection(
     shared->h2 = &h2;
     shared->io = &io;
     shared->io_index = io_thread_index;
+    shared->fd = fd;
     std::vector<CoroHttpRequest> pending;
     std::vector<std::uint32_t> pending_ids;
     h2.set_request_callback([&](http2::Http2Stream* stream) {
