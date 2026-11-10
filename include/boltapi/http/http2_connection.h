@@ -356,6 +356,18 @@ public:
         const std::string& body
     ) noexcept;
 
+    /**
+     * Streaming response (gRPC server streams): headers now, then any number
+     * of DATA chunks as the windows allow, then trailers with END_STREAM
+     * (grpc-status rides there). Data and trailers queue behind earlier data
+     * of the same stream; nothing is framed past the peer's windows.
+     */
+    core::result<void> send_response_head(uint32_t stream_id, uint16_t status,
+                                          const http::CoroResponseHeaders& headers) noexcept;
+    core::result<void> send_response_data(uint32_t stream_id, std::string_view data) noexcept;
+    core::result<void> send_response_trailers(uint32_t stream_id,
+                                              const http::CoroResponseHeaders& trailers) noexcept;
+
     core::result<void> send_rst_stream(uint32_t stream_id, ErrorCode error) noexcept;
     core::result<void> send_goaway(ErrorCode error, const std::string& debug_data = "") noexcept;
 

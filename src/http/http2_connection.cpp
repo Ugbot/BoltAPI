@@ -550,6 +550,103 @@ result<void> Http2Connection::send_response(uint32_t stream_id, uint16_t status,
     return ok();
 }
 
+namespace {
+// Lower-cased, hop-by-hop-free fields for one header block.
+void response_fields(const http::CoroResponseHeaders& headers, std::vector<http::HPACKHeader>* fields,
+                     std::vector<std::string>* names) {
+    names->reserve(headers.size());
+    for (const auto& [name, value] : headers) {
+        std::string& lower = names->emplace_back(name);
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](char c) { return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + 32) : c; });
+        if (lower.empty() || lower[0] == ':' || is_hop_by_hop(lower)) continue;
+        fields->push_back({lower, value, false});
+    }
+}
+}  // namespace
+
+result<void> Http2Connection::send_response_head(uint32_t stream_id, uint16_t status,
+                                                 const http::CoroResponseHeaders& headers) noexcept {
+    if (!is_server_ || in_response_callback_) return err<void>(error_code::invalid_state);
+    Http2Stream* stream = get_stream(stream_id);
+    if (stream == nullptr || state_ == ConnectionState::CLOSED || !stream->can_send() ||
+        stream->io.send_pending || stream->io.streaming) {
+        return err<void>(error_code::invalid_state);
+    }
+    if (status < 100 || status > 999) status = 500;
+    char status_buf[4];
+    std::snprintf(status_buf, sizeof(status_buf), "%u", static_cast<unsigned>(status));
+    std::vector<http::HPACKHeader> fields;
+    std::vector<std::string> names;
+    fields.reserve(headers.size() + 1);
+    fields.push_back({":status", status_buf, false});
+    response_fields(headers, &fields, &names);
+    if (encode_buf_.size() < kMaxResponseHeaderBlock) encode_buf_.resize(kMaxResponseHeaderBlock);
+    size_t block_len = 0;
+    if (hpack_encoder_.encode(fields.data(), fields.size(), encode_buf_.data(), encode_buf_.size(),
+                              block_len) != 0) {
+        (void)stream_error(stream_id, ErrorCode::INTERNAL_ERROR);
+        return err<void>(error_code::internal_error);
+    }
+    queue_header_block(stream_id, encode_buf_.data(), block_len, false);
+    stream->on_headers_sent(false);
+    stream->io.streaming = true;
+    assert(stream->io.streaming && !stream->io.send_pending);
+    return ok();
+}
+
+result<void> Http2Connection::send_response_data(uint32_t stream_id, std::string_view data) noexcept {
+    Http2Stream* stream = get_stream(stream_id);
+    if (stream == nullptr || !stream->io.streaming || stream->io.trailers_pending) {
+        return err<void>(error_code::invalid_state);
+    }
+    if (data.empty()) return ok();
+    Http2Stream::Io& io = stream->io;
+    if (!io.send_pending) {
+        io.send_buf.assign(data.data(), data.size());
+        io.send_off = 0;
+        io.send_pending = true;
+    } else {
+        if (io.send_off > 0 && io.send_off >= io.send_buf.size() / 2) {   // reclaim the sent prefix
+            io.send_buf.erase(0, io.send_off);
+            io.send_off = 0;
+        }
+        io.send_buf.append(data.data(), data.size());
+    }
+    pump_data();
+    return ok();
+}
+
+result<void> Http2Connection::send_response_trailers(uint32_t stream_id,
+                                                     const http::CoroResponseHeaders& trailers) noexcept {
+    Http2Stream* stream = get_stream(stream_id);
+    if (stream == nullptr || !stream->io.streaming || stream->io.trailers_pending) {
+        return err<void>(error_code::invalid_state);
+    }
+    std::vector<http::HPACKHeader> fields;
+    std::vector<std::string> names;
+    fields.reserve(trailers.size());
+    response_fields(trailers, &fields, &names);
+    if (encode_buf_.size() < kMaxResponseHeaderBlock) encode_buf_.resize(kMaxResponseHeaderBlock);
+    size_t block_len = 0;
+    if (hpack_encoder_.encode(fields.data(), fields.size(), encode_buf_.data(), encode_buf_.size(),
+                              block_len) != 0) {
+        (void)stream_error(stream_id, ErrorCode::INTERNAL_ERROR);
+        return err<void>(error_code::internal_error);
+    }
+    Http2Stream::Io& io = stream->io;
+    if (io.send_pending) {       // after the queued body drains (pump_stream)
+        io.trailer_block.assign(reinterpret_cast<const char*>(encode_buf_.data()), block_len);
+        io.trailers_pending = true;
+        return ok();
+    }
+    queue_header_block(stream_id, encode_buf_.data(), block_len, true);
+    io.streaming = false;
+    stream->on_headers_sent(true);
+    maybe_close(stream);
+    return ok();
+}
+
 bool Http2Connection::pump_stream(Http2Stream* stream) noexcept {
     assert(stream != nullptr);
     Http2Stream::Io& io = stream->io;
@@ -564,11 +661,27 @@ bool Http2Connection::pump_stream(Http2Stream* stream) noexcept {
                                static_cast<size_t>(window)});
     if (!is_server_ && output_backlog() + 9 + n > kMaxControlBacklog) return false;
     const bool last = n == remaining;
-    queue_frame(FrameType::DATA, last ? FrameFlags::DATA_END_STREAM : 0, stream->id(),
+    const bool streaming = is_server_ && io.streaming;
+    queue_frame(FrameType::DATA, (last && !streaming) ? FrameFlags::DATA_END_STREAM : 0, stream->id(),
                 reinterpret_cast<const uint8_t*>(body.data()) + io.send_off, n);
     io.send_off += n;
     connection_send_window_ -= static_cast<int32_t>(n);
     stream->send_window_ -= static_cast<int32_t>(n);
+    if (last && streaming) {
+        io.send_pending = false;
+        io.send_buf.clear();
+        io.send_off = 0;
+        if (io.trailers_pending) {
+            queue_header_block(stream->id(), reinterpret_cast<const uint8_t*>(io.trailer_block.data()),
+                               io.trailer_block.size(), true);
+            std::string().swap(io.trailer_block);
+            io.trailers_pending = false;
+            io.streaming = false;
+            stream->on_headers_sent(true);
+            maybe_close(stream);
+        }
+        return true;
+    }
     if (last) {
         io.send_pending = false;
         if (is_server_) std::string().swap(io.send_buf);
