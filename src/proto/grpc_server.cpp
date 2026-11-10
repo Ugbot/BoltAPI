@@ -10,7 +10,9 @@
 
 #if defined(BOLTAPI_WITH_FLIGHT_SQL)
 
+#include "boltapi/boltapi_limits.h"
 #include "boltapi/http/hpack.h"
+#include "boltapi/proto/grpc_limits.h"
 #include "boltapi/net/sys_compat.h"
 #include "boltapi/net/tls_context.h"
 #include "boltapi/proto/flight_sql_codec.h"
@@ -52,29 +54,23 @@ constexpr std::uint32_t kErrProtocol = 0x1;
 constexpr std::uint32_t kErrFlowControl = 0x3;
 constexpr std::uint32_t kErrFrameSize = 0x6;
 constexpr std::uint32_t kErrRefusedStream = 0x7;
-
-constexpr std::uint16_t kSettingsMaxConcurrent = 0x3;
-constexpr std::uint16_t kSettingsInitialWindow = 0x4;
-constexpr std::uint16_t kSettingsMaxFrameSize = 0x5;
+ 
+constexpr std::uint16_t kSettingsInitialWindow = 0x4; 
 
 constexpr char kPreface[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 constexpr std::size_t kPrefaceLen = 24;
-
-constexpr std::uint32_t kMaxStreamsCap = 128;
-constexpr std::size_t kOurMaxFrame = 16384;
-constexpr std::size_t kHeaderBlockCap = 65536;
-constexpr std::size_t kAuthCap = 4096;
-constexpr std::size_t kPathCap = 256;
-constexpr std::size_t kAgentCap = 256;
-constexpr std::int64_t kDefaultWindow = 65535;
-constexpr std::int64_t kMaxWindow = 0x7FFFFFFF;
+      
+constexpr std::int64_t kDefaultWindow = 65535; 
 // Our receive window, advertised once at connection start: large requests
 // (a client's Arrow payload) need not crawl at 64 KiB per round trip.
-constexpr std::uint32_t kRecvWindow = 16u * 1024u * 1024u;
-constexpr int kMaxFramesPerWait = 1 << 20;
-constexpr int kMaxTlsRetries = 1024;
-constexpr int kMaxPollFrames = 4096;
+constexpr std::uint32_t kRecvWindow = 16u * 1024u * 1024u;   
 constexpr std::size_t kWriteCoalesce = 256u * 1024u;
+
+int limit_int(boltapi_limits_id id) noexcept {
+    const std::uint64_t v = boltapi_limits_value(id);
+    assert(v >= 1 && v <= 0x7FFFFFFFu);
+    return static_cast<int>(v);
+}
 
 std::uint32_t be_u32(const std::uint8_t* p) noexcept {
     return (static_cast<std::uint32_t>(p[0]) << 24) |
@@ -254,6 +250,9 @@ private:
     int           fd_ = -1;
     SSL*          ssl_ = nullptr;
     int           tls_retries_ = 0;
+    const int     max_tls_retries_ = limit_int(boltapi_limits_id::grpc_tls_retries);
+    const int     max_poll_frames_ = limit_int(boltapi_limits_id::grpc_poll_frames);
+    const int     max_frames_per_wait_ = limit_int(boltapi_limits_id::grpc_frames_per_wait);
     int           idle_budget_ = 0;
     bool          dead_ = false;
     int           nest_depth_ = 0;
@@ -354,7 +353,7 @@ ssize_t Conn::recv_some(std::uint8_t* p, std::size_t n) noexcept {
     const int r = SSL_read(ssl_, p, cap);
     if (r > 0) { tls_retries_ = 0; return r; }
     const int e = SSL_get_error(ssl_, r);
-    if ((e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) && ++tls_retries_ < kMaxTlsRetries) {
+    if ((e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) && ++tls_retries_ < max_tls_retries_) {
         return 0;
     }
     return -1;
@@ -374,7 +373,7 @@ bool Conn::write_all(const void* src, std::size_t n) noexcept {
                                     left > 0x40000000u ? 0x40000000 : static_cast<int>(left));
             const int e = r > 0 ? SSL_ERROR_NONE : SSL_get_error(ssl_, r);
             if (r <= 0 && (e == SSL_ERROR_WANT_WRITE || e == SSL_ERROR_WANT_READ) &&
-                ++retries < kMaxTlsRetries) {
+                ++retries < max_tls_retries_) {
                 continue;
             }
             w = r;
@@ -482,7 +481,7 @@ void Conn::dispatch_ready(bool nestable_only) noexcept {
 }
 
 void Conn::poll() noexcept {
-    for (int i = 0; i < kMaxPollFrames && !dead_; ++i) {
+    for (int i = 0; i < max_poll_frames_ && !dead_; ++i) {
         if (!readable_now()) break;
         if (!read_and_handle_frame()) break;
     }
@@ -731,7 +730,7 @@ void Conn::finish(Stream& s, Code code, std::string_view msg, std::string_view d
 }
 
 bool Conn::wait_for_window(Stream& s) noexcept {
-    for (int i = 0; i < kMaxFramesPerWait; ++i) {
+    for (int i = 0; i < max_frames_per_wait_; ++i) {
         if (dead_ || s.reset) return false;
         if (conn_send_window_ > 0 && s.send_window > 0) return true;
         if (!read_and_handle_frame()) return false;

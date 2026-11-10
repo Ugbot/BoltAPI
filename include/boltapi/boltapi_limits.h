@@ -8,6 +8,7 @@
 #include <cstdint>
 
 #include "bolt/bolt_limits.h"
+#include "boltapi/proto/grpc_limits.h"
 #include "boltapi/proto/postgres_wire.h"
 #include "boltapi/http/fixed_stream_limits.h"
 #include "boltapi/quic/quic_limits.h"
@@ -23,6 +24,30 @@
       ::bolt::api::kFixedStreamMaxSlots, ::bolt::api::kFixedStreamMaxSlots,      \
       ::bolt::api::kFixedStreamMaxSlots, nullptr, nullptr,                      \
       "maximum fixed-stream slots allocated at server startup")                \
+    X(grpc_settings_max_concurrent_id, kInvariant, "id", ::bolt::api::proto::grpc::kSettingsMaxConcurrent, ::bolt::api::proto::grpc::kSettingsMaxConcurrent, ::bolt::api::proto::grpc::kSettingsMaxConcurrent, nullptr, nullptr, \
+      "RFC 9113 SETTINGS_MAX_CONCURRENT_STREAMS identifier") \
+    X(grpc_settings_max_frame_size_id, kInvariant, "id", ::bolt::api::proto::grpc::kSettingsMaxFrameSize, ::bolt::api::proto::grpc::kSettingsMaxFrameSize, ::bolt::api::proto::grpc::kSettingsMaxFrameSize, nullptr, nullptr, \
+      "RFC 9113 SETTINGS_MAX_FRAME_SIZE identifier") \
+    X(grpc_max_frame, kInvariant, "bytes", ::bolt::api::proto::grpc::kOurMaxFrame, ::bolt::api::proto::grpc::kOurMaxFrame, ::bolt::api::proto::grpc::kOurMaxFrame, nullptr, nullptr, \
+      "HTTP/2 frame payload we accept (RFC 9113 initial max)") \
+    X(grpc_max_window, kInvariant, "bytes", ::bolt::api::proto::grpc::kMaxWindow, ::bolt::api::proto::grpc::kMaxWindow, ::bolt::api::proto::grpc::kMaxWindow, nullptr, nullptr, \
+      "HTTP/2 flow-control window (RFC 9113: 2^31-1)") \
+    X(grpc_max_streams, kFixedAtAlloc, "streams", ::bolt::api::proto::grpc::kMaxStreamsCap, ::bolt::api::proto::grpc::kMaxStreamsCap, ::bolt::api::proto::grpc::kMaxStreamsCap, nullptr, nullptr, \
+      "gRPC stream slots per connection") \
+    X(grpc_header_block, kFixedAtAlloc, "bytes", ::bolt::api::proto::grpc::kHeaderBlockCap, ::bolt::api::proto::grpc::kHeaderBlockCap, ::bolt::api::proto::grpc::kHeaderBlockCap, nullptr, nullptr, \
+      "gRPC HEADERS+CONTINUATION buffer per connection") \
+    X(grpc_auth_bytes, kFixedAtAlloc, "bytes", ::bolt::api::proto::grpc::kAuthCap, ::bolt::api::proto::grpc::kAuthCap, ::bolt::api::proto::grpc::kAuthCap, nullptr, nullptr, \
+      "authorization header bytes kept per gRPC stream") \
+    X(grpc_path_bytes, kFixedAtAlloc, "bytes", ::bolt::api::proto::grpc::kPathCap, ::bolt::api::proto::grpc::kPathCap, ::bolt::api::proto::grpc::kPathCap, nullptr, nullptr, \
+      ":path bytes kept per gRPC stream") \
+    X(grpc_agent_bytes, kFixedAtAlloc, "bytes", ::bolt::api::proto::grpc::kAgentCap, ::bolt::api::proto::grpc::kAgentCap, ::bolt::api::proto::grpc::kAgentCap, nullptr, nullptr, \
+      "user-agent bytes kept per gRPC stream") \
+    X(grpc_frames_per_wait, kBudget, "frames", ::bolt::api::proto::grpc::kMaxFramesPerWait, 1, 0x7FFFFFFF, "BOLTAPI_GRPC_FRAMES_PER_WAIT", nullptr, \
+      "frames read while a gRPC stream waits for send window") \
+    X(grpc_tls_retries, kBudget, "retries", ::bolt::api::proto::grpc::kMaxTlsRetries, 1, 0x7FFFFFFF, "BOLTAPI_GRPC_TLS_RETRIES", nullptr, \
+      "TLS WANT_READ/WRITE retries per gRPC IO") \
+    X(grpc_poll_frames, kBudget, "frames", ::bolt::api::proto::grpc::kMaxPollFrames, 1, 0x7FFFFFFF, "BOLTAPI_GRPC_POLL_FRAMES", nullptr, \
+      "frames handled per gRPC connection poll") \
     X(pgwire_max_fields, kInvariant, "columns",                                 \
       ::bolt::api::proto::pgwire::kMaxFields,                                   \
       ::bolt::api::proto::pgwire::kMaxFields,                                   \
