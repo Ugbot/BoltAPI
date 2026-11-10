@@ -6,6 +6,7 @@
 // dispatched while a streaming call is still sending.
 
 #include "boltapi/proto/grpc_server.h"
+#include "grpc_reactor.h"
 
 #if defined(BOLTAPI_WITH_FLIGHT_SQL)
 
@@ -931,6 +932,7 @@ Server::Server(const Config& cfg, IServiceFactory& factory) noexcept
 Server::~Server() { stop(); }
 
 std::uint16_t Server::local_port() const noexcept {
+    if (reactor_ != nullptr) return cfg_.port;
     return listener_ ? listener_->local_port() : 0;
 }
 
@@ -952,7 +954,14 @@ void Server::worker_loop(IService& svc, std::uint16_t worker_id) noexcept {
 }
 
 Status Server::start_background() noexcept {
-    if (listener_ != nullptr) return Status(core::error_code::invalid_state);
+    if (listener_ != nullptr || reactor_ != nullptr) return Status(core::error_code::invalid_state);
+    if (cfg_.reactor && !cfg_.tls_enabled() && cfg_.unix_path.empty()) {
+        reactor_ = std::make_unique<ReactorHost>(cfg_, factory_);
+        const Status s = reactor_->start();
+        if (s.is_err()) { reactor_.reset(); return s; }
+        running_.store(true, std::memory_order_release);
+        return Status();
+    }
     if (cfg_.tls_enabled()) {
         net::TlsContextConfig tc;
         tc.cert_file = cfg_.tls_cert_file;
@@ -991,6 +1000,7 @@ Status Server::start_background() noexcept {
 
 void Server::stop() noexcept {
     stopping_.store(true, std::memory_order_release);
+    if (reactor_ != nullptr) { reactor_->stop(); reactor_.reset(); }
     if (listener_ != nullptr) listener_->stop();
     for (auto& t : workers_) {
         if (t->joinable()) t->join();

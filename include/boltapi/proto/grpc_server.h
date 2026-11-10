@@ -135,6 +135,11 @@ struct Config {
     std::string   tls_key_file;
     std::string   tls_cert_pem;
     std::string   tls_key_pem;
+    // Cleartext TCP only: host calls on the boltapi reactor (one reader and
+    // one writer per connection, every call on a blocking worker, calls of a
+    // connection concurrent) instead of a thread per connection. TLS and
+    // unix_path keep the thread-per-connection server. Needs a fixed port.
+    bool          reactor = false;
 
     bool tls_enabled() const noexcept {
         return !tls_cert_file.empty() || !tls_cert_pem.empty();
@@ -143,6 +148,7 @@ struct Config {
 
 class Listener;
 class Conn;
+class ReactorHost;
 
 class Server final {
 public:
@@ -167,6 +173,7 @@ private:
     std::unique_ptr<Listener>                          listener_;
     std::vector<std::unique_ptr<core::StackedThread>>  workers_;
     std::vector<IService*>                             services_;
+    std::unique_ptr<ReactorHost>                       reactor_;
     std::atomic<bool>                                  running_{false};
     std::atomic<bool>                                  stopping_{false};
 };

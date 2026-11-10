@@ -149,11 +149,14 @@ std::string unframe_all(const std::string& data) {
     return out;
 }
 
-class GrpcServerTest : public ::testing::Test {
+// Both hosts: thread per connection, and the boltapi reactor (Config::reactor).
+class GrpcServerTest : public ::testing::TestWithParam<bool> {
 protected:
     void SetUp() override {
         g::Config cfg;
         cfg.max_connections = 2;
+        cfg.reactor = GetParam();
+        if (cfg.reactor) cfg.port = 19517;
         server_ = std::make_unique<g::Server>(cfg, factory_);
         ASSERT_TRUE(server_->start_background().is_ok());
         ASSERT_NE(server_->local_port(), 0);
@@ -163,7 +166,7 @@ protected:
     std::unique_ptr<g::Server> server_;
 };
 
-TEST_F(GrpcServerTest, UnaryEchoAndUnknownMethod) {
+TEST_P(GrpcServerTest, UnaryEchoAndUnknownMethod) {
     Client c(server_->local_port());
     ASSERT_TRUE(c.ok());
     const auto a = c.call("/t.S/Echo", "hello");
@@ -176,7 +179,7 @@ TEST_F(GrpcServerTest, UnaryEchoAndUnknownMethod) {
     EXPECT_EQ(c[b].trailers["grpc-message"], "no such method");
 }
 
-TEST_F(GrpcServerTest, ServerStreamPastTheWindowThenTrailers) {
+TEST_P(GrpcServerTest, ServerStreamPastTheWindowThenTrailers) {
     Client c(server_->local_port());
     ASSERT_TRUE(c.ok());
     const auto s = c.call("/t.S/Stream", "");
@@ -188,7 +191,7 @@ TEST_F(GrpcServerTest, ServerStreamPastTheWindowThenTrailers) {
     EXPECT_EQ(c[s].trailers["grpc-status"], "0");
 }
 
-TEST_F(GrpcServerTest, ErrorDetailsTrailer) {
+TEST_P(GrpcServerTest, ErrorDetailsTrailer) {
     Client c(server_->local_port());
     ASSERT_TRUE(c.ok());
     const auto f = c.call("/t.S/Fail", "");
@@ -197,7 +200,7 @@ TEST_F(GrpcServerTest, ErrorDetailsTrailer) {
     EXPECT_EQ(c[f].trailers["grpc-status-details-bin"], "CAM");   // base64("\x08\x03"), unpadded
 }
 
-TEST_F(GrpcServerTest, NestableCallAnsweredWhileAStreamIsOpen) {
+TEST_P(GrpcServerTest, NestableCallAnsweredWhileAStreamIsOpen) {
     Client c(server_->local_port());
     ASSERT_TRUE(c.ok());
     const auto s = c.call("/t.S/Stream", "");
@@ -207,5 +210,8 @@ TEST_F(GrpcServerTest, NestableCallAnsweredWhileAStreamIsOpen) {
     ASSERT_TRUE(c.wait(s));
     EXPECT_EQ(unframe_all(c[s].data).size(), 50u * 4000u);
 }
+
+INSTANTIATE_TEST_SUITE_P(Hosts, GrpcServerTest, ::testing::Values(false, true),
+                         [](const ::testing::TestParamInfo<bool>& i) { return i.param ? "Reactor" : "Threads"; });
 
 }  // namespace
