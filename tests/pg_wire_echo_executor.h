@@ -5,6 +5,8 @@
 //   "rows N"     -> one int8 column "n", values 1..N ("select rows N" too)
 //   "types"      -> one row: int8, float8, text, date, numeric, bool, NULL text
 //   "ddl..."     -> no columns, tag "OK"; appended to `applied`
+//   "cols N"     -> one row of N text columns c0..c{N-1}, each "v"; more than
+//                   `fields_cap` is refused (54000)
 //   anything else -> one text column "sql" holding the SQL it received, so a
 //                    test can assert exactly what parameter binding produced.
 #pragma once
@@ -17,6 +19,7 @@
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace boltapi_test {
 
@@ -50,6 +53,21 @@ public:
             rows_ = clamp_rows(std::atoi(sql_.c_str() + 12));
             ncols_ = 1;
             f[0] = {"n", 20, 8};
+        } else if (starts(sql, "cols ")) {
+            const int k = std::atoi(sql_.c_str() + 5);
+            if (k <= 0 || static_cast<std::uint32_t>(k) > cap) {
+                qf.sqlstate = "54000";
+                qf.message = "echo executor: more columns than fields_cap";
+                return false;
+            }
+            mode_ = Mode::Cols;
+            rows_ = 1;
+            ncols_ = static_cast<std::uint32_t>(k);
+            names_.resize(ncols_);
+            for (std::uint32_t c = 0; c < ncols_; ++c) {
+                names_[c] = "c" + std::to_string(c);
+                f[c] = {names_[c], 25, -1};
+            }
         } else if (starts(sql, "types")) {
             mode_ = Mode::Types;
             rows_ = 1;
@@ -91,6 +109,9 @@ public:
                 v[0] = "-42"; v[1] = "1.5"; v[2] = "x'y"; v[3] = "2024-02-29";
                 v[4] = "-12.3450"; v[5] = "t"; nul[6] = true;
                 break;
+            case Mode::Cols:
+                for (std::uint32_t c = 0; c < ncols_; ++c) v[c] = "v";
+                break;
             default:
                 v[0] = sql_;
                 break;
@@ -111,7 +132,7 @@ public:
     std::string applied;   // every "ddl..." statement run, ';'-terminated
 
 private:
-    enum class Mode { Echo, Rows, Types, Ddl };
+    enum class Mode { Echo, Rows, Types, Ddl, Cols };
     std::uint32_t clamp_rows(int n) const noexcept {
         if (n < 0) return 0;
         return static_cast<std::uint32_t>(n) < max_rows ? static_cast<std::uint32_t>(n) : max_rows;
@@ -120,6 +141,7 @@ private:
         return s.substr(0, std::strlen(p)) == p;
     }
     std::string   sql_;
+    std::vector<std::string> names_;
     std::uint32_t rows_ = 0;
     std::uint32_t ncols_ = 0;
     Mode          mode_ = Mode::Echo;

@@ -165,17 +165,22 @@ void handle_simple_query(int fd, MsgWriter& w, ExtendedSession& ext,
             return;
         }
     }
-    FieldDesc fields[kMaxFields];
+    RowScratch& rs = ext.scratch();
+    const std::uint32_t cap = rs.ensure();
     std::uint32_t field_count = 0;
     QueryFailure failure;
     ext.displace();
-    const bool ok = exec.execute(sql, fields, kMaxFields, field_count, failure);
+    const bool ok = exec.execute(sql, rs.fields.data(), cap, field_count, failure);
     if (!ok) {
         simple_fail(fd, w, ext, failure.sqlstate, failure.message);
         return;
     }
+    if (field_count >= cap) {
+        simple_fail(fd, w, ext, kSqlStateProgramLimitExceeded, kTooManyFields);
+        return;
+    }
     if (field_count > 0) {
-        if (!put_row_description(w, fields, field_count, nullptr)) {
+        if (!put_row_description(w, rs.fields.data(), field_count, nullptr)) {
             simple_fail(fd, w, ext, "54000", "result row is too wide for this "
                         "endpoint's wire buffer");
             return;
@@ -183,8 +188,8 @@ void handle_simple_query(int fd, MsgWriter& w, ExtendedSession& ext,
         if (!w.send(fd)) return;
 
         const std::uint32_t rows = exec.row_count();
-        std::string_view values[kMaxFields];
-        bool is_null[kMaxFields];
+        std::string_view* values = rs.values.data();
+        bool* is_null = rs.is_null.get();
         for (std::uint32_t r = 0; r < rows; ++r) {          // bounded by row_count()
             if (!exec.row(r, values, is_null, field_count)) break;
             w.begin('D');

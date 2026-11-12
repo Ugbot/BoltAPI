@@ -8,6 +8,7 @@
 #include "boltapi/proto/postgres_wire_codec.h"
 #include "postgres_wire_internal.h"
 
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <string_view>
@@ -15,7 +16,6 @@
 
 namespace bolt::api::proto::pgwire::detail {
 
-inline constexpr std::uint32_t kMaxParams  = 256;   // per statement
 inline constexpr std::size_t   kMaxNameLen = 64;    // statement/portal names
 inline constexpr std::uint32_t kMaxSavepoints = 32; // per transaction block
 inline constexpr std::uint32_t kTxBlockedMsgLen = 512;
@@ -98,6 +98,9 @@ public:
     // The executor is about to replace its buffered result.
     void displace() noexcept { current_ = -1; }
 
+    // Result-shape scratch shared by the simple- and extended-query paths.
+    RowScratch& scratch() noexcept { return rows_; }
+
     // Handle one extended-protocol message ('P','B','D','E','C','H','S').
     // Returns false only when the socket write failed (connection is dead).
     bool handle(char type, const std::uint8_t* body, std::size_t len, int fd,
@@ -110,7 +113,7 @@ private:
         std::size_t   sql_off  = 0;
         std::size_t   sql_len  = 0;
         std::uint32_t n_params = 0;
-        std::int32_t  param_types[kMaxParams] = {};
+        std::vector<std::int32_t> param_types;   // n_params, grown per statement
     };
     struct Portal {
         char          name[kMaxNameLen] = {};
@@ -132,12 +135,32 @@ private:
         std::uint32_t next_row     = 0;
         std::uint32_t field_count  = 0;
         std::uint32_t n_formats    = 0;       // 0 = all text, 1 = all, else per column
-        std::int16_t  formats[kMaxFields] = {};
-        std::int32_t  oids[kMaxFields]    = {};
-        char          names[kMaxFields][kMaxNameLen] = {};   // for re-Describe
+        // Per column, grown to the widest result this portal slot has held.
+        std::vector<std::int16_t> formats;    // n_formats
+        std::vector<std::int32_t> oids;       // field_count
+        std::vector<char>         names;      // field_count * kMaxNameLen, for re-Describe
+
+        char* col_name(std::uint32_t c) noexcept {
+            assert(static_cast<std::size_t>(c + 1) * kMaxNameLen <= names.size());
+            return names.data() + static_cast<std::size_t>(c) * kMaxNameLen;
+        }
+        const char* col_name(std::uint32_t c) const noexcept {
+            assert(static_cast<std::size_t>(c + 1) * kMaxNameLen <= names.size());
+            return names.data() + static_cast<std::size_t>(c) * kMaxNameLen;
+        }
+        void shape(std::uint32_t n) noexcept {
+            assert(n <= ::bolt::api::limits::kPgwireMaxFieldsCeiling);
+            if (oids.size() < n) oids.resize(n);
+            if (names.size() < static_cast<std::size_t>(n) * kMaxNameLen) {
+                names.resize(static_cast<std::size_t>(n) * kMaxNameLen);
+            }
+            assert(oids.size() >= n);
+        }
     };
 
     bool on_parse(BodyReader& r, int fd, MsgWriter& w) noexcept;
+    bool read_bind_params(BodyReader& r, const Statement& st, const char** sqlstate,
+                          const char** message) noexcept;
     bool on_bind(BodyReader& r, int fd, MsgWriter& w) noexcept;
     bool on_describe(BodyReader& r, int fd, MsgWriter& w, IQueryExecutor& exec) noexcept;
     bool on_execute(BodyReader& r, int fd, MsgWriter& w, IQueryExecutor& exec) noexcept;
@@ -189,6 +212,9 @@ private:
     std::size_t            pool_used_ = 0;
     std::vector<char>      portal_sql_;    // [max_portals][max_statement_bytes]
     std::vector<char>      describe_sql_;  // Describe(statement) probe text
+    RowScratch             rows_;          // result shape, sized on first query
+    std::vector<std::int16_t> bind_formats_;   // one Bind's parameter formats
+    std::vector<BoundParam>   bind_params_;    // one Bind's parameters
     std::int32_t           current_ = -1;  // portal whose rows the executor holds
     bool                   in_error_ = false;
     char                   tx_status_ = 'I';

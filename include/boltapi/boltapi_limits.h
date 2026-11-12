@@ -9,7 +9,6 @@
 
 #include "bolt/bolt_limits.h"
 #include "boltapi/proto/grpc_limits.h"
-#include "boltapi/proto/postgres_wire.h"
 #include "boltapi/http/fixed_stream_limits.h"
 #include "boltapi/quic/quic_limits.h"
 #include "boltapi/router.h"
@@ -20,6 +19,13 @@ namespace bolt::api::limits {
 // fixed 4,096). One CatalogTable per table, only while a listing runs.
 inline constexpr std::uint64_t kFlightSqlCatalogTablesDefault = 1u << 20;
 inline constexpr std::uint64_t kFlightSqlCatalogTablesMax     = 0xFFFFFFFFu;
+// Postgres result columns: MaxTupleAttributeNumber (1,664) by default; the
+// RowDescription / DataRow column count is an Int16 on the wire.
+inline constexpr std::uint64_t kPgwireMaxFieldsDefault = 1664;
+inline constexpr std::uint64_t kPgwireMaxFieldsCeiling = 0x7FFF;
+// Postgres Bind / Parse parameter count: a UInt16 on the wire (65,535).
+inline constexpr std::uint64_t kPgwireMaxParamsDefault = 0xFFFF;
+inline constexpr std::uint64_t kPgwireMaxParamsCeiling = 0xFFFF;
 }  // namespace bolt::api::limits
 
 #define BOLTAPI_LIMITS(X)                                                       \
@@ -61,11 +67,18 @@ inline constexpr std::uint64_t kFlightSqlCatalogTablesMax     = 0xFFFFFFFFu;
       "TLS WANT_READ/WRITE retries per gRPC IO") \
     X(grpc_poll_frames, kBudget, "frames", ::bolt::api::proto::grpc::kMaxPollFrames, 1, 0x7FFFFFFF, "BOLTAPI_GRPC_POLL_FRAMES", nullptr, \
       "frames handled per gRPC connection poll") \
-    X(pgwire_max_fields, kInvariant, "columns",                                 \
-      ::bolt::api::proto::pgwire::kMaxFields,                                   \
-      ::bolt::api::proto::pgwire::kMaxFields,                                   \
-      ::bolt::api::proto::pgwire::kMaxFields, nullptr, nullptr,                 \
-      "columns in one Postgres RowDescription")                                 \
+    X(pgwire_max_fields, kBudget, "columns",                                    \
+      ::bolt::api::limits::kPgwireMaxFieldsDefault, 1,                          \
+      ::bolt::api::limits::kPgwireMaxFieldsCeiling,                             \
+      "BOLTAPI_PGWIRE_MAX_FIELDS", nullptr,                                     \
+      "columns in one Postgres result (RowDescription); scratch grows per "     \
+      "session on first use (past it: SQLSTATE 54000 naming this knob)")        \
+    X(pgwire_max_params, kBudget, "params",                                     \
+      ::bolt::api::limits::kPgwireMaxParamsDefault, 1,                          \
+      ::bolt::api::limits::kPgwireMaxParamsCeiling,                             \
+      "BOLTAPI_PGWIRE_MAX_PARAMS", nullptr,                                     \
+      "bind parameters in one Postgres prepared statement; storage is per "     \
+      "statement (past it: SQLSTATE 54000 naming this knob)")                   \
     X(bolt_max_offset_seconds, kInvariant, "seconds",                           \
       ::bolt::api::kBoltMaxOffsetSeconds, ::bolt::api::kBoltMaxOffsetSeconds,   \
       ::bolt::api::kBoltMaxOffsetSeconds, nullptr, nullptr,                     \

@@ -21,7 +21,8 @@ bool name_eq(const char* stored, std::string_view name) noexcept {
            std::memcmp(stored, name.data(), name.size()) == 0;
 }
 
-void set_name(char (&dst)[kMaxNameLen], std::string_view name) noexcept {
+void set_name(char* dst, std::string_view name) noexcept {
+    assert(dst != nullptr);
     assert(name.size() < kMaxNameLen);
     std::memcpy(dst, name.data(), name.size());
     dst[name.size()] = '\0';
@@ -80,12 +81,12 @@ bool ExtendedSession::tx_apply(IQueryExecutor& exec, QueryFailure& qf) noexcept 
     for (std::uint32_t i = 0; i < n; ++i) {                     // bounded by n_pending_
         const PendingWrite& pw = tx_pending_[i];
         assert(static_cast<std::size_t>(pw.off) + pw.len <= tx_pool_.size());
-        FieldDesc fields[kMaxFields];
+        const std::uint32_t cap = rows_.ensure();
         std::uint32_t count = 0;
         QueryFailure f;
         current_ = -1;
-        if (exec.execute(std::string_view(tx_pool_.data() + pw.off, pw.len), fields,
-                         kMaxFields, count, f)) {
+        if (exec.execute(std::string_view(tx_pool_.data() + pw.off, pw.len),
+                         rows_.fields.data(), cap, count, f)) {
             continue;
         }
         if (i == 0) {
@@ -385,12 +386,11 @@ bool ExtendedSession::handle(char type, const std::uint8_t* body, std::size_t le
 bool ExtendedSession::on_parse(BodyReader& r, int fd, MsgWriter& w) noexcept {
     const std::string_view name = r.cstr();
     const std::string_view sql  = r.cstr();
-    const std::int16_t ntypes   = r.i16();
-    if (!r.ok || ntypes < 0) return fail(fd, w, "08P01", "malformed Parse message");
+    // The count is a UInt16, as Postgres reads it (up to 65,535).
+    const std::uint32_t ntypes  = static_cast<std::uint16_t>(r.i16());
+    if (!r.ok) return fail(fd, w, "08P01", "malformed Parse message");
     if (name.size() >= kMaxNameLen) return fail(fd, w, "42602", "statement name too long");
-    if (static_cast<std::uint32_t>(ntypes) > kMaxParams) {
-        return fail(fd, w, "54023", "too many parameters for one statement");
-    }
+    if (ntypes > max_params()) return fail(fd, w, kSqlStateProgramLimitExceeded, kTooManyParams);
     std::int32_t si = 0;
     if (!name.empty()) {
         if (find_statement(name) >= 0) {
@@ -408,15 +408,15 @@ bool ExtendedSession::on_parse(BodyReader& r, int fd, MsgWriter& w) noexcept {
     Statement& st = stmts_[static_cast<std::size_t>(si)];
     st.used = false;
     const std::uint32_t refs = max_param_ref(sql);
-    if (refs > kMaxParams) return fail(fd, w, "54023", "too many parameters for one statement");
+    if (refs > max_params()) return fail(fd, w, kSqlStateProgramLimitExceeded, kTooManyParams);
     if (!store_sql(st, sql)) {
         return fail(fd, w, "54000", "statement text exceeds this endpoint's "
                     "prepared-statement capacity");
     }
-    st.n_params = refs > static_cast<std::uint32_t>(ntypes) ? refs
-                                                            : static_cast<std::uint32_t>(ntypes);
-    for (std::uint32_t k = 0; k < st.n_params; ++k) {           // bounded by kMaxParams
-        st.param_types[k] = k < static_cast<std::uint32_t>(ntypes) ? r.i32() : 0;
+    st.n_params = refs > ntypes ? refs : ntypes;
+    st.param_types.resize(st.n_params);
+    for (std::uint32_t k = 0; k < st.n_params; ++k) {           // bounded by max_params()
+        st.param_types[k] = k < ntypes ? r.i32() : 0;
     }
     if (!r.ok) return fail(fd, w, "08P01", "malformed Parse message");
     set_name(st.name, name);
@@ -434,31 +434,12 @@ bool ExtendedSession::on_bind(BodyReader& r, int fd, MsgWriter& w) noexcept {
     if (si < 0) return fail(fd, w, "26000", "prepared statement does not exist");
     const Statement& st = stmts_[static_cast<std::size_t>(si)];
 
-    const std::int16_t nfmt = r.i16();
-    if (nfmt < 0 || static_cast<std::uint32_t>(nfmt) > kMaxParams) {
-        return fail(fd, w, "08P01", "malformed Bind parameter formats");
-    }
-    std::int16_t pfmt[kMaxParams];
-    for (std::int16_t k = 0; k < nfmt; ++k) pfmt[k] = r.i16();
-    const std::int16_t nparams = r.i16();
-    if (!r.ok || nparams < 0 || static_cast<std::uint32_t>(nparams) != st.n_params) {
-        return fail(fd, w, "08P01", "Bind supplies a different number of "
-                    "parameters than the statement requires");
-    }
-    if (nfmt > 1 && nfmt != nparams) return fail(fd, w, "08P01", "malformed Bind parameter formats");
-    BoundParam params[kMaxParams];
-    for (std::int16_t k = 0; k < nparams; ++k) {                 // bounded by kMaxParams
-        const std::int32_t plen = r.i32();
-        BoundParam& bp = params[k];
-        bp.type_oid = st.param_types[k];
-        bp.binary   = (nfmt == 1 ? pfmt[0] : (nfmt == 0 ? 0 : pfmt[k])) == 1;
-        bp.is_null  = plen < 0;
-        if (plen > 0) bp.bytes = r.bytes(static_cast<std::size_t>(plen));
-    }
-    const std::int16_t nres = r.i16();
-    if (!r.ok || nres < 0 || static_cast<std::uint32_t>(nres) > kMaxFields) {
-        return fail(fd, w, "08P01", "malformed Bind result formats");
-    }
+    const char* sqlstate = nullptr;
+    const char* message  = nullptr;
+    if (!read_bind_params(r, st, &sqlstate, &message)) return fail(fd, w, sqlstate, message);
+    const std::uint32_t nres = static_cast<std::uint16_t>(r.i16());
+    if (!r.ok) return fail(fd, w, "08P01", "malformed Bind result formats");
+    if (nres > max_fields()) return fail(fd, w, kSqlStateProgramLimitExceeded, kTooManyFields);
     std::int32_t pi = 0;
     if (!pname.empty()) {
         if (find_portal(pname) >= 0) return fail(fd, w, "42P03", "portal already exists");
@@ -470,8 +451,9 @@ bool ExtendedSession::on_bind(BodyReader& r, int fd, MsgWriter& w) noexcept {
     }
     close_portal(pi);
     Portal& p = portals_[static_cast<std::size_t>(pi)];
-    p.n_formats = static_cast<std::uint32_t>(nres);
-    for (std::int16_t k = 0; k < nres; ++k) {
+    p.n_formats = nres;
+    if (p.formats.size() < nres) p.formats.resize(nres);
+    for (std::uint32_t k = 0; k < nres; ++k) {                   // bounded by max_fields()
         p.formats[k] = r.i16();
         if (p.formats[k] != 0 && p.formats[k] != 1) {
             return fail(fd, w, "22023", "unsupported result format code");
@@ -481,7 +463,7 @@ bool ExtendedSession::on_bind(BodyReader& r, int fd, MsgWriter& w) noexcept {
 
     CodecError ce;
     std::size_t out_len = 0;
-    if (!substitute_params(statement_sql(st), params, st.n_params, portal_sql(pi),
+    if (!substitute_params(statement_sql(st), bind_params_.data(), st.n_params, portal_sql(pi),
                            max_stmt_bytes_, out_len, ce)) {
         return fail(fd, w, ce.sqlstate, ce.message);
     }
@@ -502,8 +484,45 @@ bool ExtendedSession::on_bind(BodyReader& r, int fd, MsgWriter& w) noexcept {
     return w.finish() && w.send(fd);
 }
 
+// Bind's parameter formats and values into bind_params_. Counts are UInt16,
+// as Postgres reads them; past pgwire_max_params is refused by name.
+bool ExtendedSession::read_bind_params(BodyReader& r, const Statement& st,
+                                       const char** sqlstate, const char** message) noexcept {
+    assert(sqlstate != nullptr && message != nullptr);
+    assert(st.param_types.size() >= st.n_params);
+    *sqlstate = "08P01";
+    *message  = "malformed Bind parameter formats";
+    const std::uint32_t nfmt = static_cast<std::uint16_t>(r.i16());
+    if (!r.ok) return false;
+    if (nfmt > max_params()) {
+        *sqlstate = kSqlStateProgramLimitExceeded;
+        *message  = kTooManyParams;
+        return false;
+    }
+    bind_formats_.resize(nfmt);
+    for (std::uint32_t k = 0; k < nfmt; ++k) bind_formats_[k] = r.i16();
+    const std::uint32_t nparams = static_cast<std::uint16_t>(r.i16());
+    if (!r.ok || nparams != st.n_params) {
+        *message = "Bind supplies a different number of parameters than the "
+                   "statement requires";
+        return false;
+    }
+    if (nfmt > 1 && nfmt != nparams) return false;
+    bind_params_.assign(nparams, BoundParam{});
+    for (std::uint32_t k = 0; k < nparams; ++k) {                // bounded by n_params
+        const std::int32_t plen = r.i32();
+        BoundParam& bp = bind_params_[k];
+        bp.type_oid = st.param_types[k];
+        bp.binary   = (nfmt == 1 ? bind_formats_[0] : (nfmt == 0 ? 0 : bind_formats_[k])) == 1;
+        bp.is_null  = plen < 0;
+        if (plen > 0) bp.bytes = r.bytes(static_cast<std::size_t>(plen));
+    }
+    return r.ok;
+}
+
 std::int16_t ExtendedSession::format_of(const Portal& p, std::uint32_t col) const noexcept {
-    assert(col < kMaxFields);
+    assert(col <= ::bolt::api::limits::kPgwireMaxFieldsCeiling);
+    assert(p.formats.size() >= p.n_formats);
     if (p.n_formats == 0) return 0;
     if (p.n_formats == 1) return p.formats[0];
     return col < p.n_formats ? p.formats[col] : 0;
@@ -562,9 +581,10 @@ bool ExtendedSession::materialize(std::int32_t pi, int fd, MsgWriter& w,
         p.show         = true;
         p.show_len     = static_cast<std::uint32_t>(sa.value.size());
         std::memcpy(p.show_value, sa.value.data(), sa.value.size());
-        set_name(p.names[0], sa.column);
+        p.shape(1);
+        set_name(p.col_name(0), sa.column);
         p.oids[0]      = oid::kText;
-        fields[0].name = p.names[0];
+        fields[0].name = p.col_name(0);
         fields[0].type_oid = oid::kText;
         p.field_count  = 1;
         p.materialized = true;
@@ -580,18 +600,24 @@ bool ExtendedSession::materialize(std::int32_t pi, int fd, MsgWriter& w,
         return true;
     }
     current_ = -1;
-    if (!exec.execute(sql, fields, kMaxFields, count, qf)) return false;
+    if (!exec.execute(sql, fields, rows_.cap, count, qf)) return false;
+    if (count >= rows_.cap) {
+        qf.sqlstate = kSqlStateProgramLimitExceeded;
+        qf.message  = kTooManyFields;
+        return false;
+    }
     if (p.n_formats > 1 && p.n_formats != count) {
         qf.sqlstate = "08P01";
         qf.message  = "Bind result-format count does not match the result's columns";
         return false;
     }
-    for (std::uint32_t c = 0; c < count; ++c) {                  // bounded by kMaxFields
+    p.shape(count);
+    for (std::uint32_t c = 0; c < count; ++c) {                  // bounded by max_fields()
         p.oids[c] = fields[c].type_oid;
         const std::size_t nl = fields[c].name.size() < kMaxNameLen - 1
             ? fields[c].name.size() : kMaxNameLen - 1;
-        std::memcpy(p.names[c], fields[c].name.data(), nl);
-        p.names[c][nl] = '\0';
+        std::memcpy(p.col_name(c), fields[c].name.data(), nl);
+        p.col_name(c)[nl] = '\0';
         if (format_of(p, c) == 1 && !binary_result_supported(fields[c].type_oid)) {
             qf.sqlstate = "0A000";
             qf.message  = "binary result format requested for a column type this "
@@ -609,7 +635,7 @@ bool ExtendedSession::describe_statement(const Statement& st, int fd, MsgWriter&
                                          IQueryExecutor& exec) noexcept {
     w.begin('t');
     w.put_i16(static_cast<std::int16_t>(st.n_params));
-    for (std::uint32_t k = 0; k < st.n_params; ++k) {            // bounded by kMaxParams
+    for (std::uint32_t k = 0; k < st.n_params; ++k) {            // bounded by max_params()
         w.put_i32(st.param_types[k] != 0 ? st.param_types[k] : oid::kText);
     }
     if (!w.finish() || !w.send(fd)) return false;
@@ -636,8 +662,9 @@ bool ExtendedSession::describe_statement(const Statement& st, int fd, MsgWriter&
     }
     // Shape probe: bind every parameter to a type-appropriate placeholder
     // value (NULL for text-like/unknown) so the executor can plan it.
-    BoundParam dummies[kMaxParams];
-    for (std::uint32_t k = 0; k < st.n_params; ++k) {
+    bind_params_.assign(st.n_params, BoundParam{});
+    BoundParam* dummies = bind_params_.data();
+    for (std::uint32_t k = 0; k < st.n_params; ++k) {            // bounded by max_params()
         const std::int32_t t = st.param_types[k];
         dummies[k].type_oid = t;
         if (t == oid::kBool) dummies[k].bytes = "false";
@@ -653,13 +680,15 @@ bool ExtendedSession::describe_statement(const Statement& st, int fd, MsgWriter&
     if (!substitute_params(sql, dummies, st.n_params, scratch, max_stmt_bytes_, n, ce)) {
         return fail(fd, w, ce.sqlstate, ce.message);
     }
-    FieldDesc fields[kMaxFields];
+    const std::uint32_t cap = rows_.ensure();
+    FieldDesc* fields = rows_.fields.data();
     std::uint32_t count = 0;
     QueryFailure qf;
     current_ = -1;
-    if (!exec.describe(std::string_view(scratch, n), fields, kMaxFields, count, qf)) {
+    if (!exec.describe(std::string_view(scratch, n), fields, cap, count, qf)) {
         return fail(fd, w, qf.sqlstate, qf.message);
     }
+    if (count >= cap) return fail(fd, w, kSqlStateProgramLimitExceeded, kTooManyFields);
     if (count == 0) {
         w.begin('n');
         return w.finish() && w.send(fd);
@@ -693,7 +722,8 @@ bool ExtendedSession::on_describe(BodyReader& r, int fd, MsgWriter& w,
         return fail(fd, w, "55000", "portal's result was displaced by another "
                     "portal on this connection");
     }
-    FieldDesc fields[kMaxFields];
+    rows_.ensure();
+    FieldDesc* fields = rows_.fields.data();
     bool fresh = false;
     if (!p.materialized) {
         QueryFailure qf;
@@ -701,8 +731,8 @@ bool ExtendedSession::on_describe(BodyReader& r, int fd, MsgWriter& w,
         fresh = p.fetch_from < 0;
     }
     if (!fresh) {
-        for (std::uint32_t c = 0; c < p.field_count; ++c) {      // bounded by kMaxFields
-            fields[c].name = p.names[c];
+        for (std::uint32_t c = 0; c < p.field_count; ++c) {      // bounded by max_fields()
+            fields[c].name = p.col_name(c);
             fields[c].type_oid = p.oids[c];
         }
     }
@@ -710,7 +740,7 @@ bool ExtendedSession::on_describe(BodyReader& r, int fd, MsgWriter& w,
         w.begin('n');
         return w.finish() && w.send(fd);
     }
-    std::int16_t fmts[kMaxFields];
+    std::int16_t* fmts = rows_.formats.data();
     for (std::uint32_t c = 0; c < p.field_count; ++c) fmts[c] = format_of(p, c);
     if (!put_row_description(w, fields, p.field_count, fmts)) {
         return fail(fd, w, "54000", "result row is too wide for this endpoint's wire buffer");
@@ -787,9 +817,11 @@ bool ExtendedSession::on_execute(BodyReader& r, int fd, MsgWriter& w,
         return w.finish() && w.send(fd);
     }
     if (!p.materialized) {
-        FieldDesc fields[kMaxFields];
+        rows_.ensure();
         QueryFailure qf;
-        if (!materialize(pi, fd, w, exec, fields, qf)) return fail(fd, w, qf.sqlstate, qf.message);
+        if (!materialize(pi, fd, w, exec, rows_.fields.data(), qf)) {
+            return fail(fd, w, qf.sqlstate, qf.message);
+        }
     } else if (current_ != result_owner(p, pi) && p.session_tag == nullptr) {
         return fail(fd, w, "55000", "portal's result was displaced by another "
                     "portal on this connection");

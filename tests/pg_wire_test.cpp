@@ -2,6 +2,7 @@
 // Extended Query state machine driven by a hand-rolled raw-socket client.
 // The real-driver half (psycopg 3 / pgJDBC) is pg_wire_driver_conformance.py.
 
+#include "boltapi/boltapi_limits.h"
 #include "boltapi/proto/postgres_wire.h"
 #include "boltapi/proto/postgres_wire_codec.h"
 #include "pg_wire_echo_executor.h"
@@ -975,4 +976,127 @@ TEST_F(PgWire, ExtendedDeclareDescribeFetch) {
     r = c_.roundtrip();
     ASSERT_EQ(PgClient::types(r), "EZ");
     EXPECT_EQ(PgClient::sqlstate(r[0]), "34000");
+}
+
+// ---------------------------------------------------------------------------
+// G2CHK-1009: result width and bind parameters are budgets, not 256-wide grids.
+// ---------------------------------------------------------------------------
+namespace {
+
+std::int16_t field_count(const Msg& m) {
+    const auto* p = reinterpret_cast<const std::uint8_t*>(m.body.data());
+    return static_cast<std::int16_t>((p[0] << 8) | p[1]);
+}
+
+std::string numbered_params(std::uint32_t n) {
+    std::string sql = "select ";
+    for (std::uint32_t k = 1; k <= n; ++k) {
+        if (k > 1) sql += ",";
+        sql += "$" + std::to_string(k);
+    }
+    return sql;
+}
+
+}  // namespace
+
+TEST_F(PgWire, SimpleQueryReturnsPostgresWidthResult) {
+    c_.msg('Q', std::string("cols 1664") + '\0');
+    const auto r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "TDCZ");
+    EXPECT_EQ(field_count(r[0]), 1664);
+    EXPECT_EQ(field_count(r[1]), 1664);
+}
+
+TEST_F(PgWire, ExtendedDescribesAndExecutesWideResult) {
+    c_.parse("", "cols 300");
+    c_.bind("", "", {});
+    c_.describe('P', "");
+    c_.execute("");
+    c_.sync();
+    const auto r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "12TDCZ");
+    EXPECT_EQ(field_count(r[2]), 300);
+    EXPECT_EQ(field_count(r[3]), 300);
+}
+
+TEST_F(PgWire, BindsThousandsOfParameters) {
+    constexpr std::uint32_t kN = 5000;
+    c_.parse("", numbered_params(kN));
+    c_.bind("", "", std::vector<std::string>(kN, "7"));
+    c_.execute("");
+    c_.sync();
+    const auto r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "12DCZ");
+    const std::string sql = PgClient::col0(r[2]);
+    EXPECT_EQ(sql.rfind("select '7','7'", 0), 0u) << sql.substr(0, 64);
+    std::size_t sevens = 0;
+    for (std::size_t p = sql.find("'7'"); p != std::string::npos; p = sql.find("'7'", p + 3)) ++sevens;
+    EXPECT_EQ(sevens, kN);
+}
+
+namespace {
+
+// Lowers one boltapi limit for a test and restores it.
+struct Budget {
+    Budget(bolt::api::boltapi_limits_id id, std::uint64_t v)
+        : i(static_cast<std::uint32_t>(id)) {
+        bolt::LimitTable& t = bolt::api::boltapi_limits();
+        was = bolt::limits_value(t, i);
+        EXPECT_TRUE(bolt::limits_set(&t, i, v, nullptr, 0));
+    }
+    ~Budget() { (void)bolt::limits_set(&bolt::api::boltapi_limits(), i, was, nullptr, 0); }
+    std::uint32_t i = 0;
+    std::uint64_t was = 0;
+};
+
+bool names(const Msg& m, const char* knob) {
+    return m.body.find(knob) != std::string::npos;
+}
+
+}  // namespace
+
+TEST(PgWireLimits, DefaultsAreThePostgresLimits) {
+    const bolt::LimitTable& t = bolt::api::boltapi_limits();
+    const auto f = static_cast<std::uint32_t>(bolt::api::boltapi_limits_id::pgwire_max_fields);
+    const auto p = static_cast<std::uint32_t>(bolt::api::boltapi_limits_id::pgwire_max_params);
+    EXPECT_EQ(t.descs[f].def, 1664u);
+    EXPECT_EQ(t.descs[p].def, 65535u);
+    EXPECT_STREQ(t.descs[f].env, "BOLTAPI_PGWIRE_MAX_FIELDS");
+    EXPECT_STREQ(t.descs[p].env, "BOLTAPI_PGWIRE_MAX_PARAMS");
+}
+
+TEST_F(PgWire, ResultPastFieldBudgetNamesTheKnob) {
+    const Budget b(bolt::api::boltapi_limits_id::pgwire_max_fields, 8);
+    c_.msg('Q', std::string("cols 8") + '\0');
+    auto r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "TDCZ");
+    c_.msg('Q', std::string("cols 9") + '\0');
+    r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "EZ");
+    EXPECT_EQ(PgClient::sqlstate(r[0]), "54000");
+    EXPECT_TRUE(names(r[0], "pgwire_max_fields"));
+    c_.parse("", "cols 9");
+    c_.bind("", "", {});
+    c_.execute("");
+    c_.sync();
+    r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "12EZ");
+    EXPECT_EQ(PgClient::sqlstate(r[2]), "54000");
+    EXPECT_TRUE(names(r[2], "pgwire_max_fields"));
+}
+
+TEST_F(PgWire, ParamsPastBudgetNameTheKnob) {
+    const Budget b(bolt::api::boltapi_limits_id::pgwire_max_params, 4);
+    c_.parse("", numbered_params(4));
+    c_.bind("", "", {"1", "2", "3", "4"});
+    c_.execute("");
+    c_.sync();
+    auto r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "12DCZ");
+    c_.parse("", numbered_params(5));
+    c_.sync();
+    r = c_.roundtrip();
+    ASSERT_EQ(PgClient::types(r), "EZ");
+    EXPECT_EQ(PgClient::sqlstate(r[0]), "54000");
+    EXPECT_TRUE(names(r[0], "pgwire_max_params"));
 }

@@ -3,6 +3,7 @@
 // Private to boltapi; compiled only under BOLTAPI_WITH_PG_WIRE.
 #pragma once
 
+#include "boltapi/boltapi_limits.h"
 #include "boltapi/proto/postgres_wire.h"
 #include "boltapi/net/sys_compat.h"
 #include "socket_wait.h"
@@ -12,7 +13,9 @@
 #include <cassert>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <string_view>
+#include <vector>
 
 namespace bolt::api {
 namespace proto {
@@ -254,18 +257,67 @@ struct BodyReader {
     }
 };
 
+// Result columns allowed (pgwire_max_fields budget, read per query).
+inline std::uint32_t max_fields() noexcept {
+    const std::uint64_t v =
+        ::bolt::api::boltapi_limits_value(::bolt::api::boltapi_limits_id::pgwire_max_fields);
+    assert(v >= 1 && v <= ::bolt::api::limits::kPgwireMaxFieldsCeiling);
+    return static_cast<std::uint32_t>(v);
+}
+
+// Bind parameters allowed per statement (pgwire_max_params budget).
+inline std::uint32_t max_params() noexcept {
+    const std::uint64_t v =
+        ::bolt::api::boltapi_limits_value(::bolt::api::boltapi_limits_id::pgwire_max_params);
+    assert(v >= 1 && v <= ::bolt::api::limits::kPgwireMaxParamsCeiling);
+    return static_cast<std::uint32_t>(v);
+}
+
+inline constexpr const char* kTooManyFields =
+    "result has more columns than pgwire_max_fields allows "
+    "(raise BOLTAPI_PGWIRE_MAX_FIELDS)";
+inline constexpr const char* kTooManyParams =
+    "statement has more parameters than pgwire_max_params allows "
+    "(raise BOLTAPI_PGWIRE_MAX_PARAMS)";
+
+// Result-shape scratch for one session. Sized to the pgwire_max_fields
+// budget on the first query, never at startup; the extra slot lets the wire
+// see a result one column past the budget and refuse it by name.
+struct RowScratch {
+    std::vector<FieldDesc>        fields;
+    std::vector<std::string_view> values;
+    std::vector<std::int16_t>     formats;
+    std::unique_ptr<bool[]>       is_null;
+    std::uint32_t                 cap = 0;
+
+    std::uint32_t ensure() noexcept {
+        const std::uint32_t want = max_fields() + 1;
+        assert(want >= 2);
+        if (cap != want) {
+            fields.assign(want, FieldDesc{});
+            values.assign(want, std::string_view{});
+            formats.assign(want, 0);
+            is_null.reset(new bool[want]);
+            cap = want;
+        }
+        assert(fields.size() == cap && values.size() == cap);
+        return cap;
+    }
+};
+
 // RowDescription ('T'). `formats` is null for all-text, else one code per
-// field. Returns false if the message would not fit the writer.
+// field. Returns false if the message would not fit the writer or the count
+// is past the pgwire_max_fields budget.
 inline bool put_row_description(MsgWriter& w, const FieldDesc* fields,
                                 std::uint32_t count,
                                 const std::int16_t* formats) noexcept {
     assert(fields != nullptr || count == 0);
-    // Release-enforced: the i16 count and the executor's field array are
-    // both bounded by kMaxFields; an executor reporting more is refused.
-    BOLT_BOUND_CHECK(count <= kMaxFields, false);
+    // Release-enforced: the i16 count is bounded by the budget, whose
+    // ceiling fits an Int16.
+    BOLT_BOUND_CHECK(count <= max_fields(), false);
     w.begin('T');
     w.put_i16(static_cast<std::int16_t>(count));
-    for (std::uint32_t c = 0; c < count; ++c) {   // bounded by kMaxFields
+    for (std::uint32_t c = 0; c < count; ++c) {   // bounded by max_fields()
         w.put_cstring(fields[c].name);
         w.put_i32(0);                     // table OID: none
         w.put_i16(0);                     // column attr number: none

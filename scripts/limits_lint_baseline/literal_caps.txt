@@ -55,7 +55,6 @@ include/boltapi/proto/neo4j_bolt.h::kMaxFields
 include/boltapi/proto/packstream.h::kMaxDepth
 include/boltapi/proto/packstream.h::kMaxElements
 include/boltapi/proto/packstream.h::kMaxStringBytes
-include/boltapi/proto/postgres_wire.h::kMaxFields
 include/boltapi/proto/postgres_wire_codec.h::kMaxCursorName
 include/boltapi/quic/connection.h::kMaxCloseReason
 include/boltapi/quic/connection.h::kMaxCoalescedPackets
@@ -172,7 +171,6 @@ src/proto/postgres_wire_codec.cpp::kMaxScalarText
 src/proto/postgres_wire_codec.cpp::kMaxTxWords
 src/proto/postgres_wire_cursor.cpp::kMaxCursorTokens
 src/proto/postgres_wire_extended.h::kMaxNameLen
-src/proto/postgres_wire_extended.h::kMaxParams
 src/proto/postgres_wire_extended.h::kMaxSavepoints
 src/proto/postgres_wire_server.cpp::kMaxStartupPacket
 src/proto/postgres_wire_server.cpp::kMaxStartupPairs

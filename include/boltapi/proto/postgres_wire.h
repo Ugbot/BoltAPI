@@ -101,8 +101,6 @@ struct QueryFailure {
     const char* message  = "query execution failed";
 };
 
-inline constexpr std::uint32_t kMaxFields = 256;   // columns per result row
-
 // One output column's wire description (RowDescription 'T').
 struct FieldDesc {
     std::string_view name;
@@ -150,7 +148,10 @@ public:
     // `out_failure` to send an ErrorResponse instead.
     //
     // `out_fields` and the `name` string_views inside it must stay valid
-    // until the next execute() on this executor.
+    // until the next execute() on this executor. `fields_cap` is the
+    // pgwire_max_fields budget plus one: a result that fills the extra slot
+    // is refused by the wire with SQLSTATE 54000 naming the knob; a wider
+    // one the executor refuses itself.
     virtual bool execute(std::string_view sql, FieldDesc* out_fields,
                          std::uint32_t fields_cap,
                          std::uint32_t& out_field_count,
