@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 #include "../src/proto/postgres_wire_internal.h"
 #include "boltapi/boltapi_limits.h"
@@ -29,19 +30,22 @@ TEST(LimitsResourceExhausted, ErrorCodeAndStatusMapping) {
 
 TEST(LimitsResourceExhausted, RowDescriptionBoundEnforcedInRelease) {
     static std::uint8_t buf[1 << 16];
-    pg::FieldDesc fields[pg::kMaxFields + 1];
+    const std::uint32_t n = pg::detail::max_fields();
+    std::vector<pg::FieldDesc> fields(n + 1);
     for (auto& f : fields) f.name = "c";
     pg::detail::MsgWriter ok_w(buf, sizeof(buf));
-    EXPECT_TRUE(pg::detail::put_row_description(ok_w, fields, pg::kMaxFields, nullptr));
+    EXPECT_TRUE(pg::detail::put_row_description(ok_w, fields.data(), n, nullptr));
     pg::detail::MsgWriter bad_w(buf, sizeof(buf));
-    EXPECT_FALSE(pg::detail::put_row_description(bad_w, fields, pg::kMaxFields + 1, nullptr));
+    EXPECT_FALSE(pg::detail::put_row_description(bad_w, fields.data(), n + 1, nullptr));
 }
 
 TEST(LimitsResourceExhausted, LimitsTableRegisters) {
     const bolt::LimitTable& t = bolt::api::boltapi_limits();
     EXPECT_STREQ(t.owner, "boltapi");
     EXPECT_EQ(bolt::api::boltapi_limits_value(bolt::api::boltapi_limits_id::pgwire_max_fields),
-              pg::kMaxFields);
+              1664u);   // Postgres MaxTupleAttributeNumber
+    EXPECT_EQ(bolt::api::boltapi_limits_value(bolt::api::boltapi_limits_id::pgwire_max_params),
+              65535u);  // Postgres Bind count (UInt16)
     const bolt::LimitTable* found = nullptr;
     uint32_t idx = 0;
     ASSERT_TRUE(bolt::limits_find("router_max_params", &found, &idx));

@@ -19,9 +19,11 @@
 // owner replies with send_response(), which QPACK-encodes :status + headers as a
 // HEADERS frame and the body as DATA, then FINs the stream.
 //
-// Tiger Style: header-only, no exceptions, >=2 asserts per function, bounded
-// fixed-capacity per-stream state (a small pool — NO unbounded std::vector growth
-// on the hot path), every loop bounded, functions <70 lines. Compiles
+// Tiger Style: header-only, no exceptions, >=2 asserts per function, every loop
+// bounded, functions <70 lines. Request slots are a pool sized from
+// http3_max_streams (RFC 9114 §6.1: 100); a slot's buffer is allocated on the
+// stream's first byte, grows to at most the header cap + body budget, and is
+// returned when the stream ends (small ones are kept for reuse). Compiles
 // UNCONDITIONALLY (its only deps are header-only quic/* + http3/*), so the gate
 // test runs in the default ctest suite.
 
@@ -36,21 +38,21 @@
 #include <functional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "boltapi/http3/frame.h"
+#include "boltapi/http3/h3_limits.h"
 #include "boltapi/http3/qpack.h"
 #include "boltapi/quic/connection.h"
 
 namespace bolt::api::http3 {
 
 // ----------------------------------------------------------------------------
-// Named bounds (Tiger Style). All per-stream state is fixed-capacity.
+// Named bounds (Tiger Style). Stream count and body budget: h3_limits.h.
 // ----------------------------------------------------------------------------
-inline constexpr std::size_t kH3MaxStreams      = 8;        // concurrent requests
 inline constexpr std::size_t kH3MaxHeaderBytes  = 16 * 1024;  // QPACK block cap
-inline constexpr std::size_t kH3MaxBodyBytes    = 1 << 20;  // 1 MiB received-body cap
 inline constexpr std::size_t kH3MaxRespHeaders  = 16;       // headers per response
-inline constexpr std::size_t kH3MaxFramesPerMsg = 64;      // HEADERS + DATA frames
+inline constexpr std::uint64_t kH3RequestRejected = 0x10B;  // RFC 9114 §8.1
 
 // ----------------------------------------------------------------------------
 // H3Request — a decoded HTTP/3 request handed to the bridge callback. All views
@@ -81,8 +83,8 @@ struct H3ResponseHeader {
 using H3RequestFn = std::function<void(const H3Request&)>;
 
 // ----------------------------------------------------------------------------
-// H3Stream — bounded per-request reassembly slot. Accumulates the raw stream
-// bytes (HEADERS+DATA frames) until FIN, then the parser pulls frames out.
+// H3Stream — per-request reassembly slot. Accumulates the raw stream bytes
+// (HEADERS+DATA frames) until FIN, then the parser pulls frames out.
 // ----------------------------------------------------------------------------
 struct H3Stream {
     bool          in_use   = false;
@@ -91,10 +93,11 @@ struct H3Stream {
     bool          wt_checked = false;  // extended-CONNECT check already done
     bool          wt_data  = false;  // a WebTransport DATA stream (bidi 0x41 prefix);
                                      // its prefix is stripped + payload echoed live
+    bool          overflow = false;  // past the body budget: refused, bytes dropped
     std::uint64_t id       = 0;
-    std::size_t   len      = 0;
-    // Header (QPACK) block + body are split out by the frame parser at FIN.
-    std::uint8_t  buf[kH3MaxHeaderBytes + kH3MaxBodyBytes];
+    // Header (QPACK) block + body, split out by the frame parser at FIN.
+    // Allocated on the first byte; grown up to the stream budget.
+    std::vector<std::uint8_t> buf;
 
     void reset(std::uint64_t sid) noexcept {
         assert(sid <= quic::kVarIntMax && "stream id out of range");
@@ -104,8 +107,9 @@ struct H3Stream {
         wt         = false;
         wt_checked = false;
         wt_data    = false;
+        overflow   = false;
         id         = sid;
-        len        = 0;
+        assert(buf.empty() && "reset: slot kept bytes");
     }
 };
 
@@ -122,6 +126,22 @@ public:
     H3Connection(const H3Connection&)            = delete;
     H3Connection& operator=(const H3Connection&) = delete;
 
+    // Concurrent request slots (http3_max_streams); set before attach, equal
+    // to the QUIC MAX_STREAMS credit the connection advertises.
+    void set_max_streams(std::size_t n) noexcept {
+        assert(qc_ == nullptr && "set_max_streams after attach");
+        assert(n >= 1 && n <= kH3MaxStreamsCeiling && "h3 stream count out of range");
+        max_streams_ = n;
+    }
+
+    // Request body budget (the host's max_body_size); past it a request is
+    // answered 413 and its bytes are dropped, never truncated into a request.
+    void set_max_request_body(std::size_t bytes) noexcept {
+        assert(bytes > 0 && "zero body budget");
+        assert(bytes <= (SIZE_MAX >> 2) && "body budget overflows the stream budget");
+        max_body_ = bytes;
+    }
+
     // Bind to an established QuicConnection. Installs the QUIC stream-data handler
     // and (when ready) opens our uni streams + sends SETTINGS. `is_server`
     // selects request-receiving (server) vs response-receiving (client) role.
@@ -130,6 +150,7 @@ public:
         assert(!is_server || is_server);  // role flag is a valid bool
         qc_        = &conn;
         is_server_ = is_server;
+        streams_.resize(max_streams_);
         qc_->set_stream_data_handler(
             [this](std::uint64_t id, const std::uint8_t* d, std::size_t n,
                    bool fin) { on_stream_data(id, d, n, fin); });
@@ -273,7 +294,9 @@ private:
         // Client-initiated bidi == a request (server role) or a response
         // (client role). Both accumulate into a per-stream slot until FIN.
         H3Stream* s = slot_for(id);
-        if (s == nullptr) return;  // pool exhausted; drop (bounded)
+        // Slots equal the QUIC MAX_STREAMS credit, so a conforming peer never
+        // finds the pool full; a stream past it is rejected (RFC 9114 §8.1).
+        if (s == nullptr) { (void)qc_->reset_stream(id, kH3RequestRejected); return; }
 
         // WebTransport BIDI data stream: already classified — its prefix is
         // stripped, so every incoming chunk is pure WT payload; echo it live on
@@ -284,7 +307,7 @@ private:
             return;
         }
 
-        append_stream(*s, d, n);
+        if (!append_stream(*s, d, n)) { on_overflow(*s, fin); return; }
         // WebTransport stream classification (server). Two cases, BEFORE treating
         // the stream as an H3 request:
         //   * a BIDI WebTransport data stream begins with the varint signal 0x41 +
@@ -321,9 +344,8 @@ private:
         // Only echo for an active WT session stream (quarter*4 is its id).
         const std::uint64_t session_id = quarter * 4;
         bool is_wt_session = false;
-        for (std::size_t i = 0; i < kH3MaxStreams; ++i) {
-            if (streams_[i].in_use && streams_[i].id == session_id &&
-                streams_[i].wt) { is_wt_session = true; break; }
+        for (const H3Stream& st : streams_) {              // bounded by max_streams_
+            if (st.in_use && st.id == session_id && st.wt) { is_wt_session = true; break; }
         }
         if (!is_wt_session) return;
         (void)qc_->send_datagram(d, n);  // echo prefix+payload back to the session
@@ -362,6 +384,7 @@ private:
         H3Request req{};
         req.stream_id = s.id;
         if (!parse_message(s, req)) return;  // malformed: drop (bounded)
+        if (req.body_len > max_body_) { (void)refuse_413(s.id); return; }
         on_request_(req);
     }
 
@@ -374,22 +397,24 @@ private:
     // not 0x41), -1 = the 0x41 + session-id prefix is not fully buffered yet.
     int try_webtransport_bidi(H3Stream& s, bool fin) noexcept {
         assert(s.in_use && "wt bidi on free slot");
-        assert(s.len <= sizeof(s.buf) && "stream cursor past buffer");
+        assert(s.buf.size() <= stream_budget() && "stream cursor past budget");
+        const std::uint8_t* const b = s.buf.data();
+        const std::size_t len = s.buf.size();
         std::uint64_t sig = 0;
-        const int c = quic::varint_decode(s.buf, s.len, sig);
+        const int c = quic::varint_decode(b, len, sig);
         if (c <= 0) return -1;                 // need more bytes for the signal
         if (sig != kWtBidiStreamSignal) return 0;
         std::uint64_t session = 0;
-        const int c2 = quic::varint_decode(s.buf + c, s.len - c, session);
+        const int c2 = quic::varint_decode(b + c, len - static_cast<std::size_t>(c), session);
         if (c2 <= 0) return -1;                // need the session-id varint too
         s.wt_data = true;
-        const std::size_t prefix = static_cast<std::size_t>(c) + c2;
-        assert(prefix <= s.len && "wt bidi prefix past buffer");
-        if (s.len > prefix)
-            (void)qc_->stream_write(s.id, s.buf + prefix, s.len - prefix, fin);
+        const std::size_t prefix = static_cast<std::size_t>(c) + static_cast<std::size_t>(c2);
+        assert(prefix <= len && "wt bidi prefix past buffer");
+        if (len > prefix)
+            (void)qc_->stream_write(s.id, b + prefix, len - prefix, fin);
         else if (fin)
             (void)qc_->stream_write(s.id, nullptr, 0, /*fin=*/true);
-        s.len = 0;                             // prefix+payload consumed
+        s.buf.clear();                         // prefix+payload consumed
         if (fin) release_slot(s);
         return 1;
     }
@@ -401,10 +426,10 @@ private:
     // CONNECT, and -1 when that HEADERS frame is not yet fully buffered.
     int try_webtransport_connect(H3Stream& s) noexcept {
         assert(s.in_use && "wt check on free slot");
-        assert(s.len <= sizeof(s.buf) && "stream cursor past buffer");
+        assert(s.buf.size() <= stream_budget() && "stream cursor past budget");
         FrameView fv{};
         std::size_t used = 0;
-        const FrameStatus st = frame_parse(s.buf, s.len, fv, used);
+        const FrameStatus st = frame_parse(s.buf.data(), s.buf.size(), fv, used);
         if (st == FrameStatus::kNeedMore) return -1;
         if (st != FrameStatus::kOk) return 0;
         if (fv.type != static_cast<std::uint64_t>(FrameType::kHeaders)) return 0;
@@ -432,7 +457,7 @@ private:
         assert(s.in_use && "dispatch on free slot");
         assert(!is_server_ && "dispatch_response on a server");
         H3Request resp{};  // reuse the struct; status sits in resp.method scratch
-        if (!parse_message(s, resp)) { resp_ok_ = false; return; }
+        if (!parse_message(s, resp) || resp.body_len > max_body_) { resp_ok_ = false; return; }
         resp_status_ = parse_status(resp.method);  // method holds :status here
         resp_body_.assign(reinterpret_cast<const char*>(resp.body), resp.body_len);
         resp_stream_ = s.id;
@@ -440,30 +465,36 @@ private:
     }
 
     // Walk the frames in s.buf: first a HEADERS frame (QPACK), then DATA frames.
-    // Fills req with views into per-call scratch (decoded headers) + s.buf (body).
+    // DATA payloads are compacted to the front of s.buf in place (decoded
+    // headers own their strings, and a payload never moves forward), so the
+    // body is one contiguous view into the slot with no second buffer.
     bool parse_message(H3Stream& s, H3Request& req) noexcept {
-        assert(s.len <= sizeof(s.buf) && "stream length overran buffer");
+        assert(s.buf.size() <= stream_budget() && "stream length overran budget");
         assert(s.in_use && "parse on free slot");
+        std::uint8_t* const b = s.buf.data();
+        const std::size_t n = s.buf.size();
         std::size_t pos = 0;
+        std::size_t body = 0;
         bool got_headers = false;
-        body_len_ = 0;
-        for (std::size_t i = 0; i < kH3MaxFramesPerMsg && pos < s.len; ++i) {
+        // Every frame takes at least two bytes (type + length varints).
+        for (std::size_t i = 0; i <= n / 2 && pos < n; ++i) {
             FrameView fv{};
             std::size_t used = 0;
-            const FrameStatus st = frame_parse(s.buf + pos, s.len - pos, fv, used);
+            const FrameStatus st = frame_parse(b + pos, n - pos, fv, used, stream_budget());
             if (st != FrameStatus::kOk) return false;
-            pos += used;
             if (fv.type == static_cast<std::uint64_t>(FrameType::kHeaders)) {
                 if (!decode_headers(fv.payload, fv.length, req)) return false;
                 got_headers = true;
             } else if (fv.type == static_cast<std::uint64_t>(FrameType::kData)) {
-                if (!accumulate_body(fv.payload, fv.length)) return false;
+                assert(b + body <= fv.payload && "body compaction overtook the cursor");
+                if (fv.length > 0) std::memmove(b + body, fv.payload, fv.length);
+                body += fv.length;
             }
-            // Unknown frame types are skipped (already advanced by `used`).
+            pos += used;   // unknown frame types are skipped
         }
-        req.body     = body_buf_;
-        req.body_len = body_len_;
-        return got_headers && pos == s.len;
+        req.body     = b;
+        req.body_len = body;
+        return got_headers && pos == n;
     }
 
     // QPACK-decode the field section into req's pseudo-headers + regular headers.
@@ -499,13 +530,34 @@ private:
         return false;
     }
 
-    bool accumulate_body(const std::uint8_t* p, std::size_t n) noexcept {
-        assert((p != nullptr || n == 0) && "accumulate_body null with n>0");
-        assert(body_len_ <= sizeof(body_buf_) && "body cursor past buffer");
-        if (body_len_ + n > sizeof(body_buf_)) return false;
-        std::memcpy(body_buf_ + body_len_, p, n);
-        body_len_ += n;
-        return true;
+    // Bytes one stream may hold: the header block, the body budget, and DATA
+    // framing (an eighth of the body, as the HTTP/1.1 chunked door allows).
+    std::size_t stream_budget() const noexcept {
+        assert(max_body_ > 0 && "zero body budget");
+        return kH3MaxHeaderBytes + max_body_ + (max_body_ >> 3) + kH3MaxHeaderBytes;
+    }
+
+    // 413 with fin: the request is refused, never truncated.
+    bool refuse_413(std::uint64_t sid) noexcept {
+        assert(qc_ != nullptr && "refuse before attach");
+        assert(is_server_ && "413 from a client");
+        static constexpr char kMsg[] = "request body exceeds max_body_size";
+        const H3ResponseHeader h[1] = {{"content-type", "text/plain"}};
+        return send_response(sid, 413, h, 1, reinterpret_cast<const std::uint8_t*>(kMsg),
+                             sizeof(kMsg) - 1);
+    }
+
+    // The stream passed its budget: answer once (server 413; client: the
+    // response failed), drop its bytes, and free the slot at FIN.
+    void on_overflow(H3Stream& s, bool fin) noexcept {
+        assert(s.in_use && s.overflow && "overflow on a slot within budget");
+        assert(s.buf.empty() && "overflowed slot kept bytes");
+        if (!s.finished) {
+            s.finished = true;
+            if (is_server_) (void)refuse_413(s.id);
+            else resp_ok_ = false;
+        }
+        if (fin) release_slot(s);
     }
 
     // Build + send a HEADERS frame for a request or response on `sid`.
@@ -624,33 +676,39 @@ private:
                              /*fin=*/false);
     }
 
-    void append_stream(H3Stream& s, const std::uint8_t* d, std::size_t n) noexcept {
+    // False once the stream is past its budget (the bytes are dropped).
+    bool append_stream(H3Stream& s, const std::uint8_t* d, std::size_t n) noexcept {
         assert(s.in_use && "append to free slot");
-        assert(s.len <= sizeof(s.buf) && "stream cursor past buffer");
-        if (n == 0) return;
-        if (s.len + n > sizeof(s.buf)) {
-            n = sizeof(s.buf) - s.len;  // bounded: drop overflow tail
+        assert((d != nullptr || n == 0) && "append null with n>0");
+        if (s.overflow) return false;
+        if (s.buf.size() + n > stream_budget()) {
+            s.overflow = true;
+            std::vector<std::uint8_t>().swap(s.buf);
+            return false;
         }
-        std::memcpy(s.buf + s.len, d, n);
-        s.len += n;
+        if (n > 0) s.buf.insert(s.buf.end(), d, d + n);
+        return true;
     }
 
     H3Stream* slot_for(std::uint64_t id) noexcept {
         assert(id <= quic::kVarIntMax && "slot id out of range");
-        for (std::size_t i = 0; i < kH3MaxStreams; ++i) {
-            if (streams_[i].in_use && streams_[i].id == id) return &streams_[i];
+        assert(streams_.size() == max_streams_ && "slot pool not attached");
+        for (H3Stream& st : streams_) {                    // bounded by max_streams_
+            if (st.in_use && st.id == id) return &st;
         }
-        for (std::size_t i = 0; i < kH3MaxStreams; ++i) {
-            if (!streams_[i].in_use) { streams_[i].reset(id); return &streams_[i]; }
+        for (H3Stream& st : streams_) {
+            if (!st.in_use) { st.reset(id); return &st; }
         }
         return nullptr;  // pool exhausted
     }
 
     void release_slot(H3Stream& s) noexcept {
         assert(s.in_use && "release on free slot");
-        assert(&s >= streams_ && &s < streams_ + kH3MaxStreams && "alien slot");
+        assert(&s >= streams_.data() && &s < streams_.data() + streams_.size() &&
+               "alien slot");
         s.in_use = false;
-        s.len    = 0;
+        s.buf.clear();
+        if (s.buf.capacity() > kH3RetainBytes) std::vector<std::uint8_t>().swap(s.buf);
     }
 
     // Per-uni-stream classification state (small fixed pool keyed by id).
@@ -705,15 +763,15 @@ private:
     QpackEncoder  qpack_enc_{0};   // static-only (no dynamic table) in W5b
     QpackDecoder  qpack_dec_{0};
 
-    H3Stream      streams_[kH3MaxStreams];
+    std::size_t   max_streams_ = kH3MaxStreamsDefault;
+    std::size_t   max_body_    = kH3MaxBodyBytesDefault;
+    std::vector<H3Stream> streams_;   // max_streams_ slots, sized at attach
     UniStreamState uni_[kH3MaxUni];
 
     // Per-call scratch reused across dispatch (single-threaded per connection).
     QpackHeader   decoded_[kQpackMaxHeaders];
     QpackHeader   regular_[kQpackMaxHeaders];
     std::uint8_t  hdr_block_[kH3MaxHeaderBytes];
-    std::uint8_t  body_buf_[kH3MaxBodyBytes];
-    std::size_t   body_len_ = 0;
 
     // Client-side last-response capture.
     bool          resp_ok_     = false;

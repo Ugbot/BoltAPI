@@ -497,6 +497,45 @@ def check_parameters(port, failures):
     client.close()
 
 
+def check_limits(port, failures):
+    """G2CHK-1009: query text and DoPut parameter sets are budgets."""
+    client = fl.FlightClient("grpc://127.0.0.1:%d" % port)
+    sql = "ECHO " + "x" * (100 * 1024)
+    try:
+        got = run_query(client, sql)[1].column("sql").to_pylist()
+        if got != [sql]:
+            failures.append("a 100 KiB query came back changed")
+    except Exception as e:  # noqa: BLE001 -- any refusal is the finding
+        failures.append("a 100 KiB query was refused: %s" % e)
+    n = 5000
+    before = updates_so_far(client)
+    res = prepare(client, "UPSERT ?")
+    cmd = any_cmd("CommandPreparedStatementUpdate", _bytes_field(1, res[1][0]))
+    try:
+        got = do_put(client, cmd, pa.record_batch([pa.array([1] * n, pa.int64())], names=["n"]))
+        if got.get(1) != [n]:
+            failures.append("prepared update over %d parameter sets: %s" % (n, got))
+        if updates_so_far(client) != before + n:
+            failures.append("%d parameter sets ran %d times" % (n, updates_so_far(client) - before))
+    except Exception as e:  # noqa: BLE001
+        failures.append("%d parameter sets were refused: %s" % (n, e))
+    client.close()
+
+
+def check_lowered_limits(port, failures):
+    """Past a lowered budget the refusal is RESOURCE_EXHAUSTED naming the knob."""
+    client = fl.FlightClient("grpc://127.0.0.1:%d" % port)
+    expect_error(failures, "query past flight_sql_max_query_bytes", pa.ArrowException,
+                 "flight_sql_max_query_bytes",
+                 lambda: run_query(client, "ECHO " + "x" * 8192))
+    res = prepare(client, "UPSERT ?")
+    cmd = any_cmd("CommandPreparedStatementUpdate", _bytes_field(1, res[1][0]))
+    expect_error(failures, "DoPut past flight_sql_doput_rows", pa.ArrowException,
+                 "flight_sql_doput_rows",
+                 lambda: do_put(client, cmd, pa.record_batch([pa.array([1] * 11)], names=["n"])))
+    client.close()
+
+
 def check_auth(port, failures):
     client = fl.FlightClient("grpc://127.0.0.1:%d" % port)
     try:
@@ -776,8 +815,9 @@ def check_tls(port, cert, failures):
         failures.append("JDBC over TLS: %r" % facts.get("statement"))
     print("grpc+tls: OK")
 
-def start(server, *extra):
-    p = subprocess.Popen([server] + list(extra), stdout=subprocess.PIPE, text=True)
+def start(server, *extra, env=None):
+    full = dict(os.environ, **env) if env else None
+    p = subprocess.Popen([server] + list(extra), stdout=subprocess.PIPE, text=True, env=full)
     line = p.stdout.readline().strip()
     if not line.startswith("PORT "):
         p.kill()
@@ -798,8 +838,16 @@ def main():
         check_prepared(port, failures)
         check_updates(port, failures)
         check_parameters(port, failures)
+        check_limits(port, failures)
         check_adbc(port, failures)
         check_jdbc(port, failures)
+    finally:
+        p.terminate()
+        p.wait(timeout=10)
+    p, port = start(sys.argv[1], env={"BOLTAPI_FLIGHT_SQL_MAX_QUERY_BYTES": "4096",
+                                      "BOLTAPI_FLIGHT_SQL_DOPUT_ROWS": "10"})
+    try:
+        check_lowered_limits(port, failures)
     finally:
         p.terminate()
         p.wait(timeout=10)

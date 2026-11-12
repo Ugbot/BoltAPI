@@ -499,6 +499,17 @@ public:
         return tls_.set_server_alpn(protos, len);
     }
 
+    // Server: concurrent peer bidi streams granted (MAX_STREAMS), before the
+    // first Initial. The host sets it from the http3_max_streams knob.
+    bool set_peer_bidi_streams(std::uint64_t bidi) noexcept {
+        assert(is_server_ && "set_peer_bidi_streams: client role");
+        assert(state_ == ConnState::kNew && "set_peer_bidi_streams after start");
+        if (bidi == 0 || bidi > kPeerBidiStreamsMax) return false;
+        peer_bidi_concurrency_ = bidi;
+        peer_bidi_.set_concurrency(bidi);
+        return true;
+    }
+
     // Server: connections that negotiate `alpn` grant `bidi` concurrent peer
     // bidi streams (<= kPeerBidiStreamsMax) instead of the default; decided
     // when TLS selects the ALPN, before our transport parameters are sent.
@@ -2455,8 +2466,7 @@ private:
             std::memcmp(p, alpn_raise_, n) != 0)
             return;
         peer_bidi_concurrency_ = alpn_bidi_streams_;
-        peer_bidi_.update_limit(peer_bidi_concurrency_);
-        peer_bidi_.sent_limit = peer_bidi_.limit;  // carried by the new params
+        peer_bidi_.set_concurrency(peer_bidi_concurrency_);  // carried by the new params
         (void)tls_.set_transport_params(make_local_params());
     }
 
@@ -3026,6 +3036,13 @@ private:
                 set_bit(floor, false);
                 ++floor;
             }
+        }
+        // Before any stream: grant exactly `concurrent` (may lower the default).
+        void set_concurrency(std::uint64_t concurrent) noexcept {
+            assert(closed_total == 0 && floor == 0 && "concurrency set after streams");
+            assert(concurrent <= kClosedStreamWindowMax && "concurrency past window");
+            limit = concurrent;
+            sent_limit = concurrent;
         }
         // Credit = closed + concurrency, never past the closed-id window.
         void update_limit(std::uint64_t concurrent) noexcept {

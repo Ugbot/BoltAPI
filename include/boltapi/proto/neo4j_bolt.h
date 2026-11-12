@@ -141,7 +141,6 @@ protected:
     IRecordSink() = default;
 };
 
-inline constexpr std::uint32_t kMaxFields = 256;   // columns per result
 inline constexpr std::int64_t  kPullAll   = -1;    // PULL {n: -1}
 
 // The host's query engine. One instance per worker thread, created once at

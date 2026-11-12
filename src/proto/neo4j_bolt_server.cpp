@@ -16,6 +16,7 @@
 // FAILURE with a Neo4j error code, or an explicit handshake decline) rather
 // than a silent empty result.
 
+#include "boltapi/boltapi_limits.h"
 #include "boltapi/proto/neo4j_bolt.h"
 #include "boltapi/proto/neo4j_values.h"
 
@@ -29,6 +30,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <vector>
 #if !defined(_WIN32)
 #include <netinet/tcp.h>
 #endif
@@ -387,6 +389,18 @@ private:
     bool on_logon(const PackValue& msg) noexcept;
     void deliver_context(const PackValue* extra) noexcept;
     bool on_run(const PackValue& msg) noexcept;
+
+    // Column-name scratch: the bolt_max_fields budget plus one slot, so a
+    // result one past the budget is refused by name. Grown on first RUN.
+    std::uint32_t field_scratch() noexcept {
+        const std::uint64_t budget = ::bolt::api::boltapi_limits_value(
+            ::bolt::api::boltapi_limits_id::bolt_max_fields);
+        assert(budget >= 1 && budget <= ::bolt::api::limits::kBoltMaxFieldsCeiling);
+        const std::size_t want = static_cast<std::size_t>(budget) + 1;
+        if (fields_.size() != want) fields_.assign(want, std::string_view{});
+        assert(fields_.size() == want);
+        return static_cast<std::uint32_t>(want);
+    }
     bool on_pull(const PackValue& msg, bool discard) noexcept;
 
     bool send_success_empty() noexcept;
@@ -412,7 +426,7 @@ private:
     Version      version_{};
     State        state_ = State::Negotiation;
     char         conn_name_[32] = {0};
-    std::string_view fields_[kMaxFields]{};
+    std::vector<std::string_view> fields_;   // budget + 1, grown on first RUN
     std::uint32_t    field_count_ = 0;
     bool             write_failed_ = false;
     bool             tx_open_ = false;   // BEGIN seen, no COMMIT/ROLLBACK yet
@@ -572,15 +586,16 @@ bool Connection::on_run(const PackValue& msg) noexcept {
     QueryFailure fail{};
     field_count_ = 0;
     deliver_context(msg.len >= 3 ? &msg.items[2] : nullptr);
-    if (!exec_.begin_query(msg.items[0].str(), params, fields_, kMaxFields,
+    const std::uint32_t cap = field_scratch();
+    if (!exec_.begin_query(msg.items[0].str(), params, fields_.data(), cap,
                            field_count_, fail)) {
         return send_failure(fail);
     }
-    if (field_count_ > kMaxFields) {
-        // The executor over-reported; refuse rather than read past the array.
-        assert(false && "executor returned more fields than the declared cap");
+    assert(field_count_ <= cap && "executor returned more fields than the declared cap");
+    if (field_count_ >= cap) {
         return send_failure({"Neo.ClientError.Statement.ExecutionFailed",
-                             "result has more columns than the server supports"});
+                             "result has more columns than bolt_max_fields allows "
+                             "(raise BOLTAPI_BOLT_MAX_FIELDS)"});
     }
 
     PackWriter w(io_.out_buffer(), io_.out_capacity());

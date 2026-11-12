@@ -5,6 +5,7 @@
 // -> matched handler -> CoroHttpResponse.
 
 #include "boltapi/app.h"
+#include "boltapi/boltapi_limits.h"
 
 #include "boltapi/compression.h"
 #include "boltapi/core/logger.h"
@@ -707,6 +708,14 @@ bool h3_packet_dcid(const std::uint8_t* d, std::size_t n, const std::uint8_t** c
 }  // namespace
 
 namespace {
+// Concurrent HTTP/3 requests per connection: the http3_max_streams knob (B),
+// read when a connection is created.
+std::uint64_t h3_max_streams() noexcept {
+    const std::uint64_t n = boltapi_limits_value(boltapi_limits_id::http3_max_streams);
+    assert(n >= 1 && n <= http3::kH3MaxStreamsCeiling && "http3_max_streams out of range");
+    return n;
+}
+
 // A long-header Initial (RFC 9000 §17.2.2, type bits 00) may open a connection.
 bool h3_is_initial(const std::uint8_t* d, std::size_t n) noexcept {
     assert(d != nullptr || n == 0);
@@ -792,6 +801,10 @@ App::Http3Peer* App::http3_obtain_(net::UdpTransport* tp, const sockaddr* peer,
         slot->hq.reset(); slot->h3.reset(); slot->quic.reset(); slot->addr_len = 0;
         return nullptr;
     }
+    // Request slots match the MAX_STREAMS credit http3_configure_ granted;
+    // bodies share the h1/h2 doors' max_body_size.
+    slot->h3->set_max_streams(static_cast<std::size_t>(h3_max_streams()));
+    slot->h3->set_max_request_body(config_.server.max_body_size);
     slot->h3->attach(*slot->quic, /*is_server=*/true);
     slot->hq->attach(*slot->quic);
     App* self = this;
@@ -845,11 +858,11 @@ bool App::http3_configure_(quic::QuicConnection& qc) noexcept {
                              ? qc.set_server_alpn(kH3Hq, sizeof(kH3Hq))
                              : qc.set_server_alpn(kH3Only, sizeof(kH3Only));
     if (!alpn_ok) return false;
-    // HTTP/0.9 streams are cheap (no per-request H3 assembly slot): grant the
-    // pool's full bidi credit so a client's many parallel GETs (0-RTT
-    // included) are not throttled to the h3 default.
+    // MAX_STREAMS credit = the H3 request slots (http3_max_streams). An
+    // hq-interop connection gets its own slot count (no H3 assembly per stream).
+    if (!qc.set_peer_bidi_streams(h3_max_streams())) return false;
     if (config_.http3_hq_interop &&
-        !qc.set_alpn_bidi_streams("hq-interop", quic::kPeerBidiStreamsMax))
+        !qc.set_alpn_bidi_streams("hq-interop", kHqMaxStreams))
         return false;
     qc.set_require_retry(config_.http3_require_retry);
     if (config_.http3_early_data && !qc.tls().enable_early_data()) return false;

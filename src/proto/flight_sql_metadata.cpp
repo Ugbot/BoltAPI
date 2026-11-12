@@ -2,6 +2,8 @@
 
 #include "boltapi/proto/flight_sql_metadata.h"
 
+#include "boltapi/boltapi_limits.h"
+
 #if defined(BOLTAPI_WITH_FLIGHT_SQL)
 
 #include "boltapi/proto/flight_sql_arrow.h"
@@ -165,8 +167,13 @@ struct Snapshot {
 bool snapshot(IQueryExecutor& exec, Snapshot* s, QueryFailure& f) {
     assert(s != nullptr && s->tables.empty());
     const std::uint32_t n = exec.catalog_tables();
-    if (n > kMaxCatalogTables) {
-        return fail(f, GrpcCode::kResourceExhausted, "catalog exceeds table capacity");
+    const std::uint64_t budget = ::bolt::api::boltapi_limits_value(
+        ::bolt::api::boltapi_limits_id::flight_sql_catalog_tables);
+    assert(budget >= 1u);
+    if (n > budget) {
+        return fail(f, GrpcCode::kResourceExhausted,
+                    "catalog has more tables than flight_sql_catalog_tables allows "
+                    "(raise BOLTAPI_FLIGHT_SQL_CATALOG_TABLES)");
     }
     s->tables.resize(n);
     for (std::uint32_t i = 0; i < n; ++i) {

@@ -4,6 +4,7 @@
 
 #if defined(BOLTAPI_WITH_FLIGHT_SQL)
 
+#include "boltapi/boltapi_limits.h"
 #include "boltapi/proto/flight_sql_codec.h"
 
 #include <cassert>
@@ -512,6 +513,7 @@ Decoder::Field Decoder::describe_top(Fb& fb, std::size_t f, std::uint32_t k) {
 bool Decoder::batch(std::string_view metadata, std::string_view body, Rows* out,
                     const char** err) {
     assert(out != nullptr && err != nullptr);
+    exhausted_ = false;
     if (!have_schema_) { *err = "record batch before the parameter schema"; return false; }
     Fb fb(metadata);
     const std::size_t msg = fb.root();
@@ -526,9 +528,17 @@ bool Decoder::batch(std::string_view metadata, std::string_view body, Rows* out,
     const std::int64_t length = fb.scalar<std::int64_t>(rb, 0, 0);
     cur.n_nodes = fb.vec(rb, 1, &cur.nodes);
     cur.n_bufs = fb.vec(rb, 2, &cur.bufs);
-    if (!fb.ok() || length < 0 || cur.n_bufs > kMaxBuffers ||
-        static_cast<std::uint64_t>(out->n_rows) + static_cast<std::uint64_t>(length) > kMaxRows) {
-        *err = "malformed record batch or more than 4096 parameter sets";
+    if (!fb.ok() || length < 0 || cur.n_bufs > kMaxBuffers) {
+        *err = "malformed record batch";
+        return false;
+    }
+    const std::uint64_t budget = ::bolt::api::boltapi_limits_value(
+        ::bolt::api::boltapi_limits_id::flight_sql_doput_rows);
+    assert(budget >= 1);
+    if (static_cast<std::uint64_t>(out->n_rows) + static_cast<std::uint64_t>(length) > budget) {
+        exhausted_ = true;
+        *err = "more parameter sets than flight_sql_doput_rows allows "
+               "(raise BOLTAPI_FLIGHT_SQL_DOPUT_ROWS)";
         return false;
     }
     if (out->n_rows != 0 && out->n_cols != n_top_) { *err = "parameter width changed"; return false; }
@@ -610,13 +620,17 @@ bool render(std::string_view sql, const Value* row, std::uint32_t n, std::size_t
         return lit_ok && out->size() <= cap;
     });
     if (!lit_ok) return false;
+    if (out->size() > cap) {
+        *err = kRenderTooLarge;
+        return false;
+    }
     if (!ok || k != n) {
         *err = "parameter count does not match the statement's placeholders";
         return false;
     }
     out->append(sql.data() + from, sql.size() - from);
     if (out->size() > cap) {
-        *err = "statement with its parameters bound exceeds 65536 bytes";
+        *err = kRenderTooLarge;
         return false;
     }
     return true;

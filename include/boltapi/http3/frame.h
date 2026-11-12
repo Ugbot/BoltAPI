@@ -77,7 +77,7 @@ enum class SettingId : std::uint64_t {
 inline constexpr std::size_t kFrameHeaderMaxBytes = 16;     // two 8-byte varints
 inline constexpr std::size_t kSettingsMaxEntries  = 8;      // we emit/accept few
 inline constexpr std::size_t kSettingsMaxBytes     = 64;    // 8 entries * 2 vints
-inline constexpr std::uint64_t kFrameMaxPayloadLen = 1u << 20;  // 1 MiB cap
+inline constexpr std::uint64_t kFrameMaxPayloadLen = 1u << 20;  // default cap (control frames)
 
 // Sentinels for the frame reader's status.
 enum class FrameStatus : std::uint8_t {
@@ -101,12 +101,15 @@ struct FrameView {
 //
 // On kOk, `out` borrows the payload (valid while `data` is) and `consumed` is
 // the total bytes (header + payload) the frame occupied. On kNeedMore nothing is
-// written. On kError the input is malformed.
+// written. On kError the input is malformed or the payload is past
+// `max_payload` (a request stream passes its whole budget: a DATA frame may
+// carry the entire body).
 // ----------------------------------------------------------------------------
 inline FrameStatus frame_parse(const std::uint8_t* data, std::size_t len,
-                               FrameView& out, std::size_t& consumed) noexcept {
+                               FrameView& out, std::size_t& consumed,
+                               std::uint64_t max_payload = kFrameMaxPayloadLen) noexcept {
     assert((data != nullptr || len == 0) && "frame_parse: null with len>0");
-    assert(len <= (std::size_t{1} << 24) && "frame_parse: span implausibly large");
+    assert(max_payload <= quic::kVarIntMax && "frame_parse: payload cap past varint range");
 
     std::uint64_t type = 0;
     const int tn = quic::varint_decode(data, len, type);
@@ -118,7 +121,7 @@ inline FrameStatus frame_parse(const std::uint8_t* data, std::size_t len,
                                        flen);
     if (ln == quic::kVarIntNeedMore) return FrameStatus::kNeedMore;
     assert(ln > 0 && "length varint decode non-positive");
-    if (flen > kFrameMaxPayloadLen) return FrameStatus::kError;
+    if (flen > max_payload) return FrameStatus::kError;
 
     const std::size_t hdr = static_cast<std::size_t>(tn) + static_cast<std::size_t>(ln);
     if (len - hdr < flen) return FrameStatus::kNeedMore;

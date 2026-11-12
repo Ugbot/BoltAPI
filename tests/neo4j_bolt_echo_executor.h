@@ -23,6 +23,7 @@
 #include "neo4j_bolt_value_gen.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -61,6 +62,26 @@ public:
             return false;
         }
 
+        // "WIDE <n>": n columns w0..w{n-1} (the RUN reply only); more than
+        // `fields_cap` is refused.
+        if (cypher.rfind("WIDE ", 0) == 0) {
+            const long k = std::strtol(std::string(cypher.substr(5)).c_str(), nullptr, 10);
+            if (k <= 0 || static_cast<unsigned long>(k) > fields_cap) {
+                out_failure = {"Neo.ClientError.Statement.ExecutionFailed",
+                               "echo executor: more columns than fields_cap"};
+                return false;
+            }
+            wide_.resize(static_cast<std::size_t>(k));
+            for (std::size_t c = 0; c < wide_.size(); ++c) {
+                wide_[c] = "w" + std::to_string(c);
+                out_fields[c] = wide_[c];
+            }
+            out_field_count = static_cast<std::uint32_t>(k);
+            mode_ = Mode::Echo;
+            rows_ = 0;
+            emitted_ = 0;
+            return true;
+        }
         // "RANDOM <seed> <rows> [nozone]": random graph/temporal values plus
         // their canonical text (neo4j_bolt_value_gen.h). "BADVALUE": a Node
         // whose label is an integer, which the connection must refuse.
@@ -156,6 +177,7 @@ public:
 
 private:
     enum class Mode { Echo, Random, Bad };
+    std::vector<std::string> wide_;
 
     bool generated_row(ps::PackArena& a, ps::PackValue* v2) noexcept {
         if (mode_ == Mode::Bad) {

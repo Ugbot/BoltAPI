@@ -302,10 +302,16 @@ ExtendedSession::CursorStep ExtendedSession::cursor_declare(
         qf.message  = "too many open cursors/portals on this connection -- CLOSE some";
         return CursorStep::Failed;
     }
-    FieldDesc fields[kMaxFields];
+    const std::uint32_t cap = rows_.ensure();
+    const FieldDesc* fields = rows_.fields.data();
     std::uint32_t count = 0;
     current_ = -1;
-    if (!exec.execute(cc.query, fields, kMaxFields, count, qf)) return CursorStep::Failed;
+    if (!exec.execute(cc.query, rows_.fields.data(), cap, count, qf)) return CursorStep::Failed;
+    if (count >= cap) {
+        qf.sqlstate = kSqlStateProgramLimitExceeded;
+        qf.message  = kTooManyFields;
+        return CursorStep::Failed;
+    }
     Portal& c = portals_[static_cast<std::size_t>(ci)];
     std::memcpy(portal_sql(ci), cc.query.data(), cc.query.size());
     std::memcpy(c.name, cc.name, sizeof(c.name));
@@ -319,12 +325,13 @@ ExtendedSession::CursorStep ExtendedSession::cursor_declare(
     c.holdable     = cc.hold;
     c.fetch_from   = -1;
     c.field_count  = count;
-    for (std::uint32_t k = 0; k < count; ++k) {                  // bounded by kMaxFields
+    c.shape(count);
+    for (std::uint32_t k = 0; k < count; ++k) {                  // bounded by max_fields()
         c.oids[k] = fields[k].type_oid;
         const std::size_t nl = fields[k].name.size() < kMaxNameLen - 1
             ? fields[k].name.size() : kMaxNameLen - 1;
-        std::memcpy(c.names[k], fields[k].name.data(), nl);
-        c.names[k][nl] = '\0';
+        std::memcpy(c.col_name(k), fields[k].name.data(), nl);
+        c.col_name(k)[nl] = '\0';
     }
     c.materialized = true;
     c.used         = true;
@@ -407,8 +414,10 @@ ExtendedSession::Emit ExtendedSession::emit_rows(const Portal& fmt, std::uint32_
     assert(fmt.materialized);
     const std::uint64_t total = exec.row_count();
     const std::uint64_t end = end_row < total ? end_row : total;
-    std::string_view values[kMaxFields];
-    bool is_null[kMaxFields];
+    rows_.ensure();
+    assert(fmt.field_count < rows_.cap);
+    std::string_view* values = rows_.values.data();
+    bool* is_null = rows_.is_null.get();
     std::uint8_t cell[512];
     std::uint32_t sent = 0;
     while (next_row < end) {                                      // bounded by row_count()
@@ -416,7 +425,7 @@ ExtendedSession::Emit ExtendedSession::emit_rows(const Portal& fmt, std::uint32_
         if (!exec.row(next_row, values, is_null, fmt.field_count)) break;
         w.begin('D');
         w.put_i16(static_cast<std::int16_t>(fmt.field_count));
-        for (std::uint32_t c = 0; c < fmt.field_count; ++c) {     // bounded by kMaxFields
+        for (std::uint32_t c = 0; c < fmt.field_count; ++c) {     // bounded by max_fields()
             if (is_null[c]) { w.put_i32(-1); continue; }
             if (format_of(fmt, c) == 0 || is_text_like(fmt.oids[c])) {
                 w.put_i32(static_cast<std::int32_t>(values[c].size()));
@@ -454,9 +463,10 @@ ExtendedSession::Emit ExtendedSession::simple_fetch(std::int32_t ci, std::uint32
     assert(ci > 0 && static_cast<std::size_t>(ci) < portals_.size());
     Portal& c = portals_[static_cast<std::size_t>(ci)];
     assert(c.used && c.cursor && current_ == ci);
-    FieldDesc fields[kMaxFields];
-    for (std::uint32_t k = 0; k < c.field_count; ++k) {           // bounded by kMaxFields
-        fields[k].name = c.names[k];
+    rows_.ensure();
+    FieldDesc* fields = rows_.fields.data();
+    for (std::uint32_t k = 0; k < c.field_count; ++k) {           // bounded by max_fields()
+        fields[k].name = c.col_name(k);
         fields[k].type_oid = c.oids[k];
     }
     if (c.field_count > 0) {
@@ -491,9 +501,10 @@ bool ExtendedSession::bind_fetch(std::int32_t pi, std::int32_t ci, std::uint32_t
         qf.message  = "Bind result-format count does not match the result's columns";
         return false;
     }
-    for (std::uint32_t k = 0; k < c.field_count; ++k) {           // bounded by kMaxFields
+    p.shape(c.field_count);
+    for (std::uint32_t k = 0; k < c.field_count; ++k) {           // bounded by max_fields()
         p.oids[k] = c.oids[k];
-        std::memcpy(p.names[k], c.names[k], kMaxNameLen);
+        std::memcpy(p.col_name(k), c.col_name(k), kMaxNameLen);
         if (format_of(p, k) == 1 && !binary_result_supported(c.oids[k])) {
             qf.sqlstate = "0A000";
             qf.message  = "binary result format requested for a column type this "
@@ -551,9 +562,10 @@ bool ExtendedSession::describe_fetch(std::string_view sql, int fd, MsgWriter& w)
     if (ci <= 0 || !portals_[static_cast<std::size_t>(ci)].cursor) return false;
     const Portal& c = portals_[static_cast<std::size_t>(ci)];
     if (c.field_count == 0) return false;
-    FieldDesc fields[kMaxFields];
-    for (std::uint32_t k = 0; k < c.field_count; ++k) {           // bounded by kMaxFields
-        fields[k].name = c.names[k];
+    rows_.ensure();
+    FieldDesc* fields = rows_.fields.data();
+    for (std::uint32_t k = 0; k < c.field_count; ++k) {           // bounded by max_fields()
+        fields[k].name = c.col_name(k);
         fields[k].type_oid = c.oids[k];
     }
     if (!put_row_description(w, fields, c.field_count, nullptr)) {
@@ -561,7 +573,7 @@ bool ExtendedSession::describe_fetch(std::string_view sql, int fd, MsgWriter& w)
         return true;
     }
     (void)w.send(fd);
-    assert(c.field_count <= kMaxFields);
+    assert(c.field_count <= ::bolt::api::limits::kPgwireMaxFieldsCeiling);
     return true;
 }
 

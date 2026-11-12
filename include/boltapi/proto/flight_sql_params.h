@@ -24,7 +24,7 @@
 namespace bolt::api::proto::flightsql::params {
 
 inline constexpr std::uint32_t kMaxParams = 256;      // placeholders per statement
-inline constexpr std::uint32_t kMaxRows = 4096;       // parameter sets per DoPut
+// Parameter sets per DoPut: the flight_sql_doput_rows budget (boltapi_limits.h).
 
 enum class Kind : std::uint8_t { kNull = 0, kInt = 1, kUInt = 2, kFloat = 3, kString = 4, kBool = 5 };
 
@@ -59,6 +59,8 @@ public:
     bool has_schema() const noexcept { return have_schema_; }
     // The last failure refused a well-formed but unsupported type or encoding.
     bool unsupported() const noexcept { return unsupported_; }
+    // The last failure was a budget (flight_sql_doput_rows): RESOURCE_EXHAUSTED.
+    bool exhausted() const noexcept { return exhausted_; }
 
     struct Col {
         std::uint8_t  type = 0;       // Schema.fbs Type union id
@@ -76,6 +78,7 @@ private:
 
     bool have_schema_ = false;
     bool unsupported_ = false;
+    bool exhausted_ = false;
     const char* why_ = "";
     char        why_buf_[96] = {};
     std::uint32_t    n_top_ = 0;
@@ -89,6 +92,11 @@ std::uint8_t header_type(std::string_view metadata) noexcept;
 
 // Number of `?` placeholders; false when there are more than kMaxParams.
 bool count_placeholders(std::string_view sql, std::uint32_t* n) noexcept;
+
+// render()'s refusal when the bound statement exceeds `cap`.
+inline constexpr const char* kRenderTooLarge =
+    "statement with its parameters bound exceeds flight_sql_max_query_bytes "
+    "(raise BOLTAPI_FLIGHT_SQL_MAX_QUERY_BYTES)";
 
 // `sql` with its placeholders replaced by the literals of `row[0..n)`.
 // `n` must equal count_placeholders(sql). False (with `err`) on a value
