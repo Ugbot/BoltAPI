@@ -402,6 +402,19 @@ boltapi_apply_sanitizers(boltapi)   # no-op unless BOLTAPI_SANITIZE=ON
 # Header-only consumption alias (for pieces that are header-only).
 add_library(boltapi_headers INTERFACE)
 add_library(boltapi::headers ALIAS boltapi_headers)
+# Build-time Limits defaults: -DBOLTAPI_LIMIT_<NAME>=<value> (bolt cmake/BoltLimits.cmake).
+if(DEFINED BOLT_LIMITS_CMAKE AND EXISTS "${BOLT_LIMITS_CMAKE}")
+    include("${BOLT_LIMITS_CMAKE}")
+    bolt_limits_build_overrides(boltapi BOLTAPI boltapi_limits_build.h BOLTAPI_LIMITS_BUILD)
+    bolt_limits_build_overrides(boltapi_headers BOLTAPI boltapi_limits_build.h BOLTAPI_LIMITS_BUILD)
+else()
+    get_cmake_property(_lim_vars VARIABLES)
+    foreach(_lim_v IN LISTS _lim_vars)
+        if(_lim_v MATCHES "^BOLTAPI_LIMIT_")
+            message(FATAL_ERROR "${_lim_v} needs a bolt with cmake/BoltLimits.cmake")
+        endif()
+    endforeach()
+endif()
 target_include_directories(boltapi_headers INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>

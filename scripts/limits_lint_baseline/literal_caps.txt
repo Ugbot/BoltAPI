@@ -45,7 +45,6 @@ include/boltapi/http3/qpack.h::kQpackMaxHeaders
 include/boltapi/http3/qpack.h::kQpackMaxStringLen
 include/boltapi/http3/qpack_huffman.h::kMaxBits
 include/boltapi/net/tls_socket.h::kMaxFlushPasses
-include/boltapi/proto/flight_sql.h::kMaxCatalogTables
 include/boltapi/proto/flight_sql.h::kMaxKeyColumns
 include/boltapi/proto/flight_sql.h::kMaxQueryBytes
 include/boltapi/proto/flight_sql.h::kMaxXdbcTypes

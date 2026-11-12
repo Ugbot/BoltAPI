@@ -15,7 +15,20 @@
 #include "boltapi/router.h"
 #include "boltapi/wire_limits.h"
 
+namespace bolt::api::limits {
+// Tables one Flight SQL GetTables / GetPrimaryKeys listing carries (was a
+// fixed 4,096). One CatalogTable per table, only while a listing runs.
+inline constexpr std::uint64_t kFlightSqlCatalogTablesDefault = 1u << 20;
+inline constexpr std::uint64_t kFlightSqlCatalogTablesMax     = 0xFFFFFFFFu;
+}  // namespace bolt::api::limits
+
 #define BOLTAPI_LIMITS(X)                                                       \
+    X(flight_sql_catalog_tables, kBudget, "tables",                             \
+      ::bolt::api::limits::kFlightSqlCatalogTablesDefault, 1,                   \
+      ::bolt::api::limits::kFlightSqlCatalogTablesMax,                          \
+      "BOLTAPI_FLIGHT_SQL_CATALOG_TABLES", nullptr,                             \
+      "tables one Flight SQL GetTables / GetPrimaryKeys listing carries "        \
+      "(past it: RESOURCE_EXHAUSTED naming this knob)")                         \
     X(fixed_stream_slice_bytes, kFixedAtAlloc, "bytes",                             \
       ::bolt::api::kFixedStreamSliceBytes, ::bolt::api::kFixedStreamSliceBytes,  \
       ::bolt::api::kFixedStreamSliceBytes, nullptr, nullptr,                    \
@@ -112,6 +125,18 @@
 
 namespace bolt::api {
 
+#if defined(__has_include)
+#if __has_include(<boltapi_limits_build.h>)
+#include <boltapi_limits_build.h>
+#endif
+#endif
+#ifndef BOLTAPI_LIMITS_BUILD
+#define BOLTAPI_LIMITS_BUILD ""
+#endif
+#ifdef BOLT_LIMITS_TABLE_BUILD
+BOLT_LIMITS_TABLE_BUILD(boltapi_limits, "boltapi", BOLTAPI_LIMITS, BOLTAPI_LIMITS_BUILD)
+#else
 BOLT_LIMITS_TABLE(boltapi_limits, "boltapi", BOLTAPI_LIMITS)
+#endif
 
 }  // namespace bolt::api

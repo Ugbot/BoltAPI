@@ -5,6 +5,7 @@
 #include "boltapi/proto/flight_sql_codec.h"
 #include "boltapi/proto/flight_sql_params.h"
 #include "boltapi/proto/flight_sql_metadata.h"
+#include "boltapi/boltapi_limits.h"
 
 #include "bolt/bolt_arena.h"
 #include "bolt/bolt_column.h"
@@ -365,10 +366,41 @@ void expect_catalog(CatalogBoundsExecutor& exec, bool primary_keys,
 }
 } // namespace
 
+// Tables one GetTables/GetPrimaryKeys snapshot lists are the budget
+// flight_sql_catalog_tables (was a fixed 4,096; JDBC/DBeaver browse warehouses
+// with far more tables). Set small here so the test stays fast.
+struct CatalogBudget {
+    explicit CatalogBudget(std::uint64_t v) {
+        bolt::LimitTable& t = bolt::api::boltapi_limits();
+        i = static_cast<std::uint32_t>(bolt::api::boltapi_limits_id::flight_sql_catalog_tables);
+        was = bolt::limits_value(t, i);
+        EXPECT_TRUE(bolt::limits_set(&t, i, v, nullptr, 0));
+    }
+    ~CatalogBudget() { (void)bolt::limits_set(&bolt::api::boltapi_limits(), i, was, nullptr, 0); }
+    std::uint32_t i = 0;
+    std::uint64_t was = 0;
+};
+
+TEST(FlightSqlMetadata, CatalogBudgetDefaultListsAMillionTables) {
+    const bolt::LimitTable& t = bolt::api::boltapi_limits();
+    const auto i = static_cast<std::uint32_t>(bolt::api::boltapi_limits_id::flight_sql_catalog_tables);
+    EXPECT_GE(t.descs[i].def, 1u << 20);
+    EXPECT_STREQ(t.descs[i].env, "BOLTAPI_FLIGHT_SQL_CATALOG_TABLES");
+}
+
 TEST(FlightSqlMetadata, RejectsOversizedCatalogBeforeReadingEntries) {
+    const CatalogBudget budget(64);
     CatalogBoundsExecutor exec;
-    exec.tables = fs::kMaxCatalogTables + 1;
-    expect_catalog(exec, false, fs::GrpcCode::kResourceExhausted, 0);
+    exec.tables = 65;
+    std::string out, value;
+    std::int64_t rows = -1;
+    fs::QueryFailure failure;
+    char message[256]{};
+    (void)fs::metadata::build("arrow.flight.protocol.sql.CommandGetTables", value, exec,
+                              fs::Config{}, &out, &rows, failure, message, sizeof(message));
+    EXPECT_EQ(failure.code, fs::GrpcCode::kResourceExhausted);
+    EXPECT_NE(std::string(failure.message).find("flight_sql_catalog_tables"), std::string::npos)
+        << failure.message;
     EXPECT_EQ(exec.visits, 0u);
 }
 
@@ -383,9 +415,16 @@ TEST(FlightSqlMetadata, RejectsInvalidEntriesBeforeSerializingKeys) {
 
 TEST(FlightSqlMetadata, AcceptsExactTableAndKeyCapacity) {
     CatalogBoundsExecutor exec;
-    exec.tables = fs::kMaxCatalogTables;
-    expect_catalog(exec, false, fs::GrpcCode::kOk, fs::kMaxCatalogTables);
-    EXPECT_EQ(exec.visits, fs::kMaxCatalogTables);
+    exec.tables = 5000;   // past the old fixed 4,096, inside the default budget
+    expect_catalog(exec, false, fs::GrpcCode::kOk, 5000);
+    EXPECT_EQ(exec.visits, 5000u);
+    {
+        const CatalogBudget budget(64);
+        exec.visits = 0;
+        exec.tables = 64;
+        expect_catalog(exec, false, fs::GrpcCode::kOk, 64);
+        EXPECT_EQ(exec.visits, 64u);
+    }
     exec.tables = 1;
     exec.keys = fs::kMaxKeyColumns;
     expect_catalog(exec, true, fs::GrpcCode::kOk, fs::kMaxKeyColumns);

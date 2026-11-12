@@ -129,7 +129,6 @@ inline constexpr std::uint32_t kMaxQueryBytes = 64u * 1024u;
 // One table of the host's catalog, for the Flight SQL metadata commands.
 // Tables carry no catalog or database schema (both answer NULL): `name` is
 // exactly what the host's SQL accepts unqualified.
-inline constexpr std::uint32_t kMaxCatalogTables = 4096;
 inline constexpr std::uint16_t kMaxKeyColumns = 16;
 
 struct CatalogTable {
@@ -229,7 +228,8 @@ public:
     // Catalog for CommandGetTables/GetTableTypes/GetPrimaryKeys/... When
     // false those commands answer UNIMPLEMENTED; GetSqlInfo still works.
     virtual bool has_catalog() const noexcept { return false; }
-    // Snapshots the table list and returns its size (<= kMaxCatalogTables).
+    // Snapshots the table list and returns its size (listing refuses past the
+    // flight_sql_catalog_tables budget, boltapi_limits.h).
     virtual std::uint32_t catalog_tables() noexcept { return 0; }
     // Entry i of the last snapshot; the views stay valid until the next
     // catalog_tables() on this executor.
