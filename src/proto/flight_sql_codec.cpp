@@ -186,7 +186,8 @@ bool decode_descriptor(std::string_view buf, Descriptor* out) noexcept {
     *out = Descriptor{};
     PbReader r(buf);
     PbField f;
-    for (std::size_t guard = 0; guard < 256 && r.next(&f); ++guard) {
+    // A field takes at least two bytes, so the message bounds the loop.
+    for (std::size_t guard = 0; guard <= buf.size() && r.next(&f); ++guard) {
         if (f.number == 1 && f.wire == kWireVarint) out->type = f.varint;
         else if (f.number == 2 && f.wire == kWireBytes) out->cmd = f.bytes;
     }

@@ -172,8 +172,9 @@ TEST(FlightSqlParams, PlaceholdersSkipStringsIdentifiersAndComments) {
     ASSERT_TRUE(pm::count_placeholders("SELECT '?", &n));   // unterminated literal
     EXPECT_EQ(n, 0u);
     std::string many = "SELECT ";
-    for (int i = 0; i < 257; ++i) many += "?,";
-    EXPECT_FALSE(pm::count_placeholders(many, &n));
+    for (int i = 0; i < 300; ++i) many += "?,";
+    ASSERT_TRUE(pm::count_placeholders(many, &n));   // past the old fixed 256
+    EXPECT_EQ(n, 300u);
 }
 
 TEST(FlightSqlParams, RendersAnsiLiterals) {
@@ -530,4 +531,75 @@ TEST(FlightSqlLimits, QueryTextDefaultsToGestaltMaxQueryBytes) {
                            &out, &err)) << err;
     EXPECT_FALSE(pm::render(sql, row.data(), 1, 1024, &out, &err));
     EXPECT_EQ(err, pm::kRenderTooLarge);
+}
+
+// G2CHK-1018 (boltapi): placeholders per statement are the flight_sql_params
+// budget (was a fixed 256), Postgres's 65,535 by default.
+TEST(FlightSqlParams, PlaceholdersAreABudgetNamingTheKnob) {
+    bolt::LimitTable& t = bolt::api::boltapi_limits();
+    const auto i = static_cast<std::uint32_t>(bolt::api::boltapi_limits_id::flight_sql_params);
+    EXPECT_EQ(t.descs[i].def, 65535u);
+    EXPECT_STREQ(t.descs[i].env, "BOLTAPI_FLIGHT_SQL_PARAMS");
+    std::string sql = "SELECT ";
+    for (int k = 0; k < 1000; ++k) sql += k == 0 ? "?" : ",?";
+    std::uint32_t n = 0;
+    ASSERT_TRUE(pm::count_placeholders(sql, &n));
+    ASSERT_EQ(n, 1000u);
+    std::vector<pm::Value> row(n);
+    for (std::uint32_t k = 0; k < n; ++k) { row[k].kind = pm::Kind::kInt; row[k].i = k; }
+    std::string handle, rendered;
+    pm::encode_bound(&handle, sql, row.data(), n);
+    std::string_view back;
+    bool bound = false;
+    std::vector<pm::Value> got;
+    ASSERT_TRUE(pm::decode_handle(handle, &back, &bound, &got));
+    ASSERT_TRUE(bound);
+    ASSERT_EQ(got.size(), 1000u);
+    EXPECT_EQ(got[999].i, 999);
+    const char* err = nullptr;
+    ASSERT_TRUE(pm::render(sql, got.data(), n, 1u << 20, &rendered, &err)) << err;
+    EXPECT_NE(rendered.find(",999"), std::string::npos);
+    const std::uint64_t was = bolt::limits_value(t, i);
+    ASSERT_TRUE(bolt::limits_set(&t, i, 999, nullptr, 0));
+    EXPECT_FALSE(pm::count_placeholders(sql, &n));
+    EXPECT_FALSE(pm::decode_handle(handle, &back, &bound, &got));
+    EXPECT_NE(std::string(pm::kTooManyParams).find("flight_sql_params"), std::string::npos);
+    (void)bolt::limits_set(&t, i, was, nullptr, 0);
+}
+
+// A FlightDescriptor past 256 fields keeps its cmd (the loop stopped at 256).
+TEST(FlightSqlCodec, DescriptorPast256FieldsKeepsItsCommand) {
+    std::string desc;
+    for (int k = 0; k < 300; ++k) cd::pb_put_varint(&desc, 9, 1);   // unknown field
+    cd::pb_put_varint(&desc, 1, 2);
+    cd::pb_put_bytes(&desc, 2, "cmd-bytes");
+    cd::Descriptor d;
+    ASSERT_TRUE(cd::decode_descriptor(desc, &d));
+    EXPECT_EQ(d.type, 2u);
+    EXPECT_EQ(d.cmd, "cmd-bytes");
+}
+
+// GetTables filtered by more than 256 table types (was refused).
+TEST(FlightSqlMetadata, TableTypeFilterPast256Entries) {
+    CatalogBoundsExecutor exec;
+    exec.tables = 3;
+    std::string value;
+    for (int k = 0; k < 300; ++k) cd::pb_put_bytes(&value, 4, "VIEW");
+    cd::pb_put_bytes(&value, 4, "TABLE");
+    std::string out;
+    std::int64_t rows = -1;
+    fs::QueryFailure failure;
+    char message[256]{};
+    const auto result = fs::metadata::build("arrow.flight.protocol.sql.CommandGetTables", value,
+        exec, fs::Config{}, &out, &rows, failure, message, sizeof(message));
+    EXPECT_EQ(result, fs::metadata::Outcome::kOk) << failure.message;
+    EXPECT_EQ(rows, 3);
+}
+
+// Concurrent HTTP/2 streams per Flight SQL connection: RFC 9113's >= 100.
+TEST(FlightSqlLimits, MaxStreamsDefaultsToRfc9113) {
+    const bolt::LimitTable& t = bolt::api::boltapi_limits();
+    const auto i = static_cast<std::uint32_t>(bolt::api::boltapi_limits_id::flight_sql_max_streams);
+    EXPECT_EQ(t.descs[i].def, 100u);
+    EXPECT_STREQ(t.descs[i].env, "BOLTAPI_FLIGHT_SQL_MAX_STREAMS");
 }

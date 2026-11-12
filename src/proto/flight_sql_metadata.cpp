@@ -22,7 +22,6 @@ namespace cd = codec;
 namespace ar = arrow;
 
 constexpr std::string_view kSqlPkg = "arrow.flight.protocol.sql.";
-constexpr std::size_t kMaxFields = 256;
 constexpr std::size_t kMaxInfoIds = 1024;
 
 // A proto3 `optional string`: presence matters.
@@ -41,8 +40,7 @@ bool fail(QueryFailure& f, GrpcCode code, const char* msg) noexcept {
 // the metadata commands use. Unknown fields are skipped per proto3.
 struct Args {
     OptStr           s[7];
-    std::string_view types[kMaxFields];
-    std::size_t      n_types = 0;
+    std::vector<std::string_view> types;   // as many as the message carries
     bool             include_schema = false;
 };
 
@@ -50,12 +48,12 @@ bool parse_args(std::string_view buf, bool repeated_4, Args* a) noexcept {
     assert(a != nullptr);
     cd::PbReader r(buf);
     cd::PbField f;
+    // A field takes at least two bytes, so the message bounds the loop.
     std::size_t guard = 0;
-    for (; guard < kMaxFields && r.next(&f); ++guard) {
+    for (; guard <= buf.size() && r.next(&f); ++guard) {
         if (f.wire == cd::kWireBytes && f.number >= 1 && f.number <= 6) {
             if (f.number == 4 && repeated_4) {
-                if (a->n_types == kMaxFields) return false;
-                a->types[a->n_types++] = f.bytes;
+                a->types.push_back(f.bytes);
             } else {
                 a->s[f.number] = OptStr{f.bytes, true};
             }
@@ -63,8 +61,8 @@ bool parse_args(std::string_view buf, bool repeated_4, Args* a) noexcept {
             a->include_schema = f.varint != 0;
         }
     }
-    assert(a->n_types <= kMaxFields);
-    return r.ok() && guard < kMaxFields;
+    assert(a->types.size() <= guard);
+    return r.ok() && guard <= buf.size();
 }
 
 // CommandGetSqlInfo{repeated uint32 info = 1}, packed or not.
@@ -201,8 +199,8 @@ bool tables(std::string_view value, IQueryExecutor& exec, std::string* out,
     for (std::uint32_t i = 0; scoped && i < s.tables.size(); ++i) {
         const CatalogTable& t = s.tables[i];
         if (a.s[3].set && !ar::like_match(a.s[3].v, t.name)) continue;
-        bool type_ok = a.n_types == 0;
-        for (std::size_t k = 0; k < a.n_types && !type_ok; ++k) type_ok = a.types[k] == t.table_type;
+        bool type_ok = a.types.empty();
+        for (std::size_t k = 0; k < a.types.size() && !type_ok; ++k) type_ok = a.types[k] == t.table_type;
         if (type_ok) keep.push_back(i);
     }
     std::sort(keep.begin(), keep.end(), [&](std::uint32_t x, std::uint32_t y) {
@@ -296,13 +294,13 @@ bool xdbc_types(std::string_view value, IQueryExecutor& exec, std::string* out,
     cd::PbReader r(value);
     cd::PbField fld;
     std::size_t guard = 0;
-    for (; guard < kMaxFields && r.next(&fld); ++guard) {
+    for (; guard <= value.size() && r.next(&fld); ++guard) {
         if (fld.number == 1 && fld.wire == cd::kWireVarint) {
             filtered = true;
             want = static_cast<std::int32_t>(static_cast<std::uint32_t>(fld.varint));
         }
     }
-    if (!r.ok() || guard == kMaxFields) {
+    if (!r.ok() || guard > value.size()) {
         return fail(f, GrpcCode::kInvalidArgument, "malformed CommandGetXdbcTypeInfo");
     }
     std::vector<XdbcTypeInfo> all(kMaxXdbcTypes);

@@ -19,9 +19,9 @@ namespace {
 // Schema.fbs Type union ids.
 constexpr std::uint8_t kTypeNull = 1, kTypeInt = 2, kTypeFloat = 3, kTypeBinary = 4,
                        kTypeUtf8 = 5, kTypeBool = 6, kTypeUnion = 14, kTypeLargeUtf8 = 20;
-constexpr std::uint32_t kMaxFields = 256;
 constexpr std::uint32_t kMaxMembers = 16;
-constexpr std::uint32_t kMaxBuffers = 4 * (kMaxFields + kMaxFields * kMaxMembers);
+// Arrow buffers a parameter batch of `cols` columns (union members included) may list.
+constexpr std::uint64_t max_buffers(std::uint64_t cols) noexcept { return 4u * cols * (1u + kMaxMembers); }
 
 }  // namespace
 
@@ -441,8 +441,13 @@ bool Decoder::schema(std::string_view metadata, const char** err) {
     const std::size_t sch = fb.table(msg, 2);
     std::size_t first = 0;
     const std::uint32_t n = sch == 0 ? 0 : fb.vec(sch, 1, &first);
-    if (!fb.ok() || n > kMaxFields) {
-        *err = "malformed or too wide parameter schema";
+    if (!fb.ok()) {
+        *err = "malformed parameter schema";
+        return false;
+    }
+    if (n > max_params()) {   // one column per placeholder
+        exhausted_ = true;
+        *err = kTooManyParams;
         return false;
     }
     cols_.clear();
@@ -528,7 +533,7 @@ bool Decoder::batch(std::string_view metadata, std::string_view body, Rows* out,
     const std::int64_t length = fb.scalar<std::int64_t>(rb, 0, 0);
     cur.n_nodes = fb.vec(rb, 1, &cur.nodes);
     cur.n_bufs = fb.vec(rb, 2, &cur.bufs);
-    if (!fb.ok() || length < 0 || cur.n_bufs > kMaxBuffers) {
+    if (!fb.ok() || length < 0 || cur.n_bufs > max_buffers(n_top_)) {
         *err = "malformed record batch";
         return false;
     }
@@ -599,10 +604,18 @@ std::uint8_t header_type(std::string_view metadata) noexcept {
     return fb.ok() ? t : 0;
 }
 
+std::uint32_t max_params() noexcept {
+    const std::uint64_t v = ::bolt::api::boltapi_limits_value(
+        ::bolt::api::boltapi_limits_id::flight_sql_params);
+    assert(v >= 1 && v <= ::bolt::api::limits::kFlightSqlParamsMax);
+    return static_cast<std::uint32_t>(v);
+}
+
 bool count_placeholders(std::string_view sql, std::uint32_t* n) noexcept {
     assert(n != nullptr);
     *n = 0;
-    return scan(sql, [&](std::size_t) { return ++*n <= kMaxParams; });
+    const std::uint32_t cap = max_params();
+    return scan(sql, [&](std::size_t) { return ++*n <= cap; });
 }
 
 bool render(std::string_view sql, const Value* row, std::uint32_t n, std::size_t cap,
@@ -643,7 +656,7 @@ void encode_unbound(std::string* out, std::string_view sql) {
 }
 
 void encode_bound(std::string* out, std::string_view sql, const Value* row, std::uint32_t n) {
-    assert(out != nullptr && (n == 0 || row != nullptr) && n <= kMaxParams);
+    assert(out != nullptr && (n == 0 || row != nullptr) && n <= max_params());
     out->assign(kBoundMagic.data(), kBoundMagic.size());
     codec::pb_put_varint_raw(out, sql.size());
     out->append(sql.data(), sql.size());
@@ -667,7 +680,7 @@ bool decode_handle(std::string_view handle, std::string_view* sql, bool* bound,
     if (!codec::pb_read_varint(handle, &pos, &len) || len > handle.size() - pos) return false;
     *sql = handle.substr(pos, static_cast<std::size_t>(len));
     pos += static_cast<std::size_t>(len);
-    if (!codec::pb_read_varint(handle, &pos, &n) || n > kMaxParams) return false;
+    if (!codec::pb_read_varint(handle, &pos, &n) || n > max_params()) return false;
     row->resize(static_cast<std::size_t>(n));
     for (std::size_t i = 0; i < n; ++i) {
         if (!get_value(handle, &pos, &(*row)[i])) return false;

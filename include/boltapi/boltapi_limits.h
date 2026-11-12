@@ -31,6 +31,14 @@ inline constexpr std::uint64_t kFlightSqlDoputRowsMax     = 0xFFFFFFFFu;
 // Bytes one DoPut stream may buffer (descriptor + parameter batches).
 inline constexpr std::uint64_t kFlightSqlDoputBytesDefault = 1u << 30;
 inline constexpr std::uint64_t kFlightSqlDoputBytesMax     = 1ull << 40;
+// `?` placeholders one Flight SQL statement carries (was a fixed 256):
+// Postgres's 65,535 bind parameters by default. A bound set is held per handle.
+inline constexpr std::uint64_t kFlightSqlParamsDefault = 0xFFFF;
+inline constexpr std::uint64_t kFlightSqlParamsMax     = 1u << 24;
+// Concurrent HTTP/2 streams per Flight SQL connection (was a fixed 16).
+// RFC 9113 5.1.2: SHOULD be no smaller than 100. Slot buffers are lazy.
+inline constexpr std::uint64_t kFlightSqlMaxStreamsDefault = 100;
+inline constexpr std::uint64_t kFlightSqlMaxStreamsMax     = 1u << 16;
 // Postgres result columns: MaxTupleAttributeNumber (1,664) by default; the
 // RowDescription / DataRow column count is an Int16 on the wire.
 inline constexpr std::uint64_t kPgwireMaxFieldsDefault = 1664;
@@ -62,6 +70,18 @@ inline constexpr std::uint64_t kBoltMaxFieldsCeiling = 1u << 20;
       "BOLTAPI_FLIGHT_SQL_DOPUT_ROWS", nullptr,                                 \
       "parameter sets one Flight SQL DoPut carries, held per DoPut "            \
       "(past it: RESOURCE_EXHAUSTED naming this knob)")                         \
+    X(flight_sql_params, kBudget, "params",                                     \
+      ::bolt::api::limits::kFlightSqlParamsDefault, 1,                          \
+      ::bolt::api::limits::kFlightSqlParamsMax,                                 \
+      "BOLTAPI_FLIGHT_SQL_PARAMS", nullptr,                                     \
+      "? placeholders one Flight SQL statement (and its bound parameter set) "  \
+      "carries; Postgres's 65,535 (past it: RESOURCE_EXHAUSTED naming this knob)") \
+    X(flight_sql_max_streams, kBudget, "streams",                               \
+      ::bolt::api::limits::kFlightSqlMaxStreamsDefault, 1,                      \
+      ::bolt::api::limits::kFlightSqlMaxStreamsMax,                             \
+      "BOLTAPI_FLIGHT_SQL_MAX_STREAMS", nullptr,                                \
+      "concurrent HTTP/2 streams per Flight SQL connection (SETTINGS_MAX_"      \
+      "CONCURRENT_STREAMS; RFC 9113: >= 100), read when a connection opens")    \
     X(flight_sql_doput_bytes, kBudget, "bytes",                                 \
       ::bolt::api::limits::kFlightSqlDoputBytesDefault, 65536,                  \
       ::bolt::api::limits::kFlightSqlDoputBytesMax,                             \

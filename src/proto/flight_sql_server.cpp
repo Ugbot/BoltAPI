@@ -78,7 +78,6 @@ constexpr std::uint16_t kSettingsMaxFrameSize = 0x5;
 constexpr char kPreface[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 constexpr std::size_t kPrefaceLen = 24;
 
-constexpr std::uint32_t kMaxStreams = 16;
 constexpr std::size_t kOurMaxFrame = 16384;           // SETTINGS default
 constexpr std::size_t kHeaderBlockCap = 16384;
 // Request framing beyond the statement text (Any/FlightDescriptor wrapping).
@@ -438,7 +437,7 @@ private:
     std::vector<std::uint8_t>      frame_;
     std::vector<std::uint8_t>      out_;
     std::vector<std::uint8_t>      hblock_;
-    Stream                         streams_[kMaxStreams];
+    std::vector<Stream>            streams_;     // flight_sql_max_streams, sized per connection
     std::unique_ptr<http::HPACKDecoder> hpack_;
     std::vector<http::HPACKHeader> headers_;
     std::string                    ipc_;
@@ -463,6 +462,10 @@ void Conn::serve(int fd, SSL* ssl) noexcept {
     peer_max_frame_ = kOurMaxFrame;
     hblock_sid_ = 0;
     hblock_len_ = 0;
+    const std::uint64_t max_streams = ::bolt::api::boltapi_limits_value(
+        ::bolt::api::boltapi_limits_id::flight_sql_max_streams);
+    assert(max_streams >= 1 && max_streams <= ::bolt::api::limits::kFlightSqlMaxStreamsMax);
+    streams_.resize(static_cast<std::size_t>(max_streams));   // slot bodies stay lazy
     for (auto& s : streams_) s.in_use = false;
     hpack_ = std::make_unique<http::HPACKDecoder>();
 
@@ -474,12 +477,12 @@ void Conn::serve(int fd, SSL* ssl) noexcept {
     std::uint8_t settings[6];
     settings[0] = 0;
     settings[1] = static_cast<std::uint8_t>(kSettingsMaxConcurrent);
-    put_be_u32(settings + 2, kMaxStreams);
+    put_be_u32(settings + 2, static_cast<std::uint32_t>(streams_.size()));
     if (!send_frame(kFrameSettings, 0, 0, settings, sizeof(settings))) return;
 
     while (!dead_ && !stopping_.load(std::memory_order_acquire)) {
         if (!read_and_handle_frame()) break;
-        for (std::uint32_t k = 0; k < kMaxStreams && !dead_; ++k) {
+        for (std::size_t k = 0; k < streams_.size() && !dead_; ++k) {
             // Lowest stream id first: requests dispatch in arrival order.
             Stream* next = nullptr;
             for (auto& s : streams_) {
