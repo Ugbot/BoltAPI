@@ -51,7 +51,6 @@ include/boltapi/proto/flight_sql.h::kMaxXdbcTypes
 include/boltapi/proto/flight_sql_params.h::kMaxParams
 include/boltapi/proto/flight_sql_params.h::kMaxRows
 include/boltapi/proto/neo4j_bolt.h::kMaxBolt5Minor
-include/boltapi/proto/neo4j_bolt.h::kMaxFields
 include/boltapi/proto/packstream.h::kMaxDepth
 include/boltapi/proto/packstream.h::kMaxElements
 include/boltapi/proto/packstream.h::kMaxStringBytes

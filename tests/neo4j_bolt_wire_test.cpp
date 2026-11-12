@@ -8,6 +8,7 @@
 //
 // "Bolt" here is Neo4j's client wire protocol, not extern/bolt.
 
+#include "boltapi/boltapi_limits.h"
 #include "boltapi/proto/neo4j_bolt.h"
 #include "neo4j_bolt_echo_executor.h"
 
@@ -671,4 +672,56 @@ TEST(BoltWorkerStack, DeepRecursiveQuerySurvivesOnAWorker) {
     EXPECT_EQ(r.signature(), nb::Signature::Success);
     c.close();
     proto.stop();
+}
+
+// G2CHK-1009: result columns past the old 256-wide grid.
+namespace {
+const ps::PackValue* run_fields(WireClient& c, const char* query, Reply& reply) {
+    Msg run;
+    (void)run.w.begin_struct(static_cast<std::uint8_t>(nb::Signature::Run), 3);
+    (void)run.w.put_string(query);
+    (void)run.w.begin_dict(0);
+    (void)run.w.begin_dict(0);
+    if (!run.send(c) || !reply.read(c)) return nullptr;
+    if (reply.signature() != nb::Signature::Success) return nullptr;
+    return reply.v.items[0].find("fields");
+}
+}  // namespace
+
+TEST_F(BoltServerFixture, RunReturnsPostgresWidthColumnList) {
+    WireClient c;
+    ASSERT_TRUE(c.connect(port_));
+    ASSERT_TRUE(open_session(c).valid());
+    Reply r;
+    const ps::PackValue* fields = run_fields(c, "WIDE 1664", r);
+    ASSERT_NE(fields, nullptr) << (r.v.len > 0 ? r.v.items[0].find_str("message") : "");
+    ASSERT_EQ(fields->len, 1664u);
+    EXPECT_EQ(fields->items[1663].str(), "w1663");
+}
+
+TEST_F(BoltServerFixture, ColumnsPastBudgetNameTheKnob) {
+    bolt::LimitTable& t = bolt::api::boltapi_limits();
+    const auto i = static_cast<std::uint32_t>(bolt::api::boltapi_limits_id::bolt_max_fields);
+    EXPECT_EQ(t.descs[i].def, 1664u);
+    EXPECT_STREQ(t.descs[i].env, "BOLTAPI_BOLT_MAX_FIELDS");
+    const std::uint64_t was = bolt::limits_value(t, i);
+    ASSERT_TRUE(bolt::limits_set(&t, i, 8, nullptr, 0));
+    WireClient c;
+    ASSERT_TRUE(c.connect(port_));
+    ASSERT_TRUE(open_session(c).valid());
+    Reply ok;
+    const ps::PackValue* fields = run_fields(c, "WIDE 8", ok);
+    ASSERT_NE(fields, nullptr);
+    EXPECT_EQ(fields->len, 8u);
+    Msg reset;
+    (void)reset.w.begin_struct(static_cast<std::uint8_t>(nb::Signature::Reset), 0);
+    ASSERT_TRUE(reset.send(c));
+    Reply rr;
+    ASSERT_TRUE(rr.read(c));
+    Reply bad;
+    EXPECT_EQ(run_fields(c, "WIDE 9", bad), nullptr);
+    EXPECT_EQ(bad.signature(), nb::Signature::Failure);
+    EXPECT_NE(std::string(bad.v.items[0].find_str("message")).find("bolt_max_fields"),
+              std::string::npos);
+    (void)bolt::limits_set(&t, i, was, nullptr, 0);
 }

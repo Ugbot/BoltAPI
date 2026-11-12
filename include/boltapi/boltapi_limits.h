@@ -26,6 +26,9 @@ inline constexpr std::uint64_t kPgwireMaxFieldsCeiling = 0x7FFF;
 // Postgres Bind / Parse parameter count: a UInt16 on the wire (65,535).
 inline constexpr std::uint64_t kPgwireMaxParamsDefault = 0xFFFF;
 inline constexpr std::uint64_t kPgwireMaxParamsCeiling = 0xFFFF;
+// Neo4j Bolt RUN result columns. Neo4j sets none; the SQL doors' 1,664.
+inline constexpr std::uint64_t kBoltMaxFieldsDefault = 1664;
+inline constexpr std::uint64_t kBoltMaxFieldsCeiling = 1u << 20;
 }  // namespace bolt::api::limits
 
 #define BOLTAPI_LIMITS(X)                                                       \
@@ -79,6 +82,12 @@ inline constexpr std::uint64_t kPgwireMaxParamsCeiling = 0xFFFF;
       "BOLTAPI_PGWIRE_MAX_PARAMS", nullptr,                                     \
       "bind parameters in one Postgres prepared statement; storage is per "     \
       "statement (past it: SQLSTATE 54000 naming this knob)")                   \
+    X(bolt_max_fields, kBudget, "columns",                                      \
+      ::bolt::api::limits::kBoltMaxFieldsDefault, 1,                            \
+      ::bolt::api::limits::kBoltMaxFieldsCeiling,                               \
+      "BOLTAPI_BOLT_MAX_FIELDS", nullptr,                                       \
+      "columns in one Neo4j Bolt result; scratch grows per connection on "      \
+      "first RUN (past it: a FAILURE naming this knob)")                        \
     X(bolt_max_offset_seconds, kInvariant, "seconds",                           \
       ::bolt::api::kBoltMaxOffsetSeconds, ::bolt::api::kBoltMaxOffsetSeconds,   \
       ::bolt::api::kBoltMaxOffsetSeconds, nullptr, nullptr,                     \
