@@ -9,10 +9,12 @@
 namespace bolt::api::quic {
 
 // Concurrent peer-initiated bidi streams granted (MAX_STREAMS credit tracks
-// closures): the default, and the ceiling an ALPN may raise it to
-// (hq-interop). Both fit the stream pool beside the uni streams.
-inline constexpr std::uint64_t kPeerBidiStreamsDefault = 8;
-inline constexpr std::uint64_t kPeerBidiStreamsMax = 48;
+// closures): the default (RFC 9114 §6.1: servers SHOULD allow at least 100,
+// the http3_max_streams knob), and the ceiling a host or ALPN may set. Both
+// fit the stream pool beside the uni streams; a stream's rings are allocated
+// on first use, so the pool costs its slot metadata only.
+inline constexpr std::uint64_t kPeerBidiStreamsDefault = 100;
+inline constexpr std::uint64_t kPeerBidiStreamsMax = 128;
 // Concurrent peer-initiated uni streams (HTTP/3 control + QPACK enc/dec).
 inline constexpr std::uint64_t kPeerUniStreamsMax = 3;
 // Closed-stream memory window per direction: MAX_STREAMS never grants a stream

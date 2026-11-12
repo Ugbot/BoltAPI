@@ -24,6 +24,7 @@
 // mswsock/iphlpapi on Windows, like quic_connection_test.
 
 #include "boltapi/app.h"
+#include "boltapi/boltapi_limits.h"
 #include "boltapi/http3/h3_connection.h"
 #include "boltapi/quic/connection.h"
 #include "boltapi/net/sys_compat.h"
@@ -127,6 +128,7 @@ struct H3Pair {
     std::vector<std::vector<std::uint8_t>> to_client, to_server;
 
     api::App* app = nullptr;
+    int       served = 0;   // requests the server bridge dispatched
     bool      server_settings_sent = false;
     bool      client_settings_sent = false;
 
@@ -173,6 +175,7 @@ struct H3Pair {
     // Build a CoroHttpRequest from the decoded H3 request, route it through the
     // App's shared dispatch path, send the response back over the H3 stream.
     void serve(const h3::H3Request& r) {
+        ++served;
         api::http::CoroHttpRequest creq;
         creq.method = r.method;
         creq.path   = r.path;
@@ -460,4 +463,83 @@ TEST(Http3App, StreamsFiftyMegabyteResponse) {
     EXPECT_EQ(rx.mismatches, 0u);
     p.stop();
     app.stop();
+}
+
+// G2CHK-1009: concurrent requests per connection (RFC 9114 §6.1: at least 100)
+// and request bodies past the old 1 MiB fixed per-stream buffer.
+namespace {
+struct H3Fixture {
+    api::App app;
+    std::unique_ptr<H3Pair> pair = std::make_unique<H3Pair>();
+    bool start() {
+        app.get("/ping", [](api::Request&, api::Response& res) {
+            res.status(200).content_type("text/plain").send("pong");
+        });
+        app.post("/echo", [](api::Request& req, api::Response& res) {
+            res.status(200).content_type("application/octet-stream").send(req.body());
+        });
+        const std::uint16_t port = pick_free_port();
+        return port != 0 && app.start_background("127.0.0.1", port) == 0 &&
+               pair->setup(app) && pair->handshake(std::chrono::seconds(12));
+    }
+    ~H3Fixture() { pair->stop(); app.stop(); }
+};
+}  // namespace
+
+TEST(Http3App, ReceivesRequestBodyPastOneMebibyte) {
+    H3Fixture f;
+    ASSERT_TRUE(f.start());
+    const std::string payload = make_random_body(3u << 20, 0xB16B0D);
+    std::uint16_t status = 0;
+    std::string body;
+    ASSERT_TRUE(round_trip(*f.pair, "POST", "/echo", payload, status, body))
+        << "no HTTP/3 response for a 3 MiB POST; served=" << f.pair->served;
+    EXPECT_EQ(status, 200u);
+    ASSERT_EQ(body.size(), payload.size());
+    EXPECT_EQ(body, payload);
+}
+
+TEST(Http3App, ServesHundredConcurrentStreams) {
+    H3Fixture f;
+    ASSERT_TRUE(f.start());
+    H3Pair& p = *f.pair;
+    constexpr int kStreams = 100;
+    for (int i = 0; i < kStreams; ++i) {
+        ASSERT_NE(p.client_h3.send_request("GET", "/ping", "https", "localhost",
+                                           nullptr, 0, nullptr, 0), UINT64_MAX);
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (p.served < kStreams && std::chrono::steady_clock::now() < deadline) {
+        p.pump_once();
+    }
+    EXPECT_EQ(p.served, kStreams) << "concurrent requests were not all served";
+    EXPECT_FALSE(p.server_qc.is_closed());
+}
+
+TEST(Http3App, BodyPastBudgetIsRefusedWith413) {
+    H3Fixture f;
+    ASSERT_TRUE(f.start());
+    f.pair->server_h3.set_max_request_body(64 * 1024);
+    for (const std::size_t n : {std::size_t{100} * 1024, std::size_t{2} << 20}) {
+        std::uint16_t status = 0;
+        std::string body;
+        ASSERT_TRUE(round_trip(*f.pair, "POST", "/echo", make_random_body(n, 7), status, body));
+        EXPECT_EQ(status, 413u) << n;
+        EXPECT_NE(body.find("max_body_size"), std::string::npos) << body;
+    }
+    EXPECT_EQ(f.pair->served, 0) << "an over-budget request reached the handler";
+    std::uint16_t status = 0;
+    std::string body;
+    ASSERT_TRUE(round_trip(*f.pair, "POST", "/echo", "small", status, body));
+    EXPECT_EQ(status, 200u);
+    EXPECT_EQ(body, "small");
+}
+
+TEST(Http3Limits, MaxStreamsKnobDefaultsToRfc9114) {
+    const bolt::LimitTable& t = api::boltapi_limits();
+    const auto i = static_cast<std::uint32_t>(api::boltapi_limits_id::http3_max_streams);
+    EXPECT_EQ(t.descs[i].def, 100u);
+    EXPECT_STREQ(t.descs[i].env, "BOLTAPI_HTTP3_MAX_STREAMS");
+    EXPECT_EQ(q::kPeerBidiStreamsDefault, 100u);
+    EXPECT_GE(q::kMaxStreams, q::kPeerBidiStreamsMax + 2 * q::kPeerUniStreamsMax);
 }

@@ -971,7 +971,10 @@ bounded fixed-capacity buffers, no exceptions, functions <70 lines):**
    H3 endpoint over a `QuicConnection`: opens control + QPACK enc/dec uni streams
    and sends SETTINGS once 1-RTT keys are up; classifies inbound uni streams by
    type prefix; per client bidi stream accumulates HEADERS+DATA into a bounded
-   per-stream pool (`kH3MaxStreams=8`, fixed `buf`), QPACK-decodes pseudo-headers
+   per-stream pool (`http3_max_streams`, default 100 per RFC 9114 §6.1 and
+   equal to the QUIC MAX_STREAMS credit; each slot's buffer is allocated on the
+   stream's first byte and bounded by the host's `max_body_size`, 413 past it;
+   G2CHK-1009 — was 8 slots with a fixed 1 MiB `buf`), QPACK-decodes pseudo-headers
    (:method/:path/:scheme/:authority) + regular headers + DATA body into an
    `H3Request`, and raises a callback; `send_response` QPACK-encodes :status +
    headers as a HEADERS frame + body as DATA, FIN. Client helpers `send_request`

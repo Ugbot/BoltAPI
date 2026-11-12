@@ -120,7 +120,7 @@ private:
 
     quic::QuicConnection* qc_ = nullptr;
     HqRequestFn on_request_;
-    Slot slots_[quic::kPeerBidiStreamsMax];
+    Slot slots_[kHqMaxStreams];
 };
 
 }  // namespace bolt::api::http3

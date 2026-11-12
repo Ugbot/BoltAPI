@@ -34,11 +34,8 @@ include/boltapi/http3/frame.h::kFrameHeaderMaxBytes
 include/boltapi/http3/frame.h::kFrameMaxPayloadLen
 include/boltapi/http3/frame.h::kSettingsMaxBytes
 include/boltapi/http3/frame.h::kSettingsMaxEntries
-include/boltapi/http3/h3_connection.h::kH3MaxBodyBytes
-include/boltapi/http3/h3_connection.h::kH3MaxFramesPerMsg
 include/boltapi/http3/h3_connection.h::kH3MaxHeaderBytes
 include/boltapi/http3/h3_connection.h::kH3MaxRespHeaders
-include/boltapi/http3/h3_connection.h::kH3MaxStreams
 include/boltapi/http3/h3_connection.h::kH3MaxUni
 include/boltapi/http3/qpack.h::kMaxEntries
 include/boltapi/http3/qpack.h::kQpackMaxHeaders

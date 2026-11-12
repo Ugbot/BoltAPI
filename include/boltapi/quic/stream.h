@@ -49,7 +49,7 @@ inline constexpr std::size_t kMaxRecvExtents = 32;
 // Max concurrently live streams per connection (fixed pool, slots reused once
 // both directions finish). A slot's two rings are allocated the first time it
 // is used, so memory follows peak concurrency (<= 2 * kStreamBufferSize each).
-inline constexpr std::size_t kMaxStreams = 64;
+inline constexpr std::size_t kMaxStreams = 160;   // >= kPeerBidiStreamsMax + uni + headroom
 
 // Stream-id helpers (RFC 9000 §2.1).
 inline constexpr std::uint64_t kStreamInitiatorBit = 0x1;  // 0 client / 1 server

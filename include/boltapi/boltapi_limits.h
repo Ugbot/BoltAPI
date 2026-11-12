@@ -10,6 +10,7 @@
 #include "bolt/bolt_limits.h"
 #include "boltapi/proto/grpc_limits.h"
 #include "boltapi/http/fixed_stream_limits.h"
+#include "boltapi/http3/h3_limits.h"
 #include "boltapi/quic/quic_limits.h"
 #include "boltapi/router.h"
 #include "boltapi/wire_limits.h"
@@ -142,6 +143,12 @@ inline constexpr std::uint64_t kBoltMaxFieldsCeiling = 1u << 20;
     X(qpack_max_int, kInvariant, "value", ::bolt::api::kQpackMaxIntValue,       \
       ::bolt::api::kQpackMaxIntValue, ::bolt::api::kQpackMaxIntValue, nullptr,  \
       nullptr, "largest QPACK integer (QUIC varint range)")                     \
+    X(http3_max_streams, kFixedAtAlloc, "streams",                             \
+      ::bolt::api::http3::kH3MaxStreamsDefault, 1,                             \
+      ::bolt::api::http3::kH3MaxStreamsCeiling,                                \
+      "BOLTAPI_HTTP3_MAX_STREAMS", nullptr,                                     \
+      "concurrent HTTP/3 requests per connection (RFC 9114: >= 100); sets the " \
+      "QUIC MAX_STREAMS credit and the request slots, whose buffers are lazy")  \
     X(http3_max_method_len, kInvariant, "bytes", ::bolt::api::kHttp3MaxMethodLen, \
       ::bolt::api::kHttp3MaxMethodLen, ::bolt::api::kHttp3MaxMethodLen, nullptr, \
       nullptr, "HTTP/3 :method length routed; longer is a 400")                \
@@ -152,7 +159,7 @@ inline constexpr std::uint64_t kBoltMaxFieldsCeiling = 1u << 20;
       ::bolt::api::quic::kPeerBidiStreamsMax,                                   \
       ::bolt::api::quic::kPeerBidiStreamsMax,                                   \
       ::bolt::api::quic::kPeerBidiStreamsMax, nullptr, nullptr,                 \
-      "concurrent peer bidi QUIC streams per connection")                       \
+      "ceiling on concurrent peer bidi QUIC streams per connection")            \
     X(quic_peer_uni_streams, kInvariant, "streams",                             \
       ::bolt::api::quic::kPeerUniStreamsMax,                                    \
       ::bolt::api::quic::kPeerUniStreamsMax,                                    \
