@@ -2,6 +2,27 @@
 // DoPut (updates, parameter binding) for flight_sql_server.cpp (G2ETL-75).
 // Included inside that file's anonymous namespace, after class Conn.
 
+// A statement this endpoint will take: non-empty, within flight_sql_max_query_bytes
+// (RESOURCE_EXHAUSTED past it), with a countable set of placeholders.
+bool Conn::admit_sql(Stream& s, std::string_view sql, std::uint32_t* n) noexcept {
+    assert(n != nullptr);
+    *n = 0;
+    if (sql.empty()) {
+        respond_error(s, GrpcCode::kInvalidArgument, "statement is empty");
+        return false;
+    }
+    if (sql.size() > max_query_bytes()) {
+        respond_error(s, GrpcCode::kResourceExhausted, kQueryTooLarge);
+        return false;
+    }
+    if (!pm::count_placeholders(sql, n)) {
+        respond_error(s, GrpcCode::kInvalidArgument, "statement has more than 256 parameters");
+        return false;
+    }
+    assert(*n <= pm::kMaxParams);
+    return true;
+}
+
 // The executable text of a prepared-statement handle: the statement itself,
 // or with its bound parameter set substituted (into bound_).
 bool Conn::bound_sql(Stream& s, std::string_view handle, std::string_view* sql) noexcept {
@@ -13,10 +34,7 @@ bool Conn::bound_sql(Stream& s, std::string_view handle, std::string_view* sql) 
         return false;
     }
     std::uint32_t n = 0;
-    if (!pm::count_placeholders(*sql, &n)) {
-        respond_error(s, GrpcCode::kInvalidArgument, "statement has more than 256 parameters");
-        return false;
-    }
+    if (!admit_sql(s, *sql, &n)) return false;
     if (n == 0) return true;
     if (!bound) {
         std::snprintf(fail_buf_, sizeof(fail_buf_),
@@ -28,8 +46,9 @@ bool Conn::bound_sql(Stream& s, std::string_view handle, std::string_view* sql) 
     }
     const char* err = nullptr;
     if (handle_row_.size() != n ||
-        !pm::render(*sql, handle_row_.data(), n, kMaxQueryBytes, &bound_, &err)) {
-        respond_error(s, GrpcCode::kInvalidArgument,
+        !pm::render(*sql, handle_row_.data(), n, max_query_bytes(), &bound_, &err)) {
+        respond_error(s, err == pm::kRenderTooLarge ? GrpcCode::kResourceExhausted
+                                                    : GrpcCode::kInvalidArgument,
                       err != nullptr ? err : "bound parameters do not match the statement");
         return false;
     }
@@ -47,11 +66,7 @@ bool Conn::bound_sql(Stream& s, std::string_view handle, std::string_view* sql) 
 // is how clients tell updates from queries.
 void Conn::create_prepared(Stream& s, std::string_view sql) noexcept {
     std::uint32_t n = 0;
-    if (sql.empty() || sql.size() > kMaxQueryBytes || !pm::count_placeholders(sql, &n)) {
-        respond_error(s, GrpcCode::kInvalidArgument,
-                      "statement is empty, exceeds 65536 bytes or has more than 256 parameters");
-        return;
-    }
+    if (!admit_sql(s, sql, &n)) return;
     std::string handle;
     pm::encode_unbound(&handle, sql);
     std::string result;
@@ -103,7 +118,7 @@ void Conn::describe_typed(std::string_view sql, const ParamType* types,
         }
     }
     const char* err = nullptr;
-    if (!pm::render(sql, stand_in.data(), n, kMaxQueryBytes, &bound_, &err)) return;
+    if (!pm::render(sql, stand_in.data(), n, max_query_bytes(), &bound_, &err)) return;
     QueryFailure f;
     std::int64_t rows = 0;
     if (!exec_.execute(bound_, &ipc_, &rows, f)) ipc_.clear();
@@ -135,11 +150,7 @@ bool Conn::send_put_result(Stream& s, std::string_view app_metadata) noexcept {
 bool Conn::put_update(Stream& s, std::string_view sql, const pm::Rows& rows,
                       const std::vector<pm::Value>& handle_row, bool bound) noexcept {
     std::uint32_t n = 0;
-    if (sql.empty() || sql.size() > kMaxQueryBytes || !pm::count_placeholders(sql, &n)) {
-        respond_error(s, GrpcCode::kInvalidArgument,
-                      "statement is empty, exceeds 65536 bytes or has more than 256 parameters");
-        return false;
-    }
+    if (!admit_sql(s, sql, &n)) return false;
     const bool use_handle = n > 0 && rows.n_rows == 0 && bound;
     if (n > 0 && rows.n_rows == 0 && !bound) {
         std::snprintf(fail_buf_, sizeof(fail_buf_),
@@ -157,14 +168,15 @@ bool Conn::put_update(Stream& s, std::string_view sql, const pm::Rows& rows,
     }
     const std::uint32_t sets = (n == 0 || use_handle) ? 1u : rows.n_rows;
     std::int64_t total = 0;
-    for (std::uint32_t r = 0; r < sets; ++r) {                // bounded by kMaxRows
+    for (std::uint32_t r = 0; r < sets; ++r) {                // bounded by flight_sql_doput_rows
         std::string_view text = sql;
         if (n > 0) {
             const pm::Value* row = use_handle ? handle_row.data()
                                               : &rows.values[static_cast<std::size_t>(r) * n];
             const char* err = nullptr;
-            if (!pm::render(sql, row, n, kMaxQueryBytes, &bound_, &err)) {
-                respond_error(s, GrpcCode::kInvalidArgument, err);
+            if (!pm::render(sql, row, n, max_query_bytes(), &bound_, &err)) {
+                respond_error(s, err == pm::kRenderTooLarge ? GrpcCode::kResourceExhausted
+                                                            : GrpcCode::kInvalidArgument, err);
                 return false;
             }
             text = bound_;
@@ -186,10 +198,11 @@ bool Conn::put_update(Stream& s, std::string_view sql, const pm::Rows& rows,
 // an optional IPC stream of parameter sets.
 bool Conn::read_put(Stream& s, std::string_view* descriptor, pm::Rows* rows) noexcept {
     assert(descriptor != nullptr && rows != nullptr);
-    const std::string_view body(reinterpret_cast<const char*>(s.body), s.body_len);
+    const std::string_view body(reinterpret_cast<const char*>(s.body.data()), s.body.size());
     pm::Decoder dec;
     std::size_t pos = 0;
-    for (std::size_t k = 0; k < kMaxPutMessages && pos < body.size(); ++k) {
+    const std::size_t max_messages = body.size() / kGrpcPrefixBytes + 1;
+    for (std::size_t k = 0; k < max_messages && pos < body.size(); ++k) {
         std::string_view msg;
         std::size_t used = 0;
         const cd::GrpcFrame fr = cd::grpc_unframe(body.substr(pos), &msg, &used);
@@ -214,14 +227,16 @@ bool Conn::read_put(Stream& s, std::string_view* descriptor, pm::Rows* rows) noe
                             : false;
         if (!ok) {
             const bool unsupported = dec.unsupported() || ht == cd::kIpcHeaderDictionaryBatch;
-            respond_error(s, unsupported ? GrpcCode::kUnimplemented : GrpcCode::kInvalidArgument,
+            respond_error(s, unsupported      ? GrpcCode::kUnimplemented
+                             : dec.exhausted() ? GrpcCode::kResourceExhausted
+                                               : GrpcCode::kInvalidArgument,
                           ht == cd::kIpcHeaderDictionaryBatch
                               ? "dictionary-encoded parameters are not supported" : err);
             return false;
         }
     }
-    if (pos != body.size()) {
-        respond_error(s, GrpcCode::kResourceExhausted, "too many FlightData messages in DoPut");
+    if (pos != body.size()) {   // every iteration consumes >= one 5-byte prefix
+        respond_error(s, GrpcCode::kInvalidArgument, "malformed FlightData in DoPut");
         return false;
     }
     if (descriptor->empty()) {

@@ -46,10 +46,8 @@ include/boltapi/http3/qpack.h::kQpackMaxStringLen
 include/boltapi/http3/qpack_huffman.h::kMaxBits
 include/boltapi/net/tls_socket.h::kMaxFlushPasses
 include/boltapi/proto/flight_sql.h::kMaxKeyColumns
-include/boltapi/proto/flight_sql.h::kMaxQueryBytes
 include/boltapi/proto/flight_sql.h::kMaxXdbcTypes
 include/boltapi/proto/flight_sql_params.h::kMaxParams
-include/boltapi/proto/flight_sql_params.h::kMaxRows
 include/boltapi/proto/neo4j_bolt.h::kMaxBolt5Minor
 include/boltapi/proto/packstream.h::kMaxDepth
 include/boltapi/proto/packstream.h::kMaxElements
@@ -156,7 +154,6 @@ src/proto/flight_sql_server.cpp::kAuthCap
 src/proto/flight_sql_server.cpp::kHeaderBlockCap
 src/proto/flight_sql_server.cpp::kMaxFramesPerWait
 src/proto/flight_sql_server.cpp::kMaxIpcMessages
-src/proto/flight_sql_server.cpp::kMaxPutMessages
 src/proto/flight_sql_server.cpp::kMaxStreams
 src/proto/flight_sql_server.cpp::kMaxTlsRetries
 src/proto/flight_sql_server.cpp::kMaxWindow

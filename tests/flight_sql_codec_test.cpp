@@ -1,6 +1,7 @@
 // tests/flight_sql_codec_test.cpp — the Flight SQL byte codecs, no sockets.
 // Real-client conformance is flight_sql_client_conformance.py.
 
+#include "boltapi/proto/flight_sql.h"
 #include "boltapi/proto/flight_sql_arrow.h"
 #include "boltapi/proto/flight_sql_codec.h"
 #include "boltapi/proto/flight_sql_params.h"
@@ -428,4 +429,105 @@ TEST(FlightSqlMetadata, AcceptsExactTableAndKeyCapacity) {
     exec.tables = 1;
     exec.keys = fs::kMaxKeyColumns;
     expect_catalog(exec, true, fs::GrpcCode::kOk, fs::kMaxKeyColumns);
+}
+
+// G2CHK-1009: DoPut parameter sets are a budget (flight_sql_doput_rows), not
+// a fixed 4,096. One Int64 column of `n` rows, written by bolt's IPC writer.
+namespace {
+std::string int64_param_stream(std::uint32_t n) {
+    auto* w = static_cast<bolt::ingest::ArrowIpcWriter*>(
+        std::calloc(1, sizeof(bolt::ingest::ArrowIpcWriter)));
+    auto* batch = static_cast<bolt::BoltBatch*>(std::calloc(1, sizeof(bolt::BoltBatch)));
+    std::FILE* f = std::tmpfile();
+    if (w == nullptr || batch == nullptr || f == nullptr) return {};
+    const bolt::BoltType ty[1] = {bolt::BoltType::Int64};
+    const char* names[1] = {"p"};
+    std::vector<std::int64_t> vals(n);
+    for (std::uint32_t i = 0; i < n; ++i) vals[i] = i;
+    bolt::Arena arena;
+    bolt::BoltBatch::init_empty(batch);
+    bool ok = bolt::ingest::arrow_ipc_open(w, f, ty, names, 1) &&
+              bolt::BoltBatch::alloc_columns(batch, &arena, 1);
+    if (ok) {
+        batch->num_rows = n;
+        batch->num_cols = 1;
+        bolt::BoltColumn& c = batch->columns[batch->read_epoch][0];
+        c.type = bolt::BoltType::Int64;
+        c.format = bolt::ColumnFormat::Flat;
+        c.length = n;
+        c.data = vals.data();
+        c.type_size_bytes = 8;
+        ok = bolt::ingest::arrow_ipc_write_batch(w, batch) && bolt::ingest::arrow_ipc_close(w);
+    }
+    std::fflush(f);
+    const long size = std::ftell(f);
+    std::rewind(f);
+    std::string stream(ok && size > 0 ? static_cast<std::size_t>(size) : 0u, '\0');
+    if (!stream.empty() && std::fread(stream.data(), 1, stream.size(), f) != stream.size()) {
+        stream.clear();
+    }
+    std::fclose(f);
+    std::free(w);
+    std::free(batch);
+    return stream;
+}
+
+bool decode_params(const std::string& stream, pm::Rows* rows, const char** err) {
+    std::size_t pos = 0;
+    bool bad = false;
+    cd::IpcMessage sch;
+    cd::IpcMessage rb;
+    if (!cd::ipc_next_message(stream, &pos, &sch, &bad) ||
+        !cd::ipc_next_message(stream, &pos, &rb, &bad)) {
+        return false;
+    }
+    pm::Decoder dec;
+    return dec.schema(sch.metadata, err) && dec.batch(rb.metadata, rb.body, rows, err);
+}
+}  // namespace
+
+TEST(FlightSqlParams, DecodesMoreThan4096ParameterSets) {
+    const std::string stream = int64_param_stream(5000);
+    ASSERT_FALSE(stream.empty());
+    pm::Rows rows;
+    const char* err = nullptr;
+    ASSERT_TRUE(decode_params(stream, &rows, &err)) << err;
+    ASSERT_EQ(rows.n_rows, 5000u);
+    EXPECT_EQ(rows.values[4999].i, 4999);
+}
+
+TEST(FlightSqlParams, ParameterSetsPastBudgetNameTheKnob) {
+    bolt::LimitTable& t = bolt::api::boltapi_limits();
+    const auto i = static_cast<std::uint32_t>(bolt::api::boltapi_limits_id::flight_sql_doput_rows);
+    EXPECT_EQ(t.descs[i].def, 1u << 20);
+    EXPECT_STREQ(t.descs[i].env, "BOLTAPI_FLIGHT_SQL_DOPUT_ROWS");
+    const std::uint64_t was = bolt::limits_value(t, i);
+    ASSERT_TRUE(bolt::limits_set(&t, i, 100, nullptr, 0));
+    pm::Rows rows;
+    const char* err = nullptr;
+    EXPECT_FALSE(decode_params(int64_param_stream(101), &rows, &err));
+    ASSERT_NE(err, nullptr);
+    EXPECT_NE(std::string(err).find("flight_sql_doput_rows"), std::string::npos) << err;
+    rows = pm::Rows{};
+    EXPECT_TRUE(decode_params(int64_param_stream(100), &rows, &err)) << err;
+    (void)bolt::limits_set(&t, i, was, nullptr, 0);
+}
+
+TEST(FlightSqlLimits, QueryTextDefaultsToGestaltMaxQueryBytes) {
+    const bolt::LimitTable& t = bolt::api::boltapi_limits();
+    const auto q = static_cast<std::uint32_t>(
+        bolt::api::boltapi_limits_id::flight_sql_max_query_bytes);
+    EXPECT_EQ(t.descs[q].def, 4u << 20);
+    EXPECT_STREQ(t.descs[q].env, "BOLTAPI_FLIGHT_SQL_MAX_QUERY_BYTES");
+    EXPECT_EQ(bolt::api::proto::flightsql::max_query_bytes(), 4u << 20);
+    std::vector<pm::Value> row(1);
+    row[0].kind = pm::Kind::kInt;
+    row[0].i = 7;
+    std::string out;
+    const char* err = nullptr;
+    const std::string sql = "SELECT " + std::string(100 * 1024, ' ') + "?";
+    EXPECT_TRUE(pm::render(sql, row.data(), 1, bolt::api::proto::flightsql::max_query_bytes(),
+                           &out, &err)) << err;
+    EXPECT_FALSE(pm::render(sql, row.data(), 1, 1024, &out, &err));
+    EXPECT_EQ(err, pm::kRenderTooLarge);
 }

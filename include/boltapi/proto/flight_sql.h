@@ -124,7 +124,8 @@ struct QueryFailure {
     const char* message = "query execution failed";
 };
 
-inline constexpr std::uint32_t kMaxQueryBytes = 64u * 1024u;
+// Statement text is the flight_sql_max_query_bytes budget (boltapi_limits.h).
+std::size_t max_query_bytes() noexcept;
 
 // One table of the host's catalog, for the Flight SQL metadata commands.
 // Tables carry no catalog or database schema (both answer NULL): `name` is

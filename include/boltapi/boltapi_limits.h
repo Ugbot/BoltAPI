@@ -19,6 +19,17 @@ namespace bolt::api::limits {
 // fixed 4,096). One CatalogTable per table, only while a listing runs.
 inline constexpr std::uint64_t kFlightSqlCatalogTablesDefault = 1u << 20;
 inline constexpr std::uint64_t kFlightSqlCatalogTablesMax     = 0xFFFFFFFFu;
+// Flight SQL statement text: gestalt.max_query_bytes (4 MiB) by default; the
+// host sets it to its own max_query_bytes. A request body is buffered up to
+// this plus framing, grown as it arrives.
+inline constexpr std::uint64_t kFlightSqlQueryBytesDefault = 4u << 20;
+inline constexpr std::uint64_t kFlightSqlQueryBytesMax     = 1u << 30;
+// Parameter sets one DoPut carries (ADBC / JDBC batches set none).
+inline constexpr std::uint64_t kFlightSqlDoputRowsDefault = 1u << 20;
+inline constexpr std::uint64_t kFlightSqlDoputRowsMax     = 0xFFFFFFFFu;
+// Bytes one DoPut stream may buffer (descriptor + parameter batches).
+inline constexpr std::uint64_t kFlightSqlDoputBytesDefault = 1u << 30;
+inline constexpr std::uint64_t kFlightSqlDoputBytesMax     = 1ull << 40;
 // Postgres result columns: MaxTupleAttributeNumber (1,664) by default; the
 // RowDescription / DataRow column count is an Int16 on the wire.
 inline constexpr std::uint64_t kPgwireMaxFieldsDefault = 1664;
@@ -37,6 +48,24 @@ inline constexpr std::uint64_t kBoltMaxFieldsCeiling = 1u << 20;
       ::bolt::api::limits::kFlightSqlCatalogTablesMax,                          \
       "BOLTAPI_FLIGHT_SQL_CATALOG_TABLES", nullptr,                             \
       "tables one Flight SQL GetTables / GetPrimaryKeys listing carries "        \
+      "(past it: RESOURCE_EXHAUSTED naming this knob)")                         \
+    X(flight_sql_max_query_bytes, kBudget, "bytes",                            \
+      ::bolt::api::limits::kFlightSqlQueryBytesDefault, 1024,                   \
+      ::bolt::api::limits::kFlightSqlQueryBytesMax,                             \
+      "BOLTAPI_FLIGHT_SQL_MAX_QUERY_BYTES", nullptr,                            \
+      "Flight SQL statement text; the host sets it from its max_query_bytes "   \
+      "(past it: RESOURCE_EXHAUSTED naming this knob)")                         \
+    X(flight_sql_doput_rows, kBudget, "sets",                                   \
+      ::bolt::api::limits::kFlightSqlDoputRowsDefault, 1,                       \
+      ::bolt::api::limits::kFlightSqlDoputRowsMax,                              \
+      "BOLTAPI_FLIGHT_SQL_DOPUT_ROWS", nullptr,                                 \
+      "parameter sets one Flight SQL DoPut carries, held per DoPut "            \
+      "(past it: RESOURCE_EXHAUSTED naming this knob)")                         \
+    X(flight_sql_doput_bytes, kBudget, "bytes",                                 \
+      ::bolt::api::limits::kFlightSqlDoputBytesDefault, 65536,                  \
+      ::bolt::api::limits::kFlightSqlDoputBytesMax,                             \
+      "BOLTAPI_FLIGHT_SQL_DOPUT_BYTES", nullptr,                                \
+      "bytes one Flight SQL DoPut stream buffers, grown as they arrive "        \
       "(past it: RESOURCE_EXHAUSTED naming this knob)")                         \
     X(fixed_stream_slice_bytes, kFixedAtAlloc, "bytes",                             \
       ::bolt::api::kFixedStreamSliceBytes, ::bolt::api::kFixedStreamSliceBytes,  \

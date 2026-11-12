@@ -7,6 +7,7 @@
 // worker at a time), every buffer sized once per worker.
 
 #include "boltapi/proto/flight_sql.h"
+#include "boltapi/boltapi_limits.h"
 
 #if defined(BOLTAPI_WITH_FLIGHT_SQL)
 
@@ -31,7 +32,17 @@
 
 namespace bolt::api::proto::flightsql {
 
+std::size_t max_query_bytes() noexcept {
+    const std::uint64_t v = ::bolt::api::boltapi_limits_value(
+        ::bolt::api::boltapi_limits_id::flight_sql_max_query_bytes);
+    assert(v >= 1024 && v <= ::bolt::api::limits::kFlightSqlQueryBytesMax);
+    return static_cast<std::size_t>(v);
+}
+
 namespace {
+
+constexpr const char* kQueryTooLarge =
+    "statement exceeds flight_sql_max_query_bytes (raise BOLTAPI_FLIGHT_SQL_MAX_QUERY_BYTES)";
 
 namespace cd = codec;
 namespace pm = params;
@@ -70,7 +81,12 @@ constexpr std::size_t kPrefaceLen = 24;
 constexpr std::uint32_t kMaxStreams = 16;
 constexpr std::size_t kOurMaxFrame = 16384;           // SETTINGS default
 constexpr std::size_t kHeaderBlockCap = 16384;
-constexpr std::size_t kStreamBodyCap = kMaxQueryBytes + 8192;
+// Request framing beyond the statement text (Any/FlightDescriptor wrapping).
+constexpr std::size_t kRequestFramingBytes = 8192;
+// Body capacity a stream slot keeps for its next request; larger is freed.
+constexpr std::size_t kBodyRetainBytes = 64 * 1024;
+// A gRPC message is at least its 5-byte length prefix.
+constexpr std::size_t kGrpcPrefixBytes = 5;
 constexpr std::size_t kAuthCap = 1024;
 constexpr std::int64_t kDefaultWindow = 65535;
 constexpr std::int64_t kMaxWindow = 0x7FFFFFFF;
@@ -85,7 +101,6 @@ enum class Method : std::uint8_t {
 };
 
 constexpr std::string_view kSqlPkg = "arrow.flight.protocol.sql.";
-constexpr std::size_t kMaxPutMessages = 4096;
 constexpr int kMaxTlsRetries = 1024;
 
 Method method_for(std::string_view path) noexcept {
@@ -187,17 +202,32 @@ struct Stream {
     bool          ready = false;       // request complete, awaiting dispatch
     bool          active = false;      // being dispatched; slot must not be reused
     bool          reset = false;       // peer sent RST_STREAM
-    bool          overflow = false;    // body exceeded kStreamBodyCap
+    bool          overflow = false;    // body exceeded its budget (body_budget)
     Method        method = Method::kUnknown;
     std::uint32_t id = 0;
     std::int64_t  send_window = kDefaultWindow;
-    std::size_t   body_len = 0;
     std::size_t   auth_len = 0;
     std::uint64_t timeout_ms = 0;      // grpc-timeout; 0 = none
     char          auth[kAuthCap] = {};
     char          path[160] = {};
-    std::uint8_t* body = nullptr;      // kStreamBodyCap, owned by Conn
+    std::vector<std::uint8_t> body;    // grown as DATA arrives, up to body_budget()
 };
+
+// Budgets, read per request (boltapi_limits.h).
+std::size_t doput_bytes() noexcept {
+    const std::uint64_t v = ::bolt::api::boltapi_limits_value(
+        ::bolt::api::boltapi_limits_id::flight_sql_doput_bytes);
+    assert(v >= 1);
+    return static_cast<std::size_t>(v);
+}
+
+// A DoPut buffers its parameter batches; every other call one request message.
+std::size_t body_budget(Method m) noexcept {
+    const std::size_t b = m == Method::kDoPut ? doput_bytes()
+                                              : max_query_bytes() + kRequestFramingBytes;
+    assert(b > kRequestFramingBytes || m == Method::kDoPut);
+    return b;
+}
 
 // ---------------------------------------------------------------------------
 // One HTTP/2 connection. Owned by a worker, reused across connections.
@@ -207,11 +237,7 @@ public:
     Conn(const Config& cfg, IQueryExecutor& exec, IAuthenticator& auth,
          const std::atomic<bool>& stopping)
         : cfg_(cfg), exec_(exec), auth_(auth), stopping_(stopping),
-          frame_(kOurMaxFrame), out_(kOurMaxFrame), hblock_(kHeaderBlockCap),
-          bodies_(static_cast<std::size_t>(kMaxStreams) * kStreamBodyCap) {
-        for (std::uint32_t i = 0; i < kMaxStreams; ++i) {
-            streams_[i].body = bodies_.data() + static_cast<std::size_t>(i) * kStreamBodyCap;
-        }
+          frame_(kOurMaxFrame), out_(kOurMaxFrame), hblock_(kHeaderBlockCap) {
         headers_.reserve(128);
         ipc_.reserve(1u << 20);
         msg_.reserve(1u << 20);
@@ -336,9 +362,11 @@ private:
     Stream* alloc(std::uint32_t sid) noexcept {
         for (auto& s : streams_) {
             if (!s.in_use) {
-                std::uint8_t* body = s.body;
+                std::vector<std::uint8_t> body = std::move(s.body);
+                body.clear();
+                if (body.capacity() > kBodyRetainBytes) std::vector<std::uint8_t>().swap(body);
                 s = Stream{};
-                s.body = body;
+                s.body = std::move(body);
                 s.in_use = true;
                 s.id = sid;
                 s.send_window = peer_initial_window_;
@@ -381,6 +409,7 @@ private:
     void create_prepared(Stream& s, std::string_view sql) noexcept;
     void describe_typed(std::string_view sql, const ParamType* types, std::uint32_t n) noexcept;
     void put_leading_schema(std::string* result) noexcept;
+    bool admit_sql(Stream& s, std::string_view sql, std::uint32_t* n) noexcept;
     bool bound_sql(Stream& s, std::string_view handle, std::string_view* sql) noexcept;
     bool put_update(Stream& s, std::string_view sql, const pm::Rows& rows,
                     const std::vector<pm::Value>& handle_row, bool bound) noexcept;
@@ -409,7 +438,6 @@ private:
     std::vector<std::uint8_t>      frame_;
     std::vector<std::uint8_t>      out_;
     std::vector<std::uint8_t>      hblock_;
-    std::vector<std::uint8_t>      bodies_;
     Stream                         streams_[kMaxStreams];
     std::unique_ptr<http::HPACKDecoder> hpack_;
     std::vector<http::HPACKHeader> headers_;
@@ -634,11 +662,11 @@ void Conn::handle_data(std::uint32_t sid, std::uint8_t flags, const std::uint8_t
     if (n > 0) window_update(0, static_cast<std::uint32_t>(n));
     Stream* s = find(sid);
     if (s == nullptr || s->ready || s->active) return;   // closed or complete
-    if (s->body_len + payload > kStreamBodyCap) {
+    if (s->overflow || s->body.size() + payload > body_budget(s->method)) {
         s->overflow = true;
+        std::vector<std::uint8_t>().swap(s->body);   // refused: hold nothing more
     } else {
-        std::memcpy(s->body + s->body_len, p + off, payload);
-        s->body_len += payload;
+        s->body.insert(s->body.end(), p + off, p + off + payload);
     }
     if (end_stream) {
         s->ready = true;
@@ -648,7 +676,8 @@ void Conn::handle_data(std::uint32_t sid, std::uint8_t flags, const std::uint8_t
         // PutResult before half-closing: one complete message is enough.
         std::string_view m;
         std::size_t used = 0;
-        const bool one = cd::grpc_unframe({reinterpret_cast<const char*>(s->body), s->body_len},
+        const bool one = cd::grpc_unframe({reinterpret_cast<const char*>(s->body.data()),
+                                           s->body.size()},
                                           &m, &used) == cd::GrpcFrame::kOk;
         if (one && (s->method == Method::kHandshake ||
                     (s->method == Method::kDoPut && is_statement_update_put(m)))) {
@@ -778,7 +807,12 @@ void Conn::dispatch(Stream& s) noexcept {
         return;
     }
     if (s.overflow) {
-        respond_error(s, GrpcCode::kResourceExhausted, "request message too large");
+        respond_error(s, GrpcCode::kResourceExhausted,
+                      s.method == Method::kDoPut
+                          ? "DoPut exceeds flight_sql_doput_bytes "
+                            "(raise BOLTAPI_FLIGHT_SQL_DOPUT_BYTES)"
+                          : "request exceeds flight_sql_max_query_bytes "
+                            "(raise BOLTAPI_FLIGHT_SQL_MAX_QUERY_BYTES)");
         return;
     }
     if (s.method == Method::kUnknown) {
@@ -803,7 +837,7 @@ void Conn::dispatch(Stream& s) noexcept {
     std::string_view msg;
     std::size_t used = 0;
     const cd::GrpcFrame fr = cd::grpc_unframe(
-        {reinterpret_cast<const char*>(s.body), s.body_len}, &msg, &used);
+        {reinterpret_cast<const char*>(s.body.data()), s.body.size()}, &msg, &used);
     if (fr == cd::GrpcFrame::kCompressed) {
         respond_error(s, GrpcCode::kUnimplemented,
                       "compressed gRPC messages are not supported (identity only)");
@@ -946,8 +980,8 @@ bool Conn::run_query(Stream& s, std::string_view sql, std::int64_t* rows,
         respond_error(s, GrpcCode::kInvalidArgument, "empty query");
         return false;
     }
-    if (sql.size() > kMaxQueryBytes) {
-        respond_error(s, GrpcCode::kInvalidArgument, "query exceeds 65536 bytes");
+    if (sql.size() > max_query_bytes()) {
+        respond_error(s, GrpcCode::kResourceExhausted, kQueryTooLarge);
         return false;
     }
     QueryFailure f;
