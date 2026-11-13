@@ -23,7 +23,11 @@
 
 namespace bolt::api::proto::flightsql::params {
 
-inline constexpr std::uint32_t kMaxParams = 256;      // placeholders per statement
+// Placeholders per statement: the flight_sql_params budget (boltapi_limits.h).
+std::uint32_t max_params() noexcept;
+inline constexpr const char* kTooManyParams =
+    "statement has more ? placeholders than flight_sql_params allows "
+    "(raise BOLTAPI_FLIGHT_SQL_PARAMS)";
 // Parameter sets per DoPut: the flight_sql_doput_rows budget (boltapi_limits.h).
 
 enum class Kind : std::uint8_t { kNull = 0, kInt = 1, kUInt = 2, kFloat = 3, kString = 4, kBool = 5 };
@@ -90,7 +94,7 @@ private:
 // 0 when malformed.
 std::uint8_t header_type(std::string_view metadata) noexcept;
 
-// Number of `?` placeholders; false when there are more than kMaxParams.
+// Number of `?` placeholders; false when there are more than max_params().
 bool count_placeholders(std::string_view sql, std::uint32_t* n) noexcept;
 
 // render()'s refusal when the bound statement exceeds `cap`.

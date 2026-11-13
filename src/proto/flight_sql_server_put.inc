@@ -16,10 +16,10 @@ bool Conn::admit_sql(Stream& s, std::string_view sql, std::uint32_t* n) noexcept
         return false;
     }
     if (!pm::count_placeholders(sql, n)) {
-        respond_error(s, GrpcCode::kInvalidArgument, "statement has more than 256 parameters");
+        respond_error(s, GrpcCode::kResourceExhausted, pm::kTooManyParams);
         return false;
     }
-    assert(*n <= pm::kMaxParams);
+    assert(*n <= pm::max_params());
     return true;
 }
 
@@ -105,7 +105,7 @@ void Conn::create_prepared(Stream& s, std::string_view sql) noexcept {
 void Conn::describe_typed(std::string_view sql, const ParamType* types,
                           std::uint32_t n) noexcept {
     assert(types != nullptr);
-    assert(n > 0 && n <= pm::kMaxParams);
+    assert(n > 0 && n <= pm::max_params());
     ipc_.clear();
     std::vector<pm::Value> stand_in(n);
     for (std::uint32_t i = 0; i < n; ++i) {
