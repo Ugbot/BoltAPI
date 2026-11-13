@@ -147,7 +147,6 @@ src/proto/flight_sql_params.cpp::kMaxMembers
 src/proto/flight_sql_server.cpp::kAuthCap
 src/proto/flight_sql_server.cpp::kHeaderBlockCap
 src/proto/flight_sql_server.cpp::kMaxFramesPerWait
-src/proto/flight_sql_server.cpp::kMaxIpcMessages
 src/proto/flight_sql_server.cpp::kMaxTlsRetries
 src/proto/flight_sql_server.cpp::kMaxWindow
 src/proto/flight_sql_server.cpp::kOurMaxFrame
