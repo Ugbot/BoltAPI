@@ -61,8 +61,20 @@ public:
         if (sql == "UPDATES") {
             n = g_updates.load(std::memory_order_acquire);
         } else if (sql.size() > 7 && sql.substr(0, 7) == "SELECT ") {
+            // "SELECT <n>" or "SELECT <n> BATCH <rows per batch>".
             const std::string num(sql.substr(7));
-            n = std::strtoll(num.c_str(), nullptr, 10);
+            char* end = nullptr;
+            n = std::strtoll(num.c_str(), &end, 10);
+            if (end != nullptr && std::strncmp(end, " BATCH ", 7) == 0) {
+                batch_rows_ = std::strtoll(end + 7, nullptr, 10);
+            }
+        }
+        const std::int64_t per = batch_rows_;
+        batch_rows_ = kBatchRows;
+        if (per < 1 || per > kBatchRows) {
+            f.code = fs::GrpcCode::kInvalidArgument;
+            f.message = "batch size out of range";
+            return false;
         }
         if (n < 0 || n > g_max_rows) {
             f.code = fs::GrpcCode::kInvalidArgument;
@@ -70,7 +82,7 @@ public:
             return false;
         }
         *rows = n;
-        return encode(n, out);
+        return encode(n, per, out);
     }
 
     bool execute_update(std::string_view sql, std::int64_t* affected,
@@ -204,7 +216,8 @@ private:
         return got == out->size();
     }
 
-    bool encode(std::int64_t n, std::string* out) noexcept {
+    bool encode(std::int64_t n, std::int64_t per, std::string* out) noexcept {
+        assert(per >= 1 && per <= kBatchRows);
         std::FILE* fp = std::tmpfile();
         if (fp == nullptr) return false;
         const bolt::BoltType types[3] = {bolt::BoltType::Int64, bolt::BoltType::Utf8,
@@ -213,7 +226,7 @@ private:
         bool ok = bolt::ingest::arrow_ipc_open(writer_, fp, types, names, 3);
         std::int64_t base = 0;
         for (std::int64_t b = 0; ok && (b == 0 || base < n); ++b) {   // bounded by n
-            const std::int64_t m = (n - base) < kBatchRows ? (n - base) : kBatchRows;
+            const std::int64_t m = (n - base) < per ? (n - base) : per;
             ok = write_batch(base, m);
             base += m;
         }
@@ -268,6 +281,7 @@ private:
     bolt::BoltBatch*              batch_;
     char                          fail_[256] = {};
     std::string                   echo_;
+    std::int64_t                  batch_rows_ = kBatchRows;
 };
 
 class EchoFactory final : public fs::IExecutorFactory {

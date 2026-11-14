@@ -89,7 +89,6 @@ constexpr std::size_t kGrpcPrefixBytes = 5;
 constexpr std::size_t kAuthCap = 1024;
 constexpr std::int64_t kDefaultWindow = 65535;
 constexpr std::int64_t kMaxWindow = 0x7FFFFFFF;
-constexpr std::size_t kMaxIpcMessages = 1u << 16;
 constexpr int kMaxFramesPerWait = 1 << 20;
 
 constexpr std::string_view kServicePrefix = "/arrow.flight.protocol.FlightService/";
@@ -1033,15 +1032,21 @@ void Conn::rpc_do_get(Stream& s, std::string_view msg) noexcept {
     if (!produce(s, ticket, true, &rows, &m, nullptr)) return;
     if (!send_response_headers(s)) return;
     // ipc_ stays untouched while streaming: produce is not re-entered.
+    // G2CHK-1083: every message of the produced stream goes out. Each one
+    // advances `pos` by at least its 8-byte prefix, so the stream's size bounds
+    // the loop; a fixed message count used to end a long result with OK.
     std::size_t pos = 0;
     bool bad = false;
-    for (std::size_t i = 0; i < kMaxIpcMessages; ++i) {
-        if (!cd::ipc_next_message(ipc_, &pos, &m, &bad)) break;
+    bool done = false;
+    const std::size_t max_msgs = ipc_.size() / 8u + 1u;
+    for (std::size_t i = 0; i < max_msgs; ++i) {
+        if (!cd::ipc_next_message(ipc_, &pos, &m, &bad)) { done = true; break; }
         msg_.clear();
         cd::encode_flight_data(&msg_, m.metadata, m.body);
         if (!send_message(s, msg_)) return;
     }
-    if (bad) {
+    assert(done || bad);
+    if (bad || !done) {
         (void)send_trailers(s, GrpcCode::kInternal, "malformed Arrow IPC stream", false);
         return;
     }

@@ -497,6 +497,23 @@ def check_parameters(port, failures):
     client.close()
 
 
+def check_many_messages(port, failures):
+    """G2CHK-1083: a DoGet past 65,536 IPC messages is delivered whole."""
+    client = fl.FlightClient("grpc://127.0.0.1:%d" % port)
+    n = 70000
+    try:
+        _, table = run_query(client, "SELECT %d BATCH 1" % n)
+        if table.num_rows != n:
+            failures.append("DoGet of %d one-row batches returned %d rows" % (n, table.num_rows))
+        elif len(table.to_batches()) != n:
+            failures.append("DoGet of %d batches returned %d" % (n, len(table.to_batches())))
+        elif table.column("id").to_pylist() != list(range(n)):
+            failures.append("DoGet of %d one-row batches: ids differ" % n)
+    except Exception as e:  # noqa: BLE001
+        failures.append("DoGet of %d one-row batches failed: %s" % (n, e))
+    client.close()
+
+
 def check_limits(port, failures):
     """G2CHK-1009: query text and DoPut parameter sets are budgets."""
     client = fl.FlightClient("grpc://127.0.0.1:%d" % port)
@@ -839,6 +856,7 @@ def main():
         check_updates(port, failures)
         check_parameters(port, failures)
         check_limits(port, failures)
+        check_many_messages(port, failures)
         check_adbc(port, failures)
         check_jdbc(port, failures)
     finally:
