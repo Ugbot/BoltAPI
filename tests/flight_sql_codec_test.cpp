@@ -172,8 +172,9 @@ TEST(FlightSqlParams, PlaceholdersSkipStringsIdentifiersAndComments) {
     ASSERT_TRUE(pm::count_placeholders("SELECT '?", &n));   // unterminated literal
     EXPECT_EQ(n, 0u);
     std::string many = "SELECT ";
-    for (int i = 0; i < 257; ++i) many += "?,";
-    EXPECT_FALSE(pm::count_placeholders(many, &n));
+    for (int i = 0; i < 300; ++i) many += "?,";
+    ASSERT_TRUE(pm::count_placeholders(many, &n));   // past the old fixed 256
+    EXPECT_EQ(n, 300u);
 }
 
 TEST(FlightSqlParams, RendersAnsiLiterals) {
@@ -530,4 +531,33 @@ TEST(FlightSqlLimits, QueryTextDefaultsToGestaltMaxQueryBytes) {
                            &out, &err)) << err;
     EXPECT_FALSE(pm::render(sql, row.data(), 1, 1024, &out, &err));
     EXPECT_EQ(err, pm::kRenderTooLarge);
+}
+
+// A FlightDescriptor past 256 fields keeps its cmd (the loop stopped at 256).
+TEST(FlightSqlCodec, DescriptorPast256FieldsKeepsItsCommand) {
+    std::string desc;
+    for (int k = 0; k < 300; ++k) cd::pb_put_varint(&desc, 9, 1);   // unknown field
+    cd::pb_put_varint(&desc, 1, 2);
+    cd::pb_put_bytes(&desc, 2, "cmd-bytes");
+    cd::Descriptor d;
+    ASSERT_TRUE(cd::decode_descriptor(desc, &d));
+    EXPECT_EQ(d.type, 2u);
+    EXPECT_EQ(d.cmd, "cmd-bytes");
+}
+
+// GetTables filtered by more than 256 table types (was refused).
+TEST(FlightSqlMetadata, TableTypeFilterPast256Entries) {
+    CatalogBoundsExecutor exec;
+    exec.tables = 3;
+    std::string value;
+    for (int k = 0; k < 300; ++k) cd::pb_put_bytes(&value, 4, "VIEW");
+    cd::pb_put_bytes(&value, 4, "TABLE");
+    std::string out;
+    std::int64_t rows = -1;
+    fs::QueryFailure failure;
+    char message[256]{};
+    const auto result = fs::metadata::build("arrow.flight.protocol.sql.CommandGetTables", value,
+        exec, fs::Config{}, &out, &rows, failure, message, sizeof(message));
+    EXPECT_EQ(result, fs::metadata::Outcome::kOk) << failure.message;
+    EXPECT_EQ(rows, 3);
 }
