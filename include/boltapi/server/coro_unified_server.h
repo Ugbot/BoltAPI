@@ -24,6 +24,7 @@
 #include "boltapi/net/io_dispatcher.h"
 #include "boltapi/net/tls_context.h"
 #include "boltapi/net/coro_tls_socket.h"
+#include "boltapi/server/drain_gate.h"
 #include "boltapi/http/dispatch_task.h"
 #include "boltapi/http/fixed_stream_limits.h"
 #include "boltapi/http/http1_parser.h"
@@ -630,8 +631,11 @@ public:
      * Get number of active connections
      */
     uint64_t get_active_connections() const noexcept {
-        return connections_active_.load(std::memory_order_relaxed);
+        return drain_.active();
     }
+
+    // Graceful-shutdown drain gate; exposed for the shutdown wake tests.
+    DrainGate& drain_gate() noexcept { return drain_; }
 
     /**
      * Get the server's unified async I/O dispatcher (the event loop that backs
@@ -647,7 +651,7 @@ public:
      */
     bool track_connection_open() noexcept {
         if (!is_accepting()) return false;
-        connections_active_.fetch_add(1, std::memory_order_relaxed);
+        drain_.open_one();
         return true;
     }
 
@@ -655,9 +659,8 @@ public:
      * Track connection close - decrements counter and notifies shutdown if last connection
      */
     void track_connection_close() noexcept {
-        uint64_t prev = connections_active_.fetch_sub(1, std::memory_order_acq_rel);
-        if (prev == 1 && is_draining()) {
-            shutdown_cv_.notify_all();
+        if (drain_.close_one() && is_draining()) {
+            drain_.wake();
         }
     }
 
@@ -786,12 +789,10 @@ private:
     // Graceful shutdown support
     std::atomic<CoroShutdownState> shutdown_state_{CoroShutdownState::STOPPED};
     std::atomic<bool> stop_requested_{false};
-    std::mutex shutdown_mutex_;
-    std::condition_variable shutdown_cv_;
+    DrainGate drain_;
 
     // Statistics (cache-line aligned to prevent false sharing)
     alignas(core::kCacheLineSize) std::atomic<uint64_t> connections_accepted_{0};
-    alignas(core::kCacheLineSize) std::atomic<uint64_t> connections_active_{0};
     alignas(core::kCacheLineSize) std::atomic<uint64_t> requests_total_{0};
     alignas(core::kCacheLineSize) std::atomic<uint64_t> requests_http1_{0};
     alignas(core::kCacheLineSize) std::atomic<uint64_t> requests_http2_{0};

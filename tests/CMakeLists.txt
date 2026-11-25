@@ -69,6 +69,12 @@ if(WIN32)
     target_link_libraries(boltapi_stream_response_test PRIVATE ws2_32 mswsock)
 endif()
 
+# G2CHK-1303: graceful shutdown wakes (last-connection close, STOPPED -> start()).
+boltapi_add_test(boltapi_shutdown_drain_wake_test shutdown_drain_wake_test.cpp)
+if(WIN32)
+    target_link_libraries(boltapi_shutdown_drain_wake_test PRIVATE ws2_32 mswsock)
+endif()
+
 # App::offload: blocking handler work off the I/O thread (G2ETL-52).
 boltapi_add_test(boltapi_offload_test offload_test.cpp)
 if(WIN32)
