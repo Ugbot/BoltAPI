@@ -926,9 +926,9 @@ int CoroUnifiedServer::start() {
 
     // If draining, wait for graceful shutdown to complete
     if (is_draining()) {
-        std::unique_lock<std::mutex> lock(shutdown_mutex_);
-        auto timeout = std::chrono::milliseconds(config_.shutdown_timeout_ms);
-        shutdown_cv_.wait_for(lock, timeout, [this]() {
+        auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(config_.shutdown_timeout_ms);
+        drain_.wait_until(deadline, [this]() noexcept {
             return shutdown_state_.load(std::memory_order_acquire) == CoroShutdownState::STOPPED;
         });
     }
@@ -1242,24 +1242,21 @@ bool CoroUnifiedServer::shutdown_gracefully() {
     }
 
     // Wait for active connections to drain
-    std::unique_lock<std::mutex> lock(shutdown_mutex_);
-    auto timeout = std::chrono::milliseconds(config_.shutdown_timeout_ms);
-    auto deadline = std::chrono::steady_clock::now() + timeout;
-
-    bool drained = shutdown_cv_.wait_until(lock, deadline, [this]() {
-        return connections_active_.load(std::memory_order_relaxed) == 0;
-    });
+    auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(config_.shutdown_timeout_ms);
+    bool drained = drain_.wait_drained(deadline);
 
     if (drained) {
         std::cout << "[CoroUnifiedServer] All connections drained, shutdown complete" << std::endl;
     } else {
         std::cout << "[CoroUnifiedServer] Shutdown timeout, forcing close of "
-                  << connections_active_.load(std::memory_order_relaxed)
+                  << drain_.active()
                   << " connections" << std::endl;
     }
 
     // Complete shutdown
     shutdown_state_.store(CoroShutdownState::STOPPED, std::memory_order_release);
+    drain_.wake();  // start() waits for STOPPED on the drain gate
 
     cancel_fixed_streams();
 
@@ -2381,7 +2378,7 @@ core::coro_task<void> CoroUnifiedServer::handle_websocket_connection(
 CoroUnifiedServer::Stats CoroUnifiedServer::get_stats() const noexcept {
     return Stats{
         .connections_accepted = connections_accepted_.load(std::memory_order_relaxed),
-        .connections_active = connections_active_.load(std::memory_order_relaxed),
+        .connections_active = drain_.active(),
         .requests_total = requests_total_.load(std::memory_order_relaxed),
         .requests_http1 = requests_http1_.load(std::memory_order_relaxed),
         .requests_http2 = requests_http2_.load(std::memory_order_relaxed),
